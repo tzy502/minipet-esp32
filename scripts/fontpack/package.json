@@ -1,0 +1,16 @@
+{
+  "name": "minipet-fontpack",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Seed font pack toolchain: charset gen + lv_font_conv + intermediate JSON for server FontPackWriter (kind=4 FONT)",
+  "scripts": {
+    "build": "bash build-fonts.sh"
+  },
+  "dependencies": {
+    "lv_font_conv": "^1.5.3"
+  }
+  ,
+  "engines": {
+    "node": ">=18"
+  }
+}
