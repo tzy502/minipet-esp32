@@ -1,6 +1,6 @@
 # 素材包二进制格式（算法级规格）
 
-> 状态：**v2.1**（二轮：+3.10-9 条带周期折叠 / 3.10-5 标题 96B 已修）
+> 状态：**v2.2**（三轮 R4-R9：差量口径定稿/offset寻址/part_id保留段/manifest selector·cached·按设备隔离/导出器出处/fontTime项/开放问题全定稿）
 > 定位：实现级细节文档——布局表、部件包、背景包、字体包的二进制结构
 > 评审：Phase 2 完成后随 software-design.md 一并过 3 agent 评审（含对抗验证 agent）
 > 作者说明：C# 侧实现细节由 Agent 定稿，胶水开独立 agent 对抗验证
@@ -11,7 +11,7 @@
 
 1. **设备端零解析成本**：所有结构按「顺序读、定长头、偏移索引」设计，固件拿到就能用，不需要 JSON 解析器、不需要 WZ 知识
 2. **hash 寻址**：每个素材以内容 hash（xxhash64，快且短）为身份，manifest 按 hash 去 diff；URL 即 `GET /api/device/asset/{hash}`
-3. **差量友好**：部件按「部件图」独立成包（换一件衣服只拉一个包）；布局表按「动作」独立；背景按「地图」独立——粒度 = 差量粒度
+3. **差量友好**：**PARTS 以整套装扮为传输单元**（换任意一件 = 拉新装扮包 400-700KB，局域网 <1s；part_id 跨包稳定，未来可平滑引入单件级差量——R4 定稿）；布局表按「动作」独立；背景按「地图」独立
 4. **端序与对齐**：统一小端、4 字节对齐、所有字符串 UTF-8 定长区 + 偏移（不用 C 字符串）
 
 ## 二、包的通用信封
@@ -39,11 +39,11 @@ payload:
                     expr_group：face 类部件的表情变体组号——同一 face 部件的 25 个表情变体共享 group、组内按 LAYOUT 的 expression 列表顺序排列；非 face 件 group=0
                     offset：位图数据区内该图的显式偏移（u32；不再按累计推算，前向安全）
                     ⚠️ z_base/flags 移除：z 属于布局表（每帧可变），PARTS 只存图
-[...] 位图数据区（连续，索引按顺序偏移累计；每图 RGB565 行对齐 4B）
+[...] 位图数据区（连续，索引 offset 显式寻址；每图 RGB565 行对齐 4B）
 ```
 
 - 格式 **RGB565**（无 alpha 的部件直接不透明）；带 alpha 的部件用 **RGBA5650 变体**：1bit alpha 掩码位图附在像素后（每 8 像素 1 字节）——比 RGBA8888 省 40%，像素风 alpha 边缘 1bit 足够
-- part_id 用稳定编号（导出器分配：body=1, head=2, hair=10.., face=20.., coat=30.....）
+- part_id 用稳定编号（导出器分配：body=1, head=2, hair=10.., face=20.., coat=30..；**fontTime 时钟数字保留段 900..（见七.5）**）
 - **表情替换闭环（A2 定稿）**：渲染时 piece.expr_index ≠ 255 → 找到该 piece 引用的 face 件 part → 取其 expr_group → 在组内按 expr_index 偏移取变体 part_id → blit 变体图。导出器保证：每组变体数 == LAYOUT.expression_count，尺寸/origin 同构（仅像素不同）
 - 480 屏 2x 缩放在设备端做（nearest），包里存 1x
 
@@ -128,8 +128,11 @@ payload:
   "assets": {
     "<hash>": { "kind": "PARTS", "bytes": 51200, "url": "/api/device/asset/<hash>", "label": "默认装扮" },
     "...": { "kind": "LAYOUT", "entity": "paperdoll:default", "action": "walk1" },
-    "...": { "kind": "BGMAP", "map": "200000100", "label": "天空之城售票处", "thumb": "<hash>" }
+    "...": { "kind": "BGMAP", "map": "200000100", "label": "天空之城售票处", "thumb": "<hash>", "selector": "map" }
   },
+  （`selector`: map|paperdoll|npc|clock——无 selector 字段的条目不进设备选择器（R7）；
+   `cached` 标记 = 设备经 POST /api/device/event 附本地 hash 集上报、服务端计算回写（E7）；
+   **manifest 按设备隔离（E13），rev 每设备单调递增**）
   "firmware": { "ver": "0.3.1", "url": "/api/device/firmware/0.3.1.bin" },
   "clock_table": { "200000100": [123, 240], "220000100": [98, 258] }
 }
@@ -155,11 +158,14 @@ payload:
 2. 部件位图走 `WzService.ExtractPng` + PngEncoder 解码 → BGRA→RGB565 量化（带 1bit alpha 判定阈值 ≥128）
 3. 表情维度：对 25 表情 × 各动作跑 (action, frame, expression) 组合，face 类部件按 expr_index 替换
 4. BGMAP：`MapService.RenderViewport` 出 static_back（视口快照）+ tile 层（关 back 只渲染 tile/obj）分两趟；条带元数据从 `ParseBacks` 的 ScrollH/V 项生成
+   - 公式实证（R8）：ScrollH `X += (rx*5*t) % cx`、非滚动 `X += floor(camCenter*(100+rx)/100)`（MapService.Render.cs:221-222）；ScrollH/V 判定位 `GetBackTileMode`（MapService.cs:799，bit2/bit3）；条带图按 cx 预平铺（第五节）
+5. fontTime 全套（0-9/am/pm/comma）按 PARTS 导出，part_id 900.. 保留段（R6/R8）
 5. hash 用 xxhash64（服务端 System.IO.Hashing），manifest rev 单调递增
-6. 导出 CLI：`dotnet run --project Server/tools/Exporter -- --appearance <json> --profile amoled216`（CI/手动皆可）
+7. 导出 CLI：`dotnet run --project Server/tools/Exporter -- --appearance <json> --profile amoled216`（CI/手动皆可）
+8. manifest rev **每设备单调递增**（R7/R8，与按设备隔离一致）
 
-## 十一、开放问题（留给评审）
+## 十一、开放问题（R9 全部定稿）
 
-1. RGBA5650 的 1bit alpha 在半透明特效（如 glow）上是否可接受？备选：face/特效类部件允许 4bit alpha 变体（flag 位）
-2. LAYOUT 的 z 用 i8 是否够（WZ zmap 183 层是桌面合成顺序，导出时已折叠为相对序，预计 <127）
-3. 条带 speed 单位 px/s 与 IMU 倾角的映射系数放 Web 配置还是包内——倾向 Web（可调）
+1. **1bit alpha 保持默认**；M2 回放工具加 1bit vs 4bit 边缘质量 A/B 验收（与逐像素对比同场），结论 M2 出——届时若需 4bit 变体，用索引 flag 位扩展，格式不破坏
+2. **z 用 i8 定稿**：帧内相对序实测 <127（WZ zmap 183 层是桌面合成序，导出时已折叠）
+3. **条带 speed 与 IMU 倾角映射系数定稿放 Web 配置**（可调，不进包）

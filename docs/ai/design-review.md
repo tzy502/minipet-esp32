@@ -154,3 +154,40 @@ software-design 2.1 迁移表写「MusicCatalogService / MusicPlayerService / Mu
 3. `requirements-analysis.md` 微修：E6 定稿本地驱动（3.3）、E4 端口项只读（3.1）、E1「10.4K 行 / 17 处」更新为实测口径（3.10 之 8 与第一节）
 4. `deployment-design.md` 重写为单容器版（或顶部加「已被 E3 取代」标注），README.md / docs-ai README 同步单容器 + 38090
 5. 以上落完启动 M1，验收门禁加「`grep -r Avalonia Server/` 零命中」
+
+---
+
+## 六、三轮复核（2026-09-25，胶水修订批次 review + 待统一调整清单）
+
+> 胶水已自行落一轮修订（algorithm v2.1 / software-design v1.1 / requirements E1·E3·E6 / deployment 取代横幅 + 占位符脱敏 / 根 README 单容器一句话）。复核结论：**批次通过**（依据见 6.1）。Agent 对 algorithm 的 v2.2 直改已 `git checkout` 撤销，其内容连同本轮新发现全部收敛为 6.2 清单，**由胶水统一调整**。
+
+### 6.1 实测确认（复核通过依据）
+
+- PaperdollService「Dispatcher 仅存在于注释」：✅ 实测 3 处全为 `//` 历史注释，零代码引用
+- MusicCatalogService / MusicPlayerService 各 1 处：✅ 均为 XML doc 注释，零代码引用
+- AnimService / WzService / MapService(+Render) / SpriteService / MapCatalogService / BalloonService / WzError：✅ 零引用
+- 「迁移范围内仅 EventBus 需清理」：✅ 成立（PetManager 的 2 处代码引用在其「概念并入」范围外，不随代码迁移）
+- 全目录「14 处非注释 / 9 文件」与初测「20 行含注释」口径吻合（差 6 处注释），可信
+- E1 行数口径（17 文件 ≈13.3K / 净 ≈12K）与实测 13,140 行一致
+- LVGL 合流方案（framebuffer 单一所有权 + 单写屏者 + 气泡离屏位图化）：认可，规避 LVGL v9 custom draw unit 深水区；「菜单期宠物暂停」代价与 E6 菜单独立全屏自洽
+- GetMeshBack 处置（R2 参考命名，引用统一写 ParseBacks + DrawBackViewport）：合理
+
+### 6.2 待统一调整清单（R1–R11）
+
+| # | 位置 | 问题 | 建议改法 |
+|---|---|---|---|
+| R1 | software-design 2.4 | JSON 示例仍含 `"Server": { "Port": 38090 }`，与 E3「appsettings 无端口项」矛盾 | 删除该行；示例下补一句「端口属部署层 .env，不入 appsettings」 |
+| R2 | requirements E4 | 设置页仍列「端口」为可编辑项 | 改「端口（只读展示，部署层 .env 管理）」 |
+| R3 | README.md:34 | 文档索引描述 deployment-design 仍写「三容器」 | 改「NAS Docker 部署设计（单容器定稿，文内含历史三容器稿）」 |
+| R4 | algorithm 原则 3 | 「部件按部件图独立成包（换一件衣服只拉一个包）」与 kind=1「整套装扮一包」自相矛盾 | 改「**PARTS 以整套装扮为传输单元**（换任意一件 = 拉新装扮包 400-700KB，局域网 <1s；part_id 跨包稳定，未来可平滑引入单件级差量）」 |
+| R5 | algorithm 三节 | 位图数据区括号内「索引按顺序偏移累计」与新增显式 offset 字段矛盾 | 删「按顺序偏移累计」半句，改「offset 显式寻址」 |
+| R6 | algorithm 三节 part_id 行 | fontTime 保留段未标注 | 补「fontTime 时钟数字保留段 900..（见七.5）」 |
+| R7 | algorithm 八节 manifest | 缺 selector 字段 / cached 上报通道 / 按设备隔离说明 | 条目补 `"selector": "map|paperdoll|npc|clock"`（无 selector 不进选择器）；bullets 补「`cached` = 设备经 `POST /api/device/event` 附本地 hash 集上报、服务端计算回写（E7）」与「manifest 按设备隔离（E13），rev 每设备单调递增」 |
+| R8 | algorithm 十节 | 导出器要点缺条带公式出处 / fontTime 项 / rev 口径 | 第 4 条补「公式实证 MapService.Render.cs:221（`rx*5*t % cx` / `camCenter*(100+rx)/100`）、ScrollH/V 判定位 `GetBackTileMode`（MapService.cs:799）、条带图按 cx 预平铺（五节）」；新增条目「fontTime 全套按 PARTS 导出（part_id 900..）」；rev 改「每设备单调递增」 |
+| R9 | algorithm 十一节 | 开放问题三条未定稿 | 处置定稿：① 1bit alpha 保持默认，**M2 回放工具加 1bit vs 4bit 边缘质量 A/B 验收**，结论 M2 出；② z 用 i8 定稿够用（帧内相对序 <127）；③ 条带 speed / IMU 系数定稿放 Web 配置 |
+| R10 | software-design 2.1 表 | EventBus「3 处非注释 Dispatcher.UIThread」口径不准 | 实测 **2 处调用**（EventBus.cs:99 `CheckAccess` / :105 `Post`）+ 1 处 `using Avalonia.Threading;`；表注写清「2 处调用 + 1 处 using」 |
+| R11 | deployment-design.md:128（可选） | 环境对照表「外部 8090」过期 | 顶部横幅已声明全文历史记录，可留；要顺手改则同步 38090 |
+
+### 6.3 撤销记录
+
+Agent 曾在 algorithm v2.1 之上直改 7 处（状态头 v2.2 / 原则3 差量口径 / part_id 保留段 / manifest selector·cached·按设备隔离 / 导出器要点公式出处与 fontTime / 开放问题处置），按分工约定（胶水落修订、Agent 只 review）已于 2026-09-25 `git checkout` 撤销，内容全部清单化为 R4–R9。
