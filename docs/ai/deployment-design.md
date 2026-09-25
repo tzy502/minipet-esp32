@@ -6,16 +6,15 @@
 
 ---
 
-## 一、部署形态（前后端分离 · 两容器）
+## 一、部署形态（前后端分离 · 单容器）
 
 ```
 <NAS_IP> (NAS /volume2/docker/minipet/)
 ├─ api          minipet-server（ASP.NET Core 9）
 │                挂载：WZ数据(只读) + data/（配置/缓存/设备表/OTA）
 │                出口：内部 8080
-└─ qqmusic      Rain120/qq-music-api（Node，可选启用）
-                 出口：内部 3300，仅 api 访问
-（原设计的 nginx web 容器已砍——ASP.NET Core 直接托管 Vue 产物与 API，单容器单端口，无中间层）
+（qq-music-api 不再独立成容器：启用时由 api 容器内部拉起 node 子进程，监听内部 127.0.0.1:3300，仅 api 访问；
+未启用则不拉起。原设计的 nginx web 容器与 qqmusic 容器均已砍——**整个部署只有一个容器**，胶水定稿）
 
 访问路径（浏览器与 ESP32 同源同端口）：
   浏览器     http://<NAS_IP>:38090/            （Web UI = api 托管的 Vue 产物）
@@ -71,11 +70,7 @@ services:
     ports: ["${MINIPET_PORT:-38090}:80"]   # 五位数端口，.env 可改
     depends_on: [api]
 
-  qqmusic:                             # 可选：注释掉即纯 WZ 曲库
-    image: ghcr.io/tzy502/minipet-qqmusic:latest
-    container_name: minipet-qqmusic
-    restart: unless-stopped
-    expose: ["3300"]
+  # 无 qqmusic 服务——QQ 网关是 api 容器内的 node 子进程（配置开关控制拉起与否）
 ```
 
 ### 端口配置（胶水定稿：五位数 + 可修改）
@@ -97,7 +92,7 @@ services:
 
 **主路（GitHub Actions → GHCR）**
 ```
-git push → Actions 构建 api/web/qqmusic 三镜像（多架构按需）→ ghcr.io/tzy502/*
+git push → Actions 构建**单镜像** minipet-api（多架构按需）→ ghcr.io/tzy502/minipet-api
 NAS：Container Manager → 项目 → 拉取 compose → up -d
 ```
 - NAS 可出外网 ✅（已确认）；GHCR 若慢，走 hermes 同款镜像加速（`docker.xuanyuan.run` 前缀）
