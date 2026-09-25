@@ -41,7 +41,7 @@ minipet-esp32/
 | BassMusicPlayer | **不迁** | 设备播；服务端只转发流 |
 | CacheManager | 重写薄版 | 桌面版管磁盘 PNG 缓存 → 新版管素材包缓存（hash→文件） |
 | ConfigService | 重写 | appsettings.json 读写 + 热重载 + Web 校验端点 |
-| AnimService / EventBus / PetManager | 部分迁 | **EventBus 含 3 处非注释 Dispatcher.UIThread（实测，迁移范围内唯一需清理项）** → 改 Channel；AnimService 时序规则进导出器；PetManager 概念并入 DeviceRegistry |
+| AnimService / EventBus / PetManager | 部分迁 | **EventBus 含 2 处 Dispatcher.UIThread 调用（cs:99 CheckAccess / :105 Post）+ 1 处 using Avalonia.Threading（R10 实测口径，迁移范围内唯一清理项）** → 改 Channel；AnimService 时序规则进导出器；PetManager 概念并入 DeviceRegistry |
 | TrayService / EffectLayerService / Adapters / AgentState* / Walk* | **不迁** | 桌面专属 |
 | PngEncoder (Utils) | 原样迁入 | 导出器核心依赖 |
 
@@ -74,7 +74,6 @@ Web 端（前缀 /api/admin）：设备列表与配置 / 素材浏览与缩略�
 `data/config/appsettings.json` 单一来源，双通道写：
 ```json
 {
-  "Server":   { "Port": 38090 },
   "Wz":       { "DataPath": "/wz/Data" },
   "QqMusic":  { "Enabled": false, "Cookie": "", "GatewayPort": 3300 },
   "Bgm":      { "DefaultSource": "wz" },
@@ -82,7 +81,8 @@ Web 端（前缀 /api/admin）：设备列表与配置 / 素材浏览与缩略�
   "Clock":    { "MapOffsets": { "200000100": [123,240] } }
 }
 ```
-- Web 保存 = 序列化回写（保留注释的策略：定稿用 `_comment` 键（.NET 无 JSON5 原生支持，不留两案））
+- **端口属部署层 .env（MINIPET_PORT），不入 appsettings**（R1 定稿，与 E3 一致）
+- Web 保存 = 序列化回写（注释策略：`_comment` 键（.NET 无 JSON5 原生支持，不留两案））
 - 热重载：FileSystemWatcher → ConfigWatcher → 受影响服务 reload（WZ 重载有锁，桌面版模式复用）
 
 ### 2.5 部署（E3）

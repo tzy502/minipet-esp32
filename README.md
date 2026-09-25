@@ -31,7 +31,7 @@ minipet-esp32/
 | [docs/ai/README.md](docs/ai/README.md) | F19 分支线全部决策（架构/硬件/渲染/表情/BGM/不做清单） |
 | [docs/ai/clock-display-spec.md](docs/ai/clock-display-spec.md) | WZ 地图时钟显示规格（已定稿） |
 | [docs/ai/waveshare-wiki-ESP32-S3-Touch-AMOLED-2.16.md](docs/ai/waveshare-wiki-ESP32-S3-Touch-AMOLED-2.16.md) | 微雪官方 wiki 全量（GPIO 引脚表/外设速查） |
-| [docs/ai/deployment-design.md](docs/ai/deployment-design.md) | NAS Docker 部署设计（三容器/compose/镜像分发/验证清单） |
+| [docs/ai/deployment-design.md](docs/ai/deployment-design.md) | NAS Docker 部署设计（单容器定稿，文内含历史三容器稿） |
 
 ## 开发状态
 

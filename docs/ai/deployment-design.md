@@ -125,7 +125,7 @@ NAS: docker load < tar && compose up -d
 | 环境 | api | web | WZ 数据 |
 |---|---|---|---|
 | 本地开发 | `dotnet run`（:8080） | `npm run dev`（:5173, proxy /api） | /Volumes/SSD/mxd（Mac 直读，快） |
-| NAS 生产 | 容器 8080（内部） | 容器 80（外部 8090） | /volume2/homes/...（容器内 /wz，本地盘，快） |
+| NAS 生产 | 容器 8080（内部） | 单容器直出（外部 38090） | /volume2/homes/...（容器内 /wz，本地盘，快） |
 
 - **不复制 WZ 数据进镜像**（7.9GB+ 且涉及版权）；镜像 ≤200MB
 - 开发期不强制走 Docker（Mac 直跑更快），compose 保证「同一份代码两种跑法」
