@@ -4,7 +4,7 @@
 > 评审对象：`requirements-analysis.md`（E1–E14）/ `software-design.md` / `algorithm-asset-format.md`
 > 交叉核对：`deployment-design.md` / `clock-display-spec.md` / `README.md`（F19 决策汇总）+ 桌面版仓库（mapleStoryMiniPet）符号实证
 > 评审人：ZCode（实现 Agent，替代 Claude Code）
-> 结论：**修订一轮后方可进 M1** —— 3 个阻断级问题 + 10 项设计级意见；E9 评审建议已被胶水否决（见 4.4，维持魔法值表定稿）
+> 结论：**修订一轮后方可进 M1** —— 3 个阻断级问题 + 11 项设计级意见（二轮验证补 1 中 2 小）；E9 评审建议已被胶水否决（见 3.4，维持魔法值表定稿）
 
 ---
 
@@ -16,6 +16,11 @@
 | `ClampCamera` / `ParseBacks` / `ExtractPng` | ✅ 分别在 MapService.cs:137 / MapService.cs:327（private）/ WzService.cs:430 |
 | `CollectPiecesForFrame` / `MaterializePieces` | ✅ PaperdollService.cs 内 13 处引用 |
 | `GetMeshBack`（F19 决策文档提到） | ❌ **grep 无命中，方法不存在**（可能已改名）。M1 迁移时需更正引用 |
+| E12 气泡参数（wordWrap 90 / 行高 16 / SimSun 系） | ✅ BalloonService.cs:184-185（`wrapW=90`、`lineHeight=16f`）、:483-491（Windows SimSun/MingLiU 优先）逐字吻合 |
+| EffectLayerService 恒 default stub（F19 断言） | ✅ :311 附近 `DefaultExpressionDriver.GetExpression() => ExpressionDefault` |
+| WzService 解析链（clock spec 断言） | ✅ `LoadWz(wzLibPath, baseWzPath)` 两参签名（:74，探针用法 `LoadWz("", 数据目录)` 成立）；`GetOrigin`（:509）；:359/:386/:514 注释明确 outlink 链与「origin 在源节点、PNG 在 _Canvas」语义 |
+| 条带公式（BGMAP 元数据可行性） | ✅ MapService.Render.cs:221-222 实证公式：ScrollH 自动滚动 `X += (rx*5*t) % cx`，非滚动视差 `X += floor(camCenter*(100+rx)/100)`；MapService.cs:799 `GetBackTileMode`（bit2=ScrollH / bit3=ScrollV）。算法文档 strip 的 `speed_x`/`rx_parallax` 字段有公式来源 |
+| 表情维度（A2 修复路径可行性） | ✅ PaperdollService.cs:455 `CollectPiecesForFrame(hash, a, action, frame, expression)` 签名含 expression 维度；:79 注释「帧源缓存 key 已含 expression，换表情零额外失效成本」。算法文档十.3 的 (action, frame, expression) 组合导出成立 |
 
 **迁移表 Dispatcher 数据不准（两处方向性错误）**。严格计数 `Dispatcher.UIThread`，桌面版 `MiniPet/Services/` 根目录实测 **20 处 / 9 文件**（E1 写的「17 处」已过期）：
 
@@ -102,7 +107,12 @@ E6 写「角度 100ms 上报，服务端重算 layout 下发」，4.2 写「条�
 
 1x 存储 + 2x nearest 放大会放大 alpha 阈值锯齿。开放问题 1 的 A/B（1bit vs 4bit alpha 变体）应作为 **M2 回放工具的验收项**（与 PaperdollService 直渲染对比时顺带评估边缘质量），不留到固件阶段返工。
 
-### 3.9 零碎项
+### 3.9 IMusicPlayer 迁入口径不成立（中等）
+
+software-design 2.1 迁移表写「MusicCatalogService / MusicPlayerService / MusicDecisions 迁入，`IMusicPlayer` 换成流式转发器实现」，但实测桌面版 `IMusicPlayer` 是**围绕本地 BASS 播放的两阶段协议**（`IPreparedStream.Prepare/Validate/Commit`，注释明言「提交段任一 BASS 调用失败」）——服务端不再播放，这个接口没有「换实现」的空间。而 2.2 节 BgmRouter 自己用的是 `IMusicSource(WZ|QQ)` 概念，两处口径不一致。
+**建议定稿：统一为 `IMusicSource`（取流源抽象，服务端侧）——`IMusicPlayer`/`IPreparedStream`/`BassMusicPlayer` 全部不迁；`MusicDecisions`（选曲决策）保留迁入；`MusicPlayerService` 拆解后仅留决策相关逻辑。** E8「音量/当前源偏好存设备配置」与此一致（播放控制状态在设备端）。
+
+### 3.10 零碎项
 
 | # | 位置 | 问题 |
 |---|---|---|
@@ -113,8 +123,10 @@ E6 写「角度 100ms 上报，服务端重算 layout 下发」，4.2 写「条�
 | 5 | algorithm 七节 | AUDIO_META title 定长 64B 仅装 21 个汉字，建议 96B+ 或偏移式字符串 |
 | 6 | software-design 2.4 | JSON 注释策略建议直接定 `_comment` 键（.NET 无 JSON5 原生支持），不留两案 |
 | 7 | E3 vs 现有文档 | E3 新规「仓库禁止真实 IP/用户名」与 README、deployment-design 中 `192.168.3.46`、`homes/15080035319/...` 冲突，开源前需脱敏或私有细节外移 |
+| 8 | E1 / F19「10.4K 行」口径 | 过期：实测迁入集 17 文件 **13,140 行**（扣除将重写的 CacheManager 720 + ConfigService 620，净迁入 ≈11.8K）。迁移工作量口径更新 |
+| 9 | algorithm 五节 | BGMAP strip 头无循环周期字段——WZ 公式 `% cx` 的 cx（tile 周期宽）需导出器折叠进条带图宽（导出已按 cx 平铺好的循环图），此导出职责应在格式文档写明 |
 
-### 3.10 出厂体验缺口（可选项）
+### 3.11 出厂体验缺口（可选项）
 
 未配对 + 首启无网 + TF 为空 = 黑屏 FATAL。可考虑固件分区内置一套默认素材包保底开箱体验（P2）。
 
@@ -137,8 +149,8 @@ E6 写「角度 100ms 上报，服务端重算 layout 下发」，4.2 写「条�
 
 ## 五、修订动作顺序（建议）
 
-1. `algorithm-asset-format.md` 出 **v2**：A2（表情字段定稿）+ A3（预算修正）+ 3.9 中 3/4/5 项
-2. `software-design.md` 小修：迁移表按第一节实证更正（含 GetMeshBack）、补 node 运行时与 SIGTERM 要点（3.2）、补 LVGL 合成架构（3.7）、修 3.9 之 1/2/6
-3. `requirements-analysis.md` 微修：E6 定稿本地驱动（3.3）、E4 端口项只读（3.1）、E1「17 处」更新为实测口径
+1. `algorithm-asset-format.md` 出 **v2**：A2（表情字段定稿）+ A3（预算修正）+ 3.10 中 3/4/5/9 项
+2. `software-design.md` 小修：迁移表按第一节实证更正（含 GetMeshBack）、统一 `IMusicSource` 口径并调整 Music 系迁移范围（3.9）、补 node 运行时与 SIGTERM 要点（3.2）、补 LVGL 合成架构（3.7）、修 3.10 之 1/2/6
+3. `requirements-analysis.md` 微修：E6 定稿本地驱动（3.3）、E4 端口项只读（3.1）、E1「10.4K 行 / 17 处」更新为实测口径（3.10 之 8 与第一节）
 4. `deployment-design.md` 重写为单容器版（或顶部加「已被 E3 取代」标注），README.md / docs-ai README 同步单容器 + 38090
 5. 以上落完启动 M1，验收门禁加「`grep -r Avalonia Server/` 零命中」
