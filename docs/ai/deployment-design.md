@@ -6,25 +6,24 @@
 
 ---
 
-## 一、部署形态（前后端分离 · 三容器）
+## 一、部署形态（前后端分离 · 两容器）
 
 ```
 <NAS_IP> (NAS /volume2/docker/minipet/)
 ├─ api          minipet-server（ASP.NET Core 9）
 │                挂载：WZ数据(只读) + data/（配置/缓存/设备表/OTA）
 │                出口：内部 8080
-├─ web          nginx:alpine（Vue 静态 + /api 反代）
-│                出口：**38090 对外**（默认值，可改，见「端口配置」）
 └─ qqmusic      Rain120/qq-music-api（Node，可选启用）
                  出口：内部 3300，仅 api 访问
+（原设计的 nginx web 容器已砍——ASP.NET Core 直接托管 Vue 产物与 API，单容器单端口，无中间层）
 
-访问路径：
-  浏览器     http://<NAS_IP>:38090/          （Web UI）
+访问路径（浏览器与 ESP32 同源同端口）：
+  浏览器     http://<NAS_IP>:38090/            （Web UI = api 托管的 Vue 产物）
   ESP32      http://<NAS_IP>:38090/api/device/*（素材/指令/BGM 流）
-  api 直查   http://<NAS_IP>:38090/api/health
+  健康检查   http://<NAS_IP>:38090/api/health
 ```
 
-**为什么 web 反代 api（同源）**：ESP32 与浏览器共用一个端口，天然无 CORS；将来上 HTTPS/换端口只动 nginx。
+**为什么砍掉 nginx**（胶水定稿）：ASP.NET Core 内置静态文件托管，Vue 构建产物直接打进 api 镜像 wwwroot——少一个容器、少一跳转发、BGM 流不再需要 proxy_buffering 调优。开发期跨域由 Vite proxy 解决，生产同源无 CORS。
 
 ---
 
@@ -83,7 +82,7 @@ services:
 
 - **默认端口 38090**（五位数，避开群晖常用低位端口段）
 - 修改方式：编辑 `/volume2/docker/minipet/.env` 里 `MINIPET_PORT=xxxxx` → Container Manager 重建项目（容器端口映射属 Docker 层，改完 up -d 生效）
-- api 容器内部端口固定 8080 不对外，**对外只暴露 web 一个五位数端口**
+- api 容器直接对外暴露唯一五位数端口（内部 8080 → 映射 ${MINIPET_PORT:-38090}），**无 web 中间层**
 - ESP32 配网页输入框预填 `http://<NAS_IP>:38090`，端口改了就在配网页/设备设置里改地址（协议里服务器地址本来就是配置项）
 - 开源用户：README 写明改 .env 即可换端口
 
@@ -145,7 +144,7 @@ NAS: docker load < tar && compose up -d
 3. ⬜ compose 挂载 homes 路径权限（群晖对 homes 共享的容器访问 ACL）
 4. ⬜ .NET 9 runtime 在该架构的镜像可用性
 5. ⬜ ESP32 配网页默认值预填 `http://<NAS_IP>:38090`（端口可改，配网页是输入框不是写死）
-6. ⬜ BGM 流媒体经 nginx 反代的缓冲配置（`proxy_buffering off`，防音频卡顿——nginx 默认缓冲会毁掉流式）
+6. ⬜ BGM 流式直出（api 容器自身响应，无 nginx 中间层，确认无缓冲即可）
 
 ---
 
