@@ -1,6 +1,6 @@
 # MiniPet-ESP32 软件设计
 
-> 状态：**Phase 2 设计稿 v1**（2026-09-25）
+> 状态：**v1.1**（2026-09-25 对抗评审修订：迁移表实测更正 / node 运行时 / LVGL 合流 / IMU 本地驱动 / alpha 验收前移 / 零碎项）
 > 依据：requirements-analysis.md（E1-E14）+ algorithm-asset-format.md（素材包格式）
 > C# 实现细节由 Agent 定稿；胶水将开独立 agent 对抗验证
 > 评审：完成后过 3 agent 并行评审
@@ -33,18 +33,22 @@ minipet-esp32/
 | 桌面版类 | 去向 | 改造点 |
 |---|---|---|
 | WzService / MapCatalogService / WzError | 原样迁入 `MinipetServer/Services/` | 无（零 UI 依赖） |
-| PaperdollService / SpriteService | 原样迁入 | 无 |
-| MapService + MapService.Render | 原样迁入 | 删 1 处 `Dispatcher` 封送 → 回调 |
+| PaperdollService / SpriteService | 原样迁入 | 无（PaperdollService 的 Dispatcher 仅存在于注释，实测 0 处代码引用） |
+| MapService + MapService.Render | 原样迁入 | **0 处 UI 引用（实测）**，原样 |
 | BalloonService | 迁入 | 参数供导出器用（设备端渲染文本，不迁渲染部分） |
 | MusicCatalogService / MusicPlayerService / MusicDecisions | 迁入 | `IMusicPlayer` 换成「流式转发器」实现（不再本地播） |
 | BassMusicPlayer | **不迁** | 设备播；服务端只转发流 |
 | CacheManager | 重写薄版 | 桌面版管磁盘 PNG 缓存 → 新版管素材包缓存（hash→文件） |
 | ConfigService | 重写 | appsettings.json 读写 + 热重载 + Web 校验端点 |
-| AnimService / EventBus / PetManager | 部分迁 | AnimService 时序规则进导出器；PetManager 概念并入 DeviceRegistry |
+| AnimService / EventBus / PetManager | 部分迁 | **EventBus 含 3 处非注释 Dispatcher.UIThread（实测，迁移范围内唯一需清理项）** → 改 Channel；AnimService 时序规则进导出器；PetManager 概念并入 DeviceRegistry |
 | TrayService / EffectLayerService / Adapters / AgentState* / Walk* | **不迁** | 桌面专属 |
 | PngEncoder (Utils) | 原样迁入 | 导出器核心依赖 |
 
-迁移验收：`MinipetServer.Tests` 跑通 WZ 加载 / 纸娃娃合成 / 地图渲染三个移植测试（黑盒：真实 WZ 数据进出图）。
+迁移验收：
+1. `MinipetServer.Tests` 跑通 WZ 加载 / 纸娃娃合成 / 地图渲染三个移植测试（黑盒：真实 WZ 数据进出图）
+2. **机械门禁：迁入完成后 `grep -r Avalonia Server/` 与 `grep -r "Dispatcher.UIThread" Server/` 双零命中**（评审建议采纳）
+
+> 实测口径说明（2026-09-25 对抗评审复核）：桌面版 Services 全目录 Dispatcher.UIThread 非注释引用共 14 处 / 9 文件，但**迁移范围内仅 EventBus 3 处**（其余在不迁的 TrayService/BassMusicPlayer/EffectLayerService/PetManager/ConfigService/IMusicPlayer 或注释里）。E1 需求文档的「17 处」为早期粗估，以本表为准。GetMeshBack 系 R2 参考实现的公式命名（MapService.Render.cs 注释），非项目方法——迁移引用一律写 ParseBacks + DrawBackViewport。
 
 ### 2.2 新增服务
 
@@ -77,12 +81,12 @@ Web 端（前缀 /api/admin）：设备列表与配置 / 素材浏览与缩略�
   "Clock":    { "MapOffsets": { "200000100": [123,240] } }
 }
 ```
-- Web 保存 = 序列化回写（保留注释的策略：改用 JSON5 读写或注释字段 `_comment`，实现期定）
+- Web 保存 = 序列化回写（保留注释的策略：定稿用 `_comment` 键（.NET 无 JSON5 原生支持，不留两案））
 - 热重载：FileSystemWatcher → ConfigWatcher → 受影响服务 reload（WZ 重载有锁，桌面版模式复用）
 
 ### 2.5 部署（E3）
 
-- Dockerfile（多阶段：node 构建 Web → sdk 构建 Server → runtime 最终层，单镜像）
+- Dockerfile（多阶段：node 构建 Web → sdk 构建 Server → **runtime 最终层含 node 运行时**（QQ 网关子进程需要，+~180MB；目标镜像体积更新为 ≤400MB）；容器 SIGTERM → 主进程终止传播给 node 子进程 + Process.Exited 回收防僵尸）
 - `.env`：`MINIPET_PORT`；compose 挂载 WZ（:ro）+ data/
 - CI：GitHub Actions → GHCR 单镜像（linux/arm64+amd64）；`scripts/deploy-nas.sh`（buildx save/load 直投）
 - 验证清单落在 CI 冒烟 job：容器内跑 Tests（SkiaSharp 可用性即被覆盖，失败自动提示 fallback ImageSharp 分支）
@@ -125,12 +129,17 @@ APP_CPU(1)：渲染与交互
 ```
 帧循环（30fps 定时器）：
   1) 到 delay？→ 合成器重画实体层（PARTS+LAYOUT，含表情件替换）到实体缓冲
-  2) 条带偏移 = f(time) 或 IMU 倾角 → 移动条带
+  2) 条带偏移 = f(time) 或 IMU 倾角（**全部本地驱动，零网络往返**——IMU 只上报状态变迁事件，连续视差不上报） → 移动条带
   3) 合成最终帧区域 = static_back(不动，不重绘) + tile_layer + 实体缓冲 + 气泡label
   4) 脏区计算（与上帧 diff 的包围盒）→ QSPI 上传
 blink：本地定时器插播（断网可用）
 ```
 - 内存布局（PSRAM）：static_back 450KB + tile_layer 450KB + 实体缓冲 200×260×2≈100KB + 条带图 + LVGL 双缓冲 2×(1/10屏)；全部 heap_caps 分配，TF 直读流式（包不整载内存）
+
+**LVGL 与自研合成器的合流（3.7 定稿）**：framebuffer 单一所有权归自研合成器；LVGL 以**离屏缓冲 + 混合回调**方式接入——
+- 宠物场景：合成器全权写屏（static_back→条带→tile→实体→气泡），**LVGL 不参与**（气泡文本用 LVGL 离屏渲染成位图后由合成器 blit）
+- 菜单/设置界面：LVGL 渲染到整屏离屏缓冲 → 合成器让路（整屏直拷）
+- 切换由状态机控制（POKER vs MENU），同一时刻只有一个写屏者——避免 LVGL v9 custom draw unit 的深水区，代价是菜单期宠物暂停（可接受，菜单本就是独立全屏窗口）
 
 ### 4.3 状态机（app/）
 
@@ -146,7 +155,7 @@ OTA 态（双分区，失败回滚）
 ### 4.4 TF 卡布局
 
 ```
-/mnipet/
+/minipet/
   manifest.json        当前生效清单+本地hash集
   parts/<hash>.mpk     部件包
   layout/<hash>.mpk
@@ -161,7 +170,7 @@ OTA 态（双分区，失败回滚）
 | M# | 内容 | 验收 |
 |---|---|---|
 | M1 | Server 服务层迁移 + Tests 绿 | WZ/合成/渲染三测试真实数据通过 |
-| M2 | AssetExporter + 包格式 | 导出默认装扮全动作包；设备侧无，先做 PC 端「解包回放」校验工具（PNG 重建对比 PaperdollService 直渲染逐像素一致） |
+| M2 | AssetExporter + 包格式 | 导出默认装扮全动作包；PC 端「解包回放」校验工具（PNG 重建对比 PaperdollService 直渲染逐像素一致）+ **1bit vs 4bit alpha 边缘质量 A/B 结论**（回放工具顺带评估，不留到固件返工） |
 | M3 | 设备协议 + DeviceRegistry | curl 全端点联调通过（hello/manifest/poll/event/bgm） |
 | M4 | Web 骨架 + 设置页 + 设备卡片 | 浏览器完成配置闭环（WZ 路径校验/保存/热重载） |
 | M5 | Docker + CI + NAS 首部署 | NAS 上跑通 /api/health + Web |
@@ -177,7 +186,7 @@ M1-M5（服务端线）与 M6 前期（固件 bring-up）可并行——固件�
 
 | 风险 | 对策 |
 |---|---|
-| SkiaSharp 在群晖 arm64 容器缺 native | CI 冒烟测试先暴露；fallback：ImageSmapeSharp 替换渲染层（接口隔离在 IRenderBackend） |
+| SkiaSharp 在群晖 arm64 容器缺 native | CI 冒烟测试先暴露；fallback：ImageSharp 替换渲染层（接口隔离在 IRenderBackend） |
 | QSPI 带宽被 BGM 下载挤占 | asset_dl 任务限速 + 渲染优先（任务优先级）；BGM 流式恒定 16KB/s 影响小 |
 | QQ 网关 node 子进程崩溃 | QqGatewayProcess 自动重启 1 次→仍失败则源置灰（E8 降级） |
 | TF 卡写入寿命 | 包写入后只读；淘汰删除批量做；日志环形缓冲限内存 |
