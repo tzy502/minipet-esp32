@@ -16,7 +16,8 @@ minipet-esp32/
 
 ## 架构一句话
 
-PC 本地服务端（复用桌面版 10.4K 行核心服务 + 布局导出器）+ Web 配置前端 + ESP32 哑终端（零 WZ / 零 Hermes / 零 HA，只收素材包和指令，设备永远是 HTTP client）。
+**NAS Docker 部署**（<NAS_IP> NAS · 群晖 Container Manager）：api（ASP.NET Core，复用桌面版 10.4K 行核心服务 + 布局导出器）+ web（nginx 反代，:8090）+ qqmusic（可选网关）三容器；ESP32 哑终端（零 WZ / 零 Hermes / 零 HA，只收素材包和指令，设备永远是 HTTP client）。
+配置双通道：Web 设置页（开源用户）与文本 appsettings.json（自己改）写同一份文件。
 
 ## 硬件
 
@@ -30,6 +31,7 @@ PC 本地服务端（复用桌面版 10.4K 行核心服务 + 布局导出器）+
 | [docs/ai/README.md](docs/ai/README.md) | F19 分支线全部决策（架构/硬件/渲染/表情/BGM/不做清单） |
 | [docs/ai/clock-display-spec.md](docs/ai/clock-display-spec.md) | WZ 地图时钟显示规格（已定稿） |
 | [docs/ai/waveshare-wiki-ESP32-S3-Touch-AMOLED-2.16.md](docs/ai/waveshare-wiki-ESP32-S3-Touch-AMOLED-2.16.md) | 微雪官方 wiki 全量（GPIO 引脚表/外设速查） |
+| [docs/ai/deployment-design.md](docs/ai/deployment-design.md) | NAS Docker 部署设计（三容器/compose/镜像分发/验证清单） |
 
 ## 开发状态
 
