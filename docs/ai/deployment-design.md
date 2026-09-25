@@ -1,7 +1,7 @@
 # MiniPet-ESP32 部署设计（NAS Docker · 群晖）
 
 > 状态：设计稿（2026-09-25，胶水确认部署目标）
-> 目标主机：**<NAS_IP> NAS（群晖）**，Docker = **Container Manager**，可出外网
+> 目标主机：**内网 NAS（群晖，主机名/IP 属私有信息，用 <NAS_IP> 占位）**，Docker = **Container Manager**，可出外网
 > 参考实部署：NAS 上已有 hermes（镜像拉取+volume2 模式）、java（Mac 编译→SMB 投递 jar→容器跑）两套范例
 
 ---
@@ -9,7 +9,7 @@
 ## 一、部署形态（前后端分离 · 单容器）
 
 ```
-<NAS_IP> (NAS /volume2/docker/minipet/)
+<NAS_IP> (群晖 /volume2/docker/minipet/)
 ├─ api          minipet-server（ASP.NET Core 9）
 │                挂载：WZ数据(只读) + data/（配置/缓存/设备表/OTA）
 │                出口：内部 8080
@@ -54,7 +54,7 @@ services:
     restart: unless-stopped
     ports: ["8080:8080"]            # 仅调试期暴露，稳定后可去掉走内部网络
     volumes:
-      - /volume2/homes/<user>/Backup/MS/客户端/冒险岛online/mxd:/wz:ro   # WZ 只读
+      - /volume2/<你的WZ数据父目录>:/wz:ro   # WZ 只读（示例：/volume2/homes/<user>/Backup/MS/客户端/冒险岛online/mxd）
       - /volume2/docker/minipet/data:/app/data                                # 配置/缓存/设备表/OTA
     environment:
       - TZ=Asia/Shanghai
@@ -78,7 +78,7 @@ services:
 - **默认端口 38090**（五位数，避开群晖常用低位端口段）
 - 修改方式：编辑 `/volume2/docker/minipet/.env` 里 `MINIPET_PORT=xxxxx` → Container Manager 重建项目（容器端口映射属 Docker 层，改完 up -d 生效）
 - api 容器直接对外暴露唯一五位数端口（内部 8080 → 映射 ${MINIPET_PORT:-38090}），**无 web 中间层**
-- ESP32 配网页输入框预填 `http://<NAS_IP>:38090`，端口改了就在配网页/设备设置里改地址（协议里服务器地址本来就是配置项）
+- ESP32 配网页输入框预填 `http://<NAS_IP>:38090`（部署后填真实地址；协议里服务器地址本来就是配置项）
 - 开源用户：README 写明改 .env 即可换端口
 
 **群晖路径要点**（对齐 hermes 现有部署惯例）：
@@ -138,7 +138,7 @@ NAS: docker load < tar && compose up -d
    - fallback：渲染层换 ImageSharp（纯托管，慢 ~30% 但零 native 风险）
 3. ⬜ compose 挂载 homes 路径权限（群晖对 homes 共享的容器访问 ACL）
 4. ⬜ .NET 9 runtime 在该架构的镜像可用性
-5. ⬜ ESP32 配网页默认值预填 `http://<NAS_IP>:38090`（端口可改，配网页是输入框不是写死）
+5. ⬜ ESP32 配网页默认值预填 `http://<NAS_IP>:38090`（占位，部署后填真实值；配网页是输入框不是写死）
 6. ⬜ BGM 流式直出（api 容器自身响应，无 nginx 中间层，确认无缓冲即可）
 
 ---
