@@ -1,0 +1,33 @@
+# =====================================================================
+# MiniPet-ESP32 部署示例（E3 定稿：单容器，无 nginx/web 中间层）
+#
+# 用法：
+#   1. 复制到 NAS 项目目录并改名：cp docker-compose.example.yml docker-compose.yml
+#   2. 替换两处占位符：
+#        ghcr.io/<owner>/minipet   → 实际镜像名（与 CI 推送到 GHCR 的名字一致）
+#        <WZ_DATA_HOST_PATH>       → NAS 上 WZ 数据父目录（只读挂载进 /wz）
+#   3. 同目录放 .env（由 .env.example 复制），然后：docker compose up -d
+# =====================================================================
+services:
+  minipet:
+    image: ghcr.io/<owner>/minipet:latest
+    container_name: minipet
+    restart: unless-stopped
+    ports:
+      # 对外唯一五位数端口（.env 的 MINIPET_PORT 可改）；容器内固定 8080
+      - "${MINIPET_PORT:-38090}:8080"
+    volumes:
+      # 配置 / 缓存 / 设备表 / OTA 固件包（挂 NAS 本地目录，随目录快照备份）
+      - ./data:/app/data
+      # WZ 原始数据只读挂载（不进镜像：体积大且涉及版权）；
+      # 例：/volume2/homes/<user>/Backup/MS/客户端/冒险岛online/mxd/Data 的父目录
+      - <WZ_DATA_HOST_PATH>:/wz:ro
+    environment:
+      - TZ=Asia/Shanghai
+      # WZ 路径环境变量兜底（appsettings.json / Web 设置页可覆盖，双通道同一份配置）
+      - MINIPET_WZ_PATH=/wz/Data
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2048M

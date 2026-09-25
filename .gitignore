@@ -58,3 +58,12 @@ partition_table/*.bin
 .env.*
 secrets/
 config/private/
+
+# build artifacts
+**/bin/
+**/obj/
+node_modules/
+dist/
+Server/.m1-done
+Server/.m2-done
+.nuget/
