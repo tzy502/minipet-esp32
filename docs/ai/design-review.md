@@ -187,6 +187,10 @@ software-design 2.1 迁移表写「MusicCatalogService / MusicPlayerService / Mu
 | R9 | algorithm 十一节 | 开放问题三条未定稿 | 处置定稿：① 1bit alpha 保持默认，**M2 回放工具加 1bit vs 4bit 边缘质量 A/B 验收**，结论 M2 出；② z 用 i8 定稿够用（帧内相对序 <127）；③ 条带 speed / IMU 系数定稿放 Web 配置 |
 | R10 | software-design 2.1 表 | EventBus「3 处非注释 Dispatcher.UIThread」口径不准 | 实测 **2 处调用**（EventBus.cs:99 `CheckAccess` / :105 `Post`）+ 1 处 `using Avalonia.Threading;`；表注写清「2 处调用 + 1 处 using」 |
 | R11 | deployment-design.md:128（可选） | 环境对照表「外部 8090」过期 | 顶部横幅已声明全文历史记录，可留；要顺手改则同步 38090 |
+| R12 | requirements E2（:33） | event 端点描述仍列「**倾斜角度**」上报，与 E6 修订（只报状态变迁、不上报角度流）矛盾 | 改「倾斜状态变迁（进入/退出）」 |
+| R13 | requirements E7（:111） | 「换装 = 拉差量部件包」与 R4 定稿的「PARTS 整套装扮为传输单元」矛盾 | 改「换装 = 拉新装扮 PARTS 包（LAYOUT/背景不动，400-700KB <1s）」 |
+| R14 | docs/ai/README.md（F19，:77/:233/:234，可选） | 决策日志内残留旧数字：`GetMeshBack` 引用、「10.4K 行」「12 文件 17 处」 | 历史日志可只加一行注「资产口径以 design-review 第一节实测为准」；或顺手改实测值（≈13.1K 行；迁移范围仅 EventBus 2 处调用+1 using） |
+| R15 | algorithm 七.5 / 八节 clock_table | 坐标系语义未钉死：clock_table 的 [x,y] 是什么坐标系未写明（clock-display-spec 里时钟是世界坐标跟随镜头，设备端是烘焙视口） | 补一句定义：「clock_table 坐标 = **烘焙视口内的屏幕坐标**（世界锚点经导出相机换算后的落点）」；初始值可由导出器按 WZ clock 配置生成建议值填表（表仍是唯一事实源，见 3.4 拍板） |
 
 ### 6.3 撤销记录
 

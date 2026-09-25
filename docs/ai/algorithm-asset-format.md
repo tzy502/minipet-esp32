@@ -138,7 +138,8 @@ payload:
 }
 ```
 
-- `clock_table`：E9 的地图时钟魔法值表（地图→时钟坐标），Web 可改 → rev+1 → 设备拉新 manifest 生效
+- `clock_table`：E9 的地图时钟魔法值表，Web 可改 → rev+1 → 设备拉新 manifest 生效
+  - **坐标系语义（R15 定稿）**：clock_table 的 [x,y] = **烘焙视口内的屏幕坐标**（WZ 世界锚点经导出相机换算后的落点）；初始值可由导出器按 WZ clock 配置生成建议值一键填表（表仍是唯一事实源，见评审 3.4 拍板）
 - 设备 diff：本地已有 hash 集 vs manifest → 拉缺失/更新的
 
 ## 九、体积预算（480 屏基准）
