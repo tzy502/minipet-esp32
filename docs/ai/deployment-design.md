@@ -1,0 +1,148 @@
+# MiniPet-ESP32 部署设计（NAS Docker · 群晖）
+
+> 状态：设计稿（2026-09-25，胶水确认部署目标）
+> 目标主机：**<NAS_IP> NAS（群晖）**，Docker = **Container Manager**，可出外网
+> 参考实部署：NAS 上已有 hermes（镜像拉取+volume2 模式）、java（Mac 编译→SMB 投递 jar→容器跑）两套范例
+
+---
+
+## 一、部署形态（前后端分离 · 三容器）
+
+```
+<NAS_IP> (NAS /volume2/docker/minipet/)
+├─ api          minipet-server（ASP.NET Core 9）
+│                挂载：WZ数据(只读) + data/（配置/缓存/设备表/OTA）
+│                出口：内部 8080
+├─ web          nginx:alpine（Vue 静态 + /api 反代）
+│                出口：**8090 对外**（浏览器与 ESP32 同一入口）
+└─ qqmusic      Rain120/qq-music-api（Node，可选启用）
+                 出口：内部 3300，仅 api 访问
+
+访问路径：
+  浏览器     http://<NAS_IP>:8090/          （Web UI）
+  ESP32      http://<NAS_IP>:8090/api/device/*（素材/指令/BGM 流）
+  api 直查   http://<NAS_IP>:8090/api/health
+```
+
+**为什么 web 反代 api（同源）**：ESP32 与浏览器共用一个端口，天然无 CORS；将来上 HTTPS/换端口只动 nginx。
+
+---
+
+## 二、配置体系（WZ 路径双通道——胶水定稿）
+
+**同一份配置文件，两个编辑入口：**
+
+| 入口 | 场景 | 说明 |
+|---|---|---|
+| **Web 设置页** | 开源后其他用户 | 表单：WZ Data 目录（容器内路径）、端口、QQ cookie、阈值等；保存即热重载（WzService 重新 LoadWz） |
+| **文本直改** | 自己改方便 | 同一文件 `data/config/appsettings.json`（NAS 上直接编辑，api 监听变更热重载） |
+
+要点：
+- **Web 写的就是这个文件**——两个入口不会分叉，文本改完 Web 界面同步显示
+- 默认值（我们自己的部署）：`"WzDataPath": "/wz/Data"`（容器内路径，见下方挂载）
+- 开源用户按 README 改成自己的路径即可，**代码零硬编码路径**（延续桌面版铁律）
+- QQ cookie / HA 令牌等敏感项同文件但独立节，.gitignore 已排除 secrets
+
+---
+
+## 三、docker-compose.yml（设计稿）
+
+```yaml
+version: '3.8'
+services:
+  api:
+    image: ghcr.io/tzy502/minipet-server:latest   # 或 docker.io 镜像
+    container_name: minipet-api
+    restart: unless-stopped
+    ports: ["8080:8080"]            # 仅调试期暴露，稳定后可去掉走内部网络
+    volumes:
+      - /volume2/homes/<user>/Backup/MS/客户端/冒险岛online/mxd:/wz:ro   # WZ 只读
+      - /volume2/docker/minipet/data:/app/data                                # 配置/缓存/设备表/OTA
+    environment:
+      - TZ=Asia/Shanghai
+      - MINIPET_WZ_PATH=/wz/Data        # 环境变量兜底（appsettings 可覆盖）
+    deploy:
+      resources:
+        limits: { memory: 2048M, cpus: "2.0" }
+
+  web:
+    image: ghcr.io/tzy502/minipet-web:latest
+    container_name: minipet-web
+    restart: unless-stopped
+    ports: ["8090:80"]
+    depends_on: [api]
+
+  qqmusic:                             # 可选：注释掉即纯 WZ 曲库
+    image: ghcr.io/tzy502/minipet-qqmusic:latest
+    container_name: minipet-qqmusic
+    restart: unless-stopped
+    expose: ["3300"]
+```
+
+**群晖路径要点**（对齐 hermes 现有部署惯例）：
+- 项目目录：`/volume2/docker/minipet/`（compose + data/）
+- WZ 数据**不在 docker 共享里**，在 homes 共享——Container Manager 里 compose 挂 homes 路径需确认权限（hermes 未挂过 homes；首次部署验证清单第 ② 项）
+- `:ro` 只读挂载保护 WZ 原始数据
+
+---
+
+## 四、镜像分发（两条路，主备）
+
+**主路（GitHub Actions → GHCR）**
+```
+git push → Actions 构建 api/web/qqmusic 三镜像（多架构按需）→ ghcr.io/tzy502/*
+NAS：Container Manager → 项目 → 拉取 compose → up -d
+```
+- NAS 可出外网 ✅（已确认）；GHCR 若慢，走 hermes 同款镜像加速（`docker.xuanyuan.run` 前缀）
+
+**备路（Mac 直投，对齐 java 项目的 upload.sh 惯例）**
+```
+Mac: docker buildx build → docker save tar → cp 到 ~/nas-out/minipet/images/
+NAS: docker load < tar && compose up -d
+```
+- 不依赖 NAS 出网与 CI，应急/调试用；脚本放 `scripts/deploy-nas.sh`
+
+---
+
+## 五、数据与持久化
+
+| 数据 | 位置（NAS） | 备份策略 |
+|---|---|---|
+| 配置 appsettings.json | `/volume2/docker/minipet/data/` | 随 data 目录快照 |
+| 素材导出缓存（部件包/布局/缩略图） | `data/cache/` | 可重建（删了重导） |
+| 设备表 / 曲库配置 / 最近使用记录 | `data/`（json 文件，不引入数据库） | 同上 |
+| OTA 固件包 | `data/firmware/` | 版本化保留 |
+| QQ cookie | `data/config/`（600 权限） | 不入 git |
+| WZ 原始数据 | homes 共享（只读挂载） | 已是备份本体 |
+
+---
+
+## 六、开发 ↔ 部署环境对照
+
+| 环境 | api | web | WZ 数据 |
+|---|---|---|---|
+| 本地开发 | `dotnet run`（:8080） | `npm run dev`（:5173, proxy /api） | /Volumes/SSD/mxd（Mac 直读，快） |
+| NAS 生产 | 容器 8080（内部） | 容器 80（外部 8090） | /volume2/homes/...（容器内 /wz，本地盘，快） |
+
+- **不复制 WZ 数据进镜像**（7.9GB+ 且涉及版权）；镜像 ≤200MB
+- 开发期不强制走 Docker（Mac 直跑更快），compose 保证「同一份代码两种跑法」
+
+---
+
+## 七、首次部署验证清单（硬件/环境就绪后执行）
+
+1. ✅ NAS 出外网（已确认）
+2. ⬜ **SkiaSharp 在群晖容器内可运行**（cpu 架构先确认：`uname -m` 或 Container Manager 关于页——arm64 与 amd64 的 native 库都要备）
+   - fallback：渲染层换 ImageSharp（纯托管，慢 ~30% 但零 native 风险）
+3. ⬜ compose 挂载 homes 路径权限（群晖对 homes 共享的容器访问 ACL）
+4. ⬜ .NET 9 runtime 在该架构的镜像可用性
+5. ⬜ ESP32 固件写入 `http://<NAS_IP>:8090`（配网页默认值预填此地址）
+6. ⬜ BGM 流媒体经 nginx 反代的缓冲配置（`proxy_buffering off`，防音频卡顿——nginx 默认缓冲会毁掉流式）
+
+---
+
+## 八、开源准备（Web 配置化带来的）
+
+- README（开源版）：三步走「装 WZ 数据 → 起 compose → 浏览器配置路径」
+- 配置项全部有默认值 + Web 表单校验（路径存在性/读写权限预检）
+- 不含任何胶水私人路径/IP 的默认值——**我们的默认值走环境变量注入，开源用户改 .env 即可**
