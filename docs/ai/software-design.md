@@ -36,7 +36,8 @@ minipet-esp32/
 | PaperdollService / SpriteService | 原样迁入 | 无（PaperdollService 的 Dispatcher 仅存在于注释，实测 0 处代码引用） |
 | MapService + MapService.Render | 原样迁入 | **0 处 UI 引用（实测）**，原样 |
 | BalloonService | 迁入 | 参数供导出器用（设备端渲染文本，不迁渲染部分） |
-| MusicCatalogService / MusicPlayerService / MusicDecisions | 迁入 | `IMusicPlayer` 换成「流式转发器」实现（不再本地播） |
+| MusicCatalogService / MusicDecisions | 迁入 | 无 |
+| MusicPlayerService | **拆解迁入**（评审 3.9 定稿）：`IMusicPlayer`/`IPreparedStream`/`BassMusicPlayer` 全部不迁（BASS 两阶段播放协议在服务端无意义）；仅决策/编排相关逻辑并入 BgmRouter |
 | BassMusicPlayer | **不迁** | 设备播；服务端只转发流 |
 | CacheManager | 重写薄版 | 桌面版管磁盘 PNG 缓存 → 新版管素材包缓存（hash→文件） |
 | ConfigService | 重写 | appsettings.json 读写 + 热重载 + Web 校验端点 |
@@ -56,7 +57,7 @@ minipet-esp32/
 AssetExporter      (E1)  按 algorithm-asset-format.md 产出五类包；输入=装扮JSON+设备profile
 DeviceRegistry     (E13) 设备表 CRUD（JSON 文件，读写锁）；配对码生命周期（6位,10分钟过期）
 CommandQueue       (E2)  每设备指令队列（内存 + 持久化兜底），poll 按序取走
-BgmRouter          (E8)  IMusicSource(WZ|QQ) → 统一流式响应；同源降级状态机；failover 事件
+BgmRouter          (E8)  **统一音源抽象 = IMusicSource**（取流源：WZ 摘取 MP3 字节流 / QQ 经网关取链转发；评审 3.9 后 IMusicPlayer 协议族不迁）→ 统一流式响应；同源降级状态机；failover 事件；吸收 MusicPlayerService 的编排决策（MusicDecisions 纯函数直接复用）
 QqGatewayProcess   (E3)  node 子进程生命周期（配置开关拉起/停止/健康检查/自动重启1次）
 ConfigWatcher      (E3)  appsettings.json 变更 → 热重载事件（WZ 重载/阈值下发）
 HealthReport       (E11) 设备上报事件聚合 → Web 健康 API
