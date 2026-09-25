@@ -1,0 +1,34 @@
+# MiniPet-ESP32 镜像构建上下文裁剪（Dockerfile 只 COPY Web/ 与 Server/）
+
+# 版本库 / CI / 文档 / 脚本（构建不需要）
+.git
+.github
+.gitignore
+.idea
+.vscode
+docs
+scripts
+Firmware
+README.md
+
+# .NET 构建产物
+**/bin
+**/obj
+**/out
+**/TestResults
+**/artifacts
+
+# Node 依赖与本地产物（镜像内自己 npm ci / 自己构建）
+**/node_modules
+**/dist
+**/.vite
+**/coverage
+
+# 运行时数据与本地环境文件（绝不能进镜像）
+data
+.env
+.env.*
+
+# 杂项
+.DS_Store
+*.log

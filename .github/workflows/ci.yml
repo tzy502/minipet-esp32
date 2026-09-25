@@ -1,0 +1,154 @@
+# =====================================================================
+# MiniPet-ESP32 CI（M5）
+#   server : .NET 9 build + test（Server/Minipet.sln，不依赖 Web 就绪）
+#   web    : Vue build（Web/ 有 package.json 才跑，前端未就绪时全跳过）
+#   image  : 多架构镜像 linux/amd64+arm64 → GHCR（仅 main / v* tag 推送）
+#   smoke  : 本地起容器，重试 curl /api/health（PR 也跑，兼当 Dockerfile 门禁）
+# =====================================================================
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # ------------------------------------------------------------------
+  server:
+    name: Server build & test (.NET 9)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 9.0.x
+
+      - name: Build
+        run: dotnet build Server/Minipet.sln --configuration Release
+
+      - name: Test
+        run: dotnet test Server/Minipet.sln --configuration Release --no-build
+
+  # ------------------------------------------------------------------
+  web:
+    name: Web build (Vue 3)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 检查 Web/ 是否有 package.json（前端未就绪则跳过后续步骤）
+        id: check
+        run: |
+          if [ -f Web/package.json ]; then
+            echo "has_pkg=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_pkg=0" >> "$GITHUB_OUTPUT"
+            echo 'Web/package.json 不存在，跳过前端构建'
+          fi
+
+      - uses: actions/setup-node@v4
+        if: steps.check.outputs.has_pkg == '1'
+        with:
+          node-version: 22
+
+      - name: Install & build
+        if: steps.check.outputs.has_pkg == '1'
+        working-directory: Web
+        run: |
+          if [ -f package-lock.json ]; then npm ci; else npm install; fi
+          npm run build --if-present
+
+  # ------------------------------------------------------------------
+  # 多架构镜像 → GHCR。镜像名 = ghcr.io/<owner>/<repo>（动态取仓库名，
+  # 不在仓库里写死任何用户名；NAS 上 compose 的 image: 与此保持一致）。
+  # 仅 main 分支 / v* tag 触发推送；PR 由 smoke job 用本地 docker build
+  # 验证 Dockerfile，不推镜像。
+  image:
+    name: Build & push image (GHCR, amd64+arm64)
+    needs: [server, web]
+    if: >-
+      github.event_name != 'pull_request' &&
+      (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          # 同仓库内置令牌即可推送，无需额外 secret
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image tags & labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=sha
+
+      - name: Build & push (linux/amd64, linux/arm64)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ------------------------------------------------------------------
+  # 冒烟：本地构建镜像 → 起容器 → 重试 curl /api/health。
+  # 不 needs image（image 仅 main/tag 推送，PR 上会被跳过，needs 它会连坐
+  # 跳过 smoke）；本地 docker build 在 PR 上即可验证 Dockerfile。
+  smoke:
+    name: Smoke test (container /api/health)
+    needs: [server, web]
+    runs-on: ubuntu-latest
+    env:
+      PORT: "38090"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image
+        run: docker build -t minipet:smoke .
+
+      - name: Run container
+        run: |
+          docker rm -f minipet-smoke >/dev/null 2>&1 || true
+          docker run -d --name minipet-smoke -p 127.0.0.1:${PORT}:8080 minipet:smoke
+
+      - name: Wait for /api/health (retry up to ~60s)
+        run: |
+          for i in $(seq 1 30); do
+            if curl -fsS "http://127.0.0.1:${PORT}/api/health" >/dev/null 2>&1; then
+              echo "health OK (attempt ${i})"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::容器在 60s 内未通过 /api/health 冒烟检查"
+          exit 1
+
+      - name: Container logs (on failure)
+        if: failure()
+        run: docker logs minipet-smoke || true

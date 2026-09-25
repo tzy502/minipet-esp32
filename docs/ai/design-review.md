@@ -172,7 +172,9 @@ software-design 2.1 迁移表写「MusicCatalogService / MusicPlayerService / Mu
 - LVGL 合流方案（framebuffer 单一所有权 + 单写屏者 + 气泡离屏位图化）：认可，规避 LVGL v9 custom draw unit 深水区；「菜单期宠物暂停」代价与 E6 菜单独立全屏自洽
 - GetMeshBack 处置（R2 参考命名，引用统一写 ParseBacks + DrawBackViewport）：合理
 
-### 6.2 待统一调整清单（R1–R11）
+### 6.2 待统一调整清单（R1–R15）
+
+> **落定状态（2026-09-25 四轮复核）**：R1–R9、R12、R13、R15 已由胶水落地并逐条验证正确；R10 表行已改但 **software-design.md:52 口径块仍残留「3 处」**（应与表行一致：2 处调用 + 1 处 using，或删数字只说「仅 EventBus」）；R11、R14 按可选项约定保留历史稿不动。R10 残留清掉后本清单全闭环，文档就绪进 M1。
 
 | # | 位置 | 问题 | 建议改法 |
 |---|---|---|---|

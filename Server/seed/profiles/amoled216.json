@@ -1,0 +1,10 @@
+{
+  "name": "amoled216",
+  "w": 480,
+  "h": 480,
+  "shape": "square",
+  "psramMb": 8,
+  "audio": true,
+  "touch": true,
+  "strips": true
+}
