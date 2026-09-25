@@ -1,0 +1,20 @@
+# =============================================================
+# MiniPet 固件通用默认（与具体板卡无关）
+# 板级相关配置（目标芯片/PSRAM/Flash/主频）在 sdkconfig.defaults.amoled216
+# =============================================================
+
+# FreeRTOS tick = 1kHz：IMU 采样节拍 / 条带动画 / 消抖都需要 ms 级分辨率
+CONFIG_FREERTOS_HZ=1000
+
+# 性能优先（渲染 + QSPI 上传 + minimp3 解码都在设备端）
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+
+# TF 卡挂 FATFS：素材包/清单文件名超过 8.3，启用长文件名（heap 工作缓冲）
+CONFIG_FATFS_LFN_HEAP_ENABLED=y
+
+# 共享 I2C 五器件统一走 i2c_master 新 API（driver/i2c_master.h），
+# 显式关闭旧版 driver/i2c.h 避免符号/中断冲突
+CONFIG_I2C_ENABLE_LEGACY_DRIVERS=n
+
+# 任务看门狗：喂狗点在渲染心跳（app/ 负责），保留默认监控
+# CONFIG_ESP_TASK_WDT_TIMEOUT_S 默认 5s，够 30fps 心跳

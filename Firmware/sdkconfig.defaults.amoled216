@@ -1,0 +1,25 @@
+# =============================================================
+# 板级默认：Waveshare ESP32-S3-Touch-AMOLED-2.16（SKU 33969）
+# ESP32-S3R8（叠封 8MB Octal PSRAM）+ 16MB NOR Flash
+# =============================================================
+
+CONFIG_IDF_TARGET="esp32s3"
+
+# 240MHz 双核（PRO=网络 / APP=渲染，见 software-design.md §4.1）
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+CONFIG_FREERTOS_UNICORE=n
+
+# 16MB NOR Flash：QIO / 80MHz（素材缓存 + OTA 双分区由 main/ 的分区表定义）
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
+CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
+
+# 8MB Octal PSRAM（S3R8 叠封）：static_back/tile/实体缓冲/LVGL 双缓冲全在 PSRAM
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_SPIRAM_USE_MALLOC=y
+
+# 日志/烧录走板载 Type-C（GPIO19/20 = USB-Serial-JTAG）；板上未引出 UART0 排针
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
