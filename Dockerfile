@@ -42,12 +42,14 @@ RUN set -eux; \
 FROM mcr.microsoft.com/dotnet/sdk:9.0 AS serverbuild
 WORKDIR /src
 # 先只拷 sln + 各 csproj 做 restore，命中层缓存；Server/ 新增项目时需同步补一行
-COPY Server/Minipet.sln ./
-COPY Server/MinipetServer/MinipetServer.csproj ./MinipetServer/
-COPY Server/MinipetServer.Tests/MinipetServer.Tests.csproj ./MinipetServer.Tests/
-COPY Server/tools/Exporter/Exporter.csproj ./tools/Exporter/
+# 注意：COPY 目标必须保留 Server/ 目录结构（./ 会拍平到 /src 根，
+# 导致 dotnet restore Server/Minipet.sln 找不到文件 —— MSB1009）
+COPY Server/Minipet.sln Server/
+COPY Server/MinipetServer/MinipetServer.csproj Server/MinipetServer/
+COPY Server/MinipetServer.Tests/MinipetServer.Tests.csproj Server/MinipetServer.Tests/
+COPY Server/tools/Exporter/Exporter.csproj Server/tools/Exporter/
 RUN dotnet restore Server/Minipet.sln
-COPY Server/ ./
+COPY Server/ ./Server/
 RUN dotnet publish Server/MinipetServer/MinipetServer.csproj \
       -c Release \
       -o /app/publish
