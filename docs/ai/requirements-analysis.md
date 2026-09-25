@@ -41,3 +41,12 @@ BGM
 - **无 Hermes 字段、无 HA 字段**（隔离铁律）
 - 无网络降级：所有端点不可达时设备用 TF 卡缓存独立运行
 - 协议版本号字段预留（`proto`），v2 加东西不破坏 v1 设备
+
+### E3 — 服务端部署与配置（P0）✅ 已确认（2026-09-25）
+
+- **单容器**：api（ASP.NET Core 直接托管 Vue 产物 + API + BGM 流）；QQ 音乐网关 = 容器内 node 子进程（配置开关控制拉起，不启用则不存在）
+- **对外唯一五位数端口 38090**（`.env` 的 `MINIPET_PORT` 可改），无 web 中间层
+- **配置双通道**：Web 设置页与文本编辑写同一份 `data/config/appsettings.json`（WZ 路径 / 端口 / QQ cookie / 阈值），改后热重载（WzService 重新 LoadWz）
+- **WZ 数据只读挂载**（NAS homes → 容器 `/wz`），开源用户路径自定义；仓库内禁止出现真实 IP/用户名（占位符）
+- **镜像分发**：GitHub Actions 构建单镜像 → GHCR；备路 `scripts/deploy-nas.sh`（Mac buildx → save/load 直投 NAS）
+- 验证清单随代码交付：SkiaSharp 容器内可用（fallback ImageSharp）、homes 挂载权限、双架构镜像
