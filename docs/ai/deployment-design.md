@@ -14,14 +14,14 @@
 │                挂载：WZ数据(只读) + data/（配置/缓存/设备表/OTA）
 │                出口：内部 8080
 ├─ web          nginx:alpine（Vue 静态 + /api 反代）
-│                出口：**8090 对外**（浏览器与 ESP32 同一入口）
+│                出口：**38090 对外**（默认值，可改，见「端口配置」）
 └─ qqmusic      Rain120/qq-music-api（Node，可选启用）
                  出口：内部 3300，仅 api 访问
 
 访问路径：
-  浏览器     http://<NAS_IP>:8090/          （Web UI）
-  ESP32      http://<NAS_IP>:8090/api/device/*（素材/指令/BGM 流）
-  api 直查   http://<NAS_IP>:8090/api/health
+  浏览器     http://<NAS_IP>:38090/          （Web UI）
+  ESP32      http://<NAS_IP>:38090/api/device/*（素材/指令/BGM 流）
+  api 直查   http://<NAS_IP>:38090/api/health
 ```
 
 **为什么 web 反代 api（同源）**：ESP32 与浏览器共用一个端口，天然无 CORS；将来上 HTTPS/换端口只动 nginx。
@@ -69,7 +69,7 @@ services:
     image: ghcr.io/tzy502/minipet-web:latest
     container_name: minipet-web
     restart: unless-stopped
-    ports: ["8090:80"]
+    ports: ["${MINIPET_PORT:-38090}:80"]   # 五位数端口，.env 可改
     depends_on: [api]
 
   qqmusic:                             # 可选：注释掉即纯 WZ 曲库
@@ -78,6 +78,14 @@ services:
     restart: unless-stopped
     expose: ["3300"]
 ```
+
+### 端口配置（胶水定稿：五位数 + 可修改）
+
+- **默认端口 38090**（五位数，避开群晖常用低位端口段）
+- 修改方式：编辑 `/volume2/docker/minipet/.env` 里 `MINIPET_PORT=xxxxx` → Container Manager 重建项目（容器端口映射属 Docker 层，改完 up -d 生效）
+- api 容器内部端口固定 8080 不对外，**对外只暴露 web 一个五位数端口**
+- ESP32 配网页输入框预填 `http://<NAS_IP>:38090`，端口改了就在配网页/设备设置里改地址（协议里服务器地址本来就是配置项）
+- 开源用户：README 写明改 .env 即可换端口
 
 **群晖路径要点**（对齐 hermes 现有部署惯例）：
 - 项目目录：`/volume2/docker/minipet/`（compose + data/）
@@ -136,7 +144,7 @@ NAS: docker load < tar && compose up -d
    - fallback：渲染层换 ImageSharp（纯托管，慢 ~30% 但零 native 风险）
 3. ⬜ compose 挂载 homes 路径权限（群晖对 homes 共享的容器访问 ACL）
 4. ⬜ .NET 9 runtime 在该架构的镜像可用性
-5. ⬜ ESP32 固件写入 `http://<NAS_IP>:8090`（配网页默认值预填此地址）
+5. ⬜ ESP32 配网页默认值预填 `http://<NAS_IP>:38090`（端口可改，配网页是输入框不是写死）
 6. ⬜ BGM 流媒体经 nginx 反代的缓冲配置（`proxy_buffering off`，防音频卡顿——nginx 默认缓冲会毁掉流式）
 
 ---
