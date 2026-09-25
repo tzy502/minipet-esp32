@@ -1,0 +1,60 @@
+# ===== MiniPet-ESP32 三合一忽略（C# 服务端 / Vue Web / ESP-IDF 固件）=====
+
+# --- 通用 ---
+.DS_Store
+*.log
+*.tmp
+.tmp/
+.vscode/
+.idea/
+
+# --- C# / .NET (Server) ---
+[Oo]bj/
+[Bb]in/
+Bin/
+obj/
+Out/
+out/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+TestResult/
+[Tt]est[Rr]esult*/
+*.nuget.props
+project.lock.json
+packages/
+.nuget-packages/
+artifacts/
+
+# --- Node / Vue (Web) ---
+node_modules/
+dist/
+dist-ssr/
+*.local
+.npm/
+.vite/
+.eslintcache
+coverage/
+
+# --- ESP-IDF / C (Firmware) ---
+build/
+sdkconfig.old
+sdkconfig.ci
+dependencies.lock
+managed_components/
+dependencies.lock
+flash_args*
+flasher_args.json
+*.bin
+*.map
+*.elf
+downloaded_components/
+example_test/
+partition_table/*.bin
+
+# --- 密钥/凭据（BGM cookie、HA 令牌等不入库）---
+*.env
+.env.*
+secrets/
+config/private/
