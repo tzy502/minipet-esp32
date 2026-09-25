@@ -16,7 +16,7 @@ minipet-esp32/
 
 ## 架构一句话
 
-**NAS Docker 单容器部署**（群晖）：ASP.NET Core 一体化容器（托管 Vue 前端 + 设备 API + BGM 流，对外唯一五位数端口），QQ 音乐网关为容器内可选子进程；ESP32 哑终端（零 WZ / 零 Hermes / 零 HA，只收素材包和指令，设备永远是 HTTP client）。
+**NAS Docker 单容器部署**（群晖）：ASP.NET Core 一体化容器（托管 Vue 前端 + 设备 API + BGM 流，对外唯一五位数端口 38090，.env 可改；QQ 音乐网关为容器内可选 node 子进程，最终镜像含 node 运行时 ≤400MB）；ESP32 哑终端（零 WZ / 零 Hermes / 零 HA，只收素材包和指令，设备永远是 HTTP client）。
 配置双通道：Web 设置页（开源用户）与文本 appsettings.json（自己改）写同一份文件。
 
 ## 硬件

@@ -16,7 +16,7 @@
 - 数据一切从 WZ 走，路径经配置注入（禁止硬编码）
 - 表情按 25 个实证表情全量导出（expression 维度）
 - 480 屏部件 1x + scale 2x nearest 由导出器标注
-- 迁移时清理 17 处 Avalonia Dispatcher 引用（改普通回调/Channel）
+- 迁移时清理 Avalonia/Dispatcher 引用（改 Channel）；实测口径：迁移范围内仅 EventBus 3 处非注释引用（详见 software-design 迁移表），验收门禁 = Server/ 内 Avalonia 与 Dispatcher.UIThread 双零命中
 
 ### E2 — 设备协议（P0）✅ 已确认（2026-09-25）
 
@@ -46,7 +46,7 @@ BGM
 
 - **单容器**：api（ASP.NET Core 直接托管 Vue 产物 + API + BGM 流）；QQ 音乐网关 = 容器内 node 子进程（配置开关控制拉起，不启用则不存在）
 - **对外唯一五位数端口 38090**（`.env` 的 `MINIPET_PORT` 可改），无 web 中间层
-- **配置双通道**：Web 设置页与文本编辑写同一份 `data/config/appsettings.json`（WZ 路径 / 端口 / QQ cookie / 阈值），改后热重载（WzService 重新 LoadWz）
+- **配置双通道**：Web 设置页与文本编辑写同一份 `data/config/appsettings.json`（WZ 路径 / QQ cookie / 阈值），改后热重载（WzService 重新 LoadWz）；**端口除外（评审 3.1 修订）——端口属部署层只在 .env，appsettings 无端口项，Web 设置页端口只读展示**
 - **WZ 数据只读挂载**（NAS homes → 容器 `/wz`），开源用户路径自定义；仓库内禁止出现真实 IP/用户名（占位符）
 - **镜像分发**：GitHub Actions 构建单镜像 → GHCR；备路 `scripts/deploy-nas.sh`（Mac buildx → save/load 直投 NAS）
 - 验证清单随代码交付：SkiaSharp 容器内可用（fallback ImageSharp）、homes 挂载权限、双架构镜像
@@ -94,7 +94,8 @@ Vue 3 + Naive UI 管理界面（构建产物打进 api 镜像，单容器同源�
 **重力感应（IMU）**
 - 左右倾斜（超阈值）→ 背景视差条带反向平移（背景动、人不动）+ 人物原地 walk1
 - 上倾 → 人物切 fly；回正 → stand
-- 死区 ±8°、保持 300ms 防抖；角度 100ms 上报（服务端重算 layout 下发）
+- 死区 ±8°、保持 300ms 防抖
+- **倾斜视觉全本地驱动（评审 3.3 修订）**：IMU 只上报状态变迁事件（进入/退出倾斜），连续视差零网络往返、不上报角度流
 
 **力度分级（IMU 加速度，设备端算好只上报事件）**
 - 轻拍 <2g → alert + bewildered；大力拍打 ≥4g → hit 表情；剧烈摇晃 → stunned；拿起/翻转 → fly + oops

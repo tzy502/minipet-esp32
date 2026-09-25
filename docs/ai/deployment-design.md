@@ -1,5 +1,6 @@
 # MiniPet-ESP32 部署设计（NAS Docker · 群晖）
 
+> ⚠️ **本文档部分内容已被 E3 定稿取代（2026-09-25 评审 A1）**：最终形态为**单容器**（api 直接托管 Vue 产物+API+BGM 流，无 nginx；QQ 网关 = api 容器内 node 子进程）。文中残留的"三容器/web 反代"段落仅作历史记录，实现以 software-design.md 2.5 节 + requirements E3 为准。
 > 状态：设计稿（2026-09-25，胶水确认部署目标）
 > 目标主机：**内网 NAS（群晖，主机名/IP 属私有信息，用 <NAS_IP> 占位）**，Docker = **Container Manager**，可出外网
 > 参考实部署：NAS 上已有 hermes（镜像拉取+volume2 模式）、java（Mac 编译→SMB 投递 jar→容器跑）两套范例

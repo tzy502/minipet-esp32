@@ -1,6 +1,6 @@
 # 素材包二进制格式（算法级规格）
 
-> 状态：**Phase 2 设计稿 v1**（2026-09-25）
+> 状态：**v2**（2026-09-25 评审修订：A2 表情组字段 / A3 预算修正 / 3.5 fontTime 归属 / 3.6 manifest label / 3.9 零碎项）
 > 定位：实现级细节文档——布局表、部件包、背景包、字体包的二进制结构
 > 评审：Phase 2 完成后随 software-design.md 一并过 3 agent 评审（含对抗验证 agent）
 > 作者说明：C# 侧实现细节由 Agent 定稿，胶水开独立 agent 对抗验证
@@ -23,7 +23,7 @@
 [ 4B]  payload_len   u32
 [ 4B]  reserved  u32（0）
 [... ]  payload（按 kind 各自结构）
-[ 8B]  尾部 crc32c + zero（校验完整性）
+[ 8B]  尾部 crc32c（**覆盖 header+payload 全量**）+ zero
 ```
 
 固件校验流程：MAGIC → crc → 长度 → hash 与 manifest 比对，任一失败按 E11 损坏处理（弃用重拉 + dam 表情）。
@@ -35,13 +35,16 @@
 ```
 payload:
 [u32] part_count
-[part_count × 16B] 索引：part_id(u32) | w(u16) | h(u16) | origin_x(i16) | origin_y(i16) | z_base(i16) | flags(u16)
-                    flags: bit0=is_face（表情切换只重画 face 类）
+[part_count × 20B] 索引：part_id(u32) | expr_group(u16) | w(u16) | h(u16) | origin_x(i16) | origin_y(i16) | offset(u32)
+                    expr_group：face 类部件的表情变体组号——同一 face 部件的 25 个表情变体共享 group、组内按 LAYOUT 的 expression 列表顺序排列；非 face 件 group=0
+                    offset：位图数据区内该图的显式偏移（u32；不再按累计推算，前向安全）
+                    ⚠️ z_base/flags 移除：z 属于布局表（每帧可变），PARTS 只存图
 [...] 位图数据区（连续，索引按顺序偏移累计；每图 RGB565 行对齐 4B）
 ```
 
 - 格式 **RGB565**（无 alpha 的部件直接不透明）；带 alpha 的部件用 **RGBA5650 变体**：1bit alpha 掩码位图附在像素后（每 8 像素 1 字节）——比 RGBA8888 省 40%，像素风 alpha 边缘 1bit 足够
 - part_id 用稳定编号（导出器分配：body=1, head=2, hair=10.., face=20.., coat=30.....）
+- **表情替换闭环（A2 定稿）**：渲染时 piece.expr_index ≠ 255 → 找到该 piece 引用的 face 件 part → 取其 expr_group → 在组内按 expr_index 偏移取变体 part_id → blit 变体图。导出器保证：每组变体数 == LAYOUT.expression_count，尺寸/origin 同构（仅像素不同）
 - 480 屏 2x 缩放在设备端做（nearest），包里存 1x
 
 ## 四、kind=2 LAYOUT（布局表包）
@@ -105,10 +108,15 @@ payload:
 ```
 payload:
 [u32] track_count
-[track_count × N]：id(u32) | title(定长64B UTF-8) | source(u8: 0=WZ 1=QQ) | duration_s(u32)
+[track_count × N]：id(u32) | title(定长96B UTF-8，约32汉字) | source(u8: 0=WZ 1=QQ) | duration_s(u32)
 ```
 
 音频本体不打包（流式拉取，E8）；此包仅列表（设备端选择器/控制条显示用）。
+
+## 七.5、fontTime 时钟数字素材（3.5 评审项）
+
+待机/地图时钟的 0-9/am/pm/comma（`Map/Obj/etc.img/clock/fontTime`）**按 PARTS 包导出**（保留 part_id，设备端与普通部件同路 blit）；
+排布参数不进包——起点 `clock_table 锚点 + (18+3, 83)`、`AMPM_GAP=12px`、comma 偶显奇隐，按 clock-display-spec.md 定稿值**固件硬编码**。
 
 ## 八、manifest（版本总表，JSON，非二进制）
 
@@ -117,9 +125,9 @@ payload:
   "proto": 1,
   "rev": 184,
   "assets": {
-    "<hash>": { "kind": "PARTS", "bytes": 51200, "url": "/api/device/asset/<hash>" },
+    "<hash>": { "kind": "PARTS", "bytes": 51200, "url": "/api/device/asset/<hash>", "label": "默认装扮" },
     "...": { "kind": "LAYOUT", "entity": "paperdoll:default", "action": "walk1" },
-    "...": { "kind": "BGMAP", "map": "200000100" }
+    "...": { "kind": "BGMAP", "map": "200000100", "label": "天空之城售票处", "thumb": "<hash>" }
   },
   "firmware": { "ver": "0.3.1", "url": "/api/device/firmware/0.3.1.bin" },
   "clock_table": { "200000100": [123, 240], "220000100": [98, 258] }
@@ -131,14 +139,14 @@ payload:
 
 ## 九、体积预算（480 屏基准）
 
-| 包 | 估算 | 说明 |
+| 包 | 估算（修正 2026-09-25 评审） | 说明 |
 |---|---|---|
-| PARTS（一整套装扮） | ~200-400KB | 10-14 部件 × 1x RGB565 |
+| PARTS（一整套装扮） | ~400-700KB | 10-14 部件 1x RGB565 + **face 类 25 表情变体**（约 8 件 × 25 ≈ +200-400KB） |
 | LAYOUT（一动作） | 5-30KB | 纯索引数据 |
 | 全动作 LAYOUT（30 动作） | ~300KB | walk1/stand1/fly/... |
-| BGMAP（一地图） | 300-500KB | 480×480×2 + alpha 层 + 条带 |
-| FONT 三档 | ~1.5MB | 24px 主体 + 16px + 32px |
-| **一设备全量首拉** | **~2.5-3MB ≈ 局域网 2-3 秒** | 换装/换图只拉差量（KB 级） |
+| BGMAP（一地图） | **≈930KB 起** | static_back 450KB + tile_layer ≈478KB（2.125B/px）+ 条带；tile 层 RLE 稀疏化为 P2 优化（可省 60-70%） |
+| FONT | **≈1.7-3.2MB** | 16px 448KB + 24px 1008KB（3500 字全量）+ 32px（限标题字符集 ~500 字则 256KB；全量则 1792KB——**32px 默认限字符集**） |
+| **一设备全量首拉** | **≈4-5.5MB ≈ 局域网 3-6 秒** | 换装/换图只拉差量（KB 级）；TF 规划按 6MB/设备 + 淘汰水位
 
 ## 十、导出器（服务端侧）实现要点
 
