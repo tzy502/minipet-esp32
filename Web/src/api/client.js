@@ -35,7 +35,7 @@ export function errText(e, fallback = '请求失败') {
 }
 
 // ── 缩略图 URL 拼装（GET，直接喂给 <img>/<n-image>，不走 axios）────────────
-// 服务端：64×64 PNG，data/cache/thumbs 磁盘缓存（M3 为确定性纯色占位，M4 接真实渲染）
+// 服务端：64×64 PNG，data/cache/thumbs 磁盘缓存（type=part/paperdoll/mob/npc/map 均真实渲染）
 export function thumbUrl(type, id) {
   return `/api/admin/thumb?type=${encodeURIComponent(type)}&id=${encodeURIComponent(id)}`
 }
@@ -91,6 +91,13 @@ export function paperdollThumbUrl(id, size = 256) {
   return `/api/admin/thumb?type=paperdoll&id=${encodeURIComponent(id)}&size=${size}`
 }
 
+// ── 素材目录（素材浏览页 MaterialsView：地图 / 怪物 / NPC）──────────────────
+// GET /admin/materials?kind=map|mob|npc → { kind, total, items: [{ id, name }] }
+// 服务端实时扫 WZ（Map/Mob/Npc 目录）出 id+名称清单；WZ 未加载时 reject 走上方统一错误通道
+export function getMaterials(kind) {
+  return http.get('/admin/materials', { params: { kind } }).then((r) => r.data)
+}
+
 // ── 曲库与音源（E8：Web 只管曲库/cookie/启停，不做点歌）───────────────────
 // GET /admin/music/tracks?source=wz|qq → { source, count, tracks: [{id,title,category,bytes}] }
 export function musicTracks(source) {
@@ -124,9 +131,8 @@ export function putSettings(config) {
 }
 /**
  * WZ 路径校验（设置页「校验」按钮）。
- * 后端当前版本未提供 POST /admin/settings/validate-path 独立端点（PUT settings 内
- * 置 ValidateWzPath 硬校验、GET settings 附带 wzPathExists）；先按任务约定打该端点，
- * 404/405 时返回 { supported: false } 由页面降级提示，后端补齐后自动点亮。
+ * POST /admin/settings/validate-path { path } → { ok, message }（服务端 ConfigService
+ * .ValidateWzPath 存在性硬校验，与 PUT settings 保存前校验同一套规则）。
  */
 export async function validateWzPath(path) {
   try {

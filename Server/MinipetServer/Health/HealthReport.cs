@@ -25,10 +25,16 @@ public sealed class DeviceHealthSummary
 /// <summary>
 /// 设备健康汇总（E11）：POST /api/device/event 聚合 → Web 可见的设备健康状态。
 /// 每设备环形缓冲（最近 200 条）+ 分类计数 + 末次错误 + 电量；纯内存（服务重启清零可接受）。
+/// 事件入队时同步写一行 DeviceEventLog（Web 日志页拉取，E14）。
 /// </summary>
 public sealed class HealthReport
 {
     private const int RingCapacity = 200;
+
+    private readonly DeviceEventLog _eventLog;
+
+    /// <summary>构造注入事件环形日志：每条设备事件同步落一行文本。</summary>
+    public HealthReport(DeviceEventLog eventLog) => _eventLog = eventLog;
 
     private static readonly HashSet<string> ErrorTypes = new(StringComparer.Ordinal)
     {
@@ -53,6 +59,7 @@ public sealed class HealthReport
     {
         if (string.IsNullOrEmpty(deviceId) || string.IsNullOrEmpty(type)) return;
         var st = _states.GetOrAdd(deviceId, _ => new State());
+        var isError = ErrorTypes.Contains(type);
         lock (st.Gate)
         {
             var now = DateTime.UtcNow;
@@ -62,7 +69,7 @@ public sealed class HealthReport
             st.Ring.Enqueue(new DeviceEventRecord { TsUtc = now, Type = type, Data = data });
             while (st.Ring.Count > RingCapacity) st.Ring.Dequeue();
 
-            if (ErrorTypes.Contains(type))
+            if (isError)
             {
                 st.LastError = ExtractString(data, "message") ?? type;
                 st.LastErrorUtc = now;
@@ -73,6 +80,12 @@ public sealed class HealthReport
                 if (pct.HasValue) st.BatteryPercent = pct;
             }
         }
+
+        // 同步写一行设备事件日志：{事件名/错误} {细节}（错误类前缀标注，便于日志页扫读）
+        var detail = DetailOf(data);
+        _eventLog.Append(deviceId, detail.Length == 0
+            ? (isError ? $"错误 {type}" : type)
+            : (isError ? $"错误 {type}" : type) + " " + detail);
     }
 
     public DeviceHealthSummary? GetSummary(string deviceId)
@@ -96,6 +109,21 @@ public sealed class HealthReport
 
     public List<DeviceHealthSummary> GetAll()
         => _states.Keys.Select(GetSummary).Where(s => s != null).Cast<DeviceHealthSummary>().ToList();
+
+    /// <summary>事件日志细节：优先 message 字符串，其次原始 JSON（空对象/空数组省略）。</summary>
+    private static string DetailOf(JsonElement? data)
+    {
+        if (data is not { } el) return "";
+        if (el.ValueKind == JsonValueKind.String) return el.GetString() ?? "";
+        var msg = ExtractString(data, "message");
+        if (!string.IsNullOrEmpty(msg)) return msg!;
+        if (el.ValueKind is JsonValueKind.Object or JsonValueKind.Array)
+        {
+            var raw = el.GetRawText();
+            return raw is "{}" or "[]" ? "" : raw;
+        }
+        return "";
+    }
 
     private static string? ExtractString(JsonElement? data, string prop)
     {

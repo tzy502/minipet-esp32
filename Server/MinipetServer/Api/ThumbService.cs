@@ -17,9 +17,12 @@ namespace MinipetServer.Api;
 ///   回退 {root}/icon、{root}/iconRaw → stand 首帧 stand1/0、stand/0）→ 等比缩放进 64×64 透明画布；
 /// - type=paperdoll：拼串覆盖 seed/default-appearance.json 基底 → PaperdollService 真实合成
 ///   stand1 首帧（无帧试 stand）→ 等比缩放进 size×size 透明画布（size 64/128/192/256，默认 192）；
-/// - 其他 type（mob/npc/…）：M3 确定性纯色占位（行为不回归）。
+/// - type=mob/npc/map（素材浏览页真实化）：WZ 首帧/小地图 canvas（Mob|Npc/{id 7位补零}.img/stand/0
+///   bare 回退、Map/Map/Map{首位}/{id}.img/miniMap/canvas）→ 等比缩放进 64×64 透明画布；
+///   缓存文件名换 t_rt_ 新前缀（旧 t_{type}… 里已落盘 M3 色块，沿用旧名会永远命中旧色块）；
+/// - 其他 type（preset…）：M3 确定性纯色占位（行为不回归）。
 /// 所有失败路径（WZ 未加载 / 渲染异常 / 空帧）回落 RenderPlaceholder 色块，不 500；
-/// part/paperdoll 的失败占位不落盘（WZ 稍后加载成功可重试出真图）。
+/// part/paperdoll/mob/npc/map 的失败占位不落盘（WZ 稍后加载成功可重试出真图）。
 /// </summary>
 public sealed class ThumbService
 {
@@ -60,12 +63,13 @@ public sealed class ThumbService
 
     /// <summary>
     /// 取缩略图 PNG。type=part 用 folder/img 定位部件；type=paperdoll 用 id 拼串 + size；
-    /// 旧 type（mob/npc/preset…）只看 type/id（M3 占位行为保持不变）。
+    /// type=mob/npc/map 用 id 定位 WZ 首帧/小地图；旧 type（preset…）只看 type/id（M3 占位行为保持不变）。
     /// </summary>
     public byte[] GetOrCreatePng(string type, string id, string? folder = null, string? img = null, int? size = null)
     {
         if (type == "part") return GetOrCreatePartPng(folder ?? "", id, img ?? "");
         if (type == "paperdoll") return GetOrCreatePaperdollPng(id, size ?? DefaultPaperdollSize);
+        if (type == "mob" || type == "npc" || type == "map") return GetOrCreateEntityPng(type, id);
 
         // 旧类型：M3 确定性纯色占位（缓存机制不变：有缓存文件直接回，无则渲染+落盘）
         var file = Path.Combine(_paths.ThumbsDir, $"t_{StorageUtil.SafeFileId(type)}.{StorageUtil.SafeFileId(id)}.{Size}.png");
@@ -73,6 +77,67 @@ public sealed class ThumbService
         var png = RenderPlaceholder(type, id);
         StorageUtil.AtomicWriteAllBytes(file, png);
         return png;
+    }
+
+    // ═══════════════════════════════════════════
+    // type=mob/npc/map：WZ 首帧 / 小地图真实渲染
+    // ═══════════════════════════════════════════
+
+    /// <summary>
+    /// 怪物/NPC/地图缩略图（素材浏览页真实化）：WZ 首帧/小地图 canvas → 等比缩放进 64×64 透明画布。
+    /// 缓存文件名用 t_rt_ 新前缀——旧 t_{type}… 缓存里已落盘 M3 色块占位，沿用旧名会永远命中旧色块
+    /// （换前缀 = 旧色块缓存整体自然失效）。全失败（WZ 未加载/无帧/解码异常）回 RenderPlaceholder
+    /// 且不落盘（WZ 就绪后同 id 再请求可重试出真图，口径同 part/paperdoll）。
+    /// </summary>
+    private byte[] GetOrCreateEntityPng(string type, string id)
+    {
+        var file = Path.Combine(_paths.ThumbsDir,
+            $"t_rt_{StorageUtil.SafeFileId(type)}.{StorageUtil.SafeFileId(id)}.{Size}.png");
+        if (File.Exists(file)) return File.ReadAllBytes(file);
+
+        var png = TryRenderEntity(type, id);
+        if (png != null)
+        {
+            StorageUtil.AtomicWriteAllBytes(file, png);
+            return png;
+        }
+        return RenderPlaceholder(type, id);
+    }
+
+    /// <summary>候选 WZ canvas 路径（真实 WZ 实测命中）：
+    /// mob 首帧 Mob/{id 7位补零}.img/stand/0（实测 0100100 命中，bare 回退）；
+    /// npc 首帧 Npc/{id}.img/stand/0（实测 2100000 命中；不足 7 位也先按补零试、bare 回退）；
+    /// map 小地图 Map/Map/Map{id首位}/{id}.img/miniMap/canvas（实测 200000100 → Map2）。</summary>
+    private byte[]? TryRenderEntity(string type, string id)
+    {
+        if (!_wz.IsLoaded) return null; // WZ 未加载直接走占位（现有行为）
+        if (string.IsNullOrWhiteSpace(id)) return null;
+        var candidates = type switch
+        {
+            "mob" => new List<string>
+            {
+                $"Mob/{id.PadLeft(7, '0')}.img/stand/0",
+                $"Mob/{id}.img/stand/0",
+            },
+            "npc" => new List<string>
+            {
+                $"Npc/{id.PadLeft(7, '0')}.img/stand/0",
+                $"Npc/{id}.img/stand/0",
+            },
+            // 分派已保证 type ∈ {mob,npc,map}，_ 即 map（id首位 = 首字符，非数字 id 探测失败走占位）
+            _ => new List<string> { $"Map/Map/Map{id[..1]}/{id}.img/miniMap/canvas" },
+        };
+        foreach (var path in candidates)
+        {
+            byte[]? raw;
+            try { raw = _wz.ExtractPng(path); }
+            catch { continue; }
+            if (raw == null || raw.Length == 0) continue;
+            using var src = SKBitmap.Decode(raw);
+            var png = FitToCanvas(src, Size);
+            if (png != null) return png;
+        }
+        return null;
     }
 
     // ═══════════════════════════════════════════
