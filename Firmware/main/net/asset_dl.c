@@ -616,10 +616,6 @@ static void sync_once(void)
 static void asset_dl_task(void *arg)
 {
     (void)arg;
-    ensure_dirs();
-    crc32c_init_table();
-    load_local_manifest();
-
     for (;;) {
         if (xSemaphoreTake(s_sync_req, pdMS_TO_TICKS(60000)) == pdTRUE) {
             while (xSemaphoreTake(s_sync_req, 0) == pdTRUE) {}   /* 合并重复请求 */
@@ -637,6 +633,11 @@ void asset_dl_start(void)
 {
     s_lock = xSemaphoreCreateMutex();
     s_sync_req = xSemaphoreCreateBinary();
+    /* 清单同步加载：state_machine_boot 紧随其后查 have_local_manifest，
+     * 必须在返回前就绪（否则自检竞态 → 该起播却判空） */
+    ensure_dirs();
+    crc32c_init_table();
+    load_local_manifest();
     xTaskCreatePinnedToCore(asset_dl_task, "asset_dl", 10240, NULL,
                             2 /* 低于 poller——4.1 */, NULL, 0 /* PRO */);
 }
