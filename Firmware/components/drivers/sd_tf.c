@@ -25,8 +25,9 @@ static const char *TAG = "sd_tf";
 #define SD_MAX_FILES    8            /* manifest + 多个素材包并发流式读 */
 
 /* SDSPI 的 host/slot 结构体必须常驻（驱动内部持有指针）。
+ * IDF5：SDSPI_HOST_DEFAULT() 返回 sdmmc_host_t（sdspi_host_t 类型已不存在）。
  * C 里花括号宏只能做声明初始化，所以 static 处直接初始化，字段在 sd_mount() 里覆盖。 */
-static sdspi_host_t          s_host = SDSPI_HOST_DEFAULT();
+static sdmmc_host_t          s_host = SDSPI_HOST_DEFAULT();
 static sdspi_device_config_t s_slot = SDSPI_DEVICE_CONFIG_DEFAULT();
 static sdmmc_card_t         *s_card;
 static bool                  s_mounted;

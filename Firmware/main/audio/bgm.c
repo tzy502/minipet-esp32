@@ -113,6 +113,8 @@ typedef struct {
 
 static stream_ctx_t s_sc;
 
+static mp3dec_t *s_dec;   /* 解码器常驻复用（play_track 早于 bgm_task 引用） */
+
 /* 前向：流中控制队列排空（定义见「控制消息」节） */
 static void drain_audio_q_nonblock(void);
 
@@ -410,8 +412,6 @@ static void handle_audio_msg(const mp_audio_msg_t *m)
 /* ------------------------------------------------------------------ */
 /* bgm 任务 / feeder 任务                                                */
 /* ------------------------------------------------------------------ */
-static mp3dec_t *s_dec;
-
 static void bgm_task(void *arg)
 {
     (void)arg;

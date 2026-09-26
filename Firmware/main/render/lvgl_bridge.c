@@ -226,7 +226,7 @@ static int bubble_layout(const char *text, const lv_font_t *font,
 
         uint32_t adv = 0;
         lv_font_glyph_dsc_t dsc;
-        if (lv_font_get_glyph_dsc(font, cp, 0, &dsc))
+        if (lv_font_get_glyph_dsc(font, &dsc, cp, 0))   /* v9 签名：dsc 第 2 参 */
             adv = dsc.adv_w;
         else
             adv = size_px; /* 缺字按全宽占位（可见反馈） */

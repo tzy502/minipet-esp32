@@ -53,6 +53,11 @@ COPY Server/ ./Server/
 RUN dotnet publish Server/MinipetServer/MinipetServer.csproj \
       -c Release \
       -o /app/publish
+# 问题1 防复发断言（2026-09-26）：linux native 必须在 publish 产物里，
+# 缺失直接构建失败（此前 libSkiaSharp.so 缺失导致线上缩略图全 500）
+RUN set -eux; \
+    ls /app/publish/runtimes/linux-x64/native/libSkiaSharp.so; \
+    ls /app/publish/runtimes/linux-arm64/native/libSkiaSharp.so
 
 # ---------- Stage 3: 运行时 ----------
 FROM mcr.microsoft.com/dotnet/aspnet:9.0 AS final

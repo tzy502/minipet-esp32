@@ -1,0 +1,5 @@
+## Component manager manifest：IDF 5.5 不内置 lvgl，经 registry 拉取
+## （software-design 四：LVGL 9 用于菜单/气泡 UI 层）
+dependencies:
+  lvgl/lvgl: "^9"
+  idf: ">=5.5"

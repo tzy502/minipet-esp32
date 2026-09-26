@@ -67,4 +67,10 @@ app.MapGet("/api/health", (ConfigService c, DeviceRegistry reg) => Results.Json(
 DeviceEndpoints.Map(app);
 AdminEndpoints.Map(app);
 
+// ── SPA fallback（E4 问题2 修复 2026-09-26）：Vue Router 用 createWebHistory
+//    （URI 路径模式），直接访问/刷新 /materials 等非根路径时静态文件中间件
+//    找不到对应文件 → 404。fallback 到 index.html 交给前端路由接管。
+//    注意必须放在所有 API 端点之后：/api/* 已匹配则不会走到这里。
+app.MapFallbackToFile("/index.html");
+
 app.Run();

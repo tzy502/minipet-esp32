@@ -245,7 +245,7 @@ void watchdog_init(void)
     }
 
     xTaskCreatePinnedToCore(watchdog_task, "wdt_mon", 4096, NULL,
-                            6 /* 高于一切应用任务 */, tskNO_AFFINITY, NULL);
+                            6 /* 高于一切应用任务 */, NULL, tskNO_AFFINITY);
 }
 
 void watchdog_subscribe_render_task(void)
