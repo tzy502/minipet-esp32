@@ -149,6 +149,31 @@ jobs:
           echo "::error::容器在 60s 内未通过 /api/health 冒烟检查"
           exit 1
 
+      # ── 2026-09-26 新增：此前线上两个事故的防回归验收 ──────────────────
+      # 事故1：镜像缺 libSkiaSharp.so → /api/admin/thumb 全 500（素材加载失败）
+      #   thumb 在无 WZ 数据时可能 404/500（合理），但绝不能是 DllNotFound 的 500：
+      #   用容器日志断言无 "Unable to load shared library"。
+      - name: Assert no native library failure in logs
+        run: |
+          sleep 2
+          if docker logs minipet-smoke 2>&1 | grep -q "Unable to load shared library"; then
+            echo "::error::native 库缺失（SkiaSharp.so 没进镜像）"
+            docker logs minipet-smoke | tail -20
+            exit 1
+          fi
+          echo "native OK"
+
+      # 事故2：SPA History 路由刷新 404 → 断言任意非 API 路径返回 200 + index.html
+      - name: Assert SPA fallback (deep-link refresh 200)
+        run: |
+          code=$(curl -s -o /tmp/refresh.html -w "%{http_code}" "http://127.0.0.1:${PORT}/materials")
+          body_ok=$(grep -c "<div id=\"app\">" /tmp/refresh.html || true)
+          if [ "$code" != "200" ] || [ "$body_ok" = "0" ]; then
+            echo "::error::SPA 刷新失败 code=$code body_match=$body_ok（缺 MapFallbackToFile？）"
+            exit 1
+          fi
+          echo "SPA fallback OK"
+
       - name: Container logs (on failure)
         if: failure()
         run: docker logs minipet-smoke || true
