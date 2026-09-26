@@ -37,15 +37,17 @@ public sealed class DeviceManifestService
     private readonly ServerPaths _paths;
     private readonly ConfigService _cfg;
     private readonly DeviceRegistry _registry;
+    private readonly CommandQueue _queue;
     private readonly object _gate = new();
     private Dictionary<string, long> _revs = new(StringComparer.Ordinal);
     private Dictionary<string, CachedSet> _cached = new(StringComparer.Ordinal);
 
-    public DeviceManifestService(ServerPaths paths, ConfigService cfg, DeviceRegistry registry)
+    public DeviceManifestService(ServerPaths paths, ConfigService cfg, DeviceRegistry registry, CommandQueue queue)
     {
         _paths = paths;
         _cfg = cfg;
         _registry = registry;
+        _queue = queue;
         _revs = StorageUtil.ReadJson<RevsFile>(paths.RevsFile)?.Revs ?? new Dictionary<string, long>(StringComparer.Ordinal);
         _cached = StorageUtil.ReadJson<CachedFile>(paths.CachedHashesFile)?.Devices
                   ?? new Dictionary<string, CachedSet>(StringComparer.Ordinal);
@@ -73,8 +75,22 @@ public sealed class DeviceManifestService
             var rev = _revs.GetValueOrDefault(deviceId, 1) + 1;
             _revs[deviceId] = rev;
             SaveRevsLocked();
+            NotifyDevice(deviceId, rev);
             return rev;
         }
+    }
+
+    /// <summary>
+    /// manifest 变更即时唤醒（2026-09-26 补缝）：往指令队列塞一条轻量 manifest 指令，
+    /// 挂着的长轮询（≤55s）立即返回；设备固件本就按 poll 响应的 mrev 字段做素材 diff
+    /// （poller.c：manifest_rev != s_local_rev → asset_dl_request_sync），此前服务端既不给
+    /// mrev 也不唤醒 → 换装/时钟表变更最坏要等一个长轮询周期。未知指令 type 固件静默
+    /// 忽略，对老固件兼容。
+    /// </summary>
+    private void NotifyDevice(string deviceId, long rev)
+    {
+        try { _queue.Enqueue(deviceId, "manifest", new { rev }); }
+        catch (Exception ex) { Console.Error.WriteLine($"[Manifest] 唤醒 {deviceId} 失败: {ex.Message}"); }
     }
 
     public long BumpAllRev(string reason)
@@ -91,6 +107,7 @@ public sealed class DeviceManifestService
                 max = Math.Max(max, _revs[id]);
             }
             SaveRevsLocked();
+            foreach (var id in ids) NotifyDevice(id, _revs[id]);
             return max;
         }
     }

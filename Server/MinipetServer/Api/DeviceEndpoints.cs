@@ -167,7 +167,8 @@ public static class DeviceEndpoints
 
     /// <summary>拉指令队列（长轮询挂起 ≤55s；按 seq 有序取走）。</summary>
     private static async Task<IResult> HandlePoll(
-        HttpContext ctx, string deviceId, long since, DeviceRegistry reg, CommandQueue queue, DeviceEventLog eventLog)
+        HttpContext ctx, string deviceId, long since, DeviceRegistry reg, CommandQueue queue, DeviceEventLog eventLog,
+        DeviceManifestService mfst)
     {
         var dev = reg.Get(deviceId);
         if (dev == null) return NotFoundDevice(deviceId);
@@ -187,6 +188,9 @@ public static class DeviceEndpoints
             lastSeq = queue.GetLastSeq(deviceId),
             commands,
             waitedMs = sw.ElapsedMilliseconds,
+            // 设备素材 diff 依据（poller.c：mrev != 本地 rev → asset_dl_request_sync 立即拉包）——
+            // 此前响应缺此字段，设备恒读 0，manifest 变更只能靠设备重启兜底
+            mrev = mfst.GetCurrentRev(deviceId),
         });
     }
 

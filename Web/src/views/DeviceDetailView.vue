@@ -130,7 +130,7 @@ async function applyPet(clear = false) {
   try {
     // 显式传 null = 清空回默认宠物（后端以「字段出现且为 null」判定）
     await updateDevice(props.id, { petConfig: clear ? null : draftToAppearance(draft.value) })
-    message.success(clear ? '已恢复默认宠物（设备下次 poll 生效）' : '装扮已下发（设备下次 poll 生效）')
+    message.success(clear ? '已恢复默认宠物，设备数秒内自动生效' : '装扮已下发，设备数秒内自动换装')
     previewUrl.value = ''
     await load()
     devicesStore.fetchAll({ silent: true }).catch(() => {})
