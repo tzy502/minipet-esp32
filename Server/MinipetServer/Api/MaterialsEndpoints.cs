@@ -103,6 +103,14 @@ public static class MaterialsEndpoints
 
     /// <summary>取缓存；未命中则锁外全量构建（并发首建可能重复算一次，无害——
     /// WzLib 内部自有锁，且名字查询各有自身缓存），完成后代际相符才发布。</summary>
+    /// <summary>启动预热（WarmupService 调）：三类全量构建（含名字缓存填充），返回预热条目总数。</summary>
+    public static int WarmupAll(WzService wz)
+    {
+        int total = 0;
+        foreach (var def in Kinds.Values) total += GetOrBuild(wz, def).Count;
+        return total;
+    }
+
     private static List<object> GetOrBuild(WzService wz, KindDef def)
     {
         int gen;

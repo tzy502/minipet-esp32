@@ -31,6 +31,7 @@ builder.Services.AddSingleton<IMusicSource>(sp => sp.GetRequiredService<QqMusicS
 builder.Services.AddSingleton<BgmRouter>();              // 音源路由 + 同源降级（E8）
 builder.Services.AddSingleton<CacheManager>();           // WZ 位图/精灵 LRU（纸娃娃缩略图渲染共享）
 builder.Services.AddSingleton<WzService>();              // WZ 读取（catalog API / 纸娃娃真实缩略图共用）
+builder.Services.AddSingleton<MusicCatalogService>();    // WZ 曲库目录（BGM 曲目列表/决策共用）
 builder.Services.AddSingleton<ThumbService>();           // 64×64 缩略图 + 磁盘缓存（part/paperdoll 走真实渲染）
 builder.Services.AddSingleton<PresetStore>();            // 纸娃娃预设（data/presets/）
 
@@ -66,6 +67,32 @@ void LoadWzFromConfig(string dataPath)
         // config（只补缺失/替换样例占位，Web 改过的值不动；写入 → Changed → manifest rev+1）
         try { ClockTableSeeder.Run(wzSvc, cfgSvc, app.Logger); }
         catch (Exception ex) { app.Logger.LogWarning("[Clock] 校准调度失败：{Message}", ex.Message); }
+
+        // 启动预热：纸娃娃 17 part + 素材 3 kind 目录（含中文名缓存）+ 曲库目录。
+        // 串行后台跑（都是 WZ 锁内工作，并行无益）；NAS 冷机首开素材/曲库页不再等十几秒。
+        // 失败不致命：相关端点首请求会自建缓存（预热只是把冷启动成本挪到启动期）。
+        _ = Task.Run(() =>
+        {
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            try
+            {
+                int n = AdminCatalogEndpoints.WarmupAll(wzSvc);
+                app.Logger.LogInformation("[Warmup] 纸娃娃目录预热完成：{Count} 件（{Ms}ms）", n, sw.ElapsedMilliseconds);
+            }
+            catch (Exception ex) { app.Logger.LogWarning("[Warmup] 纸娃娃目录预热失败：{Message}", ex.Message); }
+            try
+            {
+                int n = MaterialsEndpoints.WarmupAll(wzSvc);
+                app.Logger.LogInformation("[Warmup] 素材目录预热完成：{Count} 条（{Ms}ms）", n, sw.ElapsedMilliseconds);
+            }
+            catch (Exception ex) { app.Logger.LogWarning("[Warmup] 素材目录预热失败：{Message}", ex.Message); }
+            try
+            {
+                var tracks = app.Services.GetRequiredService<MusicCatalogService>().GetCatalogAsync().GetAwaiter().GetResult();
+                app.Logger.LogInformation("[Warmup] 曲库目录预热完成：{Count} 首（{Ms}ms）", tracks.Count, sw.ElapsedMilliseconds);
+            }
+            catch (Exception ex) { app.Logger.LogWarning("[Warmup] 曲库目录预热失败：{Message}", ex.Message); }
+        });
     }
     else
     {
