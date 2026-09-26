@@ -3,6 +3,11 @@
  *
  * 13 张小图（0-9/am/pm/comma）在 configure 时一次性读入 PSRAM（共 ~24KB），
  * 合成零 IO。世界 1x 坐标 ×scale 进入屏幕（480 屏 scale=2）。
+ *
+ * 时间源（spec 六.2）：系统 time()（SNTP 直写场景）→ PCF85063 RTC
+ * （UTC 口径，经 hal_contract mp_rtc_get_time，每次渲染实时读、无缓存）
+ * → 都无效则显示「--:--」占位（数字槽画横杠、am/pm 隐、comma 常亮）并打
+ * 「时间未同步」日志，绝不显示错误时间。
  */
 #include "clock_digits.h"
 
@@ -14,6 +19,8 @@
 
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+
+#include "app/hal_contract.h"   /* mp_rtc_get_time（PCF85063 经 drivers 透传） */
 
 static const char *TAG = "clock";
 
@@ -42,6 +49,8 @@ static struct {
     bool     rect_valid;
     /* 上次绘制状态（分/秒奇偶变化才标脏由合成器管理） */
     int      last_min, last_parity;
+    /* 时间源状态（边沿日志：有效↔无效切换只打一条，不逐秒刷屏） */
+    bool     tstate_seen, tstate_valid;
 } s_ck;
 
 void clock_digits_set_screen(int32_t w, int32_t h)
@@ -136,31 +145,115 @@ int clock_digits_configure(const char *parts_path, int16_t anchor_wx,
 
 bool clock_digits_active(void) { return s_ck.enabled; }
 
-/* ---- 时间规则（clock-display-spec.md 三） ---- */
-static void time_split(int *disp_h, bool *is_am, int *minute, int *parity)
+/* ---- 时间源（clock-display-spec.md 六.2：时间源 = PCF85063 RTC，断网走时） ----
+ *
+ * 取时链路（read_now_epoch，每次渲染实时读取，无缓存）：
+ *   1. 系统 time() ≥ 2020 → 有效（SNTP 直写系统时间的场景，如配网当次）；
+ *      开机默认 1970+uptime（全工程无人 settimeofday，S3 内部 RTC 计时器
+ *      不跨断电）→ 判为未同步。
+ *   2. 否则读 PCF85063：驱动在振荡器停止(OS)标志置位时返回
+ *      ESP_ERR_INVALID_STATE → 视为未校准。
+ *   3. 两者都无效 → 调用方显示「--:--」占位并打「时间未同步」日志，
+ *      绝不显示错误时间。
+ *
+ * RTC 口径：rtc_pcf85063.h —— 寄存器存 UTC 日历。provision.c
+ * sntp_and_set_rtc() 的 localtime_r 在 setenv("TZ") 之前执行（全工程仅此
+ * 一处 TZ 设置）→ 写入的是 UTC，与驱动口径一致。显示固定东八区（+8h），
+ * 不依赖 TZ 环境变量（重启后 env 不保留，localtime_r 口径不稳定）。 */
+#define CLOCK_TZ_OFFSET_SEC  (8 * 3600)     /* CST-8，同 provision */
+#define CLOCK_EPOCH_MIN      1577836800LL   /* 2020-01-01 UTC：低于此 = 未同步 */
+
+/* UTC 日历 → Unix epoch（Hinnant days_from_civil，不依赖 timegm 实现） */
+static int64_t civil_to_epoch(const struct tm *t)
 {
-    time_t t = time(NULL);
+    int64_t y = t->tm_year + 1900;
+    unsigned m = (unsigned)t->tm_mon + 1;
+    unsigned d = (unsigned)t->tm_mday;
+    y -= (m <= 2);
+    int64_t era  = (y >= 0 ? y : y - 399) / 400;
+    unsigned yoe = (unsigned)(y - era * 400);                       /* [0,399] */
+    unsigned doy = (153u * (m + (m > 2 ? -3u : 9u)) + 2u) / 5u + d - 1u;
+    unsigned doe = yoe * 365u + yoe / 4u - yoe / 100u + doy;
+    int64_t days = era * 146097 + (int64_t)doe - 719468;
+    return days * 86400 + t->tm_hour * 3600 + t->tm_min * 60 + t->tm_sec;
+}
+
+/*
+ * 当前 UTC epoch。返回 false = 无有效时间（系统时间未同步且 RTC 未校准/
+ * 不在线），out/src 不写。src: "sys"=系统时间（SNTP），"rtc"=PCF85063。
+ */
+static bool read_now_epoch(int64_t *out, const char **src)
+{
+    time_t sys = time(NULL);
+    if ((int64_t)sys >= CLOCK_EPOCH_MIN) {
+        *out = (int64_t)sys;
+        *src = "sys";
+        return true;
+    }
+    struct tm tmr = { 0 };
+    if (mp_rtc_get_time(&tmr) &&
+        tmr.tm_year >= 120 &&                  /* >= 2020，同 provision 判据 */
+        tmr.tm_mon  >= 0 && tmr.tm_mon  <= 11 &&
+        tmr.tm_mday >= 1 && tmr.tm_mday <= 31 &&
+        tmr.tm_hour >= 0 && tmr.tm_hour <= 23 &&
+        tmr.tm_min  >= 0 && tmr.tm_min  <= 59 &&
+        tmr.tm_sec  >= 0 && tmr.tm_sec  <= 60) {
+        *out = civil_to_epoch(&tmr);
+        *src = "rtc";
+        return true;
+    }
+    return false;
+}
+
+/* ---- 时间规则（clock-display-spec.md 三；无有效时间返回 false） ---- */
+static bool time_split(int *disp_h, bool *is_am, int *minute, int *parity)
+{
+    int64_t epoch;
+    const char *src;
+    if (!read_now_epoch(&epoch, &src)) {
+        /* 边沿日志：仅在 无效→(首次/从有效跌落) 时打一条 */
+        if (!s_ck.tstate_seen || s_ck.tstate_valid) {
+            ESP_LOGW(TAG, "时间未同步：系统时间无效且 RTC 未校准，时钟显示 --:--");
+        }
+        s_ck.tstate_seen  = true;
+        s_ck.tstate_valid = false;
+        return false;
+    }
+
+    epoch += CLOCK_TZ_OFFSET_SEC;                 /* UTC → 东八区 */
+    time_t tt = (time_t)epoch;
     struct tm tmv;
-    localtime_r(&t, &tmv);
+    gmtime_r(&tt, &tmv);
     int h = tmv.tm_hour % 24;
     *is_am   = (h < 12);          /* 0~11 = AM、12~23 = PM */
     if (h >= 13) h -= 12;         /* 13..23 → 1..11；12 保持 12；0 保持 0（午夜 AM 00） */
     *disp_h  = h;
     *minute  = tmv.tm_min;
     *parity  = tmv.tm_sec & 1;    /* 偶秒显 comma、奇秒隐 */
+
+    /* 边沿日志：首次读到有效时间（含从无效恢复）只打一条 */
+    if (!s_ck.tstate_seen || !s_ck.tstate_valid) {
+        ESP_LOGI(TAG, "首次读到有效时间（%s）：%02d:%02d", src, *disp_h, *minute);
+    }
+    s_ck.tstate_seen  = true;
+    s_ck.tstate_valid = true;
+    return true;
 }
 
 /*
  * 当前时间的字形序列（7 槽；comma 奇秒 → NULL 跳过但保留间距位）。
  * 返回序列长度；out_x 各槽世界 1x 左缘；out_y0 块顶世界 1x y（居中/锚点统一）。
+ * *time_ok=false = 无有效时间：几何照常（用数字字形占位定框），compose 把
+ * 数字槽画成横杠（--:--），am/pm 槽不发（居中总宽仍含 am，块不跳位）。
  */
 static int glyph_seq(const cg_t *out_g[7], int32_t out_x[7], bool *comma_on,
-                     int32_t *out_y0)
+                     int32_t *out_y0, bool *time_ok)
 {
-    int dh, mm, parity;
-    bool am;
-    time_split(&dh, &am, &mm, &parity);
-    *comma_on = (parity == 0);
+    int dh = 0, mm = 0, parity = 0;               /* 无效时 0 → 几何仍有效 */
+    bool am = false;
+    bool ok = time_split(&dh, &am, &mm, &parity);
+    if (time_ok) *time_ok = ok;
+    *comma_on = ok ? (parity == 0) : true;        /* 占位模式 comma 常亮 */
 
     const cg_t *g_am = &s_ck.g[am ? 10 : 11];
     const cg_t *d1 = &s_ck.g[dh / 10];
@@ -189,10 +282,10 @@ static int glyph_seq(const cg_t *out_g[7], int32_t out_x[7], bool *comma_on,
 
     /* am|pm → GAP=12 → H1 → H2 → comma → M1 → M2（数字间无额外间距） */
     int n = 0;
-    if (g_am->px) {
+    if (g_am->px && ok) {                    /* 占位模式不发 am（无 am/pm 概念） */
         out_g[n] = g_am; out_x[n] = x; n++;
-        x += g_am->w;
     }
+    x += g_am->w;                            /* am 槽宽恒保留（块宽/居中不跳位） */
     x += CLOCK_AMPM_GAP;
 
     out_g[n] = d1; out_x[n] = x; n++; x += d1->w;
@@ -213,8 +306,9 @@ bool clock_digits_get_rect(int32_t *x, int32_t *y, int32_t *w, int32_t *h)
     const cg_t *seq[7];
     int32_t xs[7];
     bool comma_on;
+    bool time_ok;
     int32_t y0;
-    int n = glyph_seq(seq, xs, &comma_on, &y0);
+    int n = glyph_seq(seq, xs, &comma_on, &y0, &time_ok);
     if (n <= 0) return false;
     int32_t x0 = INT32_MAX, x1 = INT32_MIN;
     int32_t yy0 = INT32_MAX, yy1 = INT32_MIN;
@@ -232,6 +326,14 @@ bool clock_digits_get_rect(int32_t *x, int32_t *y, int32_t *w, int32_t *h)
     return true;
 }
 
+/* 占位横杠颜色：纯白（待机纯黑底，白杠即「--:--」，不与黑键控冲突） */
+#define CLOCK_PLACEHOLDER_C  0xFFFFu
+
+static inline bool cd_is_digit(const cg_t *g)
+{
+    return (g >= &s_ck.g[0] && g <= &s_ck.g[9]);
+}
+
 void clock_digits_compose(uint16_t *fb, int32_t fb_w, int32_t scale,
                           int32_t clip_x, int32_t clip_y,
                           int32_t clip_w, int32_t clip_h)
@@ -242,8 +344,9 @@ void clock_digits_compose(uint16_t *fb, int32_t fb_w, int32_t scale,
     const cg_t *seq[7];
     int32_t xs[7];
     bool comma_on;
+    bool time_ok;
     int32_t y0;
-    int n = glyph_seq(seq, xs, &comma_on, &y0);
+    int n = glyph_seq(seq, xs, &comma_on, &y0, &time_ok);
     int32_t sy = y0 * scale;
 
     for (int i = 0; i < n; i++) {
@@ -258,6 +361,25 @@ void clock_digits_compose(uint16_t *fb, int32_t fb_w, int32_t scale,
         int32_t x1 = (dx + dw < clip_x + clip_w) ? dx + dw : clip_x + clip_w;
         int32_t y1 = (sy + dh < clip_y + clip_h) ? sy + dh : clip_y + clip_h;
         if (x0 >= x1 || y0 >= y1) continue;
+
+        if (!time_ok && cd_is_digit(g)) {
+            /* 无有效时间：数字槽画居中横杠（--:--），绝不用错的时间数字 */
+            int32_t ins  = dw / 10;                 /* 两端各内缩 10% */
+            int32_t barh = dh / 7;                  /* 杠厚 ≈ 字高 1/7 */
+            if (barh < 2) barh = 2;
+            int32_t bx0 = dx + ins > x0 ? dx + ins : x0;
+            int32_t bx1 = dx + dw - ins < x1 ? dx + dw - ins : x1;
+            int32_t by0 = sy + (dh - barh) / 2;
+            int32_t by1 = by0 + barh;
+            if (by0 < y0) by0 = y0;
+            if (by1 > y1) by1 = y1;
+            for (int32_t syy = by0; syy < by1; syy++) {
+                uint16_t *drow = fb + (size_t)syy * fb_w;
+                for (int32_t sxx = bx0; sxx < bx1; sxx++)
+                    drow[sxx] = CLOCK_PLACEHOLDER_C;
+            }
+            continue;
+        }
 
         uint32_t stride_el = g->stride_b / 2u;      /* RGB565 元素 */
         for (int32_t syy = y0; syy < y1; syy++) {

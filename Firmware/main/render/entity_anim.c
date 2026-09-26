@@ -10,8 +10,8 @@
  * 坏包防御（真机「人物完全静止」排查）：delay=0 → 50ms（mpak 解析已兜底，
  * 此处双保险）；delay > RC_FRAME_DELAY_MAX_MS（导出器上限 300ms，>10s 只能是
  * 坏数据/旧版包）→ 钳到 1s 并告警一次。bind 时输出 delay 表审计日志
- * （min/max/首 4 帧），用于真机一眼判定 delay 是否被读坏。逐帧推进走
- * ESP_LOGD（默认关闭，CONFIG_LOG_DEFAULT_LEVEL=3）。
+ * （min/max/首 4 帧）与逐帧推进均走 ESP_LOGD（默认关闭，
+ * CONFIG_LOG_DEFAULT_LEVEL=3）。
  */
 #include "entity_anim.h"
 
@@ -61,8 +61,9 @@ void rc_anim_bind(rc_anim_t *st, const mpak_layout_t *lt, bool loop,
     st->delay_clamp_logged = false;
     rc_anim_kick_blink(st, now_us);
 
-    /* delay 表审计（bind 为低频事件，INFO 一条）：真机「人物静止」时先看这行——
-     * min/max 异常（0 或极大）即 delay 表损坏，正常导出为 100..300ms */
+    /* delay 表审计（bind 打点，诊断期探针，DEBUG 级默认不输出）：真机
+     * 「人物静止」排查时开 DEBUG 看——min/max 异常（0 或极大）即 delay 表
+     * 损坏，正常导出为 100..300ms */
     if (lt && lt->frame_count) {
         uint32_t dmin = UINT32_MAX, dmax = 0;
         for (uint32_t i = 0; i < lt->frame_count; i++) {
@@ -70,7 +71,7 @@ void rc_anim_bind(rc_anim_t *st, const mpak_layout_t *lt, bool loop,
             if (d < dmin) dmin = d;
             if (d > dmax) dmax = d;
         }
-        ESP_LOGI(TAG, "bind '%s' loop=%d frames=%" PRIu32 " exprs=%" PRIu32
+        ESP_LOGD(TAG, "bind '%s' loop=%d frames=%" PRIu32 " exprs=%" PRIu32
                  " delay[min/max]=%" PRIu32 "/%" PRIu32 "ms d[0..3]=%" PRIu32
                  ",%" PRIu32 ",%" PRIu32 ",%" PRIu32,
                  lt->action, (int)loop, lt->frame_count, lt->expression_count,

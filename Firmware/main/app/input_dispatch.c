@@ -5,7 +5,8 @@
  *   - 触摸 touch_read() ~25ms 轮询（MENU 态停读——LVGL indev 接管，防双读）
  *   - IMU wait_event() DRDY 中断唤醒 + 20ms 超时兜底轮询（~50Hz，中断没通
  *     也不影响采样）；任务启动时读回 CTRL7 自愈使能位（见 imu_link_selfcheck）
- *   - 菜单键 key_gpio18 30ms 防抖轮询（只在按下沿触发 + 250ms 再上膛）
+ *   - 菜单键 key_gpio18 30ms 防抖 + 状态门闩（按下沿触发后闩住，
+ *     必须先见到「释放 + 80ms 静止」才允许下一次触发，真机连发根修）
  *   - 1s 慢速节拍：闲置→DOZE 计时（state_machine_tick_1hz）、电池/温度巡检
  *   - 静置随机稀有表情（E10：wink/chu/qBlue 低频）
  */
@@ -45,7 +46,7 @@ static const char *TAG = "input";
 #define IDLE_RARE_EXPR_S    30      /* 静置时稀有表情的滚动窗口（E10） */
 
 /* 日志节流 / 键盘硬化 */
-#define KEY_REARM_MS        250     /* 菜单键两次触发的最小间隔（防连跳兜底） */
+#define KEY_RELEASE_QUIET_MS 80    /* 菜单键：确认释放后需再静止 80ms 才重新上膛（门闩） */
 #define IMU_FAIL_LOG_N      40      /* IMU 连续失败 ≈1s（50Hz）→ 首报 */
 #define IMU_ERR_RELOG_MS    5000    /* IMU 持续失败时每 5s 重复一条 */
 #define TOUCH_FAIL_LOG_N    40      /* 触摸连续读失败 ≈1s → 首报 */
@@ -349,6 +350,75 @@ static void force_tick(const imu_accel_t *a)
 /* 触摸（E6：轻点=抚摸；水平拖动=倾斜视差（问题6）；长按=BGM 控制条；
  * MENU 态全部归菜单）                                                     */
 /* ================================================================== */
+/* CST9220 直读帧解析 + 480×480 映射（真机问题：按屏幕中部上报 (355,1)）。
+ *
+ * 根因（对照 touch_cst9220.c 的字节组装 + 真机日志实证）：本板触摸控制器
+ * 属 Hynitron CST9217/9220 家族（板级 BSP waveshare__esp32_s3_touch_amoled_2_16
+ * 对同料即挂 esp_lcd_touch_cst9217），真实数据帧是【12 位跨字节打包】：
+ *   d0=status  d1=X[11:4]  d2=Y[11:4]  d3={X[3:0]<<4 | Y[3:0]}  d5=触点数  d6≈0xAB
+ * touch_cst9220.c 旧布局假设 d1=触点数、d2..d5=XH/XL/YH/YL 独立字节：
+ * 旧「Y」实际读到 d5=触点数（单指恒为 1！）；旧「X」=(Y[7:4]<<8)|
+ * (X[3:0]<<4)|Y[3:0]。真机「屏幕中部 → (355,1)」逐位可解：355=0x163 即
+ * Y[7:4]=1、X[3:0]=6、Y[3:0]=3；1=触点数。信息在旧解析中已丢失，任何
+ * 线性映射都救不回 → 消费侧（本文件）直读原始帧按 12 位重组。
+ *
+ * 方向/比例照抄板级 BSP 官方默认（esp32_s3_touch_amoled_2_16.c：
+ * swap_xy=1, mirror_x=0, mirror_y=1，x_max=y_max=480），换算式与
+ * esp_lcd_touch get_xy_process 逐字一致：先 mirror_y（y=480-y）再 swap：
+ *   screen_x = 480 - raw_y    screen_y = raw_x
+ * 自校目标：屏幕中心 → (240,240)，四角 → 对应角；每次按下沿打校准日志
+ * （原始帧 + 重组 raw + 映射值）供真机核对，若不符只需改下面两行映射。 */
+#define TOUCH_RANGE_PX     480     /* 屏幕 480×480（profile_amoled216） */
+#define TOUCH_FRAME_REG    0x00    /* 数据帧起始寄存器（同 touch_cst9220.c） */
+#define TOUCH_FRAME_LEN    8       /* 多读 2 字节：d[6] 应≈0xAB（帧对齐校验） */
+
+typedef struct {
+    bool    touched;
+    int16_t x, y;           /* 映射后屏幕坐标（已 clamp 到 0..479） */
+    int16_t raw_x, raw_y;   /* 重组的 12 位原始值（校准日志用） */
+    uint8_t count;          /* 触点数（d[5]&0x7F） */
+    uint8_t d[TOUCH_FRAME_LEN];
+} touch_frame_t;
+
+static bool touch_read_frame(touch_frame_t *f)
+{
+    static i2c_master_dev_handle_t s_dev;   /* 懒解析（touch init 在 main 里先行） */
+    static int16_t s_last_x, s_last_y;      /* 最后有效坐标：抬起帧沿用（同 esp_lcd_touch 语义） */
+    static int16_t s_last_rx, s_last_ry;
+
+    if (!s_dev) {
+        s_dev = i2c_bus_find("cst9220");    /* touch_cst9220_init 注册的设备名 */
+        if (!s_dev) return false;
+    }
+    if (i2c_bus_read_reg8v(s_dev, TOUCH_FRAME_REG, f->d, sizeof(f->d)) != ESP_OK) {
+        return false;
+    }
+
+    f->count = f->d[5] & 0x7F;
+    if (f->count == 0) {                    /* 抬起：坐标回填最后有效值（LVGL 同款） */
+        f->touched = false;
+        f->x = s_last_x;  f->y = s_last_y;
+        f->raw_x = s_last_rx;  f->raw_y = s_last_ry;
+        return true;
+    }
+
+    int rx = ((int)f->d[1] << 4) | (f->d[3] >> 4);      /* 12 位 X（旧驱动误当触点数） */
+    int ry = ((int)f->d[2] << 4) | (f->d[3] & 0x0F);    /* 12 位 Y */
+    int sx = TOUCH_RANGE_PX - ry;                       /* mirror_y 后 swap（见上注释） */
+    int sy = rx;
+    if (sx < 0) sx = 0;
+    if (sx > TOUCH_RANGE_PX - 1) sx = TOUCH_RANGE_PX - 1;
+    if (sy < 0) sy = 0;
+    if (sy > TOUCH_RANGE_PX - 1) sy = TOUCH_RANGE_PX - 1;
+
+    f->touched = true;
+    f->raw_x = (int16_t)rx;  f->raw_y = (int16_t)ry;
+    f->x = (int16_t)sx;      f->y = (int16_t)sy;
+    s_last_x = f->x;  s_last_y = f->y;
+    s_last_rx = f->raw_x;  s_last_ry = f->raw_y;
+    return true;
+}
+
 static void touch_tick(void)
 {
     static bool down = false;
@@ -358,6 +428,7 @@ static void touch_tick(void)
     static bool drag_active;              /* 问题6：本次按住已进入水平拖动 */
     static int fail_cnt;                  /* 触摸 I2C 连续读失败计数 */
     static int64_t fail_last_log_ms;
+    static bool frame_fmt_logged;         /* 首帧字节转储（只打一次，防 count 位置翻车无据可查） */
 
     if (state_machine_menu_open()) {
         /* E6 胶水定稿：菜单是独立全屏窗口，触摸归菜单不穿透——
@@ -371,8 +442,8 @@ static void touch_tick(void)
         return;
     }
 
-    touch_sample_t t;
-    if (!mp_touch_read(&t)) {
+    touch_frame_t f;
+    if (!touch_read_frame(&f)) {
         /* 问题3 兜底：读失败显式报错不静默（首报 ≈1s，之后每 5s 一条） */
         fail_cnt++;
         if (fail_cnt == TOUCH_FAIL_LOG_N ||
@@ -388,17 +459,29 @@ static void touch_tick(void)
     }
     fail_cnt = 0;
 
-    if (t.touched && !down) {
+    if (!frame_fmt_logged) {
+        frame_fmt_logged = true;
+        ESP_LOGI(TAG, "触摸首帧 [%02X %02X %02X %02X %02X %02X %02X %02X] n=%d"
+                      "（d[6] 期望≈0xAB，d[5]=触点数）",
+                 f.d[0], f.d[1], f.d[2], f.d[3],
+                 f.d[4], f.d[5], f.d[6], f.d[7], f.count);
+    }
+
+    if (f.touched && !down) {
         down = true;
-        down_x = t.x; down_y = t.y;
+        down_x = f.x; down_y = f.y;
         down_ms = mp_now_ms();
         longpress_fired = false;
         drag_active = false;
-        /* 节流：只在按下沿打一条坐标，确认 CST9220 坐标通路（问题3） */
-        ESP_LOGI(TAG, "触摸按下 (%d,%d)%s", t.x, t.y,
-                 (t.x == 0 && t.y == 0) ? " 坐标全0，疑似帧偏移错位(CST9220_OFF_*)" : "");
-    } else if (t.touched && down) {
-        int dx = (int)t.x - (int)down_x;
+        /* 校准日志（每次按下沿一条）：原始帧 + 重组 raw + 映射值。
+         * 核对目标：屏幕中心 → (240,240)、四角 → 对应角；不符时按
+         * touch_read_frame 上方注释改两行映射即可 */
+        ESP_LOGI(TAG, "触摸按下 raw(%d,%d)->屏幕(%d,%d) 帧[%02X %02X %02X %02X %02X %02X %02X %02X] n=%d",
+                 f.raw_x, f.raw_y, f.x, f.y,
+                 f.d[0], f.d[1], f.d[2], f.d[3],
+                 f.d[4], f.d[5], f.d[6], f.d[7], f.count);
+    } else if (f.touched && down) {
+        int dx = (int)f.x - (int)down_x;
         /* 问题6：按住并水平拖动（≥TAP_MOVE_PX）→ 倾斜视差同款效果：
          * dx ±60px 线性映射 ±8°（render_input_tilt 内部再 clamp），
          * 条带视差 + 实体 ±8px 偏移与 IMU 倾斜共用一条通路 */
@@ -413,19 +496,19 @@ static void touch_tick(void)
         }
         if (!longpress_fired &&
             (mp_now_ms() - down_ms) >= LONGPRESS_MS &&
-            abs((int)t.x - (int)down_x) < TAP_MOVE_PX &&
-            abs((int)t.y - (int)down_y) < TAP_MOVE_PX) {
+            abs((int)f.x - (int)down_x) < TAP_MOVE_PX &&
+            abs((int)f.y - (int)down_y) < TAP_MOVE_PX) {
             /* 宠物区长按 → 呼出选择器（E6 的 BGM 控制条入口在 E7 菜单内：
              * 渲染层契约未提供独立控制条 API，长按直达菜单=BGM 入口） */
             longpress_fired = true;
             state_machine_handle(MP_SM_EV_MENU_KEY);
             note_interaction();
         }
-    } else if (!t.touched && down) {
+    } else if (!f.touched && down) {
         down = false;
         int64_t dur = mp_now_ms() - down_ms;
-        int dx = abs((int)t.x - (int)down_x);
-        int dy = abs((int)t.y - (int)down_y);
+        int dx = abs((int)f.x - (int)down_x);
+        int dy = abs((int)f.y - (int)down_y);
         if (drag_active) {
             /* 问题6：拖动结束 → 视差回中 */
             drag_active = false;
@@ -435,7 +518,7 @@ static void touch_tick(void)
             /* 轻点 = 抚摸：smile/love 随机 + 短气泡可见反馈（问题6）。
              * 气泡走 FONT 包渲染，字形缺失时 bridge_bubble_render 报错跳过
              * → 自动降级为只做表情 */
-            mp_post_event_simple(MP_EVT_TOUCH_PET, t.x, t.y, NULL);
+            mp_post_event_simple(MP_EVT_TOUCH_PET, f.x, f.y, NULL);
             input_trigger_expression((rand() % 2) ? MP_EXPR_SMILE : MP_EXPR_LOVE, 1500);
             mp_cmd_t bc = { .type = MP_CMD_BUBBLE };
             strlcpy(bc.s, "hello", sizeof(bc.s));
@@ -468,12 +551,21 @@ static void key_fire_menu_toggle(void)
     }
 }
 
+/* 状态门闩版 key_tick（真机问题：30ms 防抖 + 250ms 再上膛挡不住机械抖动/
+ * 长按重复——抖动沿间隔 >30ms 即绕过防抖，250ms 后又能触发 → MENU/POKER
+ * 以 ~420ms 间隔反复交替）。规则：
+ *   1. 30ms 防抖照旧（原始电平稳定 30ms 才算确认沿）；
+ *   2. 按下沿触发动作后【上闩】：之后一切按下沿全部吞掉；
+ *   3. 必须先确认【释放沿】，再静止满 80ms 才开闩——期间弹回的抖动
+ *      （<80ms）视为同一次按压，不产生第二次迁移。 */
 static void key_tick(void)
 {
     static bool raw_last = false;
-    static bool stable = false;
+    static bool stable_pressed = false;
     static int64_t raw_change_ms = 0;
-    static int64_t next_fire_ok_ms = 0;    /* 再上膛时刻（连跳兜底） */
+    static bool latched = false;        /* 已按本次按压触发过：未见过释放前保持闩住 */
+    static bool release_pending = false;/* 已确认释放沿，80ms 静止确认计时中 */
+    static int64_t released_ms = 0;
 
     bool pressed = key_gpio18_pressed();   /* 低电平=按下 */
     int64_t now = mp_now_ms();
@@ -482,15 +574,25 @@ static void key_tick(void)
         raw_last = pressed;
         raw_change_ms = now;
     }
-    if ((now - raw_change_ms) >= 30 && pressed != stable) {
-        stable = pressed;
-        if (stable && now >= next_fire_ok_ms) {
-            /* 只在【按下沿】触发、释放沿只上膛 → 一次按压一次迁移；
-             * 250ms 再上膛窗兜底磨损触点 >30ms 的慢抖（防 enter+exit 连跳） */
-            next_fire_ok_ms = now + KEY_REARM_MS;
-            key_fire_menu_toggle();
+    if ((now - raw_change_ms) >= 30 && pressed != stable_pressed) {
+        stable_pressed = pressed;
+        if (stable_pressed) {
+            release_pending = false;       /* 弹回按下：静止确认作废，闩继续关 */
+            if (!latched) {
+                latched = true;            /* 只在【按下沿】触发一次 */
+                key_fire_menu_toggle();
+            }
+            /* 闩住期间的按下沿直接吞掉（长按/抖动不产生第二次迁移） */
+        } else {
+            release_pending = true;        /* 确认释放：起 80ms 静止确认 */
+            released_ms = now;
         }
         note_interaction();
+    }
+
+    if (latched && release_pending && !stable_pressed &&
+        (now - released_ms) >= KEY_RELEASE_QUIET_MS) {
+        latched = false;                   /* 开闩：允许下一次按压触发 */
     }
 }
 

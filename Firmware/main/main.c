@@ -143,7 +143,7 @@ void app_main(void)
 
     /* 任务：APP(1) 渲染+交互 —— 4.1（提前到大内存消耗者之前创建：
      * 内部 RAM 碎片化下 32K 栈分配失败过，16K/4K 实测可起） */
-    BaseType_t rc = xTaskCreatePinnedToCore(render_task, "render", 16384, NULL, 5, NULL, 1);
+    BaseType_t rc = xTaskCreatePinnedToCore(render_task, "render", 12288, NULL, 5, NULL, 1);
     if (rc != pdPASS) {
         ESP_LOGE(TAG, "render 任务创建失败 rc=%d internal=%u", rc,
                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));

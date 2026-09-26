@@ -2,11 +2,12 @@
  * provision.h — 首次配网：SoftAP + captive portal（E14）+ WiFi STA 管理
  *
  * 流程：
- *   1) 设备开热点 MiniPet-XXXX（开放网络，192.168.4.1）
+ *   1) 设备开热点 MiniPet-XXXX（开放网络，192.168.4.1，APSTA 模式）
  *   2) DNS 劫持：53 端口所有 A 查询应答 AP 地址（captive probe 必中）
- *   3) 内嵌 HTML 配网页：WiFi SSID/密码 + 服务器地址输入框
- *      （值占位 http://<NAS_IP>:38090）→ POST /save → NVS
- *   4) 拆 portal → STA 连接家里 WiFi → NTP 校时一次 → 写 RTC（E9）
+ *   3) 内嵌三步向导页：① 扫描周围 WiFi 列表（GET /scan → JSON，点选自动
+ *      填 SSID）→ ② 输密码 → ③ 服务器地址（示例格式提示，可留空）
+ *      → POST /save → NVS；STA 连接失败重开 portal 时页面顶部横幅提示
+ *   4) 拆 portal → STA 连接家里 WiFi → NTP 校时一次（成败均打日志）→ 写 RTC（E9）
  *   5) esp_restart() 进正常 BOOT 流程
  *
  * 本模块同时是固件内 WiFi 的唯一管理者：STA 连接供状态机自检复用。
@@ -40,6 +41,9 @@ void provision_stop(void);
 
 /* portal 是否在运行 */
 bool provision_is_active(void);
+
+/* portal（SoftAP+HTTP 配网）处于活动态（供 poller 挂起轮询用） */
+bool provision_portal_active(void);
 
 #ifdef __cplusplus
 }

@@ -85,6 +85,8 @@ typedef struct rc_part_img {
     const mpak_part_t *meta;
     uint16_t *px;
     uint8_t  *mask;
+    uint32_t px_hash;      /* 位图指纹（可见性探针）：part_id 不同但指纹相同
+                            * = PARTS 包内数据共享/坏偏移（帧静止嫌疑判据） */
     struct rc_part_img *next;
 } rc_part_img_t;
 static rc_part_img_t *g_pc;
@@ -183,6 +185,20 @@ static void mark_ent_at(int32_t tilt_mdeg)
     int32_t ex, ey, dw, dh;
     ent_screen_pos_at(tilt_mdeg, &ex, &ey);
     ent_disp_size(&dw, &dh);
+    /* 探针（上屏侧嫌疑）：标脏包围盒变化才打 LOGD（1s 限频，防 tilt 连续
+     * 变化刷屏；诊断期已结束，默认级别不输出）——帧静止排查时看这里：
+     * bbox 应稳定覆盖实体显示区 */
+    static int32_t lx, ly, lw, lh;
+    static int64_t llog_us;
+    int64_t now_us = esp_timer_get_time();
+    if (ex != lx || ey != ly || dw != lw || dh != lh) {
+        lx = ex; ly = ey; lw = dw; lh = dh;
+        if (now_us - llog_us > 1000000) {
+            llog_us = now_us;
+            ESP_LOGD(TAG, "mark_ent bbox (%" PRId32 ",%" PRId32 ") %" PRId32
+                     "x%" PRId32, ex, ey, dw, dh);
+        }
+    }
     mark_rect(ex, ey, dw, dh);
 }
 
@@ -190,6 +206,39 @@ static void mark_ent(void)
 {
     mark_ent_at(g_tilt_mdeg);
 }
+
+/* ================= 可见性自证探针 =================
+ * 真机「rc_anim_advance 帧推进正常（dbg 0→1→2 @300ms）但屏上人物静止」的
+ * 二分判据。诊断期已结束：全部降为 DEBUG 级（默认 INFO 不输出），
+ * 仅指纹连续 20 帧不变仍保留 WARN 一条（动画真坏时不至于无声），不改变渲染行为：
+ *   1) 数据侧：recompose 后对实体缓冲取 FNV-1a 指纹（ent_fb_hash）——
+ *      hash 变化 → 帧数据链正确，嫌疑上移 标脏/合成/blit（mark_ent_at /
+ *      flush_dirty 探针）；hash 连续 20 帧不变 → WARN 一条「位图与上帧相同」
+ *      并列出本帧 piece 的 part_id + 位图指纹：part_id 相同 = 设备上 LAYOUT
+ *      帧表坍缩（解析/数据问题）；part_id 不同但位图指纹相同 = PARTS 包数据
+ *      共享/坏偏移（导出端问题）；part_id 不同且指纹不同 = 合成器未重绘
+ *      （不可能，指纹即证明）。
+ *   2) 上屏侧：mark_ent_at 包围盒变化打 LOGD（1s 限频）；flush_dirty 首次
+ *      执行打 LOGD 一次（证明 标脏→合成→blit_be→display_blit 链路跑通），
+ *      之后 rect 稳定时静默（DEBUG）。 */
+
+static uint32_t rc_bytes_fnv(const uint8_t *p, uint32_t n)
+{
+    uint32_t h = 2166136261u;
+    for (uint32_t i = 0; i < n; i++) {
+        h ^= p[i];
+        h *= 16777619u;
+    }
+    return h;
+}
+
+/* 实体缓冲指纹（帧推进后应变化；memset 清零 + 覆盖位同写保证指纹唯一对应内容） */
+static uint32_t ent_fb_hash(void)
+{
+    return rc_bytes_fnv((const uint8_t *)g_ent_px,
+                        (uint32_t)RC_ENT_W * RC_ENT_H * 2u);
+}
+static uint32_t s_ent_fb_hash_last;
 
 /* ================= 部件缓存（懒加载） ================= */
 
@@ -228,6 +277,7 @@ static const rc_part_img_t *pc_get(const mpak_part_t *meta)
         return NULL;
     }
     e->next = g_pc;
+    e->px_hash = rc_bytes_fnv((const uint8_t *)e->px, pb);
     g_pc = e;
     g_pc_bytes += pb + mb;
     return e;
@@ -307,7 +357,7 @@ static void ent_canvas_update(void)
     g_ent_cw = cw;
     g_ent_ch = ch;
     g_ent_cbox_ok = true;
-    ESP_LOGI(TAG, "ent canvas union origin(%" PRId32 ",%" PRId32 ") %"
+    ESP_LOGD(TAG, "ent canvas union origin(%" PRId32 ",%" PRId32 ") %"
              PRId32 "x%" PRId32, g_ent_cx0, g_ent_cy0, g_ent_cw, g_ent_ch);
 }
 
@@ -329,9 +379,22 @@ static const rc_part_img_t *resolve_piece(const mpak_piece_t *piece)
         return NULL;
     }
     if (piece->expr_index != MPAK_EXPR_NONE && meta->expr_group != 0) {
-        const mpak_part_t *v = mpak_parts_variant(
-            &g_parts, meta, (uint32_t)rc_anim_active_expr(&g_anim));
-        if (v) meta = v;
+        int32_t expr = rc_anim_active_expr(&g_anim);
+        const mpak_part_t *v = mpak_parts_variant(&g_parts, meta, (uint32_t)expr);
+        if (v) {
+            /* 探针（帧静止嫌疑1）：变体替换把 piece 映射到组内其他位图。
+             * 正常仅 face 表情件走这里（导出契约：body 件 expr_index=255/
+             * expr_group=0）；若不同帧的 part 被映射到同一位图，由 ent fb
+             * hash 探针的 WARN 暴露 */
+            if (v->id != meta->id)
+                ESP_LOGD(TAG, "piece part %u -> expr variant %u (expr %d)",
+                         piece->part_id, v->id, (int)expr);
+            meta = v;
+        } else {
+            ESP_LOGW(TAG, "piece part %u expr group %u variant %d missing"
+                     " (keep base bitmap)", piece->part_id, meta->expr_group,
+                     (int)expr);
+        }
     }
     return pc_get(meta);
 }
@@ -603,6 +666,16 @@ static void flush_dirty(void)
     int32_t w = (cx1 - cx0 + 1) * RC_CELL, h = (cy1 - cy0 + 1) * RC_CELL;
     if (x + w > g_sw) w = g_sw - x;
     if (y + h > g_sh) h = g_sh - y;
+    /* 探针（上屏侧）：证明 标脏→合成→blit_be→display_blit 真的跑过。
+     * 诊断期已结束：首次执行也只打 DEBUG，rect 变化由 mark 探针反映 */
+    static bool s_flush_logged;
+    ESP_LOGD(TAG, "flush rect (%" PRId32 ",%" PRId32 ") %" PRId32 "x%" PRId32,
+             x, y, w, h);
+    if (!s_flush_logged) {
+        s_flush_logged = true;
+        ESP_LOGD(TAG, "first dirty flush rect (%" PRId32 ",%" PRId32 ") %"
+                 PRId32 "x%" PRId32, x, y, w, h);
+    }
     compose_region(x, y, w, h);
     blit_be(x, y, w, h, g_fb + (size_t)y * g_sw + x, g_sw);
 }
@@ -830,8 +903,8 @@ void render_tick(void)
     static uint32_t s_dbg_frames; static int64_t s_dbg_last;
     if (rc_anim_advance(&g_anim, now_us, &ev)) {
         s_dbg_frames++;
-        if (now_us - s_dbg_last > 3000000) {   /* 3s 一次：帧推进实证 */
-            ESP_LOGW("dbg", "帧推进: 3s 内 %u 次, 当前帧 %u/%u", s_dbg_frames, g_anim.frame_idx, g_anim.layout->frame_count);
+        if (now_us - s_dbg_last > 3000000) {   /* 3s 一次：帧推进实证（诊断期探针，DEBUG 级） */
+            ESP_LOGD("dbg", "帧推进: 3s 内 %u 次, 当前帧 %u/%u", s_dbg_frames, g_anim.frame_idx, g_anim.layout->frame_count);
             s_dbg_frames = 0; s_dbg_last = now_us;
         }
         if (ev.finished) {
@@ -849,6 +922,38 @@ void render_tick(void)
              * 对齐桌面 +mv 语义），不再累计到屏幕锚点 */
             recompose_entity();
             mark_ent();                          /* 新位置 */
+            /* 探针（数据侧判据）：帧推进后实体缓冲指纹应变化。
+             * 连续 20 帧指纹相同才 WARN 一条（防动画真坏时无声，又避免
+             * 每帧刷屏）；指纹恢复变化即清零重新计数 */
+            {
+                uint32_t h = ent_fb_hash();
+                static uint32_t s_hash_same_streak;
+                if (h == s_ent_fb_hash_last) {
+                    if (++s_hash_same_streak == 20) {
+                        const mpak_layout_t *lt = active_layout();
+                        const mpak_frame_t *fr = &lt->frames[g_anim.frame_idx];
+                        ESP_LOGW(TAG, "帧 %" PRIu32 " 连续 20 帧实体位图与上帧相同 hash=%08"
+                                 PRIx32 " pieces=%" PRIu32,
+                                 g_anim.frame_idx, h, fr->piece_count);
+                        for (uint32_t k = 0; k < fr->piece_count && k < 8; k++) {
+                            const mpak_piece_t *pc = &lt->pieces[fr->piece_off + k];
+                            const rc_part_img_t *im = resolve_piece(pc);
+                            ESP_LOGW(TAG, "  piece[%" PRIu32 "] part=%" PRIu32
+                                     " expr=%u flip=%u img_hash=%08" PRIx32,
+                                     (uint32_t)k, pc->part_id,
+                                     (unsigned)pc->expr_index,
+                                     (unsigned)(pc->flip & 1u),
+                                     im ? im->px_hash : 0);
+                        }
+                    }
+                } else {
+                    s_hash_same_streak = 0;
+                    ESP_LOGD(TAG, "ent fb hash %08" PRIx32 " -> %08" PRIx32
+                             " (frame %" PRIu32 ")",
+                             s_ent_fb_hash_last, h, g_anim.frame_idx);
+                }
+                s_ent_fb_hash_last = h;
+            }
             any = true;
         }
     }
