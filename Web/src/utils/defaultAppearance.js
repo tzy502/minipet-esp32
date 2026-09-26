@@ -1,6 +1,7 @@
 /**
  * 纸娃娃默认装扮：神子（2026-09-26 胶水定稿，从桌面版 savedPaperdolls.神子 迁移）。
- * 与 Server/seed/default-appearance.json、Firmware 固件默认三处同源。
+ * 与 Server/seed/default-appearance.json、Firmware 固件默认三处同源
+ * （槽位为 id 字符串形态；dyeHue/dyeEnabled/enableEffect 与 seed 逐字段一致）。
  * 槽位规则：overall（套服）与 coat+pants 互斥，穿套服时上/下为 null。
  */
 export const SHENZI_DEFAULT = {
@@ -25,4 +26,7 @@ export const SHENZI_DEFAULT = {
   earring: null,
   mount: null,
   chair: null,
+  dyeHue: 0,
+  dyeEnabled: false,
+  enableEffect: true,
 }

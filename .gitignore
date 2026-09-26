@@ -67,3 +67,7 @@ dist/
 Server/.m1-done
 Server/.m2-done
 .nuget/
+Server/MinipetServer/data/
+# 本地验证时拷入的 Web 构建产物（正式产物由 Dockerfile 构建期生成）
+Server/MinipetServer/wwwroot/*
+!Server/MinipetServer/wwwroot/.gitkeep

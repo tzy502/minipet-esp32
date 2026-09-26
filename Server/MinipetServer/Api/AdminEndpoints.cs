@@ -61,9 +61,11 @@ public static class AdminEndpoints
             return Results.Json(new { device = dev });
         });
 
-        // 缩略图：SkiaSharp 64×64，data/cache/thumbs/ 缓存；M3 纯色占位，M4 接真实渲染
-        g.MapGet("/thumb", (string type, string id, ThumbService thumbs)
-            => Results.File(thumbs.GetOrCreatePng(type, id), "image/png"));
+        // 缩略图：SkiaSharp + 真实 WZ 渲染，data/cache/thumbs/ 缓存（docs/ai/web-paperdoll-alignment.md §五.服务端2）。
+        // type=part → folder/img 定位部件图标；type=paperdoll → id 拼串整套合成 + size（64/128/192/256）；
+        // 旧 type（mob/npc/…）→ M3 纯色占位（不回归）。
+        g.MapGet("/thumb", (ThumbService thumbs, string type, string id, string? folder = null, string? img = null, int? size = null)
+            => Results.File(thumbs.GetOrCreatePng(type, id, folder, img, size), "image/png"));
 
         // ── 纸娃娃预设 CRUD（data/presets/，供设备选择器「纸娃娃 tab」，E7/E4）──
         g.MapGet("/presets", (PresetStore presets) => Results.Json(new { presets = presets.List() }));
