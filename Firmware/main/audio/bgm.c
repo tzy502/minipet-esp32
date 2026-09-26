@@ -508,7 +508,7 @@ void bgm_start(void)
         return;
     }
     mp_codec_init(44100);
-    xTaskCreatePinnedToCore(bgm_task, "bgm", 12288, NULL, 3, NULL, 0 /* PRO */);
+    xTaskCreatePinnedToCore(bgm_task, "bgm", 8192, NULL, 3, NULL, 0 /* PRO */);
     xTaskCreatePinnedToCore(feeder_task, "i2s_feed", 4096, NULL, 4, NULL, 0 /* PRO */);
 }
 

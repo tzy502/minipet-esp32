@@ -169,6 +169,8 @@ static void poller_task(void *arg)
     s_local_rev = asset_dl_local_rev();   /* 本地 manifest rev 起点（可能落后于 asset 任务装载，差一次冗余同步无妨） */
 
     for (;;) {
+        extern bool provision_portal_active(void);   /* portal 期间停轮询：无配置时对不可达服务端的重试会耗尽 lwip 缓冲（listen ENOBUFS 根因） */
+        while (provision_portal_active()) vTaskDelay(pdMS_TO_TICKS(1000));
         /* WiFi 掉线先重连（OFFLINE 期间唯一回网驱动，E11） */
         if (!provision_wifi_connect_sta(15000)) {
             /* 连不上家网：慢退避重试，不忙转 */
@@ -202,5 +204,5 @@ static void poller_task(void *arg)
 
 void poller_start(void)
 {
-    xTaskCreatePinnedToCore(poller_task, "poller", 6144, NULL, 3, NULL, 0 /* PRO */);
+    xTaskCreatePinnedToCore(poller_task, "poller", 4096, NULL, 3, NULL, 0 /* PRO */);
 }

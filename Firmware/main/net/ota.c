@@ -148,7 +148,7 @@ static void ota_task(void *arg)
 void ota_start(void)
 {
     s_req_q = xQueueCreate(2, sizeof(ota_req_t));
-    xTaskCreatePinnedToCore(ota_task, "ota", 8192, NULL,
+    xTaskCreatePinnedToCore(ota_task, "ota", 6144, NULL,
                             1 /* 最低优先级——4.1 */, NULL, 0 /* PRO */);
 }
 

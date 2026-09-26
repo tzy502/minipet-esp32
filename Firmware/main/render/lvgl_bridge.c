@@ -3,6 +3,9 @@
  *
  * 注意（LVGL 9.x API 假设点，联调时核对）：
  *   - flush：void (*)(lv_display_t*, const lv_area_t*, uint8_t*)
+ *   - flush 末尾必须 lv_display_flush_ready(disp)（同步 flush 契约；
+ *     缺失 = 下一次带失效区的刷新在 wait_for_flushing 死循环 → 卡死喂狗
+ *     → watchdog.c 软件看门狗 esp_restart，表现为进菜单一帧后整机重启）
  *   - lv_font_get_glyph_bitmap_cb_t：(font, letter, glyph_dsc) 三参
  *   - lv_font_glyph_dsc_t 含 resolved_font 字段
  */
@@ -51,12 +54,25 @@ static struct {
 
 static void bridge_flush(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map)
 {
-    (void)disp;
+    /* 本 flush 为同步完成（像素已落在 LVGL 缓冲/或仅记录 bbox，无 DMA 在途）。
+     * LVGL 9 契约：flush_cb 必须调用 lv_display_flush_ready() 终止本次 flush，
+     * 否则 disp->flushing 恒为 1，下一次「带失效区」的刷新会在
+     * wait_for_flushing() 的 while(disp->flushing) 处死循环（lv_refr.c:1500）
+     * → render 任务卡死不再喂狗 → watchdog.c 软件看门狗 esp_restart()
+     * （真机症状：菜单亮一帧后 ~5s 整机重启）。
+     * 在入口即清标志：对同步 flush 与出口清除等价（该标志只会在下一次刷新
+     * 被检查），且任何 early-return 分支都不可能漏标。 */
+    if (disp) lv_display_flush_ready(disp);
+
     if (!area) return;
 
     if (s_br.menu_mode) {
-        /* MENU：记录 bbox，拷贝与上屏由合成器完成（单写屏者） */
+        /* MENU：记录 bbox，拷贝与上屏由合成器完成（单写屏者）。
+         * 探针：每次进菜单的首个 flush（md_valid 仍未置位）打印一次区域，
+         * 真机日志可确认「第 1 帧已渲染完成」。 */
         if (!s_br.md_valid) {
+            ESP_LOGI(TAG, "flush[menu] first (%d,%d)-(%d,%d)",
+                     area->x1, area->y1, area->x2, area->y2);
             s_br.md_x1 = area->x1; s_br.md_y1 = area->y1;
             s_br.md_x2 = area->x2; s_br.md_y2 = area->y2;
             s_br.md_valid = true;
@@ -70,21 +86,22 @@ static void bridge_flush(lv_display_t *disp, const lv_area_t *area, uint8_t *px_
     }
 
     /* POKER：无屏可写——气泡捕获模式则收切片 */
-    if (!s_br.cap.active || !px_map) return;
-    int32_t cx1 = area->x1, cy1 = area->y1;
-    int32_t cx2 = area->x2, cy2 = area->y2;
-    if (cx1 < 0) cx1 = 0;
-    if (cy1 < 0) cy1 = 0;
-    if (cx2 > s_br.cap.w - 1) cx2 = s_br.cap.w - 1;
-    if (cy2 > s_br.cap.h - 1) cy2 = s_br.cap.h - 1;
-    if (cx1 > cx2 || cy1 > cy2) return;
-
-    int32_t area_w = area->x2 - area->x1 + 1;
-    for (int32_t y = cy1; y <= cy2; y++) {
-        const uint8_t *src = px_map +
-            (size_t)(y - area->y1) * area_w * 2u + (size_t)(cx1 - area->x1) * 2u;
-        uint16_t *dst = s_br.cap.dst + (size_t)y * s_br.cap.stride + cx1;
-        memcpy(dst, src, (size_t)(cx2 - cx1 + 1) * 2u);
+    if (s_br.cap.active && px_map) {
+        int32_t cx1 = area->x1, cy1 = area->y1;
+        int32_t cx2 = area->x2, cy2 = area->y2;
+        if (cx1 < 0) cx1 = 0;
+        if (cy1 < 0) cy1 = 0;
+        if (cx2 > s_br.cap.w - 1) cx2 = s_br.cap.w - 1;
+        if (cy2 > s_br.cap.h - 1) cy2 = s_br.cap.h - 1;
+        if (cx1 <= cx2 && cy1 <= cy2) {
+            int32_t area_w = area->x2 - area->x1 + 1;
+            for (int32_t y = cy1; y <= cy2; y++) {
+                const uint8_t *src = px_map +
+                    (size_t)(y - area->y1) * area_w * 2u + (size_t)(cx1 - area->x1) * 2u;
+                uint16_t *dst = s_br.cap.dst + (size_t)y * s_br.cap.stride + cx1;
+                memcpy(dst, src, (size_t)(cx2 - cx1 + 1) * 2u);
+            }
+        }
     }
 }
 
@@ -141,7 +158,12 @@ void bridge_deinit(void)
 
 int bridge_mode_poker(void)
 {
-    if (!s_br.disp || !s_br.poker_buf[0]) return RENDER_ERR_STATE;
+    if (!lv_is_initialized() || !s_br.disp || !s_br.poker_buf[0]) {
+        ESP_LOGE(TAG, "mode_poker: not ready (lv=%d disp=%p)",
+                 lv_is_initialized(), (void *)s_br.disp);
+        return RENDER_ERR_STATE;
+    }
+    if (s_br.menu_mode) ESP_LOGI(TAG, "mode_poker: exit menu -> PARTIAL");
     lv_display_set_buffers(s_br.disp, s_br.poker_buf[0], s_br.poker_buf[1],
                            s_br.poker_buf_sz, LV_DISPLAY_RENDER_MODE_PARTIAL);
     s_br.menu_mode = false;
@@ -156,12 +178,24 @@ int bridge_mode_poker(void)
 static void menu_build(void)
 {
     lv_obj_t *scr = lv_screen_active();
+    if (!scr) {
+        ESP_LOGE(TAG, "menu_build: no active screen");
+        return;
+    }
+
+    /* 幂等：进/出菜单多轮后默认屏上会残留上一轮的控件，重建前先清空，
+     * 防控件树逐轮叠加（内存慢性泄漏 + 重叠绘制）。 */
+    uint32_t stale = lv_obj_get_child_count(scr);
+    if (stale) lv_obj_clean(scr);
+
     lv_obj_set_style_bg_color(scr, lv_color_hex(0x000000), 0);
     lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
 
     const lv_font_t *f32 = font_lazy_get(FONT_ID_32);
     const lv_font_t *f24 = font_lazy_get(FONT_ID_24);
     const lv_font_t *f16 = font_lazy_get(FONT_ID_16);
+    ESP_LOGI(TAG, "menu_build: cleared %u stale obj, fonts 32=%d 24=%d 16=%d",
+             (unsigned)stale, f32 != NULL, f24 != NULL, f16 != NULL);
 
     lv_obj_t *title = lv_label_create(scr);
     lv_obj_set_style_text_color(title, lv_color_hex(0xFFFFFF), 0);
@@ -188,19 +222,39 @@ static void menu_build(void)
     }
     lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -40);
 
+    ESP_LOGI(TAG, "menu_build: %u widgets on screen", (unsigned)lv_obj_get_child_count(scr));
     lv_obj_invalidate(scr);   /* DIRECT 模式强制整屏重绘入 menu_buf */
 }
 
 int bridge_mode_menu(void)
 {
-    if (!s_br.disp || !s_br.menu_buf) return RENDER_ERR_STATE;
+    /* 前置验证：LVGL 未初始化/无 display/无整屏缓冲时绝不切换（防
+     * 后续 lv_* 调用在空指针/LVGL 空池上炸机）——任何失败都原样返回，
+     * render 层保持 POKER 态，不产生重启路径 */
+    if (!lv_is_initialized() || !s_br.disp || !s_br.menu_buf) {
+        ESP_LOGE(TAG, "mode_menu: not ready (lv=%d disp=%p buf=%p)",
+                 lv_is_initialized(), (void *)s_br.disp, (void *)s_br.menu_buf);
+        return RENDER_ERR_STATE;
+    }
+    /* 幂等：已在菜单态直接成功返回，不重复 set_buffers / 重建控件
+     * （旧实现重复 enter 每次在默认屏上再叠 5 个控件） */
+    if (s_br.menu_mode) {
+        ESP_LOGW(TAG, "mode_menu: already in menu (idempotent no-op)");
+        return RENDER_OK;
+    }
+
+    ESP_LOGI(TAG, "mode_menu: enter (%dx%d DIRECT buf=%u B)",
+             (int)s_br.sw, (int)s_br.sh,
+             (unsigned)((size_t)s_br.sw * s_br.sh * 2u));
     memset(s_br.menu_buf, 0, (size_t)s_br.sw * s_br.sh * 2u);
     lv_display_set_buffers(s_br.disp, s_br.menu_buf, NULL,
                            (uint32_t)s_br.sw * (uint32_t)s_br.sh * 2u,
                            LV_DISPLAY_RENDER_MODE_DIRECT);
-    s_br.menu_mode = true;
+    s_br.menu_mode = false;   /* 构建成功后才切菜单态：失败路径保持 POKER，绝不半切换 */
     s_br.md_valid = false;
     menu_build();             /* 问题5：进入菜单即构建深色 UI（防白屏/黑屏） */
+    s_br.menu_mode = true;    /* 构建成功后才切换态，失败路径保持 POKER */
+    ESP_LOGI(TAG, "mode_menu: built, first tick will render frame 1");
     return RENDER_OK;
 }
 
@@ -315,7 +369,9 @@ int bridge_bubble_render(const char *text, int font_id,
                          int32_t *out_w, int32_t *out_h)
 {
     if (!text || !*text || !dst || !out_w || !out_h) return RENDER_ERR_ARG;
-    if (s_br.menu_mode || !s_br.disp) return RENDER_ERR_STATE;
+    if (!lv_is_initialized() || !s_br.disp) return RENDER_ERR_STATE;
+    if (s_br.menu_mode) return RENDER_ERR_STATE;
+    ESP_LOGI(TAG, "bubble_render: font=%d text_len=%u", font_id, (unsigned)strlen(text));
 
     const lv_font_t *font = font_lazy_get((font_id_t)font_id);
     if (!font) {
@@ -374,5 +430,6 @@ int bridge_bubble_render(const char *text, int font_id,
 
     *out_w = bw;
     *out_h = bh;
+    ESP_LOGI(TAG, "bubble_render: done %dx%d", (int)bw, (int)bh);
     return RENDER_OK;
 }

@@ -127,5 +127,5 @@ static void events_task(void *arg)
 
 void events_start(void)
 {
-    xTaskCreatePinnedToCore(events_task, "events", 6144, NULL, 3, NULL, 0 /* PRO */);
+    xTaskCreatePinnedToCore(events_task, "events", 4096, NULL, 3, NULL, 0 /* PRO */);
 }

@@ -17,11 +17,15 @@
 #include <stdlib.h>
 #include "esp_log.h"
 #include "esp_heap_caps.h"
+#include "esp_timer.h"
 #include "esp_lcd_panel_ops.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
-#include "bsp/esp-bsp.h"
+#include "esp_lcd_panel_io.h"
+#include "esp_lcd_panel_vendor.h"
+#include "esp_lcd_co5300.h"
+#include "driver/spi_master.h"
 #include "amoled216.h"
 
 static const char *TAG = "co5300";
@@ -29,7 +33,19 @@ static const char *TAG = "co5300";
 static esp_lcd_panel_handle_t  s_panel;
 static esp_lcd_panel_io_handle_t s_io;
 static SemaphoreHandle_t s_lock;
+static SemaphoreHandle_t s_tx_done;    /* QSPI color 传输完成信号（同步化：深度 1 + 等待） */
 static bool s_inited;
+
+/* esp_lcd 颜色传输完成回调：释放等待者（同步化关键——BSP 默认异步队列深度 3
+ * 会被 30fps 连续 blit 打爆 ESP_ERR_NO_MEM 丢帧，真机定稿改深度 1+等待） */
+static bool IRAM_ATTR color_tx_done_cb(esp_lcd_panel_io_handle_t io,
+                                       esp_lcd_panel_io_event_data_t *edata, void *user)
+{
+    (void)io; (void)edata; (void)user;
+    BaseType_t hi = pdFALSE;
+    xSemaphoreGiveFromISR(s_tx_done, &hi);
+    return hi == pdTRUE;
+}
 
 static const uint16_t SW = 480;
 static const uint16_t SH = 480;
@@ -53,24 +69,54 @@ esp_err_t display_init(void)
         return ESP_OK;
     }
 
-    bsp_display_config_t cfg = {
-        .max_transfer_sz = SW * SH * 2,
-    };
-    esp_err_t err = bsp_display_new(&cfg, &s_panel, &s_io);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "bsp_display_new 失败: %s", esp_err_to_name(err));
-        return err;
-    }
-    /* bsp_display_new 内部已完成 reset + init + disp_on（官方时序） */
-
+    s_tx_done = xSemaphoreCreateBinary();
     s_lock = xSemaphoreCreateMutex();
-    if (!s_lock) {
+    if (!s_tx_done || !s_lock) {
         return ESP_ERR_NO_MEM;
     }
 
+    /* 直建 QSPI 总线 + 同步面板 IO（trans_queue_depth=1 + 完成信号量）。
+     * 引脚=本板定值（与 BSP 默认一致）：PCLK38 D0-3=4/5/6/7 CS12 RST39 */
+    const spi_bus_config_t buscfg = CO5300_PANEL_BUS_QSPI_CONFIG(38, 4, 5, 6, 7,
+                                    SW * SH * 2);
+    esp_err_t err = spi_bus_initialize(SPI2_HOST, &buscfg, SPI_DMA_CH_AUTO);
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        ESP_LOGE(TAG, "SPI 总线初始化失败: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    esp_lcd_panel_io_spi_config_t io_cfg = CO5300_PANEL_IO_QSPI_CONFIG(12,
+                                           color_tx_done_cb, NULL);
+    io_cfg.trans_queue_depth = 1;        /* 同步化关键：深度 1，永不积压 */
+    err = esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)SPI2_HOST,
+                                   &io_cfg, &s_io);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "panel_io 创建失败: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    const co5300_vendor_config_t vc = {
+        .flags.use_qspi_interface = 1,
+        /* init_cmds=NULL → 组件内置默认初始化序列（官方维护） */
+    };
+    const esp_lcd_panel_dev_config_t pc = {
+        .reset_gpio_num = 39,
+        .rgb_ele_order = LCD_RGB_ELEMENT_ORDER_RGB,
+        .bits_per_pixel = 16,
+        .vendor_config = &vc,
+    };
+    err = esp_lcd_new_panel_co5300(s_io, &pc, &s_panel);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "co5300 面板创建失败: %s", esp_err_to_name(err));
+        return err;
+    }
+    esp_lcd_panel_reset(s_panel);
+    esp_lcd_panel_init(s_panel);
+    esp_lcd_panel_disp_on_off(s_panel, true);
+
     display_brightness(80);   /* 默认 80%，应用可再调 */
     s_inited = true;
-    ESP_LOGI(TAG, "CO5300(BSP) 就绪 %ux%u QSPI", SW, SH);
+    ESP_LOGI(TAG, "CO5300(SYNC) 就绪 %ux%u QSPI", SW, SH);
     return ESP_OK;
 }
 
@@ -93,7 +139,10 @@ esp_err_t display_blit(int x, int y, int w, int h, const uint8_t *rgb565_be)
 
     esp_err_t err;
     if (aw == w && ah == h) {
+        /* BSP 面板 IO 为异步队列（深度 3），推送过快返回 ESP_ERR_NO_MEM →
+         * 短暂让权重试（QSPI 40MHz 排空一包 <2ms）——丢帧会造成画面停滞 */
         err = esp_lcd_panel_draw_bitmap(s_panel, x1, y1, x2 + 1, y2 + 1, (void *)rgb565_be);
+        if (err == ESP_OK) xSemaphoreTake(s_tx_done, pdMS_TO_TICKS(100));
     } else {
         /* 奇数区域：PSRAM 暂存补齐（边缘像素按邻边复制，视觉无差） */
         size_t sz = (size_t)aw * ah * 2u;
@@ -115,24 +164,30 @@ esp_err_t display_blit(int x, int y, int w, int h, const uint8_t *rgb565_be)
             }
         }
         err = esp_lcd_panel_draw_bitmap(s_panel, x1, y1, x2 + 1, y2 + 1, tmp);
+        if (err == ESP_OK) xSemaphoreTake(s_tx_done, pdMS_TO_TICKS(100));
         heap_caps_free(tmp);
     }
 
     xSemaphoreGive(s_lock);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "draw_bitmap 失败: %s", esp_err_to_name(err));
+        static int64_t s_last_err_log;
+        int64_t now = esp_timer_get_time();
+        if (now - s_last_err_log > 5000000) {   /* 5s 限频，防刷屏拖慢系统 */
+            ESP_LOGE(TAG, "draw_bitmap 失败: %s", esp_err_to_name(err));
+            s_last_err_log = now;
+        }
     }
     return err;
 }
 
 esp_err_t display_brightness(uint8_t pct)
 {
-    /* BSP 亮度 = 0x51 命令（CO5300 无背光 PWM）；panel 未就绪前静默跳过，
+    /* CO5300 亮度 = 0x51 DBV 命令（0-255）。panel 未就绪前静默跳过，
      * display_init 完成后由应用再调即可 */
-    if (!s_panel) {
+    if (!s_io) {
         return ESP_OK;
     }
-    return bsp_display_brightness_set(pct);
+    return esp_lcd_panel_io_tx_param(s_io, 0x51, (const uint8_t[]){ pct }, 1);
 }
 
 esp_err_t display_fill_rect(int16_t x, int16_t y, int16_t w, int16_t h,
@@ -166,9 +221,11 @@ esp_err_t display_fill_rect(int16_t x, int16_t y, int16_t w, int16_t h,
     esp_err_t err = ESP_OK;
     for (int16_t yy = y; yy + 2 <= y + h && err == ESP_OK; yy += 2) {
         err = esp_lcd_panel_draw_bitmap(s_panel, x, yy, x + w, yy + 2, line);
+        if (err == ESP_OK) xSemaphoreTake(s_tx_done, pdMS_TO_TICKS(100));
     }
     if (((y + h) & 1) && err == ESP_OK) {        /* 奇数行收尾：借上一行组成 2 行 */
         err = esp_lcd_panel_draw_bitmap(s_panel, x, y + h - 2, x + w, y + h, line);
+        if (err == ESP_OK) xSemaphoreTake(s_tx_done, pdMS_TO_TICKS(100));
     }
 
     xSemaphoreGive(s_lock);

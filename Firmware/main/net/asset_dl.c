@@ -638,7 +638,7 @@ void asset_dl_start(void)
     ensure_dirs();
     crc32c_init_table();
     load_local_manifest();
-    xTaskCreatePinnedToCore(asset_dl_task, "asset_dl", 10240, NULL,
+    xTaskCreatePinnedToCore(asset_dl_task, "asset_dl", 8192, NULL,
                             2 /* 低于 poller——4.1 */, NULL, 0 /* PRO */);
 }
 
