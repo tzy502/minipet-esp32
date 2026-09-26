@@ -202,6 +202,14 @@ public static class AdminCatalogEndpoints
         }).ToList();
     }
 
+    /// <summary>启动预热（WarmupService 调）：全 part 构建一遍（含中文名缓存填充），返回预热条目总数。</summary>
+    public static int WarmupAll(WzService wz)
+    {
+        int total = 0;
+        foreach (var def in Parts.Values) total += GetOrBuild(wz, def, null).Count;
+        return total;
+    }
+
     /// <summary>椅子枚举：Item/Install 下每个 .img（取 Name 传 GetImgChildren——传目录 Id 得空列表，
     /// 桌面版已踩坑）→ img 内数字 id，硬过滤 3010000 ≤ id &lt; 3021000（Install 内 0304.img 等是其他家具）。</summary>
     private static List<(string Id, string? Img)> EnumChairs(WzService wz)
