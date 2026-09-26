@@ -22,6 +22,9 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_system.h"
+#include "esp_log.h"
+
+static const char *TAG = "sm";
 #include "esp_heap_caps.h"
 
 #include "app_core.h"
@@ -144,9 +147,16 @@ static void self_test(bool sd_ok, bool psram_ok)
         return;
     }
 
-    /* 3) WiFi 配置：无配置 → 配网 */
+    /* 3) WiFi 配置：无配置但有本地素材 → 直接离线起播（出厂素材保底，
+     *    不让用户面对黑屏；portal 可经菜单键补配）。无素材 → 配网 + 屏显提示 */
     if (!provision_has_config()) {
+        if (asset_dl_have_local_manifest()) {
+            ESP_LOGW(TAG, "无 WiFi 配置但有本地素材 → 离线起播（配网稍后经菜单）");
+            transition(MP_ST_POKER);
+            return;
+        }
         transition(MP_ST_WIFI_PROVISION);
+        watchdog_text_persist("NO WIFI CONFIG", "AP: MINIPET-XXXX");
         return;   /* portal 完成后自行重启 */
     }
 
@@ -414,6 +424,14 @@ static void dispatch_manifest_synced(void)
     /* 默认纸娃娃部件 + 站立布局（E13：每设备独立装扮） */
     if (asset_dl_parts_path(NULL, path, sizeof(path))) {
         render_set_parts(path);
+    }
+    /* 加载失败不黑屏：屏显文字提示（E11 素材故障 → dam 语义的文本版） */
+    if (!asset_dl_layout_path("stand1", path, sizeof(path)) ||
+        !asset_dl_parts_path(NULL, path, sizeof(path))) {
+        ESP_LOGE(TAG, "本地素材加载失败（parts/stand1 缺失）");
+        transition(MP_ST_FATAL);
+        watchdog_text_persist("ASSET LOAD FAILED", "WAIT SERVER SYNC");
+        return;
     }
     dispatch_action(MP_ACTION_STAND);
 }

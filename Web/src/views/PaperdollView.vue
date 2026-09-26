@@ -11,6 +11,7 @@ import {
 } from 'naive-ui'
 import AppearancePicker from '../components/AppearancePicker.vue'
 import { buildThumbId, hasSelection, toPetConfig, CATEGORY_KEYS } from '../utils/appearance'
+import { SHENZI_DEFAULT } from '../utils/defaultAppearance'
 import { thumbUrl, listPresets, createPreset, deletePreset } from '../api/client'
 import { fmtTime } from '../utils/format'
 
@@ -19,6 +20,19 @@ const message = useMessage()
 const selection = ref({ hair: null, face: null, coat: null, pants: null, weapon: null })
 const previewUrl = ref('')
 const previewing = ref(false)
+
+/** 载入默认装扮「神子」（2026-09-26 定稿；当前编辑器仅 5 槽位，先载交集） */
+function loadDefault() {
+  selection.value = {
+    hair: SHENZI_DEFAULT.hair,
+    face: SHENZI_DEFAULT.face,
+    coat: null,
+    pants: null,
+    weapon: SHENZI_DEFAULT.weapon,
+  }
+  doPreview()
+  message.success('已载入默认装扮「神子」（cap/overall/shoes 槽位待编辑器扩类目后支持）')
+}
 
 const pickedCount = computed(() => CATEGORY_KEYS.filter((k) => selection.value[k]).length)
 

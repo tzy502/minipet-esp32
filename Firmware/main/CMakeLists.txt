@@ -37,7 +37,8 @@ idf_component_register(
     PRIV_REQUIRES
         drivers            # components/drivers（hal_contract.h 消费面）
         lvgl               # 渲染层（main/render 由渲染 agent 提供）
-        fatfs              # esp_vfs_fat_info（TF 水位）
+        fatfs              # esp_vfs_fat_info（TF 水位）+ spiflash 兜底挂载
+        wear_levelling     # assets 分区 FAT 兜底（sd_tf.c）
         nvs_flash          # 配置/看门狗计数/偏好
         esp_http_client    # E2 全端点
         esp_http_server    # provision captive portal
