@@ -1,7 +1,7 @@
 <script setup>
 /**
  * 装扮部件选择弹窗（对齐桌面素材浏览器 MaterialBrowserWindow）：
- * - 数据从服务端 catalog API 拉全量（getCatalog），组件内存 Map 缓存 per `${part}|${gender}`，重复打开不重拉
+ * - 数据从服务端 catalog API 拉全量（getCatalog），组件内存 Map 缓存 per part，重复打开不重拉
  * - 搜索：防抖 300ms，本地过滤中文名（忽略大小写）或 id 包含
  * - 发型同名折叠：多变体折叠为组行（组名 + N 变体 + ▸/▾），回退名（发型_ 前缀）不折叠
  * - 分页：「加载更多」每次追加 100 行；缩略图懒加载，失败回退类目 emoji
@@ -17,7 +17,7 @@ const props = defineProps({
   show: { type: Boolean, default: false },
   /** 类目 key（CATEGORIES 里的一项，如 'hair'） */
   part: { type: String, default: '' },
-  /** 当前草稿性别（0 男 / 1 女），仅 genderFilter 类目（发型/脸型）拉目录时使用 */
+  /** （保留 prop 兼容旧用法；2026-09-26 起目录不分性别，不再消费） */
   gender: { type: Number, default: 0 },
   /** 当前已选部件 id（或 null）—— 对应行高亮 */
   modelValue: { type: [String, Number], default: null },
@@ -97,9 +97,7 @@ const hasMore = computed(() => visibleRows.value.length < displayRows.value.leng
 async function loadCatalog(force = false) {
   const cat = activeCategory.value
   if (!cat) return
-  // 性别过滤仅 genderFilter 类目（发型/脸型，规范 3.3）：其余类目不传 gender
-  const g = cat.genderFilter ? props.gender : undefined
-  const key = `${cat.key}|${g ?? ''}`
+  const key = cat.key
   if (!force && catalogCache.has(key)) {
     const c = catalogCache.get(key)
     allItems.value = c.items
@@ -111,8 +109,8 @@ async function loadCatalog(force = false) {
   loading.value = true
   loadError.value = ''
   try {
-    const data = await getCatalog(cat.key, g)
-    if (seq !== loadSeq) return // 期间已切换类目/性别，丢弃旧响应
+    const data = await getCatalog(cat.key)
+    if (seq !== loadSeq) return // 期间已切换类目，丢弃旧响应
     const items = [...(data?.items ?? [])].sort(byIdAsc)
     const entry = { items, total: data?.total ?? items.length }
     catalogCache.set(key, entry)
@@ -184,17 +182,6 @@ watch(
   () => props.part,
   () => {
     if (props.show && props.part) {
-      resetListState()
-      loadCatalog()
-    }
-  }
-)
-
-// 性别切换：genderFilter 类目（发型/脸型）重拉列表（缓存 key 含 gender，切换不误用旧数据）
-watch(
-  () => props.gender,
-  () => {
-    if (props.show && activeCategory.value?.genderFilter) {
       resetListState()
       loadCatalog()
     }
@@ -316,7 +303,7 @@ onBeforeUnmount(() => clearTimeout(searchTimer))
     <template #action>
       <div class="picker-footer">
         <span class="picker-hint">
-          当前类目：{{ catLabel }}{{ activeCategory?.genderFilter ? '（已按性别过滤）' : '' }}
+          当前类目：{{ catLabel }}
         </span>
         <div class="footer-btns">
           <n-button quaternary type="error" @click="clearSlot">清空{{ catLabel }}（此槽位）</n-button>

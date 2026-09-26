@@ -6,10 +6,10 @@
  */
 import { SHENZI_DEFAULT } from './defaultAppearance'
 
-/** 16 类目（顺序/中文标签/图标/WZ 目录与桌面版一致）；genderFilter = 发型/脸型需按性别过滤。 */
+/** 16 类目（顺序/中文标签/图标/WZ 目录与桌面版一致）；2026-09-26 起目录不分性别全量展示。 */
 export const CATEGORIES = [
-  { key: 'hair', label: '发型', icon: '💇', folder: 'Hair', genderFilter: true },
-  { key: 'face', label: '脸型', icon: '😊', folder: 'Face', genderFilter: true },
+  { key: 'hair', label: '发型', icon: '💇', folder: 'Hair' },
+  { key: 'face', label: '脸型', icon: '😊', folder: 'Face' },
   { key: 'cap', label: '帽子', icon: '⛑️', folder: 'Cap' },
   { key: 'cape', label: '披风', icon: '🧣', folder: 'Cape' },
   { key: 'coat', label: '上衣', icon: '🛡️', folder: 'Coat' },

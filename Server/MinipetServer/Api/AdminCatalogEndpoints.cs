@@ -6,7 +6,7 @@ namespace MinipetServer.Api;
 /// Web 纸娃娃编辑器素材目录 API（docs/ai/web-paperdoll-alignment.md 问题④ 定稿 · 第三章 3.1-3.3/3.5 + 第五章服务端）：
 /// GET /api/admin/catalog?part={key}&amp;gender={0|1} → { part, total, items:[{id,name,icon,img?}] }。
 /// 逻辑对齐桌面版 MaterialBrowserWindow.Logic.cs 的 LoadFromWz / AddCharacterCategory /
-/// AddAccessoryCategories / MatchesGender（千位表修正版）：
+/// AddAccessoryCategories（饰品三拆）：
 /// - 枚举：GetDirectoryChildren("Character/{folder}")（全量目录子节点，不用 _Canvas 老写法防缺件）；
 /// - 饰品：Character/Accessory 按 id/10000 前缀拆 面饰101/眼饰102/耳环103，其余前缀丢弃；
 /// - 椅子：Item/Install/{img文件名} 内 GetImgChildren 数字 id（img 是 Wz_Image 节点，
@@ -19,7 +19,7 @@ namespace MinipetServer.Api;
 /// - 性别过滤：仅发型/脸型，gender 缺省或非 0/1 不过滤，其他类目永不按性别过滤；
 /// - 排序：int.Parse(id) 数值升序，解析失败排最后（LINQ 稳定排序保持失败者原相对顺序）；
 /// - icon：/api/admin/thumb?type={part}&amp;folder={WZ folder}&amp;id={id}（ThumbService 并行接真实渲染）。
-/// 结果按 (part, genderFilter) 内存缓存（首次冷加载 Hair 1.7 万条逐条查中文名约数秒属正常），
+/// 结果按 part 内存缓存（首次冷加载 Hair 1.7 万条逐条查中文名约数秒属正常），
 /// 订阅 WzService.WzReloaded 重载代际事件整体失效（订阅口径同 MusicCatalogService.OnWzReloaded，
 /// 参数代际号仅作失效触发）。WZ 未加载 → 503（WzService 经构造注入，DI 单例）。
 /// 局域网信任模型：v1 无鉴权（同 AdminEndpoints）。
@@ -226,18 +226,4 @@ public static class AdminCatalogEndpoints
             .Select(c => (Id: c.Id, Img: (string?)null))
             .ToList();
 
-    /// <summary>发型/脸型性别过滤（逐条对齐桌面 MaterialBrowserWindow.MatchesGender 千位表修正版，
-    /// 2026-08-16 起弃用 n&gt;=31000 老规则——男发 36633 千位 6 曾被误杀）：
-    /// 千位 = (id/1000)%10；发型 0/3/5/6=男、1/4/7/8=女、其余通用；脸型 0/3/5/7=男、1/4/6/8=女、其余通用。
-    /// 千位为通用或等于当前 gender 才保留；非发型/脸型不过滤。</summary>
-    internal static bool MatchesGender(string partKey, string id, int gender)
-    {
-        if (partKey != "hair" && partKey != "face") return true;
-        if (!int.TryParse(id, out var n)) return true;
-        int tag = (n / 1000) % 10;
-        int itemGender = partKey == "hair"
-            ? tag switch { 0 or 3 or 5 or 6 => 0, 1 or 4 or 7 or 8 => 1, _ => 2 }
-            : tag switch { 0 or 3 or 5 or 7 => 0, 1 or 4 or 6 or 8 => 1, _ => 2 };
-        return itemGender == 2 || itemGender == gender;
-    }
 }
