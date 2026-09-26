@@ -29,7 +29,8 @@ public static class ManifestBuilder
     {
         var o = new JsonObject
         {
-            ["kind"] = a.Kind.ToString(),
+            // 固件 asset_dl kind_dir 是 strcmp 大写白名单——PascalCase（"Parts"）会导致设备不下载
+            ["kind"] = a.Kind.ToString().ToUpperInvariant(),
             ["bytes"] = a.ByteCount,
             ["url"] = $"/api/device/asset/{a.Hash:x16}",
             ["label"] = a.Label,

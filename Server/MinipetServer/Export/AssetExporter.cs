@@ -774,6 +774,173 @@ public sealed class AssetExporter
         summary.Assets.Add(asset);
         return asset;
     }
+
+    // ═══════════════════════════════════════════
+    // 设备资产登记入口（DeviceAssetService 用，2026-09-26 E7 地图/怪物NPC tab 补链）
+    // 模式对齐 ExportAppearanceAssets：只产出资产（不写盘、不动 manifest）——写盘与
+    // 索引合并由 DeviceAssetService 按设备目录负责；失败抛异常由上层记录。
+    // ═══════════════════════════════════════════
+
+    /// <summary>
+    /// 为单张地图产出设备资产（BGMAP + 条带小 PARTS + 缩略图），完整复用 CLI ExportMap
+    /// 的产物段（selector=map、extra.map=mapId、extra.thumb）。视口 = 默认 DeviceProfile()
+    /// （480×480，与 PaperdollPackService/ClockTableSeeder 同口径）。
+    /// 渲染期告警（条带素材缺失等）追加进 warnings；地图加载失败/产物为空抛
+    /// InvalidOperationException。clock_table 建议值不在此返回（由 ClockTableSeeder/配置管理）。
+    /// </summary>
+    public List<ExportedAsset> ExportMapAssets(string mapId, List<string>? warnings = null)
+    {
+        if (string.IsNullOrWhiteSpace(mapId)) throw new ArgumentException("地图 id 不能为空", nameof(mapId));
+        if (!_wz.IsLoaded) throw new InvalidOperationException("WZ 未加载（先调用 WzService.LoadWz）");
+        var summary = new ExportSummary();
+        ExportMap(mapId.Trim(), new DeviceProfile(), summary);
+        warnings?.AddRange(summary.Warnings);
+        if (summary.Assets.Count == 0)
+            throw new InvalidOperationException(
+                $"地图 {mapId} 导出为空（WZ 数据缺失？）: {string.Join("; ", summary.Warnings)}");
+        return summary.Assets;
+    }
+
+    /// <summary>
+    /// 为单个 NPC 产出设备资产（PARTS 整包 + 每动作一个 LAYOUT 双包，形态同纸装扮），
+    /// selector=npc、extra.entity=npc:{npcId}。动作集 = WzService.GetActionList(npcId, "Npc")
+    /// 实测有效帧动作；默认动作优先 stand → move → 首个。条带经 BuildSpriteStrip 合成为
+    /// 统一 cell（FrameWidth×FrameHeight，锚点 = Origin）后逐帧切片成 PARTS 部件；
+    /// SpriteStrip 元数据（config）按固件消费形态折入：帧 delay_ms 进 LAYOUT payload，
+    /// cell 尺寸/锚点进 manifest extras（bounds/origin）——固件 asset_dl kind_dir 只认
+    /// PARTS/LAYOUT/BGMAP/FONT/AUDIO_META，无独立 config 包 kind。piece x/y = 位图左上角
+    /// 相对锚点坐标（含 origin，契约同装扮：设备端 compositor 不再减 origin）。
+    /// 渲染期告警追加进 warnings；无任何可导出动作/全部动作条带失败时抛 InvalidOperationException。
+    /// </summary>
+    public List<ExportedAsset> ExportNpcAssets(string npcId, List<string>? warnings = null)
+    {
+        if (string.IsNullOrWhiteSpace(npcId)) throw new ArgumentException("NPC id 不能为空", nameof(npcId));
+        if (!_wz.IsLoaded) throw new InvalidOperationException("WZ 未加载（先调用 WzService.LoadWz）");
+        npcId = npcId.Trim();
+        var warns = warnings ?? new List<string>();
+        void Warn(string msg) { warns.Add(msg); Console.Error.WriteLine($"[AssetExporter] {msg}"); }
+
+        // 动作探测：GetActionList 已过滤无画面空动作（口径同 ExportSpriteStrip 的 >1×1 有效帧）
+        var actions = _wz.GetActionList(npcId, "Npc");
+        if (actions.Count == 0)
+            throw new InvalidOperationException($"NPC {npcId} 无可导出动作（WZ 数据缺失？）");
+        string defaultAction = actions.Contains("stand") ? "stand"
+            : actions.Contains("move") ? "move" : actions[0];
+
+        string npcName = "";
+        try { npcName = _wz.GetNpcName(npcId) ?? ""; } catch { /* 目录服务未预热时名称可缺省 */ }
+        string label = string.IsNullOrEmpty(npcName) ? $"NPC {npcId}" : $"{npcName}（{npcId}）";
+
+        // LAYOUT entity_id（u32；设备端按 manifest 元数据 entity 字符串检索，此字段仅随包展示）
+        uint entityId = uint.TryParse(npcId, out var idNum) ? idNum : 0;
+
+        var partEntries = new List<PartPackWriter.PartEntry>();
+        var layoutPayloads = new List<(string Action, byte[] Payload, int CellW, int CellH, int Ox, int Oy)>();
+        uint nextPartId = 1;
+
+        foreach (var action in actions)
+        {
+            // 单次遍历同时产出条带 PNG + SpriteStrip 元数据（WzService 内部锁内读 WZ）
+            var (png, strip, _) = _wz.BuildSpriteStrip(npcId, action, "Npc");
+            if (png == null || strip == null || strip.FrameCount <= 0 || strip.FrameWidth <= 0 || strip.FrameHeight <= 0)
+            {
+                Warn($"NPC {npcId} 动作 {action} 条带导出为空，跳过");
+                continue;
+            }
+            using var stripBmp = SKBitmap.Decode(png);
+            if (stripBmp == null) { Warn($"NPC {npcId} 动作 {action} 条带 PNG 解码失败，跳过"); continue; }
+
+            int cw = strip.FrameWidth, ch = strip.FrameHeight;
+            int frames = Math.Min(strip.FrameCount, stripBmp.Width / cw);
+
+            // 帧 → PARTS 部件：条带按 cell 切片（cell 内锚点 = strip.Origin，跨帧/跨动作同口径）
+            // LAYOUT 帧：单 piece = 整 cell；piece x/y = 位图左上角(0,0) 相对锚点(OriginX,OriginY)
+            //   = (-OriginX, -OriginY)（帧恒定——条带合成已把每帧 origin 对齐到该点）
+            uint basePartId = nextPartId;
+            var layoutFrames = new List<LayoutPackWriter.LayoutFrame>();
+            for (int f = 0; f < frames; f++)
+            {
+                var cell = new SKBitmap(new SKImageInfo(cw, ch, SKColorType.Bgra8888, SKAlphaType.Unpremul));
+                using (var c = new SKCanvas(cell))
+                {
+                    c.Clear(SKColors.Transparent);
+                    c.DrawBitmap(stripBmp, f * cw, 0);
+                }
+                partEntries.Add(new PartPackWriter.PartEntry
+                {
+                    PartId = basePartId + (uint)f,
+                    ExprGroup = 0,
+                    Bitmap = cell,
+                    OriginX = strip.OriginX,
+                    OriginY = strip.OriginY,
+                });
+
+                uint delay = (uint)Math.Max(1,
+                    strip.FrameData != null && f < strip.FrameData.Count ? strip.FrameData[f].Delay
+                    : strip.FrameDelays != null && f < strip.FrameDelays.Count ? strip.FrameDelays[f]
+                    : strip.DefaultDelay);
+                layoutFrames.Add(new LayoutPackWriter.LayoutFrame
+                {
+                    DelayMs = delay,
+                    MoveDx = 0, // mob/npc 条带无帧位移
+                    MoveDy = 0,
+                    Pieces =
+                    {
+                        new LayoutPackWriter.LayoutPiece
+                        {
+                            PartId = basePartId + (uint)f,
+                            ExprIndex = LayoutPackWriter.ExprNone,
+                            X = (short)Math.Clamp(-strip.OriginX, short.MinValue, short.MaxValue),
+                            Y = (short)Math.Clamp(-strip.OriginY, short.MinValue, short.MaxValue),
+                            Flip = 0,
+                            Z = 0,
+                        },
+                    },
+                });
+            }
+            if (layoutFrames.Count == 0) { Warn($"NPC {npcId} 动作 {action} 无有效帧，跳过"); continue; }
+            nextPartId += (uint)frames;
+
+            layoutPayloads.Add((action, LayoutPackWriter.Build(new LayoutPackWriter.LayoutInput
+            {
+                EntityId = entityId,
+                Action = action,
+                Frames = layoutFrames,
+            }), cw, ch, strip.OriginX, strip.OriginY));
+        }
+
+        if (partEntries.Count == 0 || layoutPayloads.Count == 0)
+            throw new InvalidOperationException(
+                $"NPC {npcId} 条带导出失败（动作集: {string.Join(",", actions)}）: {string.Join("; ", warns)}");
+
+        // PARTS 整包（全部动作全部帧一个包）+ 每动作一个 LAYOUT —— LAYOUT/PARTS 双包同纸装扮形态
+        var summary = new ExportSummary();
+        var result = new List<ExportedAsset>();
+        var partsPayload = PartPackWriter.Build(partEntries);
+        foreach (var e in partEntries) e.Bitmap.Dispose(); // Build 内已编码落 payload，位图即弃
+        partEntries.Clear();
+
+        string entity = $"npc:{npcId}";
+        result.Add(AddAsset(summary, MpakKind.Parts, partsPayload, label, selector: "npc",
+            extra: new Dictionary<string, object?>
+            {
+                ["entity"] = entity,
+                ["defaultAction"] = defaultAction,
+            }));
+        foreach (var (action, payload, cw, ch, ox, oy) in layoutPayloads)
+        {
+            result.Add(AddAsset(summary, MpakKind.Layout, payload, $"布局 {action}", selector: "npc",
+                extra: new Dictionary<string, object?>
+                {
+                    ["entity"] = entity,
+                    ["action"] = action,
+                    ["defaultAction"] = defaultAction,
+                    ["bounds"] = new[] { cw, ch }, // cell（帧画布）[w,h]，1x 像素
+                    ["origin"] = new[] { ox, oy }, // cell 内锚点（SpriteStrip 元数据，联调/Web 用）
+                }));
+        }
+        return result;
+    }
 }
 
 /// <summary>
