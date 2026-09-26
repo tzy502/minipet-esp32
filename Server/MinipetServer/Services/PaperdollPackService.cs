@@ -101,7 +101,15 @@ public sealed class PaperdollPackService
     {
         if (root["assets"] is not JsonObject ao) return false;
         foreach (var kv in ao)
-            if ((kv.Value as JsonObject)?["appearanceHash"]?.GetValue<string>() == hash) return true;
+        {
+            if (kv.Value is not JsonObject e) continue;
+            if (e["appearanceHash"]?.GetValue<string>() != hash) continue;
+            // kind 必须是大写 PARTS 才算已打包：旧版服务端写过小写 "parts"（固件 kind_dir
+            // strcmp 大写白名单不认 → 设备登记元数据但永不下载）；若按 appearanceHash 直接
+            // 幂等跳过，坏索引永远不被纠正 → 升级后同外观重推设备仍无反应。小写视为未打包，
+            // 走重打覆盖（下方同 hash key 覆盖 + 替换旧条目）。
+            if (string.Equals(e["kind"]?.GetValue<string>(), "PARTS", StringComparison.Ordinal)) return true;
+        }
         return false;
     }
 
