@@ -127,15 +127,21 @@ public sealed class DeviceAssetService
         return new JsonObject();
     }
 
-    /// <summary>幂等判定：索引里已有 selector 相同且 extra 字段 key==value 的条目。</summary>
+    /// <summary>
+    /// 幂等判定：索引里已有 selector 相同且 extra 字段 key==value 的条目。
+    /// 主条目 kind 必须是固件白名单大写（map→BGMAP / npc→PARTS）：旧版小写条目视为未登记，
+    /// 走重打覆盖——否则坏索引永不被纠正，设备永不下载（同 PaperdollPackService.HasAppearance）。
+    /// </summary>
     private static bool HasEntry(JsonObject root, string selector, string key, string value)
     {
+        var primaryKind = selector == "map" ? "BGMAP" : "PARTS";
         if (root["assets"] is not JsonObject ao) return false;
         foreach (var kv in ao)
         {
             if (kv.Value is not JsonObject e) continue;
             if (!string.Equals(e["selector"]?.GetValue<string>(), selector, StringComparison.Ordinal)) continue;
-            if (string.Equals(e[key]?.GetValue<string>(), value, StringComparison.Ordinal)) return true;
+            if (!string.Equals(e[key]?.GetValue<string>(), value, StringComparison.Ordinal)) continue;
+            if (string.Equals(e["kind"]?.GetValue<string>(), primaryKind, StringComparison.Ordinal)) return true;
         }
         return false;
     }
