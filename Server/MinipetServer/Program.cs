@@ -59,8 +59,18 @@ var wzSvc = app.Services.GetRequiredService<WzService>();
 void LoadWzFromConfig(string dataPath)
 {
     var (ok, err) = wzSvc.LoadWz("", dataPath);
-    if (ok) app.Logger.LogInformation("[Wz] WZ 已加载：{Path}", dataPath);
-    else app.Logger.LogWarning("[Wz] WZ 加载失败（{Path}）：{Error} —— catalog/纸娃娃缩略图将降级", dataPath, err);
+    if (ok)
+    {
+        app.Logger.LogInformation("[Wz] WZ 已加载：{Path}", dataPath);
+        // clock_table 魔法值校准（E9/R15）：WZ 就绪后把世界锚点换算成烘焙视口坐标补进
+        // config（只补缺失/替换样例占位，Web 改过的值不动；写入 → Changed → manifest rev+1）
+        try { ClockTableSeeder.Run(wzSvc, cfgSvc, app.Logger); }
+        catch (Exception ex) { app.Logger.LogWarning("[Clock] 校准调度失败：{Message}", ex.Message); }
+    }
+    else
+    {
+        app.Logger.LogWarning("[Wz] WZ 加载失败（{Path}）：{Error} —— catalog/纸娃娃缩略图将降级", dataPath, err);
+    }
 }
 _ = Task.Run(() => LoadWzFromConfig(cfgSvc.Current.Wz.DataPath));
 cfgSvc.Changed += e =>

@@ -517,7 +517,17 @@ public sealed class AssetExporter
         if (map == null) { summary.Warnings.Add($"地图 {mapId} 加载失败"); return; }
 
         int vw = profile.ViewportW, vh = profile.ViewportH;
-        var (ccx, ccy) = MapService.GetMapCenter(map);
+        // 相机中心：含 clock 配置的图以 clock 锚点为优先（2026-09-26 定稿）——480 视口下地图中心
+        // 相机多看不到 clock 面板（实测 18/26 出界）；这 26 张"售票处/码头"图的存在意义就是
+        // 显示时钟，以锚点为中心烘焙 → 面板入镜 + 时钟落面板（与桌面版 1080 视口验收一致）。
+        // 无 clock 的图保持地图中心。ClockTableSeeder 换算与此同口径。
+        string clockMapRoot = MapService.GetMapWzPath(mapId);
+        int clockAnchorX = _wz.GetIntProperty($"{clockMapRoot}/clock/x");
+        int clockAnchorY = _wz.GetIntProperty($"{clockMapRoot}/clock/y");
+        bool hasClock = clockAnchorX != 0 || clockAnchorY != 0;
+        var (ccx, ccy) = hasClock
+            ? ((float)clockAnchorX, (float)clockAnchorY)
+            : MapService.GetMapCenter(map);
         var (camX, camY) = MapService.ClampCamera(map, ccx, ccy, 1f, vw, vh); // 必须夹取（clock-display-spec §五）
 
         // 条带 = ScrollH/V 项（profile 关条带时置空 → strip_count=0）
@@ -633,14 +643,10 @@ public sealed class AssetExporter
         // 6. clock_table 建议值（R15：烘焙视口内屏幕坐标；WZ clock 世界锚点经导出相机换算）
         try
         {
-            string mapRoot = MapService.GetMapWzPath(mapId);
-            var clockNode = _wz.FindNodeByPath($"{mapRoot}/clock");
-            if (clockNode != null)
+            if (hasClock)
             {
-                int cw = _wz.GetIntProperty($"{mapRoot}/clock/x");
-                int ch = _wz.GetIntProperty($"{mapRoot}/clock/y");
-                int sx = (int)Math.Round(cw - camX + vw / 2f);
-                int sy = (int)Math.Round(ch - camY + vh / 2f);
+                int sx = (int)Math.Round(clockAnchorX - camX + vw / 2f);
+                int sy = (int)Math.Round(clockAnchorY - camY + vh / 2f);
                 summary.ClockTable[mapId] = new[] { sx, sy };
             }
         }

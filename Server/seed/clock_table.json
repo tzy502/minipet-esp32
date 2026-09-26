@@ -1,5 +1,5 @@
 {
-  "_comment": "视口屏幕坐标初始建议值，Web 可改，来源 wz-clock-maps.md 2026-09-24 实测",
+  "_comment": "WZ clock 世界锚点 [x,y]（26 张图，wz-clock-maps.md 2026-09-24 实测）；服务端启动按 480×480 烘焙视口换算成屏幕坐标写入 config.Clock.MapOffsets（R15 口径），Web 可改",
   "2000100": [
     430,
     226
