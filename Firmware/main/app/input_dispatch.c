@@ -426,6 +426,16 @@ static void touch_tick(void)
     static int64_t down_ms;
     static bool longpress_fired;
     static bool drag_active;              /* 问题6：本次按住已进入水平拖动 */
+
+    /* 菜单/时钟/配网态：触摸全归 LVGL，宠物交互（抚摸/拖拽/长按）不穿透
+     * （真机：菜单里的长按再发 MENU_KEY → 菜单"关了又出现"） */
+    {
+        mp_state_t tst = state_machine_current();
+        if (tst != MP_ST_POKER && tst != MP_ST_OFFLINE) {
+            down = false; drag_active = false; longpress_fired = false;
+            return;
+        }
+    }
     static int fail_cnt;                  /* 触摸 I2C 连续读失败计数 */
     static int64_t fail_last_log_ms;
     static bool frame_fmt_logged;         /* 首帧字节转储（只打一次，防 count 位置翻车无据可查） */
@@ -501,7 +511,12 @@ static void touch_tick(void)
             /* 宠物区长按 → 呼出选择器（E6 的 BGM 控制条入口在 E7 菜单内：
              * 渲染层契约未提供独立控制条 API，长按直达菜单=BGM 入口） */
             longpress_fired = true;
-            state_machine_handle(MP_SM_EV_MENU_KEY);
+            /* 仅宠物态长按呼出菜单：菜单态的触摸归 LVGL（否则菜单里的长按
+             * 会再发 MENU_KEY 把菜单切走——"关了又出现"真机根因，2026-09-26） */
+            if (state_machine_current() == MP_ST_POKER ||
+                state_machine_current() == MP_ST_OFFLINE) {
+                state_machine_handle(MP_SM_EV_MENU_KEY);
+            }
             note_interaction();
         }
     } else if (!f.touched && down) {
