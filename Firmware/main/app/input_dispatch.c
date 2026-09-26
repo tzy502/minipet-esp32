@@ -426,7 +426,7 @@ static void touch_tick(void)
     static int64_t down_ms;
     static bool longpress_fired;
     static bool drag_active;              /* 问题6：本次按住已进入水平拖动 */
-    static int16_t s_drag_last_x;         /* 拖拽跟手：上一帧手指 x（增量基准） */
+    static int16_t s_drag_last_x, s_drag_last_y;  /* 拖拽跟手：上一帧手指 x/y */
 
     /* 菜单/时钟/配网态：触摸全归 LVGL，宠物交互（抚摸/拖拽/长按）不穿透
      * （真机：菜单里的长按再发 MENU_KEY → 菜单"关了又出现"） */
@@ -484,7 +484,7 @@ static void touch_tick(void)
         down_ms = mp_now_ms();
         longpress_fired = false;
         drag_active = false;
-        s_drag_last_x = f.x;
+        s_drag_last_x = f.x; s_drag_last_y = f.y;
         /* 校准日志（每次按下沿一条）：原始帧 + 重组 raw + 映射值。
          * 核对目标：屏幕中心 → (240,240)、四角 → 对应角；不符时按
          * touch_read_frame 上方注释改两行映射即可 */
@@ -501,14 +501,15 @@ static void touch_tick(void)
             drag_active = true;
         }
         if (drag_active) {
-            /* 拖拽跟手：手指增量 1:1 移动人物（clamp ±160），不再绕 ±8° 映射 */
-            static int16_t last_x;
-            render_set_drag_off(render_get_drag_off() + ((int)f.x - last_x));
-            last_x = f.x;
+            /* 拖拽跟手：手指增量 1:1 移动人物（X/Y 双向，clamp 内不出屏） */
+            render_set_drag_off(render_get_drag_off() + ((int)f.x - s_drag_last_x));
+            render_set_drag_off_y(render_get_drag_off_y() + ((int)f.y - s_drag_last_y));
+            s_drag_last_x = f.x;
+            s_drag_last_y = f.y;
             note_interaction();
             return;
         }
-        if (!longpress_fired &&
+        if (!longpress_fired && !drag_active &&
             (mp_now_ms() - down_ms) >= LONGPRESS_MS &&
             abs((int)f.x - (int)down_x) < TAP_MOVE_PX &&
             abs((int)f.y - (int)down_y) < TAP_MOVE_PX) {

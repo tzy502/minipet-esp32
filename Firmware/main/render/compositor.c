@@ -103,6 +103,7 @@ static char g_banner_text[48];
 /* IMU 视差（input 任务异步写；对齐 int32 写原子） */
 static volatile int32_t g_tilt_mdeg;
 static volatile int32_t g_drag_off_x;   /* 拖拽：人物屏幕 x 偏移（1:1 跟手，px） */
+static volatile int32_t g_drag_off_y;   /* 拖拽：人物屏幕 y 偏移 */
 static int32_t s_last_ent_tilt;            /* 实体已按此 tilt 值摆放（问题7 跟随标脏） */
 
 /* 脏区网格（16×16 标记；问题1：合帧后合并为单一包围盒上屏） */
@@ -144,7 +145,7 @@ static int32_t ent_tilt_off_px(int32_t tilt_mdeg)
     return px;
 }
 
-/* 拖拽 1:1 跟手偏移（clamp 保证人物不出屏） */
+/* 拖拽 1:1 跟手偏移（X 横向 ±160；Y 纵向 -300..+30，保证人物不出屏） */
 void render_set_drag_off(int32_t px)
 {
     if (px > 160) px = 160;
@@ -153,6 +154,15 @@ void render_set_drag_off(int32_t px)
 }
 
 int32_t render_get_drag_off(void) { return g_drag_off_x; }
+
+void render_set_drag_off_y(int32_t py)
+{
+    if (py > 30) py = 30;
+    if (py < -300) py = -300;
+    g_drag_off_y = py;
+}
+
+int32_t render_get_drag_off_y(void) { return g_drag_off_y; }
 
 /* 实体缓冲 → 屏幕摆放（问题2 修复）：
  * 世界 1x body 锚点 (0,0)（= 人物脚底基准，piece x/y 的原点）2x 后——
@@ -166,7 +176,7 @@ static void ent_screen_pos_at(int32_t tilt_mdeg, int32_t *sx, int32_t *sy)
           + (g_ent_base_wx << RC_SCALE_SHIFT) + ent_tilt_off_px(tilt_mdeg)
           + g_drag_off_x;
     *sy = g_sh - RC_ENT_MARGIN_B + g_ent_cy0 * RC_SCALE + RC_ENT_CENTER_OFF_Y
-          + (g_ent_base_wy << RC_SCALE_SHIFT);
+          + (g_ent_base_wy << RC_SCALE_SHIFT) + g_drag_off_y;
 }
 
 static void ent_screen_pos(int32_t *sx, int32_t *sy)
@@ -996,17 +1006,22 @@ void render_tick(void)
 
     /* 4) 倾斜/拖拽视差 → 实体 x 偏移跟随（问题6/7 可见反馈：±8° ↔ ±8px；
      * 条带偏移变化已在步骤 2 标脏，实体需另行以新旧位置标脏防残影） */
-    static int32_t s_last_drag_off;
+    static int32_t s_last_drag_x, s_last_drag_y;
     if (g_tilt_mdeg != s_last_ent_tilt) {
         mark_ent_at(s_last_ent_tilt);        /* 旧位置 */
         s_last_ent_tilt = g_tilt_mdeg;
         mark_ent();                          /* 新位置 */
         any = true;
     }
-    if (g_drag_off_x != s_last_drag_off) {
-        mark_ent();                          /* 旧位置（含旧 drag 偏移） */
-        s_last_drag_off = g_drag_off_x;
-        mark_ent();                          /* 新位置（含新 drag 偏移） */
+    /* 拖拽：旧位置必须用【旧偏移】标记（此前 mark_ent 两次都读新值，
+     * 旧位置永不重绘 → 拖动轨迹残影，真机照片实证） */
+    if (g_drag_off_x != s_last_drag_x || g_drag_off_y != s_last_drag_y) {
+        int32_t ox = g_drag_off_x, oy = g_drag_off_y;
+        g_drag_off_x = s_last_drag_x; g_drag_off_y = s_last_drag_y;
+        mark_ent();                          /* 旧位置 */
+        g_drag_off_x = ox; g_drag_off_y = oy;
+        mark_ent();                          /* 新位置 */
+        s_last_drag_x = ox; s_last_drag_y = oy;
         any = true;
     }
 
