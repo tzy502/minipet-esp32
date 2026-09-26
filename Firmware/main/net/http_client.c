@@ -149,6 +149,19 @@ int mp_http_post_json(const char *path, const char *json_body,
 /* ------------------------------------------------------------------ */
 /* POST /api/device/hello（E2）                                         */
 /* ------------------------------------------------------------------ */
+
+/* 读数值字段：primary 优先，legacy 兼容旧服务端；缺/非数返回 false。
+ * （直接对 GetNumberValue 的返回值做整型截断在缺字段时是 NaN→未定义行为） */
+static bool json_num2(const cJSON *obj, const char *primary,
+                      const char *legacy, double *out)
+{
+    const cJSON *j = cJSON_GetObjectItem(obj, primary);
+    if (!j && legacy) j = cJSON_GetObjectItem(obj, legacy);
+    if (!j || !cJSON_IsNumber(j)) return false;
+    *out = cJSON_GetNumberValue(j);
+    return true;
+}
+
 int mp_http_hello(void)
 {
     if (!mp_http_server_url()) return -1;
@@ -158,6 +171,9 @@ int mp_http_hello(void)
     cJSON *root = cJSON_CreateObject();
     cJSON_AddNumberToObject(root, "proto", MP_PROTO_VER);
     cJSON_AddStringToObject(root, "uuid", s_uuid);
+    /* 服务端 HelloRequest DTO 绑定字段是 firmware（System.Text.Json web 默认
+     * camelCase）；旧字段 fw 保留一份兼容旧服务端 */
+    cJSON_AddStringToObject(root, "firmware", MP_FIRMWARE_VERSION);
     cJSON_AddStringToObject(root, "fw", MP_FIRMWARE_VERSION);
 
     cJSON *pr = cJSON_CreateObject();                 /* E2: profile */
@@ -183,22 +199,30 @@ int mp_http_hello(void)
     const char *did = cJSON_GetStringValue(cJSON_GetObjectItem(r, "deviceId"));
     if (did) strlcpy(s_device_id, did, sizeof(s_device_id));
 
-    /* 服务端配置（阈值 Web 可配——E6；与 software-design 2.4 同名语义） */
+    /* 服务端配置（阈值 Web 可配——E6；与 software-design 2.4 同名语义）。
+     * 字段名与 DeviceEndpoints.cs hello handler 对照：config.idleToClockMin /
+     * imuDeadzoneDeg / tapLightG / tapHardG（camelCase 原样）；idleMin 为旧
+     * 服务端兼容回退 */
     cJSON *cfg = cJSON_GetObjectItem(r, "config");
-    if (cfg) {
-        cJSON *j;
-        if ((j = cJSON_GetObjectItem(cfg, "idleMin")))
-            g_mp_cfg.idle_to_clock_min = (uint8_t)cJSON_GetNumberValue(j);
-        if ((j = cJSON_GetObjectItem(cfg, "imuDeadzoneDeg")))
-            g_mp_cfg.imu_deadzone_deg = (float)cJSON_GetNumberValue(j);
-        if ((j = cJSON_GetObjectItem(cfg, "tapLightG")))
-            g_mp_cfg.tap_light_g = (float)cJSON_GetNumberValue(j);
-        if ((j = cJSON_GetObjectItem(cfg, "tapHardG")))
-            g_mp_cfg.tap_hard_g = (float)cJSON_GetNumberValue(j);
+    if (cJSON_IsObject(cfg)) {
+        double d;
+        if (json_num2(cfg, "idleToClockMin", "idleMin", &d))
+            g_mp_cfg.idle_to_clock_min = (uint8_t)d;
+        if (json_num2(cfg, "imuDeadzoneDeg", NULL, &d))
+            g_mp_cfg.imu_deadzone_deg = (float)d;
+        if (json_num2(cfg, "tapLightG", NULL, &d))
+            g_mp_cfg.tap_light_g = (float)d;
+        if (json_num2(cfg, "tapHardG", NULL, &d))
+            g_mp_cfg.tap_hard_g = (float)d;
     }
 
-    /* E13：首配对码（服务端入册后返回，已绑定则无此字段） */
-    const char *pair = cJSON_GetStringValue(cJSON_GetObjectItem(r, "pair"));
+    /* E13：首配对码（服务端入册后返回，已绑定则无此字段）。
+     * 真机根因修复：服务端实际下发字段是 pairingCode（DeviceEndpoints.cs
+     * hello handler），旧实现只读 pair → 配对码永远不显示。pairingCode
+     * 优先，pair 保留兼容旧服务端 */
+    const char *pair = cJSON_GetStringValue(cJSON_GetObjectItem(r, "pairingCode"));
+    if (!pair || !pair[0])
+        pair = cJSON_GetStringValue(cJSON_GetObjectItem(r, "pair"));
     if (pair && pair[0]) {
         mp_cmd_t c = { .type = MP_CMD_PAIRING_CODE };
         strlcpy(c.s, pair, sizeof(c.s));

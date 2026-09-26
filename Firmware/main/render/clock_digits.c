@@ -73,6 +73,10 @@ static const cg_t *cg_load(uint16_t part_id)
     g->w  = p->w;
     g->h  = p->h;
     g->stride_b = cg_stride(p->w);
+    /* 证据日志（comma=912 底色块排查）：has_alpha 由 mpak 按 extent 推导——
+     * false = 包内无掩码区（WZ 源不透明，靠此处键控/遮蔽兜底） */
+    ESP_LOGI(TAG, "glyph part %u %ux%u has_alpha=%d mask_bytes=%u",
+             part_id, p->w, p->h, (int)p->has_alpha, p->mask_bytes);
     g->px = heap_caps_malloc((size_t)p->h * g->stride_b,
                              MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!g->px) return NULL;
@@ -265,7 +269,12 @@ void clock_digits_compose(uint16_t *fb, int32_t fb_w, int32_t scale,
                 if (g->mask && !rc_mask_bit(g->mask,
                         (uint32_t)src_y * g->w + (uint32_t)src_x))
                     continue;
-                drow[sxx] = srow[src_x];
+                uint16_t c = srow[src_x];
+                /* 黑色键控：comma(912) 等 WZ 源背景不透明（或掩码全 1）时
+                 * 会整块带出底色；待机时钟纯黑底，纯黑(0x0000)按透明跳过。
+                 * 对全部字形统一生效（数字为亮色字形，不受影响）。 */
+                if (c == 0x0000u) continue;
+                drow[sxx] = c;
             }
         }
     }

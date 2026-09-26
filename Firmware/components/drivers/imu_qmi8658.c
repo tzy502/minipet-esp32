@@ -8,8 +8,8 @@
  * BRING-UP 注意（无法本机验证，寄存器语义按 QMI8658A 数据手册最佳记忆
  * 抄录，标 [核对] 的字段上机首日须对照手册 §寄存器表复核）：
  *  - CTRL1=0x60（SIM=1 I2C 模式 + 地址自增，突发读依赖自增）[核对]
- *  - CTRL7 使能位序（本文件取 bit7=aEN / bit6=gEN）[核对：若读数恒 0，
- *    先查使能位写法，部分代码库用 0x03]
+ *  - CTRL7 使能位序（bit0=aEN / bit1=gEN，数据手册定稿；旧 0xC0=自测位为错，
+ *    真机读数恒 0 已实证）
  *  - CTRL8 DRDY 路由到 INT1 的位段 [核对：错了只影响中断，不影响读取]
  */
 #include "imu_qmi8658.h"
@@ -31,31 +31,32 @@ static const char *TAG = "qmi8658";
 
 #define QMI8658_REG_WHO_AM_I  0x00   /* 期望读数 0x05 */
 #define QMI8658_REG_CTRL1     0x02   /* 串口/地址自增 */
-#define QMI8658_REG_CTRL2     0x03   /* 陀螺量程+ODR */
-#define QMI8658_REG_CTRL3     0x04   /* 加速度量程+ODR */
+#define QMI8658_REG_CTRL2     0x03   /* 加速度量程+ODR（数据手册定稿，原写反） */
+#define QMI8658_REG_CTRL3     0x04   /* 陀螺量程+ODR */
 #define QMI8658_REG_CTRL7     0x08   /* 传感器使能 */
 #define QMI8658_REG_CTRL8     0x09   /* INT1/INT2 路由 */
 #define QMI8658_REG_CTRL9     0x0A   /* CmdDone/软复位 */
-#define QMI8658_REG_DATA      0x65   /* 六轴数据起始（12 字节突发） */
+#define QMI8658_REG_DATA      0x35   /* 六轴数据起始（12 字节突发：acc XYZ + gyro XYZ；0x65 为错值——真机读数恒 0 第二根因） */
 
 #define QMI8658_WHO_AM_I_VAL  0x05
 
 /* CTRL1：SIM=1（I2C 模式）+ 地址自增 [核对] */
 #define QMI8658_CTRL1_VAL     0x60
 
-/* CTRL2（陀螺）：量程档位 [6:4]，ODR [3:0]
- * 本驱动取 gFS=±256dps、ODR 档位 0x6 [档位编码核对手册 ODR 表] */
-#define QMI8658_GFS_256DPS    (0x04 << 4)   /* ±256dps -> 128 LSB/dps */
-#define QMI8658_ODR_BITS      0x06
-#define QMI8658_CTRL2_VAL     (QMI8658_GFS_256DPS | QMI8658_ODR_BITS)
+/* ODR 档位 0x03（同家族可工作实现基准，2026-09-26 定稿；旧 0x06 非法档位） */
+#define QMI8658_ODR_BITS      0x03
 
-/* CTRL3（加速度）：取 aFS=±8g（覆盖 2.0g/4.0g 敲击阈值判定）、同 ODR
- * ±8g -> 16bit 满量程 32768/8 = 4096 LSB/g */
-#define QMI8658_AFS_8G        (0x02 << 4)   /* [档位编码核对] */
-#define QMI8658_CTRL3_VAL     (QMI8658_AFS_8G | QMI8658_ODR_BITS)
+/* CTRL2（加速度，数据手册定稿——原与 CTRL3 写反）：aFS [6:4] + aODR [3:0]
+ * aFS=±8g（覆盖 2.0g/4.0g 敲击阈值判定），±8g -> 4096 LSB/g */
+#define QMI8658_AFS_8G        (0x02 << 4)
+#define QMI8658_CTRL2_VAL     (QMI8658_AFS_8G | QMI8658_ODR_BITS)   /* = 0x23 */
 
-/* CTRL7：bit7=aEN，bit6=gEN [核对] */
-#define QMI8658_CTRL7_VAL     0xC0
+/* CTRL3（陀螺）：gFS [6:4] + gODR [3:0]，gFS=±256dps -> 128 LSB/dps */
+#define QMI8658_GFS_256DPS    (0x04 << 4)
+#define QMI8658_CTRL3_VAL     (QMI8658_GFS_256DPS | QMI8658_ODR_BITS)   /* = 0x43 */
+
+/* CTRL7：bit0=aEN，bit1=gEN（数据手册） */
+#define QMI8658_CTRL7_VAL     0x03   /* bit0=aEN bit1=gEN（QMI8658A 数据手册；0xC0 是自测位——真机读数恒 0 根因，2026-09-26 定稿） */
 
 /* CTRL8：DRDY 路由到 INT1 [核对：位段随手册定，错了只丢中断不丢数据] */
 #define QMI8658_CTRL8_VAL     0xC0

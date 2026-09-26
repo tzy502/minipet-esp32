@@ -440,6 +440,23 @@ static void strip_blit(const rc_strip_t *s, int32_t rx0, int32_t ry0,
 
 /* ================= 区域合成（全层重算，幂等） ================= */
 
+/* 横幅字形像素块填充（问题3 描边用）：scaled 块向四周外扩 grow px 涂 color，
+ * 严格裁剪到本合成区域列范围 [clip_x, clip_x+clip_w) 与横幅带行 [by0, by1)
+ * ——g_fb 常驻，绝不可写出区域外（会污染后续增量合成的残留画面） */
+static void banner_fill_block(int32_t px0, int32_t py0, int32_t grow,
+                              uint16_t color, int32_t clip_x, int32_t clip_w,
+                              int32_t by0, int32_t by1)
+{
+    for (int32_t py = py0 - grow; py < py0 + RC_BANNER_SCALE + grow; py++) {
+        if (py < by0 || py >= by1) continue;
+        uint16_t *drow = g_fb + (size_t)py * g_sw;
+        for (int32_t px = px0 - grow; px < px0 + RC_BANNER_SCALE + grow; px++) {
+            if (px < clip_x || px >= clip_x + clip_w || px >= g_sw) continue;
+            drow[px] = color;
+        }
+    }
+}
+
 static void compose_region(int32_t x, int32_t y, int32_t w, int32_t h)
 {
     if (x < 0) { w += x; x = 0; }
@@ -523,7 +540,10 @@ static void compose_region(int32_t x, int32_t y, int32_t w, int32_t h)
         }
     }
 
-    /* 7) 未配网常驻横幅（问题4：顶部 480×28 深色底白字，compose 最顶层） */
+    /* 7) 未配网常驻横幅（问题4：顶部 480×28 深色底白字，compose 最顶层）
+     * 取字模（与 font5x7.h 数据格式核对一致）：下标=字符 ASCII 值（指定初始化器，
+     * 等价 字符-' ' 起点式表），每字符 5 列字节、无 stride，bit0=顶行。
+     * 问题3 可读性加固：先整趟 1px 黑描边（块外扩 1px）再整趟白字填充。 */
     if (g_banner_on) {
         int32_t by0 = y > 0 ? y : 0;
         int32_t by1 = (y + h < RC_BANNER_H) ? y + h : RC_BANNER_H;
@@ -532,29 +552,26 @@ static void compose_region(int32_t x, int32_t y, int32_t w, int32_t h)
                 uint16_t *drow = g_fb + (size_t)r * g_sw;
                 for (int32_t c = x; c < x + w; c++) drow[c] = RC_BANNER_BG;
             }
-            int32_t gx = RC_BANNER_PAD_X;
-            for (const char *p = g_banner_text; *p && gx < g_sw; p++) {
-                unsigned char u = (unsigned char)*p;
-                if (u >= 128) u = '?';
-                const uint8_t *cols = MP_FONT5X7[u];
-                for (int col = 0; col < MP_FONT_GLYPH_W; col++) {
-                    for (int row = 0; row < MP_FONT_GLYPH_H; row++) {
-                        if (!(cols[col] & (1u << row))) continue;
-                        int32_t px0 = gx + col * RC_BANNER_SCALE;
-                        int32_t py0 = RC_BANNER_PAD_Y + row * RC_BANNER_SCALE;
-                        for (int32_t dy = 0; dy < RC_BANNER_SCALE; dy++) {
-                            int32_t py = py0 + dy;
-                            if (py < by0 || py >= by1) continue;
-                            uint16_t *drow = g_fb + (size_t)py * g_sw;
-                            for (int32_t dx = 0; dx < RC_BANNER_SCALE; dx++) {
-                                int32_t px = px0 + dx;
-                                if (px >= x && px < x + w && px < g_sw)
-                                    drow[px] = RC_BANNER_FG;
-                            }
+            for (int pass = 0; pass < 2; pass++) {
+                int32_t gx = RC_BANNER_PAD_X;
+                for (const char *p = g_banner_text; *p && gx < g_sw; p++) {
+                    unsigned char u = (unsigned char)*p;
+                    if (u >= 128) u = '?';
+                    const uint8_t *cols = MP_FONT5X7[u];
+                    for (int col = 0; col < MP_FONT_GLYPH_W; col++) {
+                        for (int row = 0; row < MP_FONT_GLYPH_H; row++) {
+                            if (!(cols[col] & (1u << row))) continue;
+                            int32_t px0 = gx + col * RC_BANNER_SCALE;
+                            int32_t py0 = RC_BANNER_PAD_Y + row * RC_BANNER_SCALE;
+                            banner_fill_block(px0, py0,
+                                              pass == 0 ? 1 : 0,
+                                              pass == 0 ? RC_BANNER_OUTLINE
+                                                        : RC_BANNER_FG,
+                                              x, w, by0, by1);
                         }
                     }
+                    gx += (MP_FONT_GLYPH_W + 1) * RC_BANNER_SCALE;
                 }
-                gx += (MP_FONT_GLYPH_W + 1) * RC_BANNER_SCALE;
             }
         }
     }
@@ -790,15 +807,17 @@ void render_tick(void)
     int64_t now_us = esp_timer_get_time();
 
     if (g_menu) {
-        /* MENU：LVGL 整屏离屏 → 直拷 framebuffer → 上屏（合成器让路） */
+        /* MENU：LVGL 整屏离屏 → 直拷 framebuffer → 上屏（合成器让路）。
+         * 问题4 加固：每帧全屏重绘。DIRECT 模式下 LVGL 只重绘失效区，
+         * menu_buf 常驻持有完整画面；若按脏 bbox 增量上屏，LVGL「本帧无
+         * 失效区」时无 flush → 不 blit，未刷新区域与残留叠加会闪烁。 */
         lv_timer_handler();
-        int32_t mx, my, mw, mh;
-        if (bridge_menu_take_dirty(&mx, &my, &mw, &mh)) {
-            const uint16_t *mb = bridge_menu_buf();
-            for (int32_t r = my; r < my + mh; r++)
-                memcpy(g_fb + (size_t)r * g_sw + mx,
-                       mb + (size_t)r * g_sw + mx, (size_t)mw * 2u);
-            blit_be(mx, my, mw, mh, g_fb + (size_t)my * g_sw + mx, g_sw);
+        const uint16_t *mb = bridge_menu_buf();
+        if (mb) {
+            for (int32_t r = 0; r < g_sh; r++)
+                memcpy(g_fb + (size_t)r * g_sw, mb + (size_t)r * g_sw,
+                       (size_t)g_sw * 2u);
+            blit_be(0, 0, g_sw, g_sh, g_fb, g_sw);
         }
         return;
     }

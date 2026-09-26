@@ -2,9 +2,10 @@
  * input_dispatch.c — 交互分发（E6 触摸/重力/力度/按键 + E10 表情状态机）
  *
  * 采样拓扑（4.1：APP 核 input 任务）：
- *   - 触摸 touch_read() 20ms 轮询（MENU 态停读——LVGL indev 接管，防双读）
- *   - IMU imu_wait_event() 双中断（GPIO17/21）唤醒采样，非轮询
- *   - 菜单键 key_gpio18 30ms 防抖轮询
+ *   - 触摸 touch_read() ~25ms 轮询（MENU 态停读——LVGL indev 接管，防双读）
+ *   - IMU wait_event() DRDY 中断唤醒 + 20ms 超时兜底轮询（~50Hz，中断没通
+ *     也不影响采样）；任务启动时读回 CTRL7 自愈使能位（见 imu_link_selfcheck）
+ *   - 菜单键 key_gpio18 30ms 防抖轮询（只在按下沿触发 + 250ms 再上膛）
  *   - 1s 慢速节拍：闲置→DOZE 计时（state_machine_tick_1hz）、电池/温度巡检
  *   - 静置随机稀有表情（E10：wink/chu/qBlue 低频）
  */
@@ -18,9 +19,13 @@
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 
+#include "esp_log.h"
+
 #include "app_core.h"
 #include "hal_contract.h"
 #include "state_machine.h"
+
+static const char *TAG = "input";
 
 /* ------------------------------------------------------------------ */
 /* 参数（默认值；阈值可被服务端下发覆盖——E6「阈值全部 Web 可配」）       */
@@ -38,6 +43,19 @@
 #define TEMP_CHK_S          60
 #define TEMP_HOT_C          45.0f
 #define IDLE_RARE_EXPR_S    30      /* 静置时稀有表情的滚动窗口（E10） */
+
+/* 日志节流 / 键盘硬化 */
+#define KEY_REARM_MS        250     /* 菜单键两次触发的最小间隔（防连跳兜底） */
+#define IMU_FAIL_LOG_N      40      /* IMU 连续失败 ≈1s（50Hz）→ 首报 */
+#define IMU_ERR_RELOG_MS    5000    /* IMU 持续失败时每 5s 重复一条 */
+#define TOUCH_FAIL_LOG_N    40      /* 触摸连续读失败 ≈1s → 首报 */
+#define TOUCH_ERR_RELOG_MS  5000    /* 触摸持续失败时每 5s 重复一条 */
+
+/* QMI8658 CTRL7（0x08）：bit0=aEN bit1=gEN（QMI8658A 手册 Register Map 口径；
+ * 加速度+陀螺同开=0x03）。驱动 imu_qmi8658.c 写了 0xC0（bit7/6=自测位），
+ * 传感器从未使能 → 数据恒 0。本文件启动时读回自愈，见 imu_link_selfcheck。 */
+#define QMI_CTRL7_REG       0x08
+#define QMI_CTRL7_ACC_GYR   0x03
 
 /* ------------------------------------------------------------------ */
 /* 倾斜状态（渲染层直读做视差；只在此处做死区+防抖）                     */
@@ -165,7 +183,14 @@ void input_get_tilt(float *roll_deg, float *pitch_deg, uint8_t *bits)
 }
 
 /* 从加速度矢量推角度（静止/低动态假设；IMU 中断触发意味着有动作，
- * 采样后的短暂动态由 300ms 防抖吸收） */
+ * 采样后的短暂动态由 300ms 防抖吸收）。
+ *
+ * 轴选择结论（问题1 ③）：QMI8658 标准贴装 X=板宽向（左右）、Y=板高向
+ * （上下）、Z=屏幕法向朝外。板子左右倾斜=绕「指向使用者外侧」的水平轴
+ * 旋转 → 改变重力在板坐标系的左右向分量（X）→ roll 用 X：
+ * roll=atan2(-ax,√(ay²+az²))；上下倾斜（抬顶边）改变 Y → pitch 用 Y。
+ * 验证：看 tilt_fsm_tick 变迁日志里的 acc 三分量——若真机左右倾斜时
+ * ay 摆动而 ax 几乎不动（芯片转 90° 贴装），把本函数 roll 的 x/y 对调即可。 */
 static void accel_to_angles(const imu_accel_t *a, float *roll, float *pitch)
 {
     float norm = sqrtf(a->x_g * a->x_g + a->y_g * a->y_g + a->z_g * a->z_g);
@@ -208,7 +233,17 @@ static void tilt_fsm_tick(const imu_accel_t *a)
     /* 只报进入/退出（E6：不上报角度流；视觉由渲染层本地驱动） */
     uint8_t entered = bits & ~s_tilt_bits;
     uint8_t exited  = s_tilt_bits & ~bits;
+    uint8_t prev    = s_tilt_bits;
     s_tilt_bits = bits;
+
+    /* 节流日志：只在状态变迁时打一条（含 roll/pitch 与原始三分量，
+     * 真机上直接核对轴向假设与死区/防抖行为；整数打印避免 %f 依赖） */
+    int rd = (int)(s_roll_deg * 10.0f);
+    int pd = (int)(s_pitch_deg * 10.0f);
+    ESP_LOGI(TAG, "倾斜 0x%02X->0x%02X roll=%d.%d pitch=%d.%d (acc %d,%d,%d)mg",
+             prev, bits, rd / 10, abs(rd % 10), pd / 10, abs(pd % 10),
+             (int)(a->x_g * 1000.0f), (int)(a->y_g * 1000.0f),
+             (int)(a->z_g * 1000.0f));
 
     /* 问题7 修复「回正不回中」：视差角度跟随稳定态——左右倾斜中透传当前
      * roll，退出（含回死区内）清零；旧实现只在变迁时透传 roll，退出后
@@ -321,6 +356,8 @@ static void touch_tick(void)
     static int64_t down_ms;
     static bool longpress_fired;
     static bool drag_active;              /* 问题6：本次按住已进入水平拖动 */
+    static int fail_cnt;                  /* 触摸 I2C 连续读失败计数 */
+    static int64_t fail_last_log_ms;
 
     if (state_machine_menu_open()) {
         /* E6 胶水定稿：菜单是独立全屏窗口，触摸归菜单不穿透——
@@ -335,7 +372,21 @@ static void touch_tick(void)
     }
 
     touch_sample_t t;
-    if (!mp_touch_read(&t)) return;
+    if (!mp_touch_read(&t)) {
+        /* 问题3 兜底：读失败显式报错不静默（首报 ≈1s，之后每 5s 一条） */
+        fail_cnt++;
+        if (fail_cnt == TOUCH_FAIL_LOG_N ||
+            (fail_cnt > TOUCH_FAIL_LOG_N &&
+             mp_now_ms() - fail_last_log_ms >= TOUCH_ERR_RELOG_MS)) {
+            fail_last_log_ms = mp_now_ms();
+            ESP_LOGE(TAG, "触摸读取失败（I2C 连续 %d 次）——轻点/拖拽不可用", fail_cnt);
+        }
+        return;
+    }
+    if (fail_cnt >= TOUCH_FAIL_LOG_N) {
+        ESP_LOGI(TAG, "触摸读取恢复");
+    }
+    fail_cnt = 0;
 
     if (t.touched && !down) {
         down = true;
@@ -343,6 +394,9 @@ static void touch_tick(void)
         down_ms = mp_now_ms();
         longpress_fired = false;
         drag_active = false;
+        /* 节流：只在按下沿打一条坐标，确认 CST9220 坐标通路（问题3） */
+        ESP_LOGI(TAG, "触摸按下 (%d,%d)%s", t.x, t.y,
+                 (t.x == 0 && t.y == 0) ? " 坐标全0，疑似帧偏移错位(CST9220_OFF_*)" : "");
     } else if (t.touched && down) {
         int dx = (int)t.x - (int)down_x;
         /* 问题6：按住并水平拖动（≥TAP_MOVE_PX）→ 倾斜视差同款效果：
@@ -394,11 +448,32 @@ static void touch_tick(void)
 /* ================================================================== */
 /* 菜单键（GPIO18，E6：任何可用物理键=菜单键）                           */
 /* ================================================================== */
+/* 菜单键按下沿：POKER/OFFLINE→MENU，MENU→POKER（DOZE 下=先唤醒）。
+ * 状态机内部锁竞争时会静默丢事件（handle 里 take 失败直接 return），
+ * 这里用 before/after 迁移日志把「按了没反应」暴露出来（问题2）。 */
+static void key_fire_menu_toggle(void)
+{
+    mp_state_t before = state_machine_current();
+    state_machine_handle(MP_SM_EV_MENU_KEY);
+    mp_state_t after = state_machine_current();
+    if (before != after) {
+        ESP_LOGI(TAG, "菜单键：%s -> %s（%s）", state_machine_name(before),
+                 state_machine_name(after),
+                 (after == MP_ST_MENU) ? "菜单全屏" : "宠物画面");
+    } else if (before == MP_ST_POKER || before == MP_ST_MENU ||
+               before == MP_ST_OFFLINE || before == MP_ST_CLOCK_DOZE) {
+        /* 该迁移本应发生却没发生（锁竞争丢事件），值得一条告警；
+         * OTA/FATAL/配网态菜单键本就无效，不打日志防刷屏 */
+        ESP_LOGW(TAG, "菜单键未迁移（态 %s，疑似事件被丢）", state_machine_name(before));
+    }
+}
+
 static void key_tick(void)
 {
     static bool raw_last = false;
     static bool stable = false;
     static int64_t raw_change_ms = 0;
+    static int64_t next_fire_ok_ms = 0;    /* 再上膛时刻（连跳兜底） */
 
     bool pressed = key_gpio18_pressed();   /* 低电平=按下 */
     int64_t now = mp_now_ms();
@@ -409,8 +484,11 @@ static void key_tick(void)
     }
     if ((now - raw_change_ms) >= 30 && pressed != stable) {
         stable = pressed;
-        if (stable) {                      /* 按下沿：呼出/收起选择器（E7） */
-            state_machine_handle(MP_SM_EV_MENU_KEY);
+        if (stable && now >= next_fire_ok_ms) {
+            /* 只在【按下沿】触发、释放沿只上膛 → 一次按压一次迁移；
+             * 250ms 再上膛窗兜底磨损触点 >30ms 的慢抖（防 enter+exit 连跳） */
+            next_fire_ok_ms = now + KEY_REARM_MS;
+            key_fire_menu_toggle();
         }
         note_interaction();
     }
@@ -460,6 +538,50 @@ static void slow_tick(int64_t idle_ms)
 }
 
 /* ================================================================== */
+/* IMU 通路自愈 + 自检（问题1 根因）                                     */
+/* ================================================================== */
+/* 根因：驱动 imu_qmi8658.c 写 CTRL7=0xC0——按 QMI8658A 手册 Register Map，
+ * bit0=aEN / bit1=gEN 才是传感器使能（bit7/6 为自测位 aST/gST），0xC0 两个
+ * 传感器都没开 → 数据寄存器恒 0 → norm<0.5 兜底把角度永久钉在 0：倾斜/
+ * 拍打/摇晃全灭；而 WHO_AM_I 校验通过、驱动照打「QMI8658 就绪」——正是
+ * 「就绪但完全无效」的假象。驱动文件不在本次修改边界 → 消费侧启动时读回
+ * 自愈一次。永久修复点（主线程落地）：imu_qmi8658.c 的
+ * QMI8658_CTRL7_VAL 0xC0 → 0x03。 */
+static void imu_link_selfcheck(void)
+{
+    if (!imu_qmi8658_ready()) {
+        ESP_LOGE(TAG, "IMU 未就绪（init 失败）：倾斜/拍打/摇晃不可用");
+        return;
+    }
+    i2c_master_dev_handle_t dev = i2c_bus_find("qmi8658");
+    if (dev) {
+        uint8_t ctrl7 = 0;
+        if (i2c_bus_read_reg8v(dev, QMI_CTRL7_REG, &ctrl7, 1) == ESP_OK &&
+            ctrl7 != QMI_CTRL7_ACC_GYR) {
+            i2c_bus_write_reg8(dev, QMI_CTRL7_REG, QMI_CTRL7_ACC_GYR);
+            ESP_LOGW(TAG, "IMU CTRL7=0x%02X 使能位错误(aEN/gEN 未开) -> 复写 0x03",
+                     ctrl7);
+        }
+    }
+    /* 使能后等首批数据：静止重力 ≈1g；200ms 内仍无有效矢量即通路不通 */
+    for (int i = 0; i < 5; i++) {
+        vTaskDelay(pdMS_TO_TICKS(40));
+        imu_accel_t a;
+        if (mp_imu_read_accel(&a)) {
+            float norm = sqrtf(a.x_g * a.x_g + a.y_g * a.y_g + a.z_g * a.z_g);
+            if (norm > 0.5f) {
+                ESP_LOGI(TAG, "IMU 通路自检 OK：重力 (%d,%d,%d)mg",
+                         (int)(a.x_g * 1000.0f), (int)(a.y_g * 1000.0f),
+                         (int)(a.z_g * 1000.0f));
+                return;
+            }
+        }
+    }
+    ESP_LOGE(TAG, "IMU 读取失败：CTRL7 修复后仍无有效重力（读数全 0）"
+                  "——驱动层需核对 CTRL7/量程档位/接线");
+}
+
+/* ================================================================== */
 /* 任务入口                                                             */
 /* ================================================================== */
 void input_dispatch_task(void *arg)
@@ -468,20 +590,46 @@ void input_dispatch_task(void *arg)
     key_gpio18_init();
     srand((unsigned)mp_now_ms());
     s_last_ax = 0;
+    imu_link_selfcheck();
+
+    static int imu_fail_cnt;              /* 连续失败/全 0 采样计数 */
+    static int64_t imu_err_last_ms;
 
     for (;;) {
-        /* IMU 采样通路（问题7 排查结论）：
-         *  - 主路：DRDY 中断（GPIO17/INT1）唤醒采样；
-         *  - 兜底：mp_imu_wait_event 20ms 超时返回后【仍然无条件读一次】
-         *    （下方 if 与 wait 返回值无关）→ 中断没配通时等效 50Hz 轮询，
-         *    远快于任务书要求的 100ms 轮询兜底，倾斜判定不受影响。
-         *    [待真机验证] 若日志/现象表明 read 持续失败（I2C 错），倾斜将
-         *    无更新——届时查 CTRL7/CTRL8 使能与 DRDY 位段（驱动内 [核对] 项）。 */
         imu_accel_t accel;
-        mp_imu_wait_event(pdMS_TO_TICKS(20));
-        if (mp_imu_read_accel(&accel)) {
+        if (imu_qmi8658_ready()) {
+            /* 主路：DRDY 中断（GPIO17/INT1）唤醒；兜底：20ms 超时后
+             * 【仍然无条件读一次】→ 中断没配通时等效 ~50Hz 轮询（采样
+             * 循环不被阻塞，倾斜判定不受中断影响）。 */
+            mp_imu_wait_event(pdMS_TO_TICKS(20));
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(20));   /* IMU 不在线：维持 ~50Hz 节拍防忙转 */
+        }
+
+        bool got = mp_imu_read_accel(&accel);
+        float norm = got ? sqrtf(accel.x_g * accel.x_g + accel.y_g * accel.y_g +
+                                 accel.z_g * accel.z_g) : 0.0f;
+        /* 兜底报错（问题1）：读失败【或读数全 0（<0.05g，静止现实不存在）】
+         * 都显式报「IMU 读取失败」，不再静默——前者 I2C/器件问题，后者典型
+         * 即 CTRL7 使能未开。节流：累计 ≈1s 首报 + 每 5s 重复。 */
+        if (got && norm > 0.05f) {
+            if (imu_fail_cnt >= IMU_FAIL_LOG_N) {
+                ESP_LOGI(TAG, "IMU 采样恢复");
+            }
+            imu_fail_cnt = 0;
             tilt_fsm_tick(&accel);
             force_tick(&accel);
+        } else if (++imu_fail_cnt == IMU_FAIL_LOG_N ||
+                   (imu_fail_cnt > IMU_FAIL_LOG_N &&
+                    mp_now_ms() - imu_err_last_ms >= IMU_ERR_RELOG_MS)) {
+            imu_err_last_ms = mp_now_ms();
+            if (!got) {
+                ESP_LOGE(TAG, "IMU 读取失败（I2C 连续 %d 次）——倾斜不可用",
+                         imu_fail_cnt);
+            } else {
+                ESP_LOGE(TAG, "IMU 读取失败（连续 %d 次读数全 0，传感器未出数）"
+                              "——倾斜不可用，查 CTRL7 使能", imu_fail_cnt);
+            }
         }
 
         touch_tick();
