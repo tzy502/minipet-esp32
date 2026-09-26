@@ -6,6 +6,7 @@ using MinipetServer.Device;
 using MinipetServer.Health;
 using MinipetServer.Manifest;
 using MinipetServer.Music;
+using MinipetServer.Services;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -27,7 +28,9 @@ builder.Services.AddSingleton<QqMusicSource>();
 builder.Services.AddSingleton<IMusicSource>(sp => sp.GetRequiredService<WzMusicSource>());
 builder.Services.AddSingleton<IMusicSource>(sp => sp.GetRequiredService<QqMusicSource>());
 builder.Services.AddSingleton<BgmRouter>();              // 音源路由 + 同源降级（E8）
-builder.Services.AddSingleton<ThumbService>();           // 64×64 缩略图 + 磁盘缓存
+builder.Services.AddSingleton<CacheManager>();           // WZ 位图/精灵 LRU（纸娃娃缩略图渲染共享）
+builder.Services.AddSingleton<WzService>();              // WZ 读取（catalog API / 纸娃娃真实缩略图共用）
+builder.Services.AddSingleton<ThumbService>();           // 64×64 缩略图 + 磁盘缓存（part/paperdoll 走真实渲染）
 builder.Services.AddSingleton<PresetStore>();            // 纸娃娃预设（data/presets/）
 
 builder.Services.ConfigureHttpJsonOptions(o =>
@@ -46,6 +49,41 @@ cfgSvc.Changed += e =>
     app.Logger.LogInformation("[Config] 已热重载（external={External}，WZ={Wz}）", e.External, e.New.Wz.DataPath);
 router.Failover += e =>
     app.Logger.LogWarning("[BgmRouter] failover {Kind} source={Source} track={Track}: {Reason}", e.Kind, e.Source, e.TrackId, e.Reason);
+
+// ── WZ 启动加载（catalog API / 纸娃娃真实缩略图依赖）──────────────────────
+// 后台线程加载（全量目录加载耗时数秒，不阻塞监听）；路径取运行时配置 Wz.DataPath
+// （设置页可改），热重载换路径时自动重载。失败只记日志：相关端点按 IsLoaded 降级
+// （catalog 503 / 缩略图回退占位），服务本身照常起。
+var wzSvc = app.Services.GetRequiredService<WzService>();
+void LoadWzFromConfig(string dataPath)
+{
+    var (ok, err) = wzSvc.LoadWz("", dataPath);
+    if (ok) app.Logger.LogInformation("[Wz] WZ 已加载：{Path}", dataPath);
+    else app.Logger.LogWarning("[Wz] WZ 加载失败（{Path}）：{Error} —— catalog/纸娃娃缩略图将降级", dataPath, err);
+}
+_ = Task.Run(() => LoadWzFromConfig(cfgSvc.Current.Wz.DataPath));
+cfgSvc.Changed += e =>
+{
+    if (!string.Equals(e.New.Wz.DataPath, e.Old.Wz.DataPath, StringComparison.OrdinalIgnoreCase))
+        Task.Run(() => LoadWzFromConfig(e.New.Wz.DataPath));
+};
+
+// ── 神子默认预设种子（首启无任何纸娃娃预设时注册，Web 编辑器/设备选择器可见）──
+var presetStore = app.Services.GetRequiredService<PresetStore>();
+if (presetStore.List().All(p => p.Type != "paperdoll"))
+{
+    try
+    {
+        var seedFile = Path.Combine(MiniPet.Export.DeviceProfile.FindSeedRoot(), "default-appearance.json");
+        var seedJson = JsonDocument.Parse(File.ReadAllText(seedFile)).RootElement.Clone();
+        presetStore.Create("神子", "paperdoll", seedJson);
+        app.Logger.LogInformation("[Preset] 已注册默认纸娃娃预设「神子」（seed: {File}）", seedFile);
+    }
+    catch (Exception ex)
+    {
+        app.Logger.LogWarning("[Preset] 神子预设种子注册失败：{Message}", ex.Message);
+    }
+}
 
 // ── 中间件：静态托管 Vue 产物（wwwroot，E3 单容器同源）；API 路由优先 ─────
 app.UseDefaultFiles();
@@ -66,6 +104,7 @@ app.MapGet("/api/health", (ConfigService c, DeviceRegistry reg) => Results.Json(
 
 DeviceEndpoints.Map(app);
 AdminEndpoints.Map(app);
+AdminCatalogEndpoints.Map(app);
 
 // ── SPA fallback（E4 问题2 修复 2026-09-26）：Vue Router 用 createWebHistory
 //    （URI 路径模式），直接访问/刷新 /materials 等非根路径时静态文件中间件

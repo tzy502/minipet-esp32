@@ -1,56 +1,173 @@
 /**
- * 纸娃娃装扮静态占位数据（E4/M4）。
- * 后端素材目录 API（按分类列举部件 id）尚未提供，先静态占位：
- * id 取冒险岛经典编号段（与 Server/seed/default-appearance.json 同命名空间），
- * 后续接真实目录后仅需替换 OPTIONS 的取数来源。
+ * 纸娃娃外观工具层（对齐桌面版，规范：docs/ai/web-paperdoll-alignment.md 第一/四/五章）。
+ * - 16 类目与桌面版 SettingsWindow.Paperdoll 逐字一致，中文标签用两字紧凑无空格版
+ * - 素材选项一律走服务端 catalog API（utils/api getCatalog），禁止静态占位
+ * - 草稿（draft）= 扁平 id 字符串形态；appearance JSON（存预设/下发设备）= 槽位 { id } 对象形态
  */
+import { SHENZI_DEFAULT } from './defaultAppearance'
 
+/** 16 类目（顺序/中文标签/图标/WZ 目录与桌面版一致）；genderFilter = 发型/脸型需按性别过滤。 */
 export const CATEGORIES = [
-  { key: 'hair', label: '发型' },
-  { key: 'face', label: '脸型' },
-  { key: 'coat', label: '上衣' },
-  { key: 'pants', label: '裤/裙' },
-  { key: 'weapon', label: '武器' },
+  { key: 'hair', label: '发型', icon: '💇', folder: 'Hair', genderFilter: true },
+  { key: 'face', label: '脸型', icon: '😊', folder: 'Face', genderFilter: true },
+  { key: 'cap', label: '帽子', icon: '⛑️', folder: 'Cap' },
+  { key: 'cape', label: '披风', icon: '🧣', folder: 'Cape' },
+  { key: 'coat', label: '上衣', icon: '🛡️', folder: 'Coat' },
+  { key: 'overall', label: '套服', icon: '🧥', folder: 'Longcoat' },
+  { key: 'pants', label: '裤子', icon: '👖', folder: 'Pants' },
+  { key: 'shoes', label: '鞋子', icon: '👢', folder: 'Shoes' },
+  { key: 'weapon', label: '武器', icon: '🗡️', folder: 'Weapon' },
+  { key: 'shield', label: '盾牌', icon: '🛡️', folder: 'Shield' },
+  { key: 'glove', label: '手套', icon: '🧤', folder: 'Glove' },
+  { key: 'faceAccessory', label: '面饰', icon: '🎭', folder: 'Accessory' },
+  { key: 'eyeAccessory', label: '眼饰', icon: '👁️', folder: 'Accessory' },
+  { key: 'earring', label: '耳环', icon: '💍', folder: 'Accessory' },
+  { key: 'mount', label: '坐骑', icon: '🏍️', folder: 'TamingMob' },
+  { key: 'chair', label: '椅子', icon: '🪑', folder: 'Install' },
 ]
 
-export const CATEGORY_KEYS = CATEGORIES.map((c) => c.key)
+/** 性别（0 男 / 1 女）。 */
+export const GENDERS = [
+  { value: 0, label: '男' },
+  { value: 1, label: '女' },
+]
 
-// 静态占位选项：value = 部件 id
-export const OPTIONS = {
-  hair: ['30000', '30030', '30060', '30120', '30230', '30310', '30450', '30560'],
-  face: ['20000', '20001', '20004', '20012', '20021', '20035', '20049', '20056'],
-  coat: ['1040002', '1040006', '1040018', '1040036', '1041044', '1041061', '1041083'],
-  pants: ['1060002', '1060006', '1060020', '1061034', '1061085', '1061108'],
-  weapon: ['1302000', '1302013', '1312005', '1322012', '1332005', '1372004', '1402009', '1452008'],
-}
+/** 耳型选项（对齐桌面版 body/ear 渲染分支）。 */
+export const EARS = [
+  { value: 'humanEar', label: '人类' },
+  { value: 'ear', label: '精灵' },
+  { value: 'lefEar', label: '精灵(Lef)' },
+  { value: 'highlefEar', label: '高等精灵' },
+]
 
-export function optionsOf(key) {
-  return (OPTIONS[key] ?? []).map((id) => ({ label: `${id}`, value: id }))
+/** 发型回退名前缀：String.wz 读不到中文名时用 "{分类}_{id}"，回退名不参与同名折叠。 */
+export const HAIR_FALLBACK_PREFIX = '发型_'
+
+/** 空草稿：16 槽全 null（键序同 CATEGORIES）+ 基础字段 + 染色/特效开关。 */
+export function newDraft() {
+  return {
+    gender: 0,
+    skin: 0,
+    bodyId: 2000,
+    ear: 'humanEar',
+    hair: null,
+    face: null,
+    cap: null,
+    cape: null,
+    coat: null,
+    overall: null,
+    pants: null,
+    shoes: null,
+    weapon: null,
+    shield: null,
+    glove: null,
+    faceAccessory: null,
+    eyeAccessory: null,
+    earring: null,
+    mount: null,
+    chair: null,
+    dyeHue: 0,
+    dyeEnabled: false,
+    enableEffect: true,
+  }
 }
 
 /**
- * 拼装缩略图 id：按固定顺序「类目:部件」用 '|' 连接（未选类目跳过）。
- * 例：{ hair: '30000', face: '20000' } → "hair:30000|face:20000"
- * 服务端 /admin/thumb?type=paperdoll 用 id 决定确定性占位渲染（M4 接真实合成）。
+ * 默认装扮（神子）→ 完整草稿。
+ * SHENZI_DEFAULT 本身是 id 字符串形态，复用 appearanceToDraft 的宽容转换并深拷贝，
+ * 缺失字段（如旧数据无 dyeHue）回落 newDraft 默认。
  */
-export function buildThumbId(selection) {
-  return CATEGORY_KEYS.filter((k) => selection?.[k])
-    .map((k) => `${k}:${selection[k]}`)
-    .join('|')
+export function draftFromShenzi() {
+  return appearanceToDraft(SHENZI_DEFAULT)
 }
 
-/** 当前是否至少选了一个部件（预览/保存的前置条件）。 */
-export function hasSelection(selection) {
-  return CATEGORY_KEYS.some((k) => !!selection?.[k])
+/**
+ * 草稿 → 纸娃娃拼串 id（服务端 /admin/thumb?type=paperdoll 按此解析合成）。
+ * 头部 g/ear/body + 16 槽全显式 `key:{id}`，`-` 表示显式清空（null）。
+ * 例：g:0|ear:humanEar|body:2000|hair:36633|face:20094|cap:-|…|chair:-
+ */
+export function buildPaperdollId(draft) {
+  const d = draft ?? {}
+  const head = `g:${d.gender ?? 0}|ear:${d.ear ?? 'humanEar'}|body:${d.bodyId ?? 2000}`
+  const slots = CATEGORIES.map((c) => {
+    const v = d[c.key]
+    return `${c.key}:${v != null && v !== '' ? v : '-'}`
+  })
+  return `${head}|${slots.join('|')}`
 }
 
-/** 转成设备 petConfig 子集（对齐 seed/default-appearance.json 的部件命名）。 */
-export function toPetConfig(selection) {
-  return {
-    hair: selection.hair ?? null,
-    face: selection.face ?? null,
-    coat: selection.coat ?? null,
-    pants: selection.pants ?? null,
-    weapon: selection.weapon ?? null,
+/**
+ * 草稿 → 完整 appearance JSON（存预设/下发设备，形态对齐桌面 CharacterAppearance）。
+ * 槽位字符串包成 { id } 对象，空槽显式 null；skin（皮肤索引）与 bodyId（2000 系）都输出。
+ */
+export function draftToAppearance(draft) {
+  const d = draft ?? {}
+  const out = {}
+  if (d.name != null && d.name !== '') out.name = d.name
+  out.gender = d.gender ?? 0
+  out.skin = d.skin ?? 0
+  out.bodyId = d.bodyId ?? 2000
+  out.ear = d.ear ?? 'humanEar'
+  for (const c of CATEGORIES) {
+    const v = d[c.key]
+    out[c.key] = v != null && v !== '' ? { id: String(v) } : null
   }
+  out.dyeHue = d.dyeHue ?? 0
+  out.dyeEnabled = d.dyeEnabled ?? false
+  out.enableEffect = d.enableEffect ?? true
+  return out
+}
+
+/**
+ * appearance JSON → 草稿（{ id } → 字符串、null → null、缺字段回落 newDraft 默认）。
+ * 兼容纯 id 字符串槽位形态（defaultAppearance.js）；name 参数优先，否则取 appearance.name。
+ */
+export function appearanceToDraft(appearance, name) {
+  const draft = newDraft()
+  if (!appearance) {
+    if (name !== undefined) draft.name = name
+    return draft
+  }
+  for (const key of ['gender', 'skin', 'bodyId', 'ear', 'dyeHue', 'dyeEnabled', 'enableEffect']) {
+    const v = appearance[key]
+    if (v !== undefined && v !== null) draft[key] = v
+  }
+  for (const c of CATEGORIES) {
+    const v = appearance[c.key]
+    draft[c.key] = v == null ? null : typeof v === 'object' ? (v.id != null ? String(v.id) : null) : String(v)
+  }
+  draft.name = name !== undefined ? name : appearance.name
+  return draft
+}
+
+/** 是否发型回退名（"{分类}_{id}" 形态，不参与同名折叠）。 */
+export function isHairFallbackName(name) {
+  return typeof name === 'string' && name.startsWith(HAIR_FALLBACK_PREFIX)
+}
+
+/**
+ * 发型同名折叠分组（纯函数，对齐桌面 GroupHairByName）：
+ * 过滤回退名后按 name 分组，只保留 variants.length > 1 的组，组内按数值 id 升序。
+ * 返回 [{ name, variants }]；组间顺序 = 首次出现顺序（入参已按 id 升序时即稳定）。
+ */
+export function groupHairItems(items) {
+  const groups = new Map()
+  for (const item of items ?? []) {
+    if (!item || isHairFallbackName(item.name)) continue
+    if (!groups.has(item.name)) groups.set(item.name, [])
+    groups.get(item.name).push(item)
+  }
+  const result = []
+  for (const [name, variants] of groups) {
+    if (variants.length < 2) continue
+    variants.sort((a, b) => numericId(a.id) - numericId(b.id))
+    result.push({ name, variants })
+  }
+  return result
+}
+
+/** 部件 id → 数值（排序用）；解析失败排最后（Number.MAX_SAFE_INTEGER）。 */
+export function numericId(id) {
+  const n = parseInt(id, 10)
+  return Number.isNaN(n) ? Number.MAX_SAFE_INTEGER : n
 }

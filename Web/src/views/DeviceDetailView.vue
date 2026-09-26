@@ -4,17 +4,19 @@
  * 换装 = PUT devices/{id} 显式传 petConfig（按设备隔离，manifest rev+1）；
  * 阈值覆盖 = 传 thresholds 对象；显式传 petConfig:null = 清空回默认宠物。
  */
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import {
   NCard, NSpace, NButton, NTag, NDescriptions, NDescriptionsItem, NInput,
   NInputNumber, NCheckbox, NForm, NFormItem, NResult, NSpin, NPopconfirm,
   NImage, NDivider, useMessage,
 } from 'naive-ui'
-import { getDevice, updateDevice, triggerOta, thumbUrl } from '../api/client'
+import { getDevice, updateDevice, triggerOta, getCatalog, paperdollThumbUrl } from '../api/client'
 import { useDevicesStore } from '../stores/devices'
 import AppearancePicker from '../components/AppearancePicker.vue'
-import { buildThumbId, hasSelection, toPetConfig } from '../utils/appearance'
+import {
+  CATEGORIES, GENDERS, newDraft, appearanceToDraft, draftToAppearance, buildPaperdollId,
+} from '../utils/appearance'
 import { fmtTime, fmtAgo } from '../utils/format'
 
 const props = defineProps({ id: { type: String, required: true } })
@@ -35,15 +37,8 @@ async function load() {
     device.value = data?.device ?? null
     health.value = data?.health ?? null
     if (device.value) {
-      // 从 petConfig 回填选择（设备配置与静态占位 id 同命名空间时直接回显）
-      const pc = device.value.petConfig
-      selection.value = {
-        hair: pc?.hair ?? null,
-        face: pc?.face ?? null,
-        coat: pc?.coat ?? null,
-        pants: pc?.pants ?? null,
-        weapon: pc?.weapon ?? null,
-      }
+      // 从 petConfig 回填草稿（完整 appearance；旧 5 槽字符串形态由 appearanceToDraft 宽容兼容）
+      draft.value = appearanceToDraft(device.value.petConfig ?? {})
       const th = device.value.thresholds ?? {}
       thresholdForm.deadzone = th.imuDeadzoneDeg ?? 8
       thresholdForm.light = th.tapLightG ?? 2
@@ -76,21 +71,65 @@ async function saveName() {
   }
 }
 
-// ── 换宠换装 ────────────────────────────────────────────────────────────
-const selection = ref({ hair: null, face: null, coat: null, pants: null, weapon: null })
+// ── 换宠换装（完整 16 槽草稿，与纸娃娃编辑器同一套选择器/合成预览）───────
+const draft = ref(newDraft())
 const applying = ref(false)
 const previewUrl = ref('')
 const hasPetConfig = computed(() => !!device.value?.petConfig)
+const hasAnyWorn = computed(() => CATEGORIES.some((c) => !!draft.value[c.key]))
 
-function refreshPreview() {
-  previewUrl.value = hasSelection(selection.value) ? thumbUrl('paperdoll', buildThumbId(selection.value)) : ''
+// 部件选择器（单类目弹窗）
+const pickerShow = ref(false)
+const pickerPart = ref('hair')
+function openPicker(key) {
+  pickerPart.value = key
+  pickerShow.value = true
 }
+function onPick(v) {
+  draft.value = { ...draft.value, [pickerPart.value]: v ?? null }
+}
+function clearSlot(key) {
+  draft.value = { ...draft.value, [key]: null }
+}
+function clearAll() {
+  draft.value = newDraft()
+}
+
+// 槽位中文名缓存（part → Map(id → name)），失败静默回退显示 id
+const partNames = ref({})
+async function ensureNames(key) {
+  if (partNames.value[key]) return
+  try {
+    const cat = CATEGORIES.find((c) => c.key === key)
+    const data = await getCatalog(key, cat?.genderFilter ? draft.value.gender : undefined)
+    partNames.value[key] = Object.fromEntries(data?.items?.map((it) => [it.id, it.name]) ?? [])
+  } catch { partNames.value[key] = {} }
+}
+CATEGORIES.forEach((c) => ensureNames(c.key))
+function slotLabel(key) {
+  const id = draft.value[key]
+  if (!id) return null
+  return partNames.value[key]?.[id] ? `${partNames.value[key][id]} [${id}]` : id
+}
+
+// 预览：草稿任何变化 300ms 防抖刷新（服务端真实合成）
+let previewTimer = null
+watch(
+  draft,
+  () => {
+    clearTimeout(previewTimer)
+    previewTimer = setTimeout(() => {
+      previewUrl.value = paperdollThumbUrl(buildPaperdollId(draft.value), 192)
+    }, 300)
+  },
+  { deep: true },
+)
 
 async function applyPet(clear = false) {
   applying.value = true
   try {
     // 显式传 null = 清空回默认宠物（后端以「字段出现且为 null」判定）
-    await updateDevice(props.id, { petConfig: clear ? null : toPetConfig(selection.value) })
+    await updateDevice(props.id, { petConfig: clear ? null : draftToAppearance(draft.value) })
     message.success(clear ? '已恢复默认宠物（设备下次 poll 生效）' : '装扮已下发（设备下次 poll 生效）')
     previewUrl.value = ''
     await load()
@@ -207,20 +246,42 @@ async function doOta() {
 
       <n-card title="换宠换装（按设备隔离，E13）" size="small">
         <n-space align="flex-start" :size="20">
-          <div style="flex: 1; min-width: 280px">
-            <AppearancePicker v-model="selection" />
+          <div style="flex: 1; min-width: 320px">
+            <div class="gender-row">
+              <span class="slot-label">性别</span>
+              <n-select
+                :value="draft.gender"
+                :options="GENDERS"
+                size="small"
+                style="width: 120px"
+                @update:value="(v) => (draft = { ...draft, gender: v })"
+              />
+              <span class="hint">发型/脸型列表按性别过滤</span>
+            </div>
+            <div class="slot-grid">
+              <div v-for="cat in CATEGORIES" :key="cat.key" class="slot-row">
+                <span class="slot-icon">{{ cat.icon }}</span>
+                <span class="slot-label">{{ cat.label }}</span>
+                <span class="slot-value" :class="{ worn: !!draft[cat.key] }" :title="slotLabel(cat.key)">
+                  {{ slotLabel(cat.key) || '未穿戴' }}
+                </span>
+                <n-button size="tiny" secondary @click="openPicker(cat.key)">选择…</n-button>
+                <n-button size="tiny" quaternary :disabled="!draft[cat.key]" @click="clearSlot(cat.key)">×</n-button>
+              </div>
+            </div>
           </div>
           <div class="preview-col">
             <div class="preview-box">
               <n-image
-                v-if="previewUrl || hasPetConfig"
-                :src="previewUrl || thumbUrl('paperdoll', device.deviceId)"
+                v-if="previewUrl"
+                :src="previewUrl"
+                :key="previewUrl"
                 width="160"
                 height="160"
                 object-fit="contain"
                 style="border-radius: 8px; background: #f7f7fa"
               />
-              <span v-else class="hint">无预览</span>
+              <span v-else class="hint">装扮后出合成预览</span>
             </div>
             <n-tag size="small" :bordered="false">{{ hasPetConfig ? '当前有自定义装扮' : '当前为默认宠物' }}</n-tag>
           </div>
@@ -234,14 +295,22 @@ async function doOta() {
               清空该设备的自定义装扮，恢复默认宠物？
             </n-popconfirm>
             <n-space>
-              <n-button secondary @click="refreshPreview" :disabled="!hasSelection(selection)">预览组合</n-button>
-              <n-button type="primary" :loading="applying" :disabled="!hasSelection(selection)" @click="applyPet(false)">
+              <n-button secondary @click="clearAll">全部清空</n-button>
+              <n-button type="primary" :loading="applying" :disabled="!hasAnyWorn" @click="applyPet(false)">
                 应用到设备
               </n-button>
             </n-space>
           </n-space>
         </template>
       </n-card>
+
+      <AppearancePicker
+        v-model:show="pickerShow"
+        :model-value="draft[pickerPart]"
+        :part="pickerPart"
+        :gender="draft.gender"
+        @update:model-value="onPick"
+      />
 
       <n-card title="阈值（IMU / 力度 / 待机）" size="small">
         <template #header-extra>
@@ -298,6 +367,16 @@ async function doOta() {
   gap: 0 16px;
 }
 .hint { font-size: 12px; opacity: 0.6; }
+.gender-row { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
+.slot-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 4px 16px; }
+.slot-row { display: flex; align-items: center; gap: 6px; min-height: 30px; }
+.slot-icon { width: 18px; text-align: center; }
+.slot-label { font-size: 12px; opacity: 0.75; width: 34px; flex: none; }
+.slot-value {
+  flex: 1; min-width: 0; font-size: 12px; opacity: 0.45;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.slot-value.worn { opacity: 1; }
 .preview-col { display: flex; flex-direction: column; align-items: center; gap: 8px; }
 .preview-box { width: 160px; height: 160px; display: flex; align-items: center; justify-content: center; }
 .block-center { display: flex; justify-content: center; padding: 48px 0; }

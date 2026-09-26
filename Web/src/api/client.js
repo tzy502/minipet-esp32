@@ -77,6 +77,20 @@ export function deletePreset(id) {
   return http.delete(`/admin/presets/${encodeURIComponent(id)}`).then((r) => r.data)
 }
 
+// ── 纸娃娃素材目录与真实合成缩略图（docs/ai/web-paperdoll-alignment.md 五）────
+// GET /admin/catalog?part={key}&gender={0|1} → { part, total, items: [{ id, name, icon, img? }] }
+// icon 已是完整 URL（/api/admin/thumb?type=part&...）；gender 仅 hair/face 生效，可省略
+// 404/503 不在此兜底，走 axios reject → 上方拦截器统一 serverError 通道
+export function getCatalog(part, gender) {
+  const params = { part }
+  if ((part === 'hair' || part === 'face') && gender !== undefined && gender !== null) params.gender = gender
+  return http.get('/admin/catalog', { params }).then((r) => r.data)
+}
+// 纸娃娃真实合成 PNG 的 URL（id 为 appearance.js buildPaperdollId 拼串），直接喂 <img>，不走 axios
+export function paperdollThumbUrl(id, size = 256) {
+  return `/api/admin/thumb?type=paperdoll&id=${encodeURIComponent(id)}&size=${size}`
+}
+
 // ── 曲库与音源（E8：Web 只管曲库/cookie/启停，不做点歌）───────────────────
 // GET /admin/music/tracks?source=wz|qq → { source, count, tracks: [{id,title,category,bytes}] }
 export function musicTracks(source) {
