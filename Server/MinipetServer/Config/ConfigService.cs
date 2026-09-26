@@ -52,6 +52,10 @@ public sealed class ClockConfig
     public string Comment { get; set; } = "地图时钟位置表（E9 魔法值）：mapId → 烘焙视口内屏幕坐标 [x,y]；Web 可改 → manifest rev+1 → 设备拉新 manifest 生效";
 
     public Dictionary<string, int[]> MapOffsets { get; set; } = new(StringComparer.Ordinal);
+
+    /// <summary>校准口径版本（ClockTableSeeder 写入）：小于当前口径时启动校准全量重算覆盖，
+    /// 等于时只补缺失条目（Web 手改的值永不覆盖）。Web 保存回传请原样携带。</summary>
+    public int Calib { get; set; }
 }
 
 public sealed class MinipetConfig
