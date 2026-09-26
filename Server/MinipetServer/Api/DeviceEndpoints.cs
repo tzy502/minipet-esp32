@@ -74,7 +74,7 @@ public static class DeviceEndpoints
 
     /// <summary>设备注册：profile+UUID+固件版本 → deviceId 与配置。匿名可用（配对只解锁 Web 管理，E13）。</summary>
     private static IResult HandleHello(
-        HelloRequest body, DeviceRegistry reg, ConfigService cfg, DeviceManifestService mfst)
+        HelloRequest body, DeviceRegistry reg, ConfigService cfg, DeviceManifestService mfst, DeviceEventLog eventLog)
     {
         if (string.IsNullOrWhiteSpace(body?.Uuid))
             return Results.Json(new { error = "uuid 必填" }, statusCode: 400);
@@ -92,7 +92,16 @@ public static class DeviceEndpoints
             };
         }
 
+        // 事件日志：注册前先取旧态（首次注册 / 断线后 hello 重新上线）
+        var before = reg.List().FirstOrDefault(d =>
+            string.Equals(d.Uuid, body.Uuid.Trim(), StringComparison.OrdinalIgnoreCase));
+
         var dev = reg.GetOrCreateByUuid(body.Uuid, profile, body.Firmware);
+
+        if (before == null)
+            eventLog.Append(dev.DeviceId, $"设备首次注册（hello 接入，固件 {dev.Firmware}）");
+        else if (!DeviceRegistry.IsOnline(before))
+            eventLog.Append(dev.DeviceId, "设备上线（hello 心跳）");
 
         string? code = null;
         if (!dev.Paired)
@@ -158,11 +167,14 @@ public static class DeviceEndpoints
 
     /// <summary>拉指令队列（长轮询挂起 ≤55s；按 seq 有序取走）。</summary>
     private static async Task<IResult> HandlePoll(
-        HttpContext ctx, string deviceId, long since, DeviceRegistry reg, CommandQueue queue)
+        HttpContext ctx, string deviceId, long since, DeviceRegistry reg, CommandQueue queue, DeviceEventLog eventLog)
     {
         var dev = reg.Get(deviceId);
         if (dev == null) return NotFoundDevice(deviceId);
+        var wasOnline = DeviceRegistry.IsOnline(dev); // Touch 前取旧态：离线→在线即记一行上线
         reg.Touch(deviceId);
+        if (!wasOnline)
+            eventLog.Append(deviceId, "设备上线（poll 心跳）");
 
         var sw = Stopwatch.StartNew();
         var commands = await queue.PollAsync(deviceId, since, PollMaxWait, ctx.RequestAborted);

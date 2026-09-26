@@ -11,7 +11,7 @@ namespace MinipetServer.Api;
 /// <summary>
 /// Web 管理端点（E4/E13，前缀 /api/admin）：设备卡片与配置 / 配对 / 缩略图 /
 /// 纸娃娃预设 CRUD / 曲库与音源管理（cookie 导入·健康·启停）/ 设置读写（WZ 校验）/
-/// 日志（占位）/ OTA 触发。局域网信任模型：v1 无鉴权。
+/// 设备事件日志 / OTA 触发。局域网信任模型：v1 无鉴权。
 /// </summary>
 public static class AdminEndpoints
 {
@@ -28,7 +28,7 @@ public static class AdminEndpoints
             => Detail(id, reg, cfg, health) ?? NotFoundDevice(id));
 
         g.MapPut("/devices/{id}", (string id, DeviceUpdateRequest body, DeviceRegistry reg, ConfigService cfg,
-            HealthReport health, DeviceManifestService mfst) =>
+            HealthReport health, DeviceManifestService mfst, DeviceEventLog eventLog) =>
         {
             var existing = reg.Get(id);
             if (existing == null) return NotFoundDevice(id);
@@ -47,23 +47,37 @@ public static class AdminEndpoints
                 if (body.Thresholds != null) d.Thresholds = body.Thresholds;
             });
             if (updated == null) return NotFoundDevice(id);
-            if (petChanged) mfst.BumpRev(id, "petConfig 变更");
+
+            // 事件日志：重命名 / petConfig 变更（含清空）/ BGM 与阈值保存（预设删除为非设备事件，不记）
+            if (body.Name != null && !string.Equals(existing.Name, updated.Name, StringComparison.Ordinal))
+                eventLog.Append(id, $"设备重命名：「{existing.Name}」→「{updated.Name}」");
+            if (petChanged)
+            {
+                bool cleared = body.PetConfig!.Value.ValueKind == JsonValueKind.Null;
+                eventLog.Append(id, cleared ? "petConfig 清空（回默认宠物）" : "petConfig 变更（换宠换装）");
+                mfst.BumpRev(id, cleared ? "petConfig 清空" : "petConfig 变更");
+            }
+            if (body.Bgm != null)
+                eventLog.Append(id, $"BGM 偏好保存：source={updated.Bgm.Source}，volume={updated.Bgm.Volume}");
+            if (body.Thresholds != null)
+                eventLog.Append(id, "按设备阈值覆盖保存：IMU 死区/轻拍/重拍/待机时钟");
             return Results.Json(new { device = Detail(id, reg, cfg, health) });
         });
 
-        g.MapPost("/pair", (PairRequest body, DeviceRegistry reg) =>
+        g.MapPost("/pair", (PairRequest body, DeviceRegistry reg, DeviceEventLog eventLog) =>
         {
             if (string.IsNullOrWhiteSpace(body?.Code))
                 return Results.Json(new { error = "code 必填" }, statusCode: 400);
             var dev = reg.TryPair(body.Code, body.Name ?? "");
             if (dev == null)
                 return Results.Json(new { error = "配对码无效或已过期（6 位码 10 分钟内有效）" }, statusCode: 404);
+            eventLog.Append(dev.DeviceId,
+                string.IsNullOrWhiteSpace(dev.Name) ? "配对完成（未命名）" : $"配对完成：命名「{dev.Name}」");
             return Results.Json(new { device = dev });
         });
 
         // 缩略图：SkiaSharp + 真实 WZ 渲染，data/cache/thumbs/ 缓存（docs/ai/web-paperdoll-alignment.md §五.服务端2）。
-        // type=part → folder/img 定位部件图标；type=paperdoll → id 拼串整套合成 + size（64/128/192/256）；
-        // 旧 type（mob/npc/…）→ M3 纯色占位（不回归）。
+        // type=part/paperdoll 真实渲染；mob/npc/map 由 MaterialsEndpoints 配套真实化（详见 ThumbService）。
         g.MapGet("/thumb", (ThumbService thumbs, string type, string id, string? folder = null, string? img = null, int? size = null)
             => Results.File(thumbs.GetOrCreatePng(type, id, folder, img, size), "image/png"));
 
@@ -140,7 +154,7 @@ public static class AdminEndpoints
                 ok = true,
                 imported = !string.IsNullOrEmpty(body?.Cookie),
                 health = qq.Health(),
-                note = "cookie 已保存；QQ 源为占位（M10 接入 node 网关后生效）",
+                note = "cookie 已保存；曲库/取链待 M10 node 网关接入（cookie 导入与启停已可用）",
             });
         });
 
@@ -151,6 +165,14 @@ public static class AdminEndpoints
             wzPathExists = Directory.Exists(cfg.Current.Wz.DataPath),
             note = "端口属部署层 .env（MINIPET_PORT），不入 appsettings，此页只读展示（E3 定稿）",
         }));
+
+        // WZ 路径独立校验（设置页选完路径即时验证，不落盘）：恒 200——ok=false 表校验
+        // 不通过而非 HTTP 错误；空 body/缺 path 由 ValidateWzPath 分支回「不能为空」。
+        g.MapPost("/settings/validate-path", (ValidatePathRequest body, ConfigService cfg) =>
+        {
+            var (ok, message) = cfg.ValidateWzPath(body?.Path);
+            return Results.Json(new { ok, message });
+        });
 
         g.MapPut("/settings", (MinipetConfig body, ConfigService cfg) =>
         {
@@ -165,8 +187,8 @@ public static class AdminEndpoints
             });
         });
 
-        // ── 日志（占位：E14 环形日志拉取，M10 接入；先回健康事件流救急）──
-        g.MapGet("/logs/{id}", (string id, DeviceRegistry reg, HealthReport health) =>
+        // ── 设备事件日志（E14：服务端环形日志，每设备 200 条，重启清零）+ 健康事件流 ──
+        g.MapGet("/logs/{id}", (string id, DeviceRegistry reg, HealthReport health, DeviceEventLog eventLog) =>
         {
             var dev = reg.Get(id);
             if (dev == null) return NotFoundDevice(id);
@@ -174,14 +196,16 @@ public static class AdminEndpoints
             return Results.Json(new
             {
                 deviceId = id,
-                note = "设备环形日志拉取为占位（E14/M10）；当前返回健康事件流（最近 20 条）",
-                lines = Array.Empty<string>(),
+                online = DeviceRegistry.IsOnline(dev),
+                note = "服务端事件环形日志（每设备 200 条，服务重启清零）",
+                lines = eventLog.Tail(id),
                 events = summary?.Recent ?? new List<DeviceEventRecord>(),
             });
         });
 
         // ── OTA 触发（E11：入队升级指令，设备 WiFi 拉包自更新，双分区回滚）──
-        g.MapPost("/ota/{id}", (string id, OtaRequest body, DeviceRegistry reg, CommandQueue queue, DeviceManifestService mfst) =>
+        g.MapPost("/ota/{id}", (string id, OtaRequest body, DeviceRegistry reg, CommandQueue queue,
+            DeviceManifestService mfst, DeviceEventLog eventLog) =>
         {
             var dev = reg.Get(id);
             if (dev == null) return NotFoundDevice(id);
@@ -191,6 +215,7 @@ public static class AdminEndpoints
             var url = $"/api/device/firmware/{body.Ver}.bin";
             var cmd = queue.Enqueue(id, "ota", new { ver = body.Ver, url });
             mfst.BumpRev(id, $"OTA {body.Ver} 下发");
+            eventLog.Append(id, $"OTA 下发：v{body.Ver}（seq {cmd.Seq}）");
             return Results.Json(new { queued = true, seq = cmd.Seq, ver = body.Ver, url });
         });
 
@@ -241,6 +266,12 @@ public static class AdminEndpoints
     public sealed class CookieRequest
     {
         public string? Cookie { get; set; }
+    }
+
+    /// <summary>WZ 路径独立校验请求体（POST /settings/validate-path，不落盘）。</summary>
+    public sealed class ValidatePathRequest
+    {
+        public string? Path { get; set; }
     }
 
     public sealed class OtaRequest

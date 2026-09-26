@@ -21,6 +21,7 @@ builder.Services.AddSingleton(paths);
 builder.Services.AddSingleton<ConfigService>();          // data/config/appsettings.json + 热重载
 builder.Services.AddSingleton<DeviceRegistry>();         // 设备表（E13）
 builder.Services.AddSingleton<CommandQueue>();           // 每设备指令队列（E2）
+builder.Services.AddSingleton<DeviceEventLog>();         // 设备事件环形日志（E14，logs 页拉取）
 builder.Services.AddSingleton<HealthReport>();           // 事件聚合（E11）
 builder.Services.AddSingleton<DeviceManifestService>();  // 按设备 manifest + rev
 builder.Services.AddSingleton<WzMusicSource>();
@@ -105,6 +106,7 @@ app.MapGet("/api/health", (ConfigService c, DeviceRegistry reg) => Results.Json(
 DeviceEndpoints.Map(app);
 AdminEndpoints.Map(app);
 AdminCatalogEndpoints.Map(app);
+MaterialsEndpoints.Map(app);
 
 // ── SPA fallback（E4 问题2 修复 2026-09-26）：Vue Router 用 createWebHistory
 //    （URI 路径模式），直接访问/刷新 /materials 等非根路径时静态文件中间件
