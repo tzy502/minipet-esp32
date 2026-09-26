@@ -114,6 +114,25 @@ public sealed class AssetExporter
         _music = new MusicCatalogService(_wz);
     }
 
+    /// <summary>
+    /// 宿主服务入口（PaperdollPackService 用）：只为给定外观产出装扮资产（PARTS 整包 +
+    /// 各动作 LAYOUT + fontTime 时钟数字），不写盘、不动 manifest——写盘与索引合并由调用方
+    /// （按设备目录）负责。返回外观 hash 与资产列表。
+    /// </summary>
+    public (string AppearanceHash, List<ExportedAsset> Assets) ExportAppearanceAssets(CharacterAppearance appearance)
+    {
+        if (!_wz.IsLoaded) throw new InvalidOperationException("WZ 未加载（先调用 WzService.LoadWz）");
+        var summary = new ExportSummary();
+        ExportPaperdoll(appearance, summary);
+        try
+        {
+            var payload = FontPackWriter.ExportFontTimeParts(_wz);
+            AddAsset(summary, MpakKind.Parts, payload, "时钟数字 fontTime", selector: "clock");
+        }
+        catch (Exception ex) { summary.Warnings.Add($"fontTime 导出失败: {ex.Message}"); }
+        return (PaperdollService.HashAppearance(appearance), summary.Assets);
+    }
+
     public ExportSummary Run(ExportOptions o)
     {
         if (o == null) throw new ArgumentNullException(nameof(o));

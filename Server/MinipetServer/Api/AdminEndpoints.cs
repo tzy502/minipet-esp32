@@ -5,6 +5,7 @@ using MinipetServer.Device;
 using MinipetServer.Health;
 using MinipetServer.Manifest;
 using MinipetServer.Music;
+using MinipetServer.Services;
 
 namespace MinipetServer.Api;
 
@@ -28,7 +29,7 @@ public static class AdminEndpoints
             => Detail(id, reg, cfg, health) ?? NotFoundDevice(id));
 
         g.MapPut("/devices/{id}", (string id, DeviceUpdateRequest body, DeviceRegistry reg, ConfigService cfg,
-            HealthReport health, DeviceManifestService mfst, DeviceEventLog eventLog) =>
+            HealthReport health, DeviceManifestService mfst, DeviceEventLog eventLog, PaperdollPackService packs) =>
         {
             var existing = reg.Get(id);
             if (existing == null) return NotFoundDevice(id);
@@ -55,7 +56,31 @@ public static class AdminEndpoints
             {
                 bool cleared = body.PetConfig!.Value.ValueKind == JsonValueKind.Null;
                 eventLog.Append(id, cleared ? "petConfig 清空（回默认宠物）" : "petConfig 变更（换宠换装）");
-                mfst.BumpRev(id, cleared ? "petConfig 清空" : "petConfig 变更");
+                // 装扮打包后台跑（PARTS+LAYOUT 导出数秒）：先生成设备资产包，成功才 bump rev——
+                // 设备 poll 拉新 manifest 时包已就位。此前只存配置直接 bump → manifest assets
+                // 未变 → 设备不拉包，「应用到设备」无效的根因。打包失败记日志+设备事件，不 bump
+                // （设备不读 petConfig 本身，只认 manifest assets）。清空（null）无需打包。
+                if (cleared)
+                {
+                    mfst.BumpRev(id, "petConfig 清空");
+                }
+                else
+                {
+                    var snap = body.PetConfig!.Value;
+                    _ = Task.Run(() =>
+                    {
+                        try
+                        {
+                            var packed = packs.EnsurePacked(id, snap);
+                            mfst.BumpRev(id, packed ? "装扮包已生成（petConfig 变更）" : "装扮包未变化（同外观已打包）");
+                        }
+                        catch (Exception ex)
+                        {
+                            Console.Error.WriteLine($"[PaperdollPack] 设备 {id} 装扮打包失败: {ex.Message}");
+                            health.RecordEvent(id, "pack_error", JsonSerializer.SerializeToElement(new { error = ex.Message }));
+                        }
+                    });
+                }
             }
             if (body.Bgm != null)
                 eventLog.Append(id, $"BGM 偏好保存：source={updated.Bgm.Source}，volume={updated.Bgm.Volume}");

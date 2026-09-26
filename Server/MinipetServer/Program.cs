@@ -34,6 +34,7 @@ builder.Services.AddSingleton<WzService>();              // WZ 读取（catalog 
 builder.Services.AddSingleton<MusicCatalogService>();    // WZ 曲库目录（BGM 曲目列表/决策共用）
 builder.Services.AddSingleton<ThumbService>();           // 64×64 缩略图 + 磁盘缓存（part/paperdoll 走真实渲染）
 builder.Services.AddSingleton<PresetStore>();            // 纸娃娃预设（data/presets/）
+builder.Services.AddSingleton<PaperdollPackService>();   // petConfig → 设备装扮资产包（换装下发链路）
 
 builder.Services.ConfigureHttpJsonOptions(o =>
 {
