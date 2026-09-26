@@ -20,7 +20,10 @@
 # .dockerignore 排除）；Web/ 目前还没有 package.json（前端并行开发中），
 # 下面的 RUN 会在缺失时放一个占位首页而不是让构建失败。
 # package.json 出现后此文件零改动。
-FROM node:22-alpine AS webbuild
+# 前端构建固定跑在构建机原生架构（$BUILDPLATFORM）：buildx 跨架构时 QEMU 模拟下
+# Node/V8 JIT 偶发 SIGILL（exit 132，2026-09-26 dfe6b79 CI 实证）；产物是纯静态文件
+# 与目标架构无关，拷进 final stage 即可。
+FROM --platform=$BUILDPLATFORM node:22-alpine AS webbuild
 WORKDIR /src
 COPY Web/ ./
 RUN set -eux; \
