@@ -12,5 +12,5 @@ idf_component_register(
          "key_gpio18.c"
     INCLUDE_DIRS "." "include"
     REQUIRES profiles driver esp_driver_i2c esp_driver_spi esp_driver_gpio esp_driver_i2s
-    PRIV_REQUIRES esp_timer sdmmc fatfs wear_levelling esp_partition
+    PRIV_REQUIRES esp_timer sdmmc fatfs wear_levelling esp_partition esp_lcd waveshare__esp32_s3_touch_amoled_2_16
 )

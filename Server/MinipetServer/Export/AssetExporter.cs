@@ -71,6 +71,25 @@ public sealed class ExportSummary
 /// 预平铺为独立小 PARTS）；fontTime → PARTS 保留段 900..912；FONT / AUDIO_META 按需；
 /// 输出 data/cache/export/{deviceId}/ 下 {hash}.mpak + manifest-assets.json + manifest.json（rev 每设备单调递增）。
 /// </summary>
+///
+/// <remarks>
+/// ═════════════ 导出器 ↔ 设备端渲染契约（LAYOUT 坐标语义，金样测试 ExportReplayTests 锁死）═════════════
+///
+/// 「LAYOUT piece x/y = 桌面版合成画布内 piece 左上角绝对坐标（含 origin 平移），画布包围盒 =
+///   所有 piece 联合；设备端渲染 = 画布 1x 合成 → 2x nearest → 屏幕水平居中/底对齐 40px」
+///
+/// 逐条展开（与桌面版 PaperdollService.RenderFrame 逐像素同轴）：
+/// 1. piece 绘制位置公式（桌面版权威式）：canvas_x = FinalX - bodyAnchorX - bounds.Left + moveDx，
+///    canvas_y 同理。其中 FinalX/Y = AnchorX/Y - origin（含 WZ origin 平移的 navel 系坐标）、
+///    bodyAnchor = body 部件锚点（navel 系原点）、bounds = 该动作全部帧全部 piece 矩形的联合包围盒、
+///    move = 该帧 WZ move 位移。导出时 move 直接含入 x/y。
+/// 2. 画布 = 一个动作一张（跨帧共用，防逐帧抖动），尺寸 = bounds.W×bounds.H，
+///    随 manifest-assets.json 对应 LAYOUT 条目的 "bounds":[w,h] 下发（像素 1x）；x/y ∈ [0, bounds]。
+/// 3. 帧头 move_dx/move_dy 仅为桌面版对齐参考数据（已含入 x/y），设备端不得再加算。
+/// 4. 设备端摆放 = 画布 1x 合成 → 2x nearest 放大 → 屏幕水平居中、底对齐 40px；
+///    落点公式唯一权威实现见 Export/PlacementMath.cs（固件照抄同一公式）。
+/// 金样测试：ExportReplayTests 按「画布绝对坐标 1x 合成」重建位图，与 RenderFrame 输出同包围盒逐像素对比。
+/// </remarks>
 public sealed class AssetExporter
 {
     /// <summary>导出的常见动作集（算法规格 §十.3；无帧的动作自动跳过）。</summary>
@@ -78,6 +97,9 @@ public sealed class AssetExporter
     {
         "walk1", "stand1", "stand2", "blink", "jump", "fly", "prone", "ladder", "rope", "alert", "heal",
     };
+
+    /// <summary>默认动作引用（设备端开机/待机播它；manifest-assets.json LAYOUT/PARTS 条目 "defaultAction"）。</summary>
+    public const string DefaultAction = "stand1";
 
     private readonly WzService _wz;
     private readonly CacheManager _cache;
@@ -224,6 +246,8 @@ public sealed class AssetExporter
     {
         public byte[] PartsPayload = Array.Empty<byte>();
         public Dictionary<string, byte[]> Layouts = new(StringComparer.Ordinal);
+        /// <summary>动作 → 画布联合包围盒 [w,h]（1x 像素；manifest LAYOUT 条目 "bounds"，契约见类头注释）。</summary>
+        public Dictionary<string, int[]> LayoutBounds = new(StringComparer.Ordinal);
         public string AppearanceHash = "";
         public List<string> SkippedActions = new();
     }
@@ -234,12 +258,24 @@ public sealed class AssetExporter
         if (core.PartsPayload.Length > 0)
         {
             AddAsset(summary, MpakKind.Parts, core.PartsPayload, "纸娃娃装扮", selector: "paperdoll",
-                extra: new Dictionary<string, object?> { ["entity"] = "paperdoll:default", ["appearanceHash"] = core.AppearanceHash });
+                extra: new Dictionary<string, object?>
+                {
+                    ["entity"] = "paperdoll:default",
+                    ["appearanceHash"] = core.AppearanceHash,
+                    ["defaultAction"] = DefaultAction,
+                });
         }
         foreach (var (action, payload) in core.Layouts)
         {
-            AddAsset(summary, MpakKind.Layout, payload, $"布局 {action}", selector: "paperdoll",
-                extra: new Dictionary<string, object?> { ["entity"] = "paperdoll:default", ["action"] = action });
+            var extra = new Dictionary<string, object?>
+            {
+                ["entity"] = "paperdoll:default",
+                ["action"] = action,
+                ["defaultAction"] = DefaultAction,
+            };
+            if (core.LayoutBounds.TryGetValue(action, out var bounds))
+                extra["bounds"] = bounds; // [w,h] 画布联合包围盒（1x 像素，契约见类头注释）
+            AddAsset(summary, MpakKind.Layout, payload, $"布局 {action}", selector: "paperdoll", extra: extra);
         }
     }
 
@@ -279,6 +315,7 @@ public sealed class AssetExporter
             if (frameCount <= 0) { result.SkippedActions.Add(action); Warn($"动作 {action} 无帧，跳过"); continue; }
 
             var frames = new List<LayoutPackWriter.LayoutFrame>();
+            PaperdollInternals.UnionBounds boundsLast = default; // 各帧共用同一画布（GetBounds 按动作缓存），记成功帧的即可
             for (int f = 0; f < frameCount; f++)
             {
                 List<PaperdollInternals.PieceView> pieces;
@@ -295,6 +332,7 @@ public sealed class AssetExporter
                     continue;
                 }
                 if (pieces.Count == 0 || bounds.W <= 0 || bounds.H <= 0) continue;
+                boundsLast = bounds;
 
                 // 画布原点 = body 锚点（对齐 RenderFrame：bx/by 取 body 锚）
                 var bodyP = pieces.FirstOrDefault(p => p.Category == "body");
@@ -361,10 +399,12 @@ public sealed class AssetExporter
                         exprIndex = LayoutPackWriter.ExprNone;
                     }
 
-                    // x/y = 部件相对 body 锚点（navel 系）的偏移，不含帧位移 move、不含 union 画布偏移
-                    // （回放/设备画布 = 全 piece 矩形联合，起点自动对齐直渲染 bounds 画布）
-                    int px = p.FinalX - bx;
-                    int py = p.FinalY - by;
+                    // 契约（见类头注释）：x/y = 桌面版合成画布内 piece 左上角绝对坐标
+                    //   = FinalX - bx - bounds.Left + move（含 origin 平移 + 帧位移 move + 画布原点平移），
+                    // 与 RenderFrame 的 canvas.DrawBitmap 位置逐像素同轴；画布包围盒 = bounds（manifest "bounds"）。
+                    // 帧头 move_dx/move_dy 仅参考数据，设备端不得再加算。
+                    int px = p.FinalX - bx - bounds.Left + move.Dx;
+                    int py = p.FinalY - by - bounds.Top + move.Dy;
                     if (px is < short.MinValue or > short.MaxValue || py is < short.MinValue or > short.MaxValue)
                     {
                         Warn($"{action}/{f} 部件 {p.PiecePath} 坐标越界 ({px},{py})，截断");
@@ -399,6 +439,8 @@ public sealed class AssetExporter
                 Expressions = expressions,
                 Frames = frames,
             });
+            // 画布联合包围盒（RunPipeline 的 bounds = GetBounds(hash, a, action)，跨帧共用同一张画布）
+            result.LayoutBounds[action] = new[] { boundsLast.W, boundsLast.H };
         }
 
         // 补齐表情家族 25 槽位的 part 登记（缺帧槽回退 default / 首个可用槽，ShareDataOf 去重数据）

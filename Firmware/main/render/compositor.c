@@ -24,6 +24,7 @@
 #include "entity_anim.h"
 #include "clock_digits.h"
 #include "font_lazy.h"
+#include "font5x7.h"
 #include "lvgl_bridge.h"
 #include "render.h"
 
@@ -61,17 +62,23 @@ static rc_strip_t *g_strips;
 static int         g_strip_n;
 
 /* 实体 */
-static uint16_t *g_ent_px;                 /* 200×260 */
+static uint16_t *g_ent_px;                 /* RC_ENT_W×RC_ENT_H（内容=2x 展开图，像素=屏幕像素） */
 static uint8_t  *g_ent_cov;                /* 1bit 覆盖 */
-static int32_t   g_ent_base_wx, g_ent_base_wy;   /* 世界 1x 锚点 */
-static int32_t   g_ent_move_wx, g_ent_move_wy;   /* 帧位移累计 */
+static int32_t   g_ent_base_wx, g_ent_base_wy;   /* 世界 1x 附加偏移（默认 0,0） */
+
+/* 实体画布（对齐桌面版 GetBounds 联合画布，见 LayoutPackWriter 语义注释）：
+ * 导出 x/y = FinalX - body锚点（FinalX 已含 part origin，即位图左上角相对 body 锚点
+ * 的偏移；不含帧位移 move）。设备画布 = 该动作全部帧 piece 矩形的联合包围盒，
+ * 原点 = min(x,y)（等价桌面 bounds.Left/Top 画布原点，manifest 不带 bounds 时按
+ * piece 联合包围盒现算）。绑定 parts+layout 后懒计算一次。 */
+static bool    g_ent_cbox_ok;
+static int32_t g_ent_cx0, g_ent_cy0;       /* 联合包围盒左上（世界 1x） */
+static int32_t g_ent_cw,  g_ent_ch;        /* 联合包围盒宽高（世界 1x，已 clamp 到缓冲） */
 
 static mpak_t g_parts;   static bool g_parts_ok;
 static mpak_t g_lt_loop; static bool g_lt_loop_ok;   /* stand1 等循环动作 */
 static mpak_t g_lt_once; static bool g_lt_once_ok;   /* 单次动作 */
 static rc_anim_t g_anim;
-static uint16_t *g_sortidx;                /* 每帧 piece 的 z 序索引 */
-static uint32_t  g_sortidx_cap;
 
 /* 部件位图缓存（当前装扮；TF 懒读） */
 typedef struct rc_part_img {
@@ -87,11 +94,15 @@ static bool g_pc_cap_logged;
 /* 气泡 */
 static struct { bool active; uint16_t *px; int32_t w, h, x, y; } g_bub;
 
+/* 未配网常驻横幅（问题4：POKER 态顶部深色底白字，compose 最顶层） */
+static bool g_banner_on;
+static char g_banner_text[48];
+
 /* IMU 视差（input 任务异步写；对齐 int32 写原子） */
 static volatile int32_t g_tilt_mdeg;
+static int32_t s_last_ent_tilt;            /* 实体已按此 tilt 值摆放（问题7 跟随标脏） */
 
-/* 脏区网格 */
-static uint32_t g_hash[RC_GRID_MAX];
+/* 脏区网格（16×16 标记；问题1：合帧后合并为单一包围盒上屏） */
 static uint8_t  g_mark[RC_GRID_MAX];
 static int      g_gw, g_gh;
 static time_t   g_last_clock_t;
@@ -111,10 +122,42 @@ static void *psram(size_t n)
     return p;
 }
 
+/* 实体显示尺寸：画布宽高 ×2（clamp 到缓冲与屏幕；画布未算出前为 0 → 无显示区） */
+static void ent_disp_size(int32_t *dw, int32_t *dh)
+{
+    *dw = g_ent_cw * RC_SCALE;
+    *dh = g_ent_ch * RC_SCALE;
+    if (*dw > RC_ENT_W) *dw = RC_ENT_W;
+    if (*dh > RC_ENT_H) *dh = RC_ENT_H;
+    if (*dw > g_sw) *dw = g_sw;
+}
+
+/* 倾斜/拖拽 → 实体 x 偏移可见反馈（问题6/7）：±8° ↔ ±8px */
+static int32_t ent_tilt_off_px(int32_t tilt_mdeg)
+{
+    int32_t px = (tilt_mdeg / 1000) * RC_TILT_ENT_PX_PER_DEG;
+    if (px > RC_TILT_ENT_MAX_PX) px = RC_TILT_ENT_MAX_PX;
+    if (px < -RC_TILT_ENT_MAX_PX) px = -RC_TILT_ENT_MAX_PX;
+    return px;
+}
+
+/* 实体缓冲 → 屏幕摆放（问题2 修复）：
+ * 世界 1x body 锚点 (0,0)（= 人物脚底基准，piece x/y 的原点）2x 后——
+ *   水平钉在屏幕中心（+调参偏移 + tilt 可见偏移），
+ *   垂直钉在 屏底-40px。
+ * 不再按画布联合包围盒居中/贴底（武器/翅膀大件撑大包围盒会把人物挤偏左上）。
+ * g_ent_base_wx/wy 为世界 1x 附加偏移（render_set_entity_pos，默认 0,0）。 */
+static void ent_screen_pos_at(int32_t tilt_mdeg, int32_t *sx, int32_t *sy)
+{
+    *sx = g_sw / 2 + g_ent_cx0 * RC_SCALE + RC_ENT_CENTER_OFF_X
+          + (g_ent_base_wx << RC_SCALE_SHIFT) + ent_tilt_off_px(tilt_mdeg);
+    *sy = g_sh - RC_ENT_MARGIN_B + g_ent_cy0 * RC_SCALE + RC_ENT_CENTER_OFF_Y
+          + (g_ent_base_wy << RC_SCALE_SHIFT);
+}
+
 static void ent_screen_pos(int32_t *sx, int32_t *sy)
 {
-    *sx = g_sw / 2 + ((g_ent_base_wx + g_ent_move_wx) << RC_SCALE_SHIFT) - RC_ENT_W / 2;
-    *sy = g_sh / 2 + ((g_ent_base_wy + g_ent_move_wy) << RC_SCALE_SHIFT) - RC_ENT_H / 2;
+    ent_screen_pos_at(g_tilt_mdeg, sx, sy);
 }
 
 static void mark_rect(int32_t x, int32_t y, int32_t w, int32_t h)
@@ -135,11 +178,17 @@ static void mark_rect(int32_t x, int32_t y, int32_t w, int32_t h)
             g_mark[cy * g_gw + cx] = 1;
 }
 
+static void mark_ent_at(int32_t tilt_mdeg)
+{
+    int32_t ex, ey, dw, dh;
+    ent_screen_pos_at(tilt_mdeg, &ex, &ey);
+    ent_disp_size(&dw, &dh);
+    mark_rect(ex, ey, dw, dh);
+}
+
 static void mark_ent(void)
 {
-    int32_t ex, ey;
-    ent_screen_pos(&ex, &ey);
-    mark_rect(ex, ey, RC_ENT_W, RC_ENT_H);
+    mark_ent_at(g_tilt_mdeg);
 }
 
 /* ================= 部件缓存（懒加载） ================= */
@@ -199,7 +248,7 @@ static void pc_flush(void)
     g_pc_cap_logged = false;
 }
 
-/* ================= 布局/动画接线 ================= */
+/* ================= 实体画布/布局接线 ================= */
 
 static const mpak_layout_t *active_layout(void)
 {
@@ -208,30 +257,58 @@ static const mpak_layout_t *active_layout(void)
     return NULL;
 }
 
-static void build_sortidx(const mpak_layout_t *lt)
+/* parts/layout 任一变化后失效，下次重合成前按新数据现算 */
+static void ent_canvas_invalidate(void)
 {
-    if (!lt || lt->pieces_total == 0) return;
-    if (lt->pieces_total > g_sortidx_cap) {
-        if (g_sortidx) heap_caps_free(g_sortidx);
-        g_sortidx = psram((size_t)lt->pieces_total * sizeof(uint16_t));
-        if (!g_sortidx) { g_sortidx_cap = 0; return; }
-        g_sortidx_cap = lt->pieces_total;
-    }
-    /* 每帧段内按 z 升序（插入排序；帧内 piece < 256） */
+    g_ent_cbox_ok = false;
+}
+
+/* 扫描当前布局全部帧的 piece 矩形（x/y 与 part w/h），求联合包围盒。
+ * 语义（LayoutPackWriter）：设备画布 = 全 piece 矩形联合，起点 = min(x/y)；
+ * 画布尺寸不落 manifest 时按此联合包围盒取（对齐桌面 GetBounds 的 union 画布）。 */
+static void ent_canvas_update(void)
+{
+    if (g_ent_cbox_ok) return;
+    g_ent_cw = 0; g_ent_ch = 0;
+    const mpak_layout_t *lt = active_layout();
+    if (!lt || !g_parts_ok) return;
+
+    int32_t minX = 0, minY = 0, maxX = 0, maxY = 0;
+    bool any = false;
     for (uint32_t f = 0; f < lt->frame_count; f++) {
-        uint32_t off = lt->frames[f].piece_off, cnt = lt->frames[f].piece_count;
-        for (uint32_t k = 0; k < cnt; k++) g_sortidx[off + k] = (uint16_t)k;
-        for (uint32_t k = 1; k < cnt; k++) {
-            uint16_t v = g_sortidx[off + k];
-            int8_t  zv = lt->pieces[off + v].z;
-            uint32_t j = k;
-            while (j > 0 && lt->pieces[off + g_sortidx[off + j - 1]].z > zv) {
-                g_sortidx[off + j] = g_sortidx[off + j - 1];
-                j--;
+        const mpak_frame_t *fr = &lt->frames[f];
+        for (uint32_t k = 0; k < fr->piece_count; k++) {
+            const mpak_piece_t *pc = &lt->pieces[fr->piece_off + k];
+            const mpak_part_t *meta = mpak_parts_find(&g_parts, pc->part_id);
+            if (!meta) continue;
+            int32_t x0 = pc->x, y0 = pc->y;
+            int32_t x1 = x0 + (int32_t)meta->w, y1 = y0 + (int32_t)meta->h;
+            if (!any) {
+                minX = x0; minY = y0; maxX = x1; maxY = y1;
+                any = true;
+            } else {
+                if (x0 < minX) minX = x0;
+                if (y0 < minY) minY = y0;
+                if (x1 > maxX) maxX = x1;
+                if (y1 > maxY) maxY = y1;
             }
-            g_sortidx[off + j] = v;
         }
     }
+    if (!any) return;
+    int32_t cw = maxX - minX, ch = maxY - minY;
+    int32_t cx0 = minX, cy0 = minY;
+    /* 画布超出缓冲窗口的退化情形：横向取以 body 锚点(0,0)为中心的窗口
+     * （人物保持居中，武器/翅膀大件外溢裁剪）；纵向取底部窗口（保脚底对齐） */
+    int32_t max_w = RC_ENT_W / RC_SCALE, max_h = RC_ENT_H / RC_SCALE;
+    if (cw > max_w) { cw = max_w; cx0 = -max_w / 2; }
+    if (ch > max_h) { ch = max_h; cy0 = maxY - max_h; }
+    g_ent_cx0 = cx0;
+    g_ent_cy0 = cy0;
+    g_ent_cw = cw;
+    g_ent_ch = ch;
+    g_ent_cbox_ok = true;
+    ESP_LOGI(TAG, "ent canvas union origin(%" PRId32 ",%" PRId32 ") %"
+             PRId32 "x%" PRId32, g_ent_cx0, g_ent_cy0, g_ent_cw, g_ent_ch);
 }
 
 static void bind_active_layout(int64_t now_us, bool reset_expr)
@@ -239,7 +316,7 @@ static void bind_active_layout(int64_t now_us, bool reset_expr)
     const mpak_layout_t *lt = active_layout();
     if (!lt) return;
     rc_anim_bind(&g_anim, lt, !g_lt_once_ok, reset_expr, now_us);
-    build_sortidx(lt);
+    ent_canvas_invalidate();
 }
 
 /* ================= 实体层合成 ================= */
@@ -295,19 +372,23 @@ static void recompose_entity(void)
     memset(g_ent_cov, 0, RC_ENT_COV_BYTES);
 
     const mpak_layout_t *lt = active_layout();
-    if (!lt || !g_parts_ok || !g_sortidx) return;
+    if (!lt || !g_parts_ok) return;
     if (g_anim.frame_idx >= lt->frame_count) return;
+    ent_canvas_update();
 
     const mpak_frame_t *fr = &lt->frames[g_anim.frame_idx];
+    /* 帧内 piece 列表顺序 = 权威绘制序（导出端按桌面 RenderFrame 底→顶排列：
+     * OrderByDescending(ZIndex)，z 字段仅诊断参考）→ 顺序画，不再排序 */
     for (uint32_t k = 0; k < fr->piece_count; k++) {
-        uint16_t idx = g_sortidx[fr->piece_off + k];
-        const mpak_piece_t *piece = &lt->pieces[fr->piece_off + idx];
+        const mpak_piece_t *piece = &lt->pieces[fr->piece_off + k];
         const rc_part_img_t *img = resolve_piece(piece);
         if (!img) continue;
-        int32_t bx = ((int32_t)piece->x - img->meta->origin_x + RC_ENT_WIN_W / 2)
-                     << RC_SCALE_SHIFT;
-        int32_t by = ((int32_t)piece->y - img->meta->origin_y + RC_ENT_WIN_H / 2)
-                     << RC_SCALE_SHIFT;
+        /* 导出 x/y = 位图左上角相对 body 锚点坐标（FinalX 已含 part origin，
+         * 不再减 origin）；+帧位移 move（桌面同轴：画布内绝对位移，非累计），
+         * -联合画布原点 → 实体缓冲内位置（世界 1x → 2x 移位展开） */
+        /* LAYOUT x/y 已含帧位移（导出契约：画布绝对坐标），move 字段仅参考，勿重复叠加 */
+        int32_t bx = ((int32_t)piece->x - g_ent_cx0) << RC_SCALE_SHIFT;
+        int32_t by = ((int32_t)piece->y - g_ent_cy0) << RC_SCALE_SHIFT;
         blit_ent_2x(img, piece->flip & 1u, bx, by);
     }
 }
@@ -367,6 +448,16 @@ static void compose_region(int32_t x, int32_t y, int32_t w, int32_t h)
     if (y + h > g_sh) h = g_sh - y;
     if (w <= 0 || h <= 0) return;
 
+    /* 0) CLOCK_DOZE（问题3/E9）：AMOLED 纯黑背景只数字发光——
+     * 时钟激活即 doze 语义（enable 仅由 CLOCK_DOZE 进出指令驱动），
+     * 黑底 + 时钟，跳过条带/tile/实体/气泡/横幅 */
+    if (clock_digits_active()) {
+        for (int32_t r = y; r < y + h; r++)
+            memset(g_fb + (size_t)r * g_sw + x, 0, (size_t)w * 2u);
+        clock_digits_compose(g_fb, g_sw, RC_SCALE, x, y, w, h);
+        return;
+    }
+
     /* 1) static_back（不动底；无地图 → 黑底） */
     for (int32_t r = y; r < y + h; r++) {
         uint16_t *drow = g_fb + (size_t)r * g_sw;
@@ -400,13 +491,14 @@ static void compose_region(int32_t x, int32_t y, int32_t w, int32_t h)
     /* 4) 地图时钟（场景层，实体之下） */
     clock_digits_compose(g_fb, g_sw, RC_SCALE, x, y, w, h);
 
-    /* 5) 实体缓冲（1bit 覆盖） */
+    /* 5) 实体缓冲（1bit 覆盖；显示区 = 画布尺寸×2 的摆放矩形） */
     {
-        int32_t ex, ey;
+        int32_t ex, ey, dw, dh;
         ent_screen_pos(&ex, &ey);
+        ent_disp_size(&dw, &dh);
         int32_t X0 = ex > x ? ex : x, Y0 = ey > y ? ey : y;
-        int32_t X1 = (ex + RC_ENT_W < x + w) ? ex + RC_ENT_W : x + w;
-        int32_t Y1 = (ey + RC_ENT_H < y + h) ? ey + RC_ENT_H : y + h;
+        int32_t X1 = (ex + dw < x + w) ? ex + dw : x + w;
+        int32_t Y1 = (ey + dh < y + h) ? ey + dh : y + h;
         for (int32_t sy = Y0; sy < Y1; sy++) {
             uint32_t erow = (uint32_t)(sy - ey) * RC_ENT_W;
             uint16_t *drow = g_fb + (size_t)sy * g_sw;
@@ -430,60 +522,71 @@ static void compose_region(int32_t x, int32_t y, int32_t w, int32_t h)
                    (size_t)(X1 - X0) * 2u);
         }
     }
-}
 
-/* ================= 脏区：16×16 网格 hash diff ================= */
-
-static uint32_t cell_hash(int cx, int cy)
-{
-    int32_t x = (int32_t)cx * RC_CELL, y = (int32_t)cy * RC_CELL;
-    int32_t cw = g_sw - x < RC_CELL ? g_sw - x : RC_CELL;
-    int32_t ch = g_sh - y < RC_CELL ? g_sh - y : RC_CELL;
-    uint32_t hsh = 2166136261u;
-    for (int32_t r = 0; r < ch; r++) {
-        const uint8_t *p = (const uint8_t *)(g_fb + (size_t)(y + r) * g_sw + x);
-        for (int32_t i = 0; i < cw * 2; i++) {
-            hsh ^= p[i];
-            hsh *= 16777619u;
+    /* 7) 未配网常驻横幅（问题4：顶部 480×28 深色底白字，compose 最顶层） */
+    if (g_banner_on) {
+        int32_t by0 = y > 0 ? y : 0;
+        int32_t by1 = (y + h < RC_BANNER_H) ? y + h : RC_BANNER_H;
+        if (by0 < by1) {
+            for (int32_t r = by0; r < by1; r++) {
+                uint16_t *drow = g_fb + (size_t)r * g_sw;
+                for (int32_t c = x; c < x + w; c++) drow[c] = RC_BANNER_BG;
+            }
+            int32_t gx = RC_BANNER_PAD_X;
+            for (const char *p = g_banner_text; *p && gx < g_sw; p++) {
+                unsigned char u = (unsigned char)*p;
+                if (u >= 128) u = '?';
+                const uint8_t *cols = MP_FONT5X7[u];
+                for (int col = 0; col < MP_FONT_GLYPH_W; col++) {
+                    for (int row = 0; row < MP_FONT_GLYPH_H; row++) {
+                        if (!(cols[col] & (1u << row))) continue;
+                        int32_t px0 = gx + col * RC_BANNER_SCALE;
+                        int32_t py0 = RC_BANNER_PAD_Y + row * RC_BANNER_SCALE;
+                        for (int32_t dy = 0; dy < RC_BANNER_SCALE; dy++) {
+                            int32_t py = py0 + dy;
+                            if (py < by0 || py >= by1) continue;
+                            uint16_t *drow = g_fb + (size_t)py * g_sw;
+                            for (int32_t dx = 0; dx < RC_BANNER_SCALE; dx++) {
+                                int32_t px = px0 + dx;
+                                if (px >= x && px < x + w && px < g_sw)
+                                    drow[px] = RC_BANNER_FG;
+                            }
+                        }
+                    }
+                }
+                gx += (MP_FONT_GLYPH_W + 1) * RC_BANNER_SCALE;
+            }
         }
     }
-    return hsh;
 }
 
+/* ================= 脏区：标脏 16×16 块 → 单一包围盒（问题1） =================
+ * 旧实现：逐行行程分别 compose+blit，且 blit 前按 hash 过滤把行内连续变化段
+ * 拆成多段——相邻矩形之间的间隙像素漏刷，叠加 display_blit 内部 2px 向外取偶
+ * 的外扩错位，真机表现为行/列裂纹与残影。现改为：本帧所有标脏块合并为一个
+ * 包围盒，一次 compose_region + 一次 blit（480 宽全帧重绘成本可接受，
+ * 先正确后优化）；实体/条带每帧整体重绘各自包围盒由 mark_ent/mark_rect 保证。 */
 static void flush_dirty(void)
 {
-    for (int cy = 0; cy < g_gh; cy++) {
-        int cx = 0;
-        while (cx < g_gw) {
-            if (!g_mark[cy * g_gw + cx]) { cx++; continue; }
-            int run0 = cx;
-            while (cx < g_gw && g_mark[cy * g_gw + cx]) cx++;
-            int run1 = cx;
-
-            int32_t x = (int32_t)run0 * RC_CELL, y = (int32_t)cy * RC_CELL;
-            int32_t w = (int32_t)(run1 - run0) * RC_CELL, h = RC_CELL;
-            if (x + w > g_sw) w = g_sw - x;
-            if (y + h > g_sh) h = g_sh - y;
-            compose_region(x, y, w, h);
-
-            int cmin = -1, cmax = -1;
-            for (int c = run0; c < run1; c++) {
-                uint32_t nh = cell_hash(c, cy);
-                if (nh != g_hash[cy * g_gw + c]) {
-                    g_hash[cy * g_gw + c] = nh;
-                    if (cmin < 0) cmin = c;
-                    cmax = c;
-                }
-                g_mark[cy * g_gw + c] = 0;
-            }
-            if (cmin >= 0) {
-                int32_t bx = (int32_t)cmin * RC_CELL;
-                int32_t bw = (int32_t)(cmax - cmin + 1) * RC_CELL;
-                if (bx + bw > g_sw) bw = g_sw - bx;
-                blit_be(bx, y, bw, h, g_fb + (size_t)y * g_sw + bx, g_sw);
-            }
+    int32_t cx0 = -1, cy0 = -1, cx1 = -1, cy1 = -1;
+    for (int32_t cy = 0; cy < g_gh; cy++) {
+        for (int32_t cx = 0; cx < g_gw; cx++) {
+            if (!g_mark[cy * g_gw + cx]) continue;
+            g_mark[cy * g_gw + cx] = 0;
+            if (cx0 < 0 || cx < cx0) cx0 = cx;
+            if (cy0 < 0 || cy < cy0) cy0 = cy;
+            if (cx > cx1) cx1 = cx;
+            if (cy > cy1) cy1 = cy;
         }
     }
+    if (cx0 < 0) return;
+
+    int32_t x = cx0 * RC_CELL, y = cy0 * RC_CELL;
+    int32_t w = (cx1 - cx0 + 1) * RC_CELL, h = (cy1 - cy0 + 1) * RC_CELL;
+    if (x + w > g_sw) w = g_sw - x;
+    if (y + h > g_sh) h = g_sh - y;
+    compose_region(x, y, w, h);
+    blit_be(x, y, w, h, g_fb + (size_t)y * g_sw + x, g_sw);
 }
 
 /* ================= 上屏边界：LE framebuffer → 驱动大端 RGB565 =================
@@ -517,9 +620,6 @@ static void blit_be(int32_t x, int32_t y, int32_t w, int32_t h,
 static void full_recompose(void)
 {
     compose_region(0, 0, g_sw, g_sh);
-    for (int cy = 0; cy < g_gh; cy++)
-        for (int cx = 0; cx < g_gw; cx++)
-            g_hash[cy * g_gw + cx] = cell_hash(cx, cy);
     memset(g_mark, 0, (size_t)g_gw * g_gh);
     blit_be(0, 0, g_sw, g_sh, g_fb, g_sw);
 }
@@ -664,8 +764,16 @@ int render_init(const minipet_profile_t *profile)
     g_ent_px = psram((size_t)RC_ENT_W * RC_ENT_H * 2u);
     g_ent_cov = psram(RC_ENT_COV_BYTES);
     if (!g_fb || !g_ent_px || !g_ent_cov) return RENDER_ERR_NOMEM;
+    /* PSRAM 不保证清零：覆盖位/像素必须先清空，否则首次 full_recompose 会把
+     * 未初始化覆盖位当已画像素上屏（真机表现为黑色竖条 + 随机竖条纹残留） */
+    memset(g_ent_px, 0, (size_t)RC_ENT_W * RC_ENT_H * 2u);
+    memset(g_ent_cov, 0, RC_ENT_COV_BYTES);
 
     rc_anim_init(&g_anim);
+
+    /* 问题3：屏尺寸/比例先行告知时钟模块（默认居中锚点与 get_rect 标脏依赖；
+     * 旧实现 scale 在首次 compose 才赋值 → enable 后时钟矩形恒 0 永不标脏） */
+    clock_digits_set_screen(g_sw, g_sh);
 
     int rc = bridge_init(g_sw, g_sh);
     if (rc != RENDER_OK) return rc;
@@ -711,10 +819,8 @@ void render_tick(void)
             any = true;
         } else {
             mark_ent();                          /* 旧位置 */
-            if (ev.frame_changed) {
-                g_ent_move_wx += ev.dx;
-                g_ent_move_wy += ev.dy;
-            }
+            /* 帧位移 move 已在实体画布内逐帧绝对叠加（recompose_entity，
+             * 对齐桌面 +mv 语义），不再累计到屏幕锚点 */
             recompose_entity();
             mark_ent();                          /* 新位置 */
             any = true;
@@ -733,7 +839,7 @@ void render_tick(void)
         }
     }
 
-    /* 3) 地图时钟（每秒标脏；comma 偶显奇隐 + 分进位由 hash 过滤） */
+    /* 3) 地图时钟（每秒标脏；comma 偶显奇隐） */
     if (clock_digits_active()) {
         time_t t = time(NULL);
         if (t != g_last_clock_t) {
@@ -743,6 +849,15 @@ void render_tick(void)
                 mark_rect(cx, cy, cw, ch);
             any = true;
         }
+    }
+
+    /* 4) 倾斜/拖拽视差 → 实体 x 偏移跟随（问题6/7 可见反馈：±8° ↔ ±8px；
+     * 条带偏移变化已在步骤 2 标脏，实体需另行以新旧位置标脏防残影） */
+    if (g_tilt_mdeg != s_last_ent_tilt) {
+        mark_ent_at(s_last_ent_tilt);        /* 旧位置 */
+        s_last_ent_tilt = g_tilt_mdeg;
+        mark_ent();                          /* 新位置 */
+        any = true;
     }
 
     if (any) flush_dirty();
@@ -759,6 +874,7 @@ int render_set_parts(const char *mpk_path)
     if (g_parts_ok) mpak_close(&g_parts);
     g_parts = tmp;             /* FILE* 所有权转移 */
     g_parts_ok = true;
+    ent_canvas_invalidate();   /* part 尺寸可能变化 → 画布联合包围盒重算 */
 
     mark_ent();                /* 下一 tick 以新部件重合成实体层 */
     return RENDER_OK;
@@ -792,10 +908,20 @@ int render_set_expression(const char *name)
     if (!g_inited || !name) return RENDER_ERR_ARG;
     int rc = rc_anim_set_expression(&g_anim, name);
     if (rc == 0) {
+        mark_ent();            /* 旧覆盖区（表情件形状可能缩小） */
         recompose_entity();
         mark_ent();
     }
     return rc;
+}
+
+/* 强制一次全屏重合成 + 全幅上屏（脏区基线同步重建）。
+ * 用于外部直写面板（面板自检色块等）或素材全量重绑后清除残留：
+ * 无 BGMAP → 全屏填黑；有 BGMAP → static_back+条带+tile 一次铺满。 */
+void render_force_redraw(void)
+{
+    if (!g_inited) return;
+    full_recompose();
 }
 
 int render_set_map(const char *bgmap_path,
@@ -873,13 +999,9 @@ int render_set_clock(const char *fonttime_parts_path,
                                     anchor_world_y, enable);
     if (rc != MPAK_OK) return rc;
     g_last_clock_t = 0;        /* 下一 tick 立即标脏 */
-    if (enable) {
-        int32_t cx, cy, cw, ch;
-        if (clock_digits_get_rect(&cx, &cy, &cw, &ch))
-            mark_rect(cx, cy, cw, ch);
-    } else {
-        full_recompose();      /* 关时钟 → 清残留 */
-    }
+    /* 问题3：enable/disable 都全幅重合成——doze 语义是「纯黑底+时钟」，
+     * 必须清掉进 doze 前的场景残留（局部标脏会留下旧画面） */
+    full_recompose();
     return RENDER_OK;
 }
 
@@ -946,14 +1068,15 @@ int render_bubble_show(const char *text, render_font_t font)
     g_bub.h = bh;
     g_bub.active = true;
 
-    /* 锚在实体上方（实体顶部居中；越界落到实体下方） */
-    int32_t ex, ey;
+    /* 锚在实体上方（实体显示区顶部居中；越界落到实体下方） */
+    int32_t ex, ey, dw, dh;
     ent_screen_pos(&ex, &ey);
-    int32_t bx = ex + RC_ENT_W / 2 - bw / 2;
+    ent_disp_size(&dw, &dh);
+    int32_t bx = ex + dw / 2 - bw / 2;
     if (bx < 0) bx = 0;
     if (bx + bw > g_sw) bx = g_sw - bw;
     int32_t by = ey - bh - 8;
-    if (by < 0) by = ey + RC_ENT_H + 8;
+    if (by < 0) by = ey + dh + 8;
     if (by + bh > g_sh) by = g_sh - bh;
     if (by < 0) by = 0;
     g_bub.x = bx;
@@ -972,6 +1095,28 @@ void render_bubble_hide(void)
     g_bub.active = false;
 }
 
+/* ---------------- 未配网常驻横幅（问题4） ----------------
+ * POKER 态顶部 480×28 深色底白字（5x7 内嵌字体 ×2，文本需 ASCII 大写），
+ * compose_region 最顶层绘制；CLOCK_DOZE（时钟激活）态自动让位不画。 */
+
+int render_banner_show(const char *text)
+{
+    if (!g_inited) return RENDER_ERR_STATE;
+    if (g_banner_on) mark_rect(0, 0, g_sw, RC_BANNER_H);
+    g_banner_on = true;
+    g_banner_text[0] = 0;
+    if (text) strlcpy(g_banner_text, text, sizeof(g_banner_text));
+    mark_rect(0, 0, g_sw, RC_BANNER_H);
+    return RENDER_OK;
+}
+
+void render_banner_hide(void)
+{
+    if (!g_inited || !g_banner_on) return;
+    g_banner_on = false;
+    mark_rect(0, 0, g_sw, RC_BANNER_H);
+}
+
 void render_input_tilt(float tilt_deg)
 {
     if (tilt_deg > 8.0f) tilt_deg = 8.0f;
@@ -986,8 +1131,8 @@ void render_input_tilt(float tilt_deg)
  *   static_back            460,800 B   屏幕尺寸（装载时按需 2x 展开）
  *   tile_layer             460,800 B   屏幕尺寸
  *   tile_mask               28,800 B   (480*480+7)/8
- *   实体缓冲 200×260×2     104,000 B
- *   实体覆盖 1bit            6,500 B
+ *   实体缓冲 480×440×2     422,400 B   摆放上限（画布 240×220 世界 @2x，底部留 40px）
+ *   实体覆盖 1bit           26,400 B
  *   LVGL MENU 整屏         460,800 B   render_mode_menu 离屏（DIRECT）
  *   LVGL POKER 双缓冲       92,160 B   2 × 1/10 屏（46,080 B each）
  *   气泡位图 460×160×2      147,200 B   显示时分配，隐藏即释放
@@ -997,6 +1142,6 @@ void render_input_tilt(float tilt_deg)
  *   字形缓存 3×16 槽          ~40 KB   16/24/32px 各 max_glyph×16
  *   LAYOUT/PARTS 索引        ~120 KB   头+索引常驻
  *   ------------------------------------------------------------------
- *   固定峰值（无气泡）     ≈ 2.03 MB；典型全负载（含缓存/条带）≈ 3.0-3.6 MB
+ *   固定峰值（无气泡）     ≈ 2.41 MB；典型全负载（含缓存/条带）≈ 3.4-4.0 MB
  *   （8MB PSRAM，与网络/音频共享；menu 与 poker 的 LVGL 缓冲常驻不切换释放）
  */

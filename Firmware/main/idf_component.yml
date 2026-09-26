@@ -2,4 +2,5 @@
 ## （software-design 四：LVGL 9 用于菜单/气泡 UI 层）
 dependencies:
   lvgl/lvgl: "^9"
+  waveshare/esp32_s3_touch_amoled_2_16: "^2.0.1"
   idf: ">=5.5"

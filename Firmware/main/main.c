@@ -134,14 +134,6 @@ void app_main(void)
     state_machine_init();
     render_init(&MINIPET_PROFILE_AMOLED216);   /* FATFS 挂载后、首 tick 前（render.h） */
 
-    /* 【临时诊断】面板直通测试：红 1.2s → 绿 1.2s。红绿可见=面板与驱动 OK，
-     * 黑屏=面板初始化问题。结论出来后删除本段。 */
-    display_fill_rect(0, 0, 480, 480, 0xF800);
-    vTaskDelay(pdMS_TO_TICKS(1200));
-    display_fill_rect(0, 0, 480, 480, 0x07E0);
-    vTaskDelay(pdMS_TO_TICKS(1200));
-    ESP_LOGW(TAG, "面板直通测试结束（应见过红/绿全屏）");
-
     /* 任务：PRO(0) 网络/后台 —— 4.1 */
     poller_start();        /* 长轮询+退避（内含 WiFi 回网重连） */
     events_start();        /* POST event */

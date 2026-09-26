@@ -70,6 +70,10 @@ int  render_set_expression(const char *name);
 int  render_set_map(const char *bgmap_path,
                     const char *strip_parts_paths[], int strip_count);
 
+/* 强制一次全屏重合成 + 全幅上屏（外部直写面板/素材重绑后清残留；
+ * 无 BGMAP → 全屏填黑 blit 一次，有 BGMAP → static_back+tile 铺满） */
+void render_force_redraw(void);
+
 /* 实体屏幕锚点（世界 1x 坐标，映射到屏幕中心偏移；默认 0,0） */
 void render_set_entity_pos(int16_t world_x, int16_t world_y);
 
@@ -93,6 +97,11 @@ lv_display_t *render_lvgl_display(void);
 /* ---------------- 气泡（POKER 专用；离屏位图由合成器 blit 到宠物上方） --- */
 int  render_bubble_show(const char *text, render_font_t font);
 void render_bubble_hide(void);
+
+/* ---------------- 未配网常驻横幅（POKER 态顶部 480×28，合成器最顶层） ------
+ * text 为 ASCII 大写串（内嵌 5x7 字体）；CLOCK_DOZE 态自动让位不画 */
+int  render_banner_show(const char *text);
+void render_banner_hide(void);
 
 /* ---------------- IMU 视差（input 任务可异步调用；int32 对齐写原子） --- */
 void render_input_tilt(float tilt_deg);

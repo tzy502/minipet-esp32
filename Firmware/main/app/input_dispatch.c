@@ -26,7 +26,8 @@
 /* 参数（默认值；阈值可被服务端下发覆盖——E6「阈值全部 Web 可配」）       */
 /* ------------------------------------------------------------------ */
 #define TAP_MAX_MS          400     /* 按下→抬起 <400ms = 轻点 */
-#define TAP_MOVE_PX         30      /* 位移 <30px = 点（否则是拖动，忽略） */
+#define TAP_MOVE_PX         30      /* 位移 <30px = 点（≥30px = 水平拖动，问题6） */
+#define DRAG_TILT_FULL_PX   60      /* 问题6：水平拖动 ±60px ↔ ±8° 满幅视差 */
 #define LONGPRESS_MS        800     /* 宠物区长按 → BGM 控制条（E6） */
 #define SHAKE_WINDOW_MS     700     /* 摇晃检测窗口 */
 #define SHAKE_MIN_FLIPS     4       /* 窗口内 x/y 过零次数阈值 */
@@ -209,8 +210,10 @@ static void tilt_fsm_tick(const imu_accel_t *a)
     uint8_t exited  = s_tilt_bits & ~bits;
     s_tilt_bits = bits;
 
-    /* E6：倾斜视觉全本地驱动——视差条带偏移零网络往返（渲染层直读） */
-    render_input_tilt(s_roll_deg);
+    /* 问题7 修复「回正不回中」：视差角度跟随稳定态——左右倾斜中透传当前
+     * roll，退出（含回死区内）清零；旧实现只在变迁时透传 roll，退出后
+     * 残角永留 → 条带/实体回不到中位。 */
+    render_input_tilt((bits & (MP_TILT_LEFT | MP_TILT_RIGHT)) ? s_roll_deg : 0.0f);
 
     if (entered & MP_TILT_LEFT) {
         mp_post_event_simple(MP_EVT_TILT_ENTER, MP_TILT_LEFT, 0, NULL);
@@ -308,7 +311,8 @@ static void force_tick(const imu_accel_t *a)
 }
 
 /* ================================================================== */
-/* 触摸（E6：轻点=抚摸；长按=BGM 控制条；MENU 态全部归菜单）             */
+/* 触摸（E6：轻点=抚摸；水平拖动=倾斜视差（问题6）；长按=BGM 控制条；
+ * MENU 态全部归菜单）                                                     */
 /* ================================================================== */
 static void touch_tick(void)
 {
@@ -316,10 +320,15 @@ static void touch_tick(void)
     static int16_t down_x, down_y;
     static int64_t down_ms;
     static bool longpress_fired;
+    static bool drag_active;              /* 问题6：本次按住已进入水平拖动 */
 
     if (state_machine_menu_open()) {
         /* E6 胶水定稿：菜单是独立全屏窗口，触摸归菜单不穿透——
          * 本任务停读（渲染层 LVGL indev 接管 touch_read），只复位状态 */
+        if (drag_active) {
+            drag_active = false;
+            render_input_tilt(0.0f);      /* 进菜单前先回中 */
+        }
         down = false;
         longpress_fired = false;
         return;
@@ -333,7 +342,21 @@ static void touch_tick(void)
         down_x = t.x; down_y = t.y;
         down_ms = mp_now_ms();
         longpress_fired = false;
+        drag_active = false;
     } else if (t.touched && down) {
+        int dx = (int)t.x - (int)down_x;
+        /* 问题6：按住并水平拖动（≥TAP_MOVE_PX）→ 倾斜视差同款效果：
+         * dx ±60px 线性映射 ±8°（render_input_tilt 内部再 clamp），
+         * 条带视差 + 实体 ±8px 偏移与 IMU 倾斜共用一条通路 */
+        if (!drag_active && !longpress_fired && abs(dx) >= TAP_MOVE_PX) {
+            drag_active = true;
+        }
+        if (drag_active) {
+            float deg = ((float)dx * 8.0f) / (float)DRAG_TILT_FULL_PX;
+            render_input_tilt(deg);
+            note_interaction();
+            return;
+        }
         if (!longpress_fired &&
             (mp_now_ms() - down_ms) >= LONGPRESS_MS &&
             abs((int)t.x - (int)down_x) < TAP_MOVE_PX &&
@@ -349,10 +372,20 @@ static void touch_tick(void)
         int64_t dur = mp_now_ms() - down_ms;
         int dx = abs((int)t.x - (int)down_x);
         int dy = abs((int)t.y - (int)down_y);
-        if (!longpress_fired && dur < TAP_MAX_MS && dx < TAP_MOVE_PX && dy < TAP_MOVE_PX) {
-            /* 轻点 = 抚摸：smile/love 随机（E6） */
+        if (drag_active) {
+            /* 问题6：拖动结束 → 视差回中 */
+            drag_active = false;
+            render_input_tilt(0.0f);
+            note_interaction();
+        } else if (!longpress_fired && dur < TAP_MAX_MS && dx < TAP_MOVE_PX && dy < TAP_MOVE_PX) {
+            /* 轻点 = 抚摸：smile/love 随机 + 短气泡可见反馈（问题6）。
+             * 气泡走 FONT 包渲染，字形缺失时 bridge_bubble_render 报错跳过
+             * → 自动降级为只做表情 */
             mp_post_event_simple(MP_EVT_TOUCH_PET, t.x, t.y, NULL);
             input_trigger_expression((rand() % 2) ? MP_EXPR_SMILE : MP_EXPR_LOVE, 1500);
+            mp_cmd_t bc = { .type = MP_CMD_BUBBLE };
+            strlcpy(bc.s, "hello", sizeof(bc.s));
+            mp_post_cmd(&bc);
             note_interaction();
         }
     }
@@ -437,8 +470,13 @@ void input_dispatch_task(void *arg)
     s_last_ax = 0;
 
     for (;;) {
-        /* IMU：双中断（GPIO17/21）唤醒采样（4.1）；20ms 超时兜底节拍
-         * （超时也读一次：拿上次值更新倾斜/触摸/按键节拍，保证确定性） */
+        /* IMU 采样通路（问题7 排查结论）：
+         *  - 主路：DRDY 中断（GPIO17/INT1）唤醒采样；
+         *  - 兜底：mp_imu_wait_event 20ms 超时返回后【仍然无条件读一次】
+         *    （下方 if 与 wait 返回值无关）→ 中断没配通时等效 50Hz 轮询，
+         *    远快于任务书要求的 100ms 轮询兜底，倾斜判定不受影响。
+         *    [待真机验证] 若日志/现象表明 read 持续失败（I2C 错），倾斜将
+         *    无更新——届时查 CTRL7/CTRL8 使能与 DRDY 位段（驱动内 [核对] 项）。 */
         imu_accel_t accel;
         mp_imu_wait_event(pdMS_TO_TICKS(20));
         if (mp_imu_read_accel(&accel)) {

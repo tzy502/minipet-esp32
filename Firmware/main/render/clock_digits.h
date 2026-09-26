@@ -32,6 +32,20 @@ extern "C" {
 #define CLOCK_OFF_Y   83   /* 官方偏移，世界 1x px */
 #define CLOCK_AMPM_GAP 12  /* AM/PM 与时间数字间距，世界 1x px */
 
+/* 无地图锚点默认（问题3）：anchor 传 CLOCK_ANCHOR_AUTO → 时钟整块居中于
+ * 屏幕 (CLOCK_CENTER_SCREEN_X, CLOCK_CENTER_SCREEN_Y)（屏 px，忽略官方
+ * 地图偏移 CLOCK_OFF_X/OFF_Y） */
+#define CLOCK_ANCHOR_AUTO       ((int16_t)-32768)
+#define CLOCK_CENTER_SCREEN_X   240
+#define CLOCK_CENTER_SCREEN_Y   120
+
+/*
+ * 告知屏幕尺寸（render_init 调用一次）：居中布局与 get_rect 标脏矩形
+ * 都依赖 scale/屏宽；旧实现 scale 首次 compose 才赋值 → enable 后矩形
+ * 恒 0、时钟永不标脏（问题3 根因之一）。
+ */
+void clock_digits_set_screen(int32_t w, int32_t h);
+
 /*
  * 载入 fontTime PARTS 包（13 张小图常驻 PSRAM）。
  * anchor 为 clock_table 的世界 1x 锚点（manifest 下发，R15：烘焙视口坐标）。

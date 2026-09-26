@@ -2,8 +2,8 @@
  * entity_anim.c — 动作播放器实现
  *
  * 帧推进：delay_ms 到点进入下一帧；单次动作播完置 finished（不自行换包，
- * 由合成器回绑 standby 循环布局，即 stand1）。帧进入位移（move_dx/dy）
- * 随事件上报，由合成器累计到实体屏幕锚点上。
+ * 由合成器回绑 standby 循环布局，即 stand1）。帧位移（move_dx/dy）随事件
+ * 上报；合成器在实体画布内按帧绝对叠加（对齐桌面 +mv 语义，非屏幕累计）。
  * blink：本地定时器随机 3-8s 插播 250ms（断网可用）；仅当当前动作的
  * expression 列表含 "blink" 且当前表情不是 blink 时生效。
  */
