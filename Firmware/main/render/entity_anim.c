@@ -135,6 +135,7 @@ bool rc_anim_advance(rc_anim_t *st, int64_t now_us, rc_anim_ev_t *ev)
 
     /* ---- 帧时钟（上限 64 帧/次，防坏包拖死 tick） ---- */
     const mpak_layout_t *lt = st->layout;
+    uint32_t dbg_frame_before = st->frame_idx;
     for (int guard = 0; guard < 64; guard++) {
         uint32_t d = lt->frames[st->frame_idx].delay_ms;
         if (d == 0) d = 50u;                       /* 双保险（解析端已兜底） */

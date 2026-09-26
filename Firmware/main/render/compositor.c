@@ -556,6 +556,7 @@ static void compose_region(int32_t x, int32_t y, int32_t w, int32_t h)
                 int32_t gx = RC_BANNER_PAD_X;
                 for (const char *p = g_banner_text; *p && gx < g_sw; p++) {
                     unsigned char u = (unsigned char)*p;
+                    if (u >= 'a' && u <= 'z') u -= 32;   /* 5x7 字库仅大写：小写转大写（SSID 小写会渲染成空白） */
                     if (u >= 128) u = '?';
                     const uint8_t *cols = MP_FONT5X7[u];
                     for (int col = 0; col < MP_FONT_GLYPH_W; col++) {
@@ -826,7 +827,13 @@ void render_tick(void)
 
     /* 1) 实体动画帧/表情/blink */
     rc_anim_ev_t ev;
+    static uint32_t s_dbg_frames; static int64_t s_dbg_last;
     if (rc_anim_advance(&g_anim, now_us, &ev)) {
+        s_dbg_frames++;
+        if (now_us - s_dbg_last > 3000000) {   /* 3s 一次：帧推进实证 */
+            ESP_LOGW("dbg", "帧推进: 3s 内 %u 次, 当前帧 %u/%u", s_dbg_frames, g_anim.frame_idx, g_anim.layout->frame_count);
+            s_dbg_frames = 0; s_dbg_last = now_us;
+        }
         if (ev.finished) {
             /* 单次动作播完 → 回退 standby 循环布局（stand1） */
             mark_ent();
