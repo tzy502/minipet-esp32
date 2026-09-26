@@ -21,9 +21,12 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <dirent.h>         /* audio/ 目录扫描（曲目表构建） */
+#include <strings.h>        /* strcasecmp（.mpk 后缀） */
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "cJSON.h"
@@ -34,6 +37,7 @@
 #include "input_dispatch.h"
 #include "pcm_ring.h"
 #include "minimp3/minimp3.h"
+#include "mpak.h"           /* AUDIO_META 包解析（复用格式实现，不另写） */
 
 static const char *TAG = "bgm";
 
@@ -60,13 +64,161 @@ static volatile mp_bgm_source_t s_source = MP_BGM_SRC_WZ;   /* NVS 偏好 */
 static volatile bool     s_greyed[2] = { false, false };     /* E8 源置灰 */
 static volatile bool     s_offline;
 
+static volatile uint32_t s_cur_id;   /* 最近起播的流 id（暂停恢复重开流用） */
 static pcm_ring_t *s_ring;
+
+/* ------------------------------------------------------------------ */
+/* 曲目表（AUDIO_META 包懒加载缓存）                                     */
+/* ------------------------------------------------------------------ */
+/* asset_dl.h 只有 hash→路径 查询面、无 audio 列表接口 → 此处直接扫
+ * /sdcard/minipet/audio/<hash>.mpk，逐包 mpak_open(expect_kind=AUDIO_META)
+ * 解析（复用 render/mpak 格式实现；损坏包 MPAK_ERR_* 静默跳过，E11 归
+ * asset_dl 管）。表按当前源过滤（E8 同源口径，流 URL 的 source 也同源），
+ * 源切换后按需重建；bgm 任务与表读者共一把锁（表构建持锁做 TF IO，
+ * 读者短临界区——bgm_list 首调可能令 bgm 任务阻塞百 ms 级，可接受）。 */
+
+#define TBL_TITLE_LEN      32      /* 对外 title 定宽（bgm_list 契约：32B 含 NUL） */
+#define TBL_PATH_LEN       64      /* /sdcard/minipet/audio/<16hex>.mpk */
+#define TBL_RESCAN_MS      30000   /* 空表扫描结果缓存 30s（play session 曲末查表，防逐曲扫 TF） */
+
+static SemaphoreHandle_t s_tbl_lock;
+static uint32_t *s_tids;                       /* PSRAM [s_tcount]（已按源过滤+去重） */
+static char (*s_titles)[TBL_TITLE_LEN];        /* PSRAM [s_tcount] */
+static int   s_tcount;                         /* 0=无表（未加载/空/失败） */
+static int   s_tcur = -1;                      /* 当前曲表内 index；-1=未锚定 */
+static uint8_t s_tbl_src = 0xFF;               /* 表对应源（0xFF=未建） */
+static int64_t s_tbl_failed_ms;                /* 上次空表扫描时刻（重扫节流） */
+
+static const char *source_str(mp_bgm_source_t s);   /* 定义见 bgm/cmd 回传节 */
+
+/* 定宽 title 拷贝：截 31 字节并回退 UTF-8 续字节，避免截半个汉字 */
+static void tbl_title_copy(char dst[TBL_TITLE_LEN], const char *src)
+{
+    int n = 0;
+    while (n < TBL_TITLE_LEN - 1 && src[n]) n++;
+    while (n > 0 && ((unsigned char)src[n] & 0xC0) == 0x80) n--;  /* 0b10xxxxxx=截断残体 */
+    memcpy(dst, src, (size_t)n);
+    dst[n] = '\0';
+}
+
+/* 构建期去重（多包/重复 id 只收一次；n≤~千级，线性扫一次性成本可忽略） */
+static bool tbl_build_has(const uint32_t *ids, int n, uint32_t id)
+{
+    for (int i = 0; i < n; i++) {
+        if (ids[i] == id) return true;
+    }
+    return false;
+}
+
+/* 扫 audio/ 全部 .mpk 构建（须持 s_tbl_lock）。结果发布前旧表保持可读：
+ * 中途 OOM 弃新保旧/置空，调用方按 s_tcount 语义自然降级服务端兜底。 */
+static void tbl_load_locked(void)
+{
+    mp_bgm_source_t src = (mp_bgm_source_t)s_source;
+    uint32_t *ids = NULL;
+    char (*titles)[TBL_TITLE_LEN] = NULL;
+    int cnt = 0, cap = 0;
+    bool oom = false;
+
+    DIR *d = opendir(MP_TF_MINIPET_DIR "/audio");
+    if (d) {
+        struct dirent *e;
+        while (!oom && (e = readdir(d)) != NULL) {
+            size_t nlen = strlen(e->d_name);
+            if (nlen < 5 || strcasecmp(e->d_name + nlen - 4, ".mpk") != 0) continue;
+
+            char path[TBL_PATH_LEN];
+            snprintf(path, sizeof(path), MP_TF_MINIPET_DIR "/audio/%s", e->d_name);
+
+            mpak_t m;
+            if (mpak_open(&m, path, 0 /*hash 免比（asset_dl 落盘已校验）*/,
+                          MPAK_KIND_AUDIO_META) != MPAK_OK) {
+                ESP_LOGW(TAG, "audio pack %s unusable, skipped", e->d_name);
+                continue;                        /* 空/截断/坏包：跳过 */
+            }
+            const mpak_audio_t *au = m.u.audio;
+            for (uint32_t i = 0; au && i < au->track_count; i++) {
+                if ((mp_bgm_source_t)au->tracks[i].source != src) continue;
+                if (tbl_build_has(ids, cnt, au->tracks[i].id)) continue;
+                if (cnt == cap) {                /* 倍增扩容（PSRAM） */
+                    int ncap = cap ? cap * 2 : 256;
+                    uint32_t *nid = heap_caps_realloc(
+                        ids, (size_t)ncap * sizeof(uint32_t), MALLOC_CAP_SPIRAM);
+                    if (!nid) { oom = true; break; }
+                    ids = nid;
+                    char (*ntl)[TBL_TITLE_LEN] = heap_caps_realloc(
+                        titles, (size_t)ncap * TBL_TITLE_LEN, MALLOC_CAP_SPIRAM);
+                    if (!ntl) { oom = true; break; }
+                    titles = ntl;
+                    cap = ncap;
+                }
+                ids[cnt] = au->tracks[i].id;
+                tbl_title_copy(titles[cnt], au->tracks[i].title);   /* 96B→31B 安全截断 */
+                cnt++;
+            }
+            mpak_close(&m);
+        }
+        closedir(d);
+    }
+
+    if (oom) {
+        ESP_LOGE(TAG, "track table build OOM @%d", cnt);
+        heap_caps_free(ids);
+        heap_caps_free(titles);
+        ids = NULL; titles = NULL; cnt = 0;      /* 弃半成品，旧表/空表语义不变 */
+    }
+
+    heap_caps_free(s_tids);
+    heap_caps_free(s_titles);
+    s_tids = ids;
+    s_titles = titles;
+    s_tcount = cnt;
+    s_tcur = -1;                                 /* 表换血，播放锚点作废 */
+    s_tbl_src = (uint8_t)src;
+    s_tbl_failed_ms = cnt ? 0 : mp_now_ms();     /* 空表 30s 内不重扫 */
+    ESP_LOGI(TAG, "track table: %d tracks (source=%s)", cnt, source_str(src));
+}
+
+/* 表与当前源一致且可用 → 直接用；否则（重）构建 */
+static void tbl_ensure_locked(void)
+{
+    if (s_tbl_src == (uint8_t)s_source && s_tcount > 0) return;
+    if (s_tbl_src == (uint8_t)s_source && mp_now_ms() - s_tbl_failed_ms < TBL_RESCAN_MS) return;
+    tbl_load_locked();
+}
+
+/* idx 处曲目 id（越界/空表=-1）。短临界区，不触发构建。 */
+static int tbl_id_at(int idx)
+{
+    xSemaphoreTake(s_tbl_lock, portMAX_DELAY);
+    int id = (idx >= 0 && idx < s_tcount) ? (int)s_tids[idx] : -1;
+    xSemaphoreGive(s_tbl_lock);
+    return id;
+}
+
+static int tbl_find_locked(uint32_t id)
+{
+    for (int i = 0; i < s_tcount; i++) {
+        if (s_tids[i] == id) return i;
+    }
+    return -1;
+}
+
+/* 表内步进（dir=+1/-1），尾↔首循环；空表=-1；锚点无效时 dir>0 从 0 起 */
+static int tbl_step_locked(int dir)
+{
+    if (s_tcount <= 0) return -1;
+    if (s_tcur < 0 || s_tcur >= s_tcount) return (dir > 0) ? 0 : s_tcount - 1;
+    int i = s_tcur + dir;
+    if (i < 0) i = s_tcount - 1;
+    if (i >= s_tcount) i = 0;
+    return i;
+}
 
 /* ------------------------------------------------------------------ */
 /* bgm/cmd 回传（E8：设备端现场控制）                                    */
 /* ------------------------------------------------------------------ */
 static const char *source_str(mp_bgm_source_t s) { return s ? "qq" : "wz"; }
-
 /* 发控制命令并取回应答 id（next/prev/play 用）；纯回传可忽略应答 */
 static int bgm_cmd(const char *cmd, int n, int *out_id)
 {
@@ -236,44 +388,81 @@ static void source_failover(void)
              source_str((mp_bgm_source_t)s_source));
 }
 
-static void bgm_play_session(int track_id)
+/* 播放会话（bgm 任务上下文）：
+ *   start_idx >= 0        → 曲目表驱动：自然播完/曲废均走 tbl_step 循环推进
+ *                           （E8 同源内循环；表构建时已按源过滤）
+ *   start_idx <0 且 fb_id>0 → 服务端驱动兜底（audio/ 无表）：bgm_cmd("next") 取下一首
+ *   两皆无效               → 直接返回（无可播）
+ * s_tcur 只在真正起播前提交：暂停/流中止退出时不前移，恢复续播仍在当前曲。 */
+static void bgm_play_session(int start_idx, int fb_id)
 {
-    int track = track_id;
+    bool by_table = (tbl_id_at(start_idx) > 0);
+    int track = by_table ? 0 : fb_id;            /* 服务端模式：track=当前曲 id */
+    int idx = by_table ? start_idx : -1;
+    if (!by_table && fb_id <= 0) return;
+
     int track_fails = 0;
 
     while (track_fails < TRACK_FAIL_LIMIT) {
         drain_audio_q_nonblock();                       /* 曲间也收控制 */
-        if (!s_playing || s_offline) return;            /* 中止 */
+        if (!s_playing || s_offline) return;            /* 中止（锚点不前移） */
         if (s_greyed[s_source]) return;
+
+        int id;
+        if (by_table) {
+            id = tbl_id_at(idx);
+            if (id <= 0) return;                        /* 表中途重建/失效：结束会话 */
+            s_tcur = idx;                               /* 真正起播前锚定 */
+        } else {
+            id = track;
+        }
+        s_cur_id = (uint32_t)id;                        /* 恢复续播/上报用 */
 
         int retries = 0;
         bool ok = false;
         while (retries <= RETRY_SAME_TRACK) {
             if (!s_playing || s_offline) return;
-            if (play_track(track)) { ok = true; break; }
+            if (play_track(id)) { ok = true; break; }
             retries++;
         }
         if (!ok) {
             track_fails++;
+            ESP_LOGW(TAG, "track %d failed (streak %d), skip", id, track_fails);
             /* 同曲重试耗尽 → 跳下一首（仍同源——E8 禁跨源自动换歌） */
-            int next = 0;
-            if (bgm_cmd("next", 0, &next) != 0 || next <= 0) {
-                track_fails++;                   /* 取下一首也失败：加速三振 */
-                break;
+            if (by_table) {
+                xSemaphoreTake(s_tbl_lock, portMAX_DELAY);
+                idx = tbl_step_locked(+1);
+                xSemaphoreGive(s_tbl_lock);
+                if (idx < 0) break;                     /* 空表（异常）：会话结束 */
+            } else {
+                int next = 0;
+                if (bgm_cmd("next", 0, &next) != 0 || next <= 0) {
+                    track_fails++;                      /* 取下一首也失败：加速三振 */
+                    break;
+                }
+                track = next;
             }
-            track = next;
             continue;
         }
 
         track_fails = 0;                         /* 有成功播放即复位 */
 
-        /* 自然播完 → 下一首（同源内切歌） */
-        int next = 0;
-        if (bgm_cmd("next", 0, &next) != 0 || next <= 0) {
-            track_fails = 1;
-            break;                               /* 拿不到下一首：会话结束 */
+        if (!s_playing) return;                  /* 暂停/切歌中止：不前移锚点 */
+
+        /* 自然播完 → 下一首（同源内循环） */
+        if (by_table) {
+            xSemaphoreTake(s_tbl_lock, portMAX_DELAY);
+            idx = tbl_step_locked(+1);
+            xSemaphoreGive(s_tbl_lock);
+            if (idx < 0) break;
+        } else {
+            int next = 0;
+            if (bgm_cmd("next", 0, &next) != 0 || next <= 0) {
+                track_fails = 1;
+                break;                               /* 拿不到下一首：会话结束 */
+            }
+            track = next;
         }
-        track = next;
     }
 
     if (track_fails >= TRACK_FAIL_LIMIT) {
@@ -292,6 +481,17 @@ static void bgm_play_session(int track_id)
 /* 流播放期间（bgm 任务阻塞在 HTTP 读流）非阻塞排空控制队列：
  * 暂停/停止/切歌立即中止流；音量即时生效；下一首动作记账延后执行 */
 static volatile int s_pending_op;      /* 0=无 1=next 2=prev */
+
+/* 音量统一落点（仅 bgm 任务上下文调用；s_vol 为 volatile u8 单写者）：
+ * clamp 0..100 → 立即生效（feeder 出口读 s_vol）→ NVS 偏好 */
+static void vol_apply(int v)
+{
+    if (v < 0) v = 0;
+    if (v > 100) v = 100;
+    if ((uint8_t)v == s_vol) return;
+    s_vol = (uint8_t)v;
+    mp_nvs_set_u32("bgm_vol", s_vol);
+}
 
 static void drain_audio_q_nonblock(void)
 {
@@ -316,10 +516,10 @@ static void drain_audio_q_nonblock(void)
             s_playing = false;
             break;
         case MP_AUDIO_VOL:
-            if (m.a >= 0 && m.a <= 100) {
-                s_vol = (uint8_t)m.a;
-                mp_nvs_set_u32("bgm_vol", s_vol);
-            }
+            vol_apply(m.a);
+            break;
+        case MP_AUDIO_VOLUME:
+            vol_apply((int)s_vol + m.a);   /* 流中增减：feeder 出口即时生效，不做 HTTP 回传 */
             break;
         case MP_AUDIO_SOURCE:
             if (m.a == 0 || m.a == 1) {
@@ -328,6 +528,7 @@ static void drain_audio_q_nonblock(void)
                 mp_nvs_set_u32("bgm_src", (uint32_t)s_source);
                 s_playing = false;
                 s_state = MP_BGM_IDLE;
+                s_tcur = -1;                    /* 换源：播放锚点作废（表按新源重建） */
             }
             break;
         default:
@@ -350,19 +551,39 @@ static void handle_audio_msg(const mp_audio_msg_t *m)
         s_playing = true;
         mp_codec_start(s_rate ? s_rate : 44100);
         input_trigger_expression(MP_EXPR_HUM, 1500);     /* E10：BGM 播放=hum */
-        bgm_play_session(id);
+        /* 表内有此 id → 按表位起播（next/prev 循环锚点）；
+         * 表不可用/不在表内 → 服务端 id 兜底路径 */
+        xSemaphoreTake(s_tbl_lock, portMAX_DELAY);
+        tbl_ensure_locked();
+        int idx = tbl_find_locked((uint32_t)id);
+        xSemaphoreGive(s_tbl_lock);
+        bgm_play_session(idx, idx < 0 ? id : 0);
         break;
     }
     case MP_AUDIO_RESUME:
         if (s_state == MP_BGM_PAUSED) {
+            /* 暂停采用「关流」方案（见 MP_AUDIO_PAUSE），此处重开当前曲流：
+             * 从头续播（~前 1s 环形缓冲已在暂停侧丢弃），服务端进度由
+             * bgm_cmd("resume") 回传记账；s_tcur 锚点未动 → 续的还是当前曲。 */
+            xSemaphoreTake(s_tbl_lock, portMAX_DELAY);
+            tbl_ensure_locked();
+            int idx = (s_tcur >= 0) ? s_tcur : tbl_find_locked(s_cur_id);
+            xSemaphoreGive(s_tbl_lock);
+            if (idx < 0 && s_cur_id == 0) return;        /* 从未起播：无可续 */
             s_state = MP_BGM_PLAYING;
             s_playing = true;
+            pcm_ring_flush(s_ring);                      /* 丢暂停残留，防旧数据先出声 */
             mp_codec_start(s_rate ? s_rate : 44100);
-            bgm_cmd("resume", 0, NULL);                 /* 现场控制回传 */
+            bgm_cmd("resume", 0, NULL);                  /* 现场控制回传 */
+            bgm_play_session(idx, (int)s_cur_id);
         }
         break;
     case MP_AUDIO_PAUSE:
         if (s_state == MP_BGM_PLAYING) {
+            /* 暂停=停 feeder+PA 静音（feeder 见 !s_playing 即关 PA），并选择
+             * 关闭流：mp_http_get 为阻塞读，无「挂起保连」机制，stream_chunk
+             * 见 !s_playing 返回 false 即中止 HTTP → 连接释放。代价是恢复时
+             * 重开当前曲流（见 MP_AUDIO_RESUME）。 */
             s_state = MP_BGM_PAUSED;
             s_playing = false;                          /* 流/出声双停 */
             bgm_cmd("pause", 0, NULL);
@@ -377,21 +598,36 @@ static void handle_audio_msg(const mp_audio_msg_t *m)
     case MP_AUDIO_NEXT:
     case MP_AUDIO_PREV: {
         if (s_state == MP_BGM_FAILED) return;           /* 置灰源禁播 */
-        int id = 0;
-        if (bgm_cmd(m->type == MP_AUDIO_NEXT ? "next" : "prev", 0, &id) == 0 && id > 0) {
+        int dir = (m->type == MP_AUDIO_NEXT) ? +1 : -1;
+        xSemaphoreTake(s_tbl_lock, portMAX_DELAY);
+        tbl_ensure_locked();
+        int idx = tbl_step_locked(dir);                 /* 表内尾↔首循环 */
+        xSemaphoreGive(s_tbl_lock);
+        if (idx >= 0) {
+            s_pending_op = 0;
             s_state = MP_BGM_PLAYING;
             s_playing = true;
             mp_codec_start(s_rate ? s_rate : 44100);
-            bgm_play_session(id);
+            bgm_play_session(idx, 0);
+        } else {
+            /* 兜底：表不可用（audio/ 无包）→ 服务端 next/prev */
+            int sid = 0;
+            if (bgm_cmd(m->type == MP_AUDIO_NEXT ? "next" : "prev", 0, &sid) == 0 && sid > 0) {
+                s_state = MP_BGM_PLAYING;
+                s_playing = true;
+                mp_codec_start(s_rate ? s_rate : 44100);
+                bgm_play_session(-1, sid);
+            }
         }
         break;
     }
     case MP_AUDIO_VOL:
-        if (m->a >= 0 && m->a <= 100) {
-            s_vol = (uint8_t)m->a;
-            mp_nvs_set_u32("bgm_vol", s_vol);           /* 偏好存设备配置（E8） */
-            bgm_cmd("vol", m->a, NULL);
-        }
+        vol_apply(m->a);
+        bgm_cmd("vol", (int)s_vol, NULL);
+        break;
+    case MP_AUDIO_VOLUME:
+        vol_apply((int)s_vol + m->a);
+        bgm_cmd("vol", (int)s_vol, NULL);              /* 现场控制回传 */
         break;
     case MP_AUDIO_SOURCE:
         /* E8：手动切类型才换源（并清该源灰显） */
@@ -402,6 +638,7 @@ static void handle_audio_msg(const mp_audio_msg_t *m)
             /* 换源停播：等用户显式 play */
             s_state = MP_BGM_IDLE;
             s_playing = false;
+            s_tcur = -1;                                /* 曲目表按新源重建（tbl_ensure） */
         }
         break;
     default:
@@ -429,9 +666,11 @@ static void bgm_task(void *arg)
         mp_audio_msg_t m;
         if (xQueueReceive(mp_audio_q, &m, portMAX_DELAY) == pdTRUE) {
             if (!s_dec) continue;                       /* 解码器不可用 */
-            if (m.type == MP_AUDIO_VOL) { handle_audio_msg(&m); continue; }
-            if (s_offline && m.type != MP_AUDIO_SOURCE && m.type != MP_AUDIO_VOL) {
-                continue;                               /* 断网静音降级（E8） */
+            if (m.type == MP_AUDIO_VOL || m.type == MP_AUDIO_VOLUME) {
+                handle_audio_msg(&m); continue;     /* 音量本地可用，断网也不拦 */
+            }
+            if (s_offline && m.type != MP_AUDIO_SOURCE) {
+                continue;                               /* 断网静音降级（E8）；切源仍可 */
             }
             handle_audio_msg(&m);
 
@@ -502,6 +741,11 @@ static void feeder_task(void *arg)
 /* ------------------------------------------------------------------ */
 void bgm_start(void)
 {
+    s_tbl_lock = xSemaphoreCreateMutex();
+    if (!s_tbl_lock) {
+        ESP_LOGE(TAG, "tbl mutex alloc failed");
+        return;
+    }
     s_ring = pcm_ring_create(RING_BYTES);
     if (!s_ring) {
         ESP_LOGE(TAG, "pcm ring alloc failed (PSRAM?)");
@@ -512,6 +756,87 @@ void bgm_start(void)
     xTaskCreatePinnedToCore(feeder_task, "i2s_feed", 4096, NULL, 4, NULL, 0 /* PRO */);
 }
 
+/* ---------------- 曲目表 / 播放控制（任意任务上下文，异步生效）--------- */
+
+bool bgm_play_id(uint32_t id)
+{
+    if (id == 0) return false;                      /* 0=服务端决定，不走选曲 */
+    if (s_offline) return false;                    /* 断网静音降级（E8） */
+    if (s_greyed[s_source]) return false;           /* 置灰源禁播（E8） */
+    mp_audio_msg_t m = { .type = MP_AUDIO_PLAY, .a = (int32_t)id };
+    return mp_post_audio(&m);                       /* bgm 任务内锚定表位并起播 */
+}
+
+bool bgm_toggle_pause(void)
+{
+    mp_bgm_state_t st = s_state;
+    mp_audio_msg_t m = { .type = MP_AUDIO_NONE, .a = 0 };
+    bool to_playing;
+
+    if (st == MP_BGM_PLAYING) {
+        m.type = MP_AUDIO_PAUSE;
+        to_playing = false;
+    } else if (st == MP_BGM_PAUSED) {
+        m.type = MP_AUDIO_RESUME;
+        to_playing = true;
+    } else {
+        return false;                               /* IDLE/FAILED：无可切换 */
+    }
+    /* 返回值为意图态（消息刚入队，bgm 任务尚未落地；控制条回显以
+     * bgm_get_state() 轮询为准） */
+    mp_post_audio(&m);
+    return to_playing;
+}
+
+void bgm_next(void)
+{
+    mp_audio_msg_t m = { .type = MP_AUDIO_NEXT, .a = 0 };
+    mp_post_audio(&m);                              /* 表内循环推进（bgm 任务落地） */
+}
+
+void bgm_prev(void)
+{
+    mp_audio_msg_t m = { .type = MP_AUDIO_PREV, .a = 0 };
+    mp_post_audio(&m);
+}
+
+int bgm_list(uint32_t *ids, char titles[][32], int max)
+{
+    if (max <= 0 || (!ids && !titles)) return 0;
+    if (!s_tbl_lock) return 0;                      /* bgm_start 未跑（异常序） */
+
+    int n = 0;
+    xSemaphoreTake(s_tbl_lock, portMAX_DELAY);
+    tbl_ensure_locked();                            /* 首调扫 TF（持锁，百 ms 级） */
+    for (int i = 0; i < s_tcount && n < max; i++) {
+        if (ids) ids[n] = s_tids[i];
+        if (titles) memcpy(titles[n], s_titles[i], TBL_TITLE_LEN);   /* 已 32B 定宽 */
+        n++;
+    }
+    xSemaphoreGive(s_tbl_lock);
+    return n;
+}
+
+void bgm_volume_add(int delta)
+{
+    if (delta == 0) return;
+    /* 经 audio_q 由 bgm 任务落地（clamp/NVS/回传单写者；不阻塞调用方，
+     * 音量本身经 feeder 出口即时生效） */
+    mp_audio_msg_t m = { .type = MP_AUDIO_VOLUME, .a = (int32_t)delta };
+    mp_post_audio(&m);
+}
+
+uint8_t bgm_volume_get(void)
+{
+    return (uint8_t)s_vol;
+}
+
+
+const char *bgm_current_title(void)
+{
+    if (s_tcur >= 0 && s_tcur < s_tcount && s_titles) return s_titles[s_tcur];
+    return "";
+}
 void bgm_set_offline(bool offline)
 {
     if (s_offline == offline) return;

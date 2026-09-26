@@ -75,6 +75,11 @@ void asset_dl_set_active_map(const char *hash);
 
 /* ---------------- 收藏 / LRU / rev ------------------------------------ */
 void asset_dl_set_favorite(const char *hash, bool fav);   /* E7 收藏保护 */
+
+/* E7 选择器列表（真机定稿）：kind 过滤 + manifest label 透传。
+ * 返回条数；labels 供选择器显示（缺失时回退 hash 前 8 位） */
+int asset_dl_bgmap_list(char hashes[][20], char labels[][32], int max);
+int asset_dl_parts_list(char hashes[][20], char labels[][32], int max);
 void asset_dl_touch(const char *hash);                    /* 最近使用 */
 uint32_t asset_dl_local_rev(void);
 

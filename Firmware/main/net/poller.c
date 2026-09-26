@@ -132,14 +132,86 @@ static bool do_poll_once(void)
     cJSON *jrev = cJSON_GetObjectItem(root, "rev");
     uint32_t rev = jrev ? (uint32_t)cJSON_GetNumberValue(jrev) : s_since;
 
-    cJSON *cmds = cJSON_GetObjectItem(root, "cmds");
+    /* 服务端实际响应（DeviceEndpoints.cs）：{ commands:[{seq,type,payload}], lastSeq, mrev }
+     * payload 可能是对象（map:{id} / ota:{ver,url}）或字符串——统一摊平成
+     * handle_cmd 期望的 {t,v,n,u} 视图后复用既有语义映射 */
+    cJSON *cmds = cJSON_GetObjectItem(root, "commands");
+    if (!cJSON_IsArray(cmds)) cmds = cJSON_GetObjectItem(root, "cmds");  /* 兼容旧口径 */
     if (cJSON_IsArray(cmds)) {
         cJSON *jc;
         cJSON_ArrayForEach(jc, cmds) {
-            handle_cmd(jc);
+            cJSON *t = cJSON_GetObjectItem(jc, "type");
+            cJSON *payload = cJSON_GetObjectItem(jc, "payload");
+            if (!t) { handle_cmd(jc); continue; }   /* 旧口径直通 */
+            /* 构造 {t, v, n, u} 视图：v=字符串 payload 或对象中的字符串字段 */
+            cJSON *vitem = NULL;
+            if (cJSON_IsString(payload)) vitem = payload;
+            cJSON *pid = payload ? cJSON_GetObjectItem(payload, "id") : NULL;
+            cJSON *pver = payload ? cJSON_GetObjectItem(payload, "ver") : NULL;
+            cJSON *purl = payload ? cJSON_GetObjectItem(payload, "url") : NULL;
+            cJSON *pn = payload ? cJSON_GetObjectItem(payload, "n") : NULL;
+
+            if (pid && cJSON_IsString(pid)) {           /* map: {"id":...} */
+                vitem = pid;
+            } else if (pver && cJSON_IsString(pver)) {  /* ota: {"ver","url"} */
+                vitem = pver;
+            } else if (!vitem && pn) {
+                vitem = NULL;                           /* 数值型走 n 通道 */
+            }
+            /* —— 专用解析：type + payload 字段 → 既有 handle_cmd 语义 —— */
+            {
+                const char *ts = t->valuestring;
+                char tbuf[24];
+                strlcpy(tbuf, ts, sizeof(tbuf));
+                cJSON jv = { 0 };
+                jv.type = cJSON_IsString(vitem) ? cJSON_String : cJSON_Number;
+                if (cJSON_IsString(vitem)) jv.valuestring = vitem->valuestring;
+                else if (pn) jv.valuedouble = cJSON_GetNumberValue(pn);
+
+                cJSON jn = { 0 };
+                if (pn) { jn.type = cJSON_Number; jn.valuedouble = cJSON_GetNumberValue(pn); }
+
+                cJSON ju = { 0 };
+                if (purl && cJSON_IsString(purl)) { ju.type = cJSON_String; ju.valuestring = purl->valuestring; }
+
+                /* 直接内联 handle_cmd 的等价处理（构造伪节点传入） */
+                if (strcmp(tbuf, "action") == 0 && cJSON_IsString(vitem)) {
+                    mp_cmd_t c = { 0 }; c.type = MP_CMD_SET_ACTION;
+                    strlcpy(c.s, vitem->valuestring, sizeof(c.s)); mp_post_cmd(&c);
+                } else if (strcmp(tbuf, "expression") == 0 && cJSON_IsString(vitem)) {
+                    mp_cmd_t c = { 0 }; c.type = MP_CMD_SET_EXPRESSION;
+                    strlcpy(c.s, vitem->valuestring, sizeof(c.s)); mp_post_cmd(&c);
+                } else if (strcmp(tbuf, "bubble") == 0 && cJSON_IsString(vitem)) {
+                    mp_cmd_t c = { 0 }; c.type = MP_CMD_BUBBLE;
+                    strlcpy(c.s, vitem->valuestring, sizeof(c.s)); mp_post_cmd(&c);
+                } else if (strcmp(tbuf, "map") == 0 && cJSON_IsString(pid)) {
+                    mp_cmd_t c = { 0 }; c.type = MP_CMD_SET_MAP;
+                    strlcpy(c.s, pid->valuestring, sizeof(c.s)); mp_post_cmd(&c);
+                } else if (strcmp(tbuf, "brightness") == 0 && pn) {
+                    mp_cmd_t c = { 0 }; c.type = MP_CMD_BRIGHTNESS;
+                    c.a = (int32_t)cJSON_GetNumberValue(pn); mp_post_cmd(&c);
+                } else if (strcmp(tbuf, "reboot") == 0) {
+                    mp_cmd_t c = { 0 }; c.type = MP_CMD_REBOOT; mp_post_cmd(&c);
+                } else if (strcmp(tbuf, "bgm") == 0 && cJSON_IsString(vitem)) {
+                    mp_audio_msg_t m = { 0 };
+                    const char *vv = vitem->valuestring;
+                    if      (strcmp(vv, "play") == 0)   m.type = MP_AUDIO_PLAY;
+                    else if (strcmp(vv, "pause") == 0)  m.type = MP_AUDIO_PAUSE;
+                    else if (strcmp(vv, "resume") == 0) m.type = MP_AUDIO_RESUME;
+                    else if (strcmp(vv, "stop") == 0)   m.type = MP_AUDIO_STOP;
+                    else if (strcmp(vv, "next") == 0)   m.type = MP_AUDIO_NEXT;
+                    else if (strcmp(vv, "prev") == 0)   m.type = MP_AUDIO_PREV;
+                    if (m.type != MP_AUDIO_NONE) mp_post_audio(&m);
+                } else if (strcmp(tbuf, "ota") == 0 && pver && cJSON_IsString(pver)) {
+                    const char *u = (purl && cJSON_IsString(purl)) ? purl->valuestring : "";
+                    mp_ota_offer(pver->valuestring, u);
+                }
+            }
         }
     }
 
+    cJSON *jls = cJSON_GetObjectItem(root, "lastSeq");
+    if (jls) rev = (uint32_t)cJSON_GetNumberValue(jls);
     if (rev > s_since) {
         s_since = rev;
         mp_nvs_set_u32("poll_since", s_since);   /* 断电续读（尽力而为） */

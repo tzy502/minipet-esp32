@@ -7,6 +7,10 @@
  *     也不影响采样）；任务启动时读回 CTRL7 自愈使能位（见 imu_link_selfcheck）
  *   - 菜单键 key_gpio18 30ms 防抖 + 状态门闩（按下沿触发后闩住，
  *     必须先见到「释放 + 80ms 静止」才允许下一次触发，真机连发根修）
+ *   - 中键 key_gpio0（GPIO0）纯轮询同口径消抖：BGM 播放/暂停切换
+ *     （走 audio_q 既有命令通道，无 ISR——GPIO0 与复位时序相关）
+ *   - 底键 = AXP2101 PWRON 短按（IRQ 脚未接线，慢速巡检轮询 IRQ 状态寄存器）：
+ *     手动进/出待机时钟
  *   - 1s 慢速节拍：闲置→DOZE 计时（state_machine_tick_1hz）、电池/温度巡检
  *   - 静置随机稀有表情（E10：wink/chu/qBlue 低频）
  */
@@ -25,6 +29,7 @@
 #include "app_core.h"
 #include "hal_contract.h"
 #include "state_machine.h"
+#include "bgm.h"              /* bgm_get_state（BGM 态回读，切播放/暂停用） */
 
 static const char *TAG = "input";
 
@@ -430,6 +435,15 @@ static bool touch_read_frame(touch_frame_t *f)
     return true;
 }
 
+/* 【四向判定】映射后落点所在象限（屏幕中线 240 分界） */
+static const char *touch_quadrant_name(int16_t x, int16_t y)
+{
+    if (x < TOUCH_RANGE_PX / 2) {
+        return (y < TOUCH_RANGE_PX / 2) ? "左上" : "左下";
+    }
+    return (y < TOUCH_RANGE_PX / 2) ? "右上" : "右下";
+}
+
 static void touch_tick(void)
 {
     static bool down = false;
@@ -466,7 +480,20 @@ static void touch_tick(void)
     }
 
     touch_frame_t f;
-    if (!touch_read_frame(&f)) {
+    bool read_ok = touch_read_frame(&f);
+
+    /* 菜单/时钟/配网态：触摸全归 LVGL（菜单真实化：读帧后经 feed 注入
+     * indev），宠物交互不穿透（真机：菜单里的长按再发 MENU_KEY →
+     * 菜单"关了又出现"） */
+    {
+        mp_state_t tst = state_machine_current();
+        if (tst != MP_ST_POKER && tst != MP_ST_OFFLINE) {
+            if (read_ok) lv_bridge_touch_feed(f.x, f.y, f.touched);
+            down = false; drag_active = false; longpress_fired = false;
+            return;
+        }
+    }
+    if (!read_ok) {
         /* 问题3 兜底：读失败显式报错不静默（首报 ≈1s，之后每 5s 一条） */
         fail_cnt++;
         if (fail_cnt == TOUCH_FAIL_LOG_N ||
@@ -509,6 +536,16 @@ static void touch_tick(void)
                  f.raw_x, f.raw_y, f.x, f.y,
                  f.d[0], f.d[1], f.d[2], f.d[3],
                  f.d[4], f.d[5], f.d[6], f.d[7], f.count);
+        /* 【四向判定提示】（标定收尾，等真机数据，本层不改映射）：
+         * 真机依次按屏幕左上/右上/左下/右下四个角，看每条按下沿日志的
+         * 「落点象限」是否与按角一致，主线程据此二选一修正：
+         *   四角全部一致                     → 现映射正确，无需修改；
+         *   落点随按角旋转 90°（对角互换）    → swap_xy 取反；
+         *   仅左右镜像或仅上下镜像           → 对应 mirror_x / mirror_y 取反。
+         * 现口径：sx=raw_y, sy=480−raw_x（BSP swap_xy=1+mirror_y=1）。 */
+        ESP_LOGI(TAG, "四向判定: 按角→落点象限【%s】 屏幕(%d,%d)",
+                 touch_quadrant_name(f.x, f.y), f.x, f.y);
+        render_calib_set(true, f.x, f.y);    /* 【校准】落点回显到屏 */
     } else if (f.touched && down) {
         int dx = (int)f.x - (int)down_x;
         /* 问题6：按住并水平拖动（≥TAP_MOVE_PX）→ 倾斜视差同款效果：
@@ -573,6 +610,14 @@ static void touch_tick(void)
 static void key_fire_menu_toggle(void)
 {
     mp_state_t before = state_machine_current();
+    if (before == MP_ST_MENU) {
+        /* 菜单真实化：MENU 态顶键短按=确认当前项（LVGL 内部处理），
+         * 退出菜单走屏上 Exit 项（post MENU_EXIT → 状态机回 POKER） */
+        render_menu_ok();
+        mp_state_t after = state_machine_current();
+        ESP_LOGI(TAG, "菜单键：确认（%s）", state_machine_name(after));
+        return;
+    }
     state_machine_handle(MP_SM_EV_MENU_KEY);
     mp_state_t after = state_machine_current();
     if (before != after) {
@@ -602,6 +647,8 @@ static void key_tick(void)
     static bool latched = false;        /* 已按本次按压触发过：未见过释放前保持闩住 */
     static bool release_pending = false;/* 已确认释放沿，80ms 静止确认计时中 */
     static int64_t released_ms = 0;
+    static int64_t press_ms = 0;        /* 短按/长按分界（700ms 转时钟） */
+    static bool menu_fired = false, clock_fired = false;
 
     bool pressed = key_gpio18_pressed();   /* 低电平=按下 */
     int64_t now = mp_now_ms();
@@ -615,15 +662,29 @@ static void key_tick(void)
         if (stable_pressed) {
             release_pending = false;       /* 弹回按下：静止确认作废，闩继续关 */
             if (!latched) {
-                latched = true;            /* 只在【按下沿】触发一次 */
+                latched = true;
+                press_ms = now;            /* 短按/长按分界计时起点 */
+                menu_fired = clock_fired = false;
+            }
+        } else {
+            /* 释放沿：未达长按 → 短按翻转菜单一次（长按已转时钟则吞掉） */
+            release_pending = true;
+            released_ms = now;
+            if (latched && !clock_fired && !menu_fired) {
+                menu_fired = true;
                 key_fire_menu_toggle();
             }
-            /* 闩住期间的按下沿直接吞掉（长按/抖动不产生第二次迁移） */
-        } else {
-            release_pending = true;        /* 确认释放：起 80ms 静止确认 */
-            released_ms = now;
         }
         note_interaction();
+    }
+
+    /* 长按 ≥700ms（按住未释放）→ 转时钟模式（用户定稿：长按菜单键=时间） */
+    if (latched && stable_pressed && !clock_fired && !menu_fired &&
+        (now - press_ms) >= 700) {
+        clock_fired = true;
+        note_interaction();
+        ESP_LOGI(TAG, "菜单键长按 → 待机时钟");
+        state_machine_handle(MP_SM_EV_IDLE_TIMEOUT);
     }
 
     if (latched && release_pending && !stable_pressed &&
@@ -633,11 +694,108 @@ static void key_tick(void)
 }
 
 /* ================================================================== */
+/* 中键（GPIO0：BGM 播放/暂停切换）                                      */
+/* ================================================================== */
+/* 接线口径 [核对]：据微雪 wiki，三键的【中键】大概率接 GPIO0（CHIP_PU 附近）。
+ * GPIO0 是 strapping 脚，运行期只准「输入 + 内部上拉」，绝不可配成输出/
+ * 挂中断（复位时序相关）——key_gpio0 驱动为纯轮询（30ms 消抖 + 释放门闩，
+ * 与菜单键同口径），~20ms 主循环节拍采样。
+ *
+ * 功能绑定：BGM 播放/暂停切换。全部走既有通道，未新增命令枚举：
+ *   - 态回读 bgm_get_state()（main/audio/bgm.h 对外接口）；
+ *   - 切换经 audio_q（app_core.h 的 MP_AUDIO_PAUSE/RESUME/PLAY），
+ *     由 bgm 任务消费；app_core 无 MP_CMD_BGM* 播控枚举（只有回显用
+ *     MP_CMD_BGM_STATE），故不占用 cmd_q。 */
+static void key0_fire_bgm_toggle(void)
+{
+    mp_audio_msg_t m = { .type = MP_AUDIO_NONE, .a = 0 };
+    switch (bgm_get_state()) {
+    case MP_BGM_PLAYING:
+        m.type = MP_AUDIO_PAUSE;         /* 播放中 → 暂停 */
+        break;
+    case MP_BGM_PAUSED:
+        m.type = MP_AUDIO_RESUME;        /* 暂停中 → 继续 */
+        break;
+    case MP_BGM_IDLE:
+        m.type = MP_AUDIO_PLAY;          /* 无曲 → 起播（a=0 服务端决定曲目） */
+        break;
+    case MP_BGM_FAILED:
+    default:
+        ESP_LOGW(TAG, "中键：BGM 源置灰（failover），忽略切换");
+        return;
+    }
+    if (!mp_post_audio(&m)) {
+        ESP_LOGW(TAG, "中键：audio_q 满，本次 BGM 切换丢失");
+    }
+}
+
+static void key0_tick(void)
+{
+    if (!key_gpio0_tick()) return;       /* 消抖后的按下沿事件（一次/按压） */
+    ESP_LOGI(TAG, "中键（GPIO0）按下沿");
+    note_interaction();
+    mp_state_t st = state_machine_current();
+    if (st == MP_ST_MENU) {
+        extern void render_menu_nav(int dir);   /* render.h（菜单选择器，真机定稿） */
+        render_menu_nav(0);              /* 菜单内：选中项上移 */
+        return;
+    }
+    if (st == MP_ST_CLOCK_DOZE) {
+        state_machine_notify_activity(); /* DOZE：先唤醒回 POKER */
+        return;
+    }
+    /* POKER/OFFLINE：音量减（用户定稿：桌宠页中/底键=音量加减） */
+    mp_audio_msg_t m = { .type = MP_AUDIO_VOLUME, .a = -10 };
+    if (!mp_post_audio(&m)) ESP_LOGW(TAG, "audio_q 满，音量-丢失");
+}
+
+/* ================================================================== */
+/* 底键（AXP2101 PWRON 短按：手动进/出待机时钟）                         */
+/* ================================================================== */
+/* 接线口径 [核对]：底键大概率接 AXP2101 的 PWRON；本板 PMU IRQ 引脚未接线
+ * → 驱动侧走 IRQ 状态寄存器轮询（pmu_pwron_short_press，PMU 事件锁存 +
+ * 写 1 清除，慢轮询不丢短按）。
+ *
+ * 功能绑定：手动进/出待机时钟。state_machine.h 无专用「时钟切换」事件，
+ * 用既有接口组合实现（无新增枚举/接口）：
+ *   - CLOCK_DOZE → state_machine_notify_activity()（任意交互唤醒回 POKER，E9）；
+ *   - 其余态 → state_machine_handle(MP_SM_EV_IDLE_TIMEOUT)
+ *     （POKER/MENU/OFFLINE → CLOCK_DOZE；BOOT/OTA/FATAL 状态机本就忽略）。 */
+#define PWRON_POLL_MS 100    /* 巡检节拍：100ms 一查（短按响应足够快） */
+
+static void pwron_tick(void)
+{
+    static int64_t last_poll_ms;
+    int64_t now = mp_now_ms();
+    if (now - last_poll_ms < PWRON_POLL_MS) return;
+    last_poll_ms = now;
+
+    if (!pmu_pwron_short_press()) return;
+    ESP_LOGI(TAG, "底键（PWRON 短按）");
+    mp_state_t st = state_machine_current();
+    if (st == MP_ST_MENU) {
+        extern void render_menu_nav(int dir);
+        render_menu_nav(1);              /* 菜单内：选中项下移 */
+        return;
+    }
+    if (st == MP_ST_CLOCK_DOZE) {
+        state_machine_notify_activity();           /* 出时钟 → POKER */
+        return;
+    }
+    note_interaction();
+    /* POKER/OFFLINE：音量加 */
+    mp_audio_msg_t m = { .type = MP_AUDIO_VOLUME, .a = +10 };
+    if (!mp_post_audio(&m)) ESP_LOGW(TAG, "audio_q 满，音量+丢失");
+}
+
+/* ================================================================== */
 /* 慢速巡检：电池 / 温度（E10/E11）                                     */
 /* ================================================================== */
 static void slow_tick(int64_t idle_ms)
 {
     int64_t now_s = mp_now_ms() / 1000;
+
+    pwron_tick();                 /* 底键（PWRON 短按）慢速巡检（内部 100ms 节流） */
 
     if (now_s - s_last_battery_s >= BATTERY_CHK_S) {
         s_last_battery_s = now_s;
@@ -726,6 +884,7 @@ void input_dispatch_task(void *arg)
 {
     (void)arg;
     key_gpio18_init();
+    key_gpio0_init();             /* 中键 GPIO0（输入+上拉+轮询消抖，绝不输出） */
     srand((unsigned)mp_now_ms());
     s_last_ax = 0;
     imu_link_selfcheck();
@@ -772,6 +931,7 @@ void input_dispatch_task(void *arg)
 
         touch_tick();
         key_tick();
+        key0_tick();              /* 中键 GPIO0：BGM 播放/暂停切换 */
         expr_fsm_tick();
 
         int64_t idle_ms = (s_last_interaction_ms == 0)

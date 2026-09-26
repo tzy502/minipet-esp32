@@ -11,6 +11,8 @@
  */
 #include "lvgl_bridge.h"
 
+#include <limits.h>
+#include <stdio.h>
 #include <string.h>
 
 #include <lvgl.h>
@@ -22,7 +24,19 @@
 #include "font_lazy.h"
 #include "render.h" /* RENDER_* 错误码 */
 
+/* 菜单真实化（E7）跨模块消费面（只读调用，不改这些模块）：
+ *   app_core.h      mp_post_cmd / mp_post_audio 三队列 + 指令/音频消息枚举 + MP_ACTION_*
+ *   asset_dl.h      本地清单查询（当前地图/PARTS 路径，MP_MPK_PATH_MAX）
+ *   bgm.h           BGM 状态回显（bgm_get_state/get_source）
+ *   state_machine.h 菜单 Exit 行经 MP_SM_EV_MENU_KEY 走既有状态机通道收菜单 */
+#include "app_core.h"
+#include "asset_dl.h"
+#include "bgm.h"
+#include "state_machine.h"
+
 static const char *TAG = "bridge";
+
+static void touch_indev_read_cb(lv_indev_t *indev, lv_indev_data_t *data);
 
 #define BR_BUBBLE_PAD    8
 #define BR_BUBBLE_BORDER 2
@@ -49,6 +63,57 @@ static struct {
         int32_t   stride, w, h;
     } cap;
 } s_br;
+
+/* ---------------- 菜单选择器状态（E7；函数体在下方 menu 段） ---------------- */
+
+typedef enum {
+    MENU_PAGE_ROOT = 0,
+    MENU_PAGE_MAPS,
+    MENU_PAGE_PAPERDOLL,
+    MENU_PAGE_BGM,
+} menu_page_t;
+
+#define MENU_ROWS_MAX   8       /* 单页可选行上限（含 Back/Exit 行） */
+#define MENU_MAPS_MAX   3       /* Maps 页真实条目位（当前 + 2 示例） */
+
+typedef struct {
+    char label[32];             /* 列表显示串（ASCII，Montserrat 可渲染） */
+    char hash[24];              /* MP_CMD_SET_MAP 的 s（16 hex / 示例名） */
+} map_item_t;
+
+typedef struct {
+    menu_page_t page;
+    int      row_cnt;           /* 当前页可选行数 */
+    int      sel;               /* 选中行（input 任务单字写，渲染任务读） */
+    int      sel_applied;       /* 已贴高亮的行号（变化才重贴，防 10Hz 失效） */
+    lv_obj_t *rows[MENU_ROWS_MAX];
+
+    map_item_t maps[MENU_MAPS_MAX];
+    int        map_cnt;
+
+    lv_obj_t *status_label;     /* BGM 页状态行（tick 500ms 刷新） */
+
+    const lv_font_t *f_title, *f_item, *f_small;
+
+    /* 跨任务请求旗标（input 任务置位 / 菜单 tick 在渲染任务排空） */
+    volatile bool req_ok;
+    volatile bool req_exit;
+    volatile bool req_rebuild;          /* 仅渲染任务写：点击/tick 换页统一延后 */
+    menu_page_t   pend_page;
+    int           pend_sel;
+
+    /* 触摸喂入：input 任务写，渲染任务 indev 读。两任务同钉 APP 核
+     * （main.c xTaskCreatePinnedToCore(...,1)），单写者单读者 + 先坐标后
+     * pressed 的写序，volatile 单字读写即安全（同 render_input_tilt 约定） */
+    volatile int32_t t_x, t_y;
+    volatile bool    t_pressed;
+
+    lv_indev_t *indev;                  /* 唯一 pointer indev（bridge_init 建） */
+    lv_timer_t *tick;                   /* 菜单态 100ms 节拍（进菜单建/出菜单删） */
+    int         bgm_refr_div;           /* 状态行 500ms 分频计数 */
+} menu_ui_t;
+
+static menu_ui_t s_menu;
 
 /* ---------------- flush ---------------- */
 
@@ -110,6 +175,7 @@ static void bridge_flush(lv_display_t *disp, const lv_area_t *area, uint8_t *px_
 int bridge_init(int32_t screen_w, int32_t screen_h)
 {
     memset(&s_br, 0, sizeof s_br);
+    memset(&s_menu, 0, sizeof s_menu);
     s_br.sw = screen_w;
     s_br.sh = screen_h;
 
@@ -124,6 +190,19 @@ int bridge_init(int32_t screen_w, int32_t screen_h)
     }
     lv_display_set_flush_cb(s_br.disp, bridge_flush);
     lv_display_set_color_format(s_br.disp, LV_COLOR_FORMAT_RGB565);
+
+    /* 触摸 indev（菜单真实化）：数据源 = input 任务经 lv_bridge_touch_feed
+     * 喂入的最新帧（input_dispatch touch_read_frame 直读，本侧不做 I2C）。
+     * 创建失败不阻断渲染（菜单退化为纯侧键操作） */
+    s_menu.indev = lv_indev_create();
+    if (s_menu.indev) {
+        lv_indev_set_type(s_menu.indev, LV_INDEV_TYPE_POINTER);
+        lv_indev_set_read_cb(s_menu.indev, touch_indev_read_cb);
+        lv_indev_set_display(s_menu.indev, s_br.disp);
+        ESP_LOGI(TAG, "touch indev created (menu mode)");
+    } else {
+        ESP_LOGW(TAG, "lv_indev_create failed: menu touch disabled");
+    }
 
     /* POKER：2 × 1/10 屏双缓冲 */
     s_br.poker_buf_sz = (uint32_t)screen_w * (uint32_t)(screen_h / 10) * 2u;
@@ -149,11 +228,14 @@ int bridge_init(int32_t screen_w, int32_t screen_h)
 
 void bridge_deinit(void)
 {
+    if (s_menu.tick) { lv_timer_del(s_menu.tick); s_menu.tick = NULL; }
+    if (s_menu.indev) { lv_indev_delete(s_menu.indev); s_menu.indev = NULL; }
     if (s_br.disp) lv_display_delete(s_br.disp);
     if (s_br.poker_buf[0]) heap_caps_free(s_br.poker_buf[0]);
     if (s_br.poker_buf[1]) heap_caps_free(s_br.poker_buf[1]);
     if (s_br.menu_buf) heap_caps_free(s_br.menu_buf);
     memset(&s_br, 0, sizeof s_br);
+    memset(&s_menu, 0, sizeof s_menu);
 }
 
 int bridge_mode_poker(void)
@@ -164,6 +246,14 @@ int bridge_mode_poker(void)
         return RENDER_ERR_STATE;
     }
     if (s_br.menu_mode) ESP_LOGI(TAG, "mode_poker: exit menu -> PARTIAL");
+    /* 菜单资源收尾：节拍定时器删除；indev 复位并断掉残留按下态
+     * （抬指前退出菜单时防止 indev 把 PRESSED 带进 POKER 态误触） */
+    if (s_menu.tick) { lv_timer_del(s_menu.tick); s_menu.tick = NULL; }
+    s_menu.t_pressed = false;
+    s_menu.req_ok = false;
+    s_menu.req_exit = false;
+    s_menu.req_rebuild = false;
+    if (s_menu.indev) lv_indev_reset(s_menu.indev, NULL);
     lv_display_set_buffers(s_br.disp, s_br.poker_buf[0], s_br.poker_buf[1],
                            s_br.poker_buf_sz, LV_DISPLAY_RENDER_MODE_PARTIAL);
     s_br.menu_mode = false;
@@ -171,59 +261,413 @@ int bridge_mode_poker(void)
     return RENDER_OK;
 }
 
-/* ---------------- MENU 深色菜单屏（问题5） ----------------
- * 旧实现 enter_menu 后从未构建任何 LVGL 控件，LVGL 默认屏幕底色为白 →
- * 整屏发白。现构建黑底菜单：标题 + 三行占位 + 底部退出提示。
- * 须与 render_tick 同任务（render_enter_menu → bridge_mode_menu）调用。 */
-static void menu_build(void)
+/* ---------------- MENU 真实选择器（E7 菜单真实化） ----------------
+ * 旧实现只有黑底占位文字。现为真实选择器：
+ *   主菜单：Maps / Paperdoll / BGM / Exit 四行（触摸点选 + 侧键矩阵）
+ *   Maps     子页：当前缓存地图（asset_dl_map_path(NULL)）+ 2 个示例条目
+ *            点选 → MP_CMD_SET_MAP（hash 通道，state_machine.dispatch_map 查
+ *            路径+条带并切图）→ 回主菜单
+ *   Paperdoll 子页：现有通道只有动作切换（MP_CMD_SET_ACTION）→ 列出五个真实
+ *            动作；「列出 PARTS 条目 + 换装指令」缺失见汇报
+ *   BGM      子页：状态行（曲目数/bgm_get_state/get_source）+ 播放暂停/
+ *            上一首/下一首三按钮（bgm_toggle_pause/prev/next，audio_q 异步）
+ *
+ * 输入接线（跨任务）：
+ *   触摸：input 任务菜单态调 lv_bridge_touch_feed(x,y,pressed)（读 I2C 帧后
+ *         喂坐标）→ 本文件 pointer indev 在渲染任务 lv_timer_handler 里消费。
+ *   侧键矩阵（短按）：顶键=确认 → render_menu_ok()；中键=上移/底键=下移 →
+ *         render_menu_nav(0/1)。跨任务安全：nav 只写单字 sel（渲染任务 100ms
+ *         tick 贴高亮），ok 置 req_ok 旗标由同一 tick 排空——绝不在 indev/
+ *         外任务上下文直接动控件树；触摸点击虽在渲染任务 indev 上下文，
+ *         换页/重建也统一经 req_rebuild 延到 tick 排空（防 indev 压着对象时
+ *         lv_obj_clean 自删）。长按顶键（转时钟）归 input_dispatch，不在此处理。
+ * 须与 render_tick 同任务构建（render_enter_menu → bridge_mode_menu）。 */
+
+/* 字体：内置 Montserrat（sdkconfig.defaults 三行 + 主线程 regen 后生效）；
+ * 未 regen 时 #if 短路 → 回退 TF FONT 包（16/24/32），再退 LVGL 默认主题字体 */
+static void menu_fonts_refresh(void)
+{
+    s_menu.f_title = NULL;
+    s_menu.f_item  = NULL;
+    s_menu.f_small = NULL;
+#if LV_FONT_MONTSERRAT_28
+    s_menu.f_title = &lv_font_montserrat_28;
+#endif
+#if LV_FONT_MONTSERRAT_20
+    s_menu.f_item = &lv_font_montserrat_20;
+#elif LV_FONT_MONTSERRAT_16
+    s_menu.f_item = &lv_font_montserrat_16;
+#endif
+#if LV_FONT_MONTSERRAT_16
+    s_menu.f_small = &lv_font_montserrat_16;
+#endif
+    if (!s_menu.f_title) s_menu.f_title = font_lazy_get(FONT_ID_32);
+    if (!s_menu.f_item)  s_menu.f_item  = font_lazy_get(FONT_ID_24);
+    if (!s_menu.f_small) s_menu.f_small = font_lazy_get(FONT_ID_16);
+}
+
+/* 触摸 indev 读回调（渲染任务，lv_timer_handler 驱动 ~30ms） */
+static void touch_indev_read_cb(lv_indev_t *indev, lv_indev_data_t *data)
+{
+    (void)indev;
+    /* POKER/气泡态恒报释放：菜单外触摸归 input_dispatch 宠物交互，LVGL
+     * 不消费（默认屏无可点控件）；残留按下在进/出菜单时由 reset 清掉 */
+    if (!s_br.menu_mode || !s_menu.t_pressed) {
+        data->state = LV_INDEV_STATE_RELEASED;
+        return;
+    }
+    data->point.x = s_menu.t_x;
+    data->point.y = s_menu.t_y;
+    data->state   = LV_INDEV_STATE_PRESSED;
+}
+
+void lv_bridge_touch_feed(int x, int y, bool pressed)
+{
+    if (x < 0) x = 0;
+    if (y < 0) y = 0;
+    if (x > s_br.sw - 1) x = s_br.sw - 1;
+    if (y > s_br.sh - 1) y = s_br.sh - 1;
+    /* 写序：先坐标后 pressed——读侧见 pressed=true 时坐标必已有效 */
+    s_menu.t_x = x;
+    s_menu.t_y = y;
+    s_menu.t_pressed = pressed;
+}
+
+/* ---------------- 侧键矩阵钩子（input 任务调用） ---------------- */
+
+/* 侧键导航：dir=0 上移（中键）/ 1 下移（底键）。根页移动选中项，子页移动
+ * 列表高亮，越界回绕。只写单字 sel，高亮由菜单 tick 统一贴（跨任务安全） */
+void render_menu_nav(int dir)
+{
+    if (!s_br.menu_mode || s_menu.row_cnt <= 0) return;
+    if (dir) s_menu.sel = (s_menu.sel + 1) % s_menu.row_cnt;
+    else     s_menu.sel = (s_menu.sel + s_menu.row_cnt - 1) % s_menu.row_cnt;
+}
+
+/* 顶键短按=确认/进入：置请求旗标，菜单 tick 在渲染任务排空
+ * （根页进入选中子页/Exit；Maps/Paperdoll 执行选中条目并回根页；
+ *  BGM 页执行按钮动作；Back 行回根页）。非菜单态返回不动作 */
+void render_menu_ok(void)
+{
+    if (!s_br.menu_mode) return;
+    s_menu.req_ok = true;
+}
+
+/* 菜单内部收起（Exit 行 / 兼容单键入口）：复用实体键同一状态机事件——
+ * MENU→POKER 迁移先出菜单态再经 cmd_q 调 render_exit_menu，状态与渲染
+ * 严格同步。直接 post MP_CMD_MENU_EXIT 会让状态机滞留 MENU 态（input
+ * 触摸从此停读 → 死菜单），禁止 */
+static void menu_request_exit(void)
+{
+    ESP_LOGI(TAG, "menu: exit (state machine MENU_KEY path)");
+    state_machine_handle(MP_SM_EV_MENU_KEY);
+}
+
+/* ---------------- 数据收集（Maps 数据面） ---------------- */
+
+/* /sdcard/minipet/bg/<hash>.mpk → <hash>（MP_CMD_SET_MAP 通道按 hash 派发） */
+static void menu_hash_from_path(const char *path, char *out, size_t cap)
+{
+    const char *base = strrchr(path, '/');
+    base = base ? base + 1 : path;
+    const char *dot = strrchr(base, '.');
+    size_t n = dot ? (size_t)(dot - base) : strlen(base);
+    if (n >= cap) n = cap - 1;
+    memcpy(out, base, n);
+    out[n] = '\0';
+}
+
+/* 本地缓存地图清单。数据面现状：asset_dl 只有「当前地图」单条查询
+ * （asset_dl_map_path(NULL)），无「列出全部 BGMAP 条目」接口 →
+ * 当前地图 1 条真实条目 + 2 个写死示例条目兜底演示（示例 hash 未缓存时
+ * dispatch_map 内 asset_dl_map_path 查不到自动短路，无副作用）。 */
+static void menu_maps_collect(void)
+{
+    char path[MP_MPK_PATH_MAX];
+    s_menu.map_cnt = 0;
+
+    if (asset_dl_map_path(NULL, path, sizeof(path))) {
+        map_item_t *it = &s_menu.maps[s_menu.map_cnt++];
+        menu_hash_from_path(path, it->hash, sizeof(it->hash));
+        char nowlbl[16];
+        snprintf(nowlbl, sizeof(nowlbl), "Now %.8s", it->hash);
+        strlcpy(it->label, nowlbl, sizeof(it->label));   /* 经临时缓冲避 -Wrestrict 误报 */
+    }
+    static const char * const demo[2] = { "Demo map A", "Demo map B" };
+    for (int i = 0; i < 2 && s_menu.map_cnt < MENU_MAPS_MAX; i++) {
+        map_item_t *it = &s_menu.maps[s_menu.map_cnt++];
+        strlcpy(it->label, demo[i], sizeof(it->label));
+        snprintf(it->hash, sizeof(it->hash), "demo_map_%c", (char)('a' + i));
+    }
+}
+
+/* ---------------- Paperdoll / BGM 动作表 ---------------- */
+
+/* 现有通道只有 MP_CMD_SET_ACTION（s=动作名 → render_set_layout）；
+ * 真换装（PARTS 列表 + MP_CMD_SET_PARTS）缺失见汇报 */
+static const struct { const char *label, *action; } PD_ITEMS[] = {
+    { "Stand", MP_ACTION_STAND },
+    { "Walk",  MP_ACTION_WALK  },
+    { "Fly",   MP_ACTION_FLY   },
+    { "Alert", MP_ACTION_ALERT },
+    { "Hit",   MP_ACTION_HIT   },
+};
+#define PD_CNT ((int)(sizeof(PD_ITEMS) / sizeof(PD_ITEMS[0])))
+
+static void menu_bgm_post(mp_audio_msg_type_t type, int32_t a)
+{
+    mp_audio_msg_t m = { .type = type, .a = a };
+    mp_post_audio(&m);          /* audio_q → bgm 任务（E8 控制权在设备） */
+}
+
+/* 播放/暂停 + 起播：bgm.h 真实控制接口（本地曲目表优先，自动回退服务端） */
+static void menu_bgm_toggle(void)
+{
+    mp_bgm_state_t st = bgm_get_state();
+    if (st == MP_BGM_PLAYING || st == MP_BGM_PAUSED) {
+        bgm_toggle_pause();          /* 播放↔暂停（停 feeder+PA 静音同口径） */
+        return;
+    }
+    /* IDLE/FAILED → 起播：本地曲目表（AUDIO_META 包）有曲则选首曲；
+     * 表不可用回退 MP_AUDIO_PLAY(a=0) 服务端定曲 */
+    uint32_t id = 0;
+    if (bgm_list(&id, NULL, 1) > 0) {
+        bgm_play_id(id);
+    } else {
+        menu_bgm_post(MP_AUDIO_PLAY, 0);
+    }
+}
+
+static void menu_bgm_status_refresh(void)
+{
+    if (!s_menu.status_label) return;
+    static const char *const st_name[] = { "Idle", "Playing", "Paused", "Failed" };
+    mp_bgm_state_t st = bgm_get_state();
+    mp_bgm_source_t src = bgm_get_source();
+    int tracks = bgm_list(NULL, NULL, INT_MAX);   /* 曲目表容量查询（0=无本地表） */
+    /* 「当前曲目名」查询接口缺失（bgm 无 get_current，见汇报）→ 只回显
+     * 本地表曲目数 + 播放态 + 音源，三个数据点全部真实 */
+    lv_label_set_text_fmt(s_menu.status_label, "Tracks:%d  State: %s  Src: %s",
+                          tracks,
+                          (st >= MP_BGM_IDLE && st <= MP_BGM_FAILED) ? st_name[st] : "?",
+                          (src == MP_BGM_SRC_QQ) ? "QQ" : "WZ");
+}
+
+/* ---------------- 行为分发 ---------------- */
+
+static void menu_goto(menu_page_t page)
+{
+    s_menu.pend_page  = page;
+    s_menu.pend_sel   = 0;
+    s_menu.req_rebuild = true;      /* tick 排空重建（防 indev 上下文自删） */
+}
+
+static void menu_activate(int idx)
+{
+    if (idx < 0 || idx >= s_menu.row_cnt) return;
+
+    switch (s_menu.page) {
+    case MENU_PAGE_ROOT:
+        if (idx == 3) { menu_request_exit(); break; }   /* Exit 行 */
+        menu_goto((menu_page_t)(MENU_PAGE_MAPS + idx));
+        break;
+
+    case MENU_PAGE_MAPS:
+        /* 点选 → SET_MAP（hash）→ 回主菜单；示例条目 hash 未缓存时
+         * dispatch_map 短路，界面仍回根页（演示路径可见） */
+        if (idx < s_menu.map_cnt) {
+            mp_cmd_t c = { .type = MP_CMD_SET_MAP };
+            strlcpy(c.s, s_menu.maps[idx].hash, sizeof(c.s));
+            mp_post_cmd(&c);
+        }
+        menu_goto(MENU_PAGE_ROOT);
+        break;
+
+    case MENU_PAGE_PAPERDOLL:
+        if (idx < PD_CNT) {
+            mp_cmd_t c = { .type = MP_CMD_SET_ACTION };
+            strlcpy(c.s, PD_ITEMS[idx].action, sizeof(c.s));
+            mp_post_cmd(&c);
+        }
+        menu_goto(MENU_PAGE_ROOT);
+        break;
+
+    case MENU_PAGE_BGM:
+        if      (idx == 0) menu_bgm_toggle();
+        else if (idx == 1) bgm_prev();                  /* 本地曲目表循环，表空回退服务端 */
+        else if (idx == 2) bgm_next();
+        else if (idx == 3) menu_goto(MENU_PAGE_ROOT);   /* Back 行 */
+        break;
+    }
+}
+
+static void row_click_cb(lv_event_t *e)
+{
+    menu_activate((int)(intptr_t)lv_event_get_user_data(e));
+}
+
+/* ---------------- 控件构建 ---------------- */
+
+static void menu_style_row(lv_obj_t *btn, bool selected)
+{
+    lv_obj_set_style_bg_color(btn, lv_color_hex(selected ? 0x1E2A3A : 0x121216), 0);
+    lv_obj_set_style_border_color(btn, lv_color_hex(selected ? 0x4DA3FF : 0x34343C), 0);
+}
+
+static lv_obj_t *menu_add_row(lv_obj_t *parent, int idx, const char *text,
+                              int32_t y, int32_t h)
+{
+    lv_obj_t *btn = lv_button_create(parent);
+    lv_obj_set_pos(btn, 48, y);
+    lv_obj_set_size(btn, s_br.sw - 96, h);
+    lv_obj_set_style_radius(btn, 10, 0);
+    lv_obj_set_style_border_width(btn, 2, 0);
+    lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, 0);
+    lv_obj_set_style_shadow_width(btn, 0, 0);
+    menu_style_row(btn, idx == s_menu.sel);
+
+    lv_obj_t *lb = lv_label_create(btn);
+    lv_obj_set_style_text_color(lb, lv_color_hex(0xFFFFFF), 0);
+    if (s_menu.f_item) lv_obj_set_style_text_font(lb, s_menu.f_item, 0);
+    lv_label_set_text(lb, text);
+    lv_obj_center(lb);
+
+    lv_obj_add_event_cb(btn, row_click_cb, LV_EVENT_CLICKED, (void *)(intptr_t)idx);
+    if (idx < MENU_ROWS_MAX) s_menu.rows[idx] = btn;
+    return btn;
+}
+
+static lv_obj_t *menu_add_title(lv_obj_t *parent, const char *text)
+{
+    lv_obj_t *lb = lv_label_create(parent);
+    lv_obj_set_style_text_color(lb, lv_color_hex(0xFFFFFF), 0);
+    if (s_menu.f_title) lv_obj_set_style_text_font(lb, s_menu.f_title, 0);
+    lv_label_set_text(lb, text);
+    lv_obj_align(lb, LV_ALIGN_TOP_MID, 0, 36);
+    return lb;
+}
+
+static void menu_add_hint(lv_obj_t *parent, const char *text)
+{
+    lv_obj_t *lb = lv_label_create(parent);
+    lv_obj_set_style_text_color(lb, lv_color_hex(0x8A8A94), 0);
+    if (s_menu.f_small) lv_obj_set_style_text_font(lb, s_menu.f_small, 0);
+    lv_label_set_text(lb, text);   /* ASCII：Montserrat 内置字体只含拉丁字形 */
+    lv_obj_align(lb, LV_ALIGN_BOTTOM_MID, 0, -16);
+}
+
+/* 重建当前页控件树（只在渲染任务菜单 tick / bridge_mode_menu 里调用）。
+ * 幂等：进/出菜单与换页多轮后默认屏会残留控件，重建前先清空 */
+static void menu_rebuild(void)
 {
     lv_obj_t *scr = lv_screen_active();
     if (!scr) {
-        ESP_LOGE(TAG, "menu_build: no active screen");
+        ESP_LOGE(TAG, "menu_rebuild: no active screen");
         return;
     }
-
-    /* 幂等：进/出菜单多轮后默认屏上会残留上一轮的控件，重建前先清空，
-     * 防控件树逐轮叠加（内存慢性泄漏 + 重叠绘制）。 */
-    uint32_t stale = lv_obj_get_child_count(scr);
-    if (stale) lv_obj_clean(scr);
+    if (lv_obj_get_child_count(scr)) lv_obj_clean(scr);
+    memset(s_menu.rows, 0, sizeof s_menu.rows);
+    s_menu.status_label = NULL;
+    s_menu.row_cnt = 0;
+    s_menu.sel_applied = -1;
 
     lv_obj_set_style_bg_color(scr, lv_color_hex(0x000000), 0);
     lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
+    menu_fonts_refresh();
 
-    const lv_font_t *f32 = font_lazy_get(FONT_ID_32);
-    const lv_font_t *f24 = font_lazy_get(FONT_ID_24);
-    const lv_font_t *f16 = font_lazy_get(FONT_ID_16);
-    ESP_LOGI(TAG, "menu_build: cleared %u stale obj, fonts 32=%d 24=%d 16=%d",
-             (unsigned)stale, f32 != NULL, f24 != NULL, f16 != NULL);
+    switch (s_menu.page) {
+    case MENU_PAGE_ROOT: {
+        static const char *const rows[4] = { "Maps", "Paperdoll", "BGM", "Exit" };
+        menu_add_title(scr, "MiniPet");
+        for (int i = 0; i < 4; i++)
+            menu_add_row(scr, i, rows[i], 118 + i * 70, 56);
+        s_menu.row_cnt = 4;
+        menu_add_hint(scr, "UP:MID DOWN:BOT LONG:CLOCK");
+        break;
+    }
+    case MENU_PAGE_MAPS: {
+        menu_add_title(scr, "Maps");
+        menu_maps_collect();
+        for (int i = 0; i < s_menu.map_cnt; i++)
+            menu_add_row(scr, i, s_menu.maps[i].label, 118 + i * 70, 56);
+        menu_add_row(scr, s_menu.map_cnt, "< Back", 118 + s_menu.map_cnt * 70, 56);
+        s_menu.row_cnt = s_menu.map_cnt + 1;
+        menu_add_hint(scr, "TAP: PICK   TOP:OK");
+        break;
+    }
+    case MENU_PAGE_PAPERDOLL: {
+        menu_add_title(scr, "Paperdoll");
+        for (int i = 0; i < PD_CNT; i++)
+            menu_add_row(scr, i, PD_ITEMS[i].label, 104 + i * 56, 48);
+        menu_add_row(scr, PD_CNT, "< Back", 104 + PD_CNT * 56, 48);
+        s_menu.row_cnt = PD_CNT + 1;
+        menu_add_hint(scr, "ACTION DEMO - OUTFIT LISTS NEED SYNC");
+        break;
+    }
+    case MENU_PAGE_BGM: {
+        menu_add_title(scr, "BGM");
+        s_menu.status_label = lv_label_create(scr);
+        lv_obj_set_style_text_color(s_menu.status_label, lv_color_hex(0xB9B9C4), 0);
+        if (s_menu.f_small) lv_obj_set_style_text_font(s_menu.status_label, s_menu.f_small, 0);
+        lv_label_set_text(s_menu.status_label, "Tracks:-");
+        lv_obj_align(s_menu.status_label, LV_ALIGN_TOP_MID, 0, 96);
+        menu_bgm_status_refresh();
 
-    lv_obj_t *title = lv_label_create(scr);
-    lv_obj_set_style_text_color(title, lv_color_hex(0xFFFFFF), 0);
-    if (f32) lv_obj_set_style_text_font(title, f32, 0);
-    lv_label_set_text(title, "MiniPet");
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 64);
-
-    static const char *rows[3] = { "Maps", "Paperdoll", "BGM" };   /* 占位项（E7） */
-    for (int i = 0; i < 3; i++) {
-        lv_obj_t *it = lv_label_create(scr);
-        lv_obj_set_style_text_color(it, lv_color_hex(0xE8E8EC), 0);
-        if (f24) lv_obj_set_style_text_font(it, f24, 0);
-        lv_label_set_text_fmt(it, "> %s", rows[i]);
-        lv_obj_align(it, LV_ALIGN_LEFT_MID, 110, -48 + i * 72);
+        menu_add_row(scr, 0, "Play / Pause", 170, 54);
+        menu_add_row(scr, 1, "Prev",          238, 54);
+        menu_add_row(scr, 2, "Next",          306, 54);
+        menu_add_row(scr, 3, "< Back",        374, 54);
+        s_menu.row_cnt = 4;
+        menu_add_hint(scr, "TOUCH OR TOP KEY");
+        break;
+    }
     }
 
-    lv_obj_t *hint = lv_label_create(scr);
-    lv_obj_set_style_text_color(hint, lv_color_hex(0x909098), 0);
-    if (f16) {
-        lv_obj_set_style_text_font(hint, f16, 0);
-        lv_label_set_text(hint, "长按退出");   /* [待真机验证] FONT 包需含这 4 个汉字字形，缺字时降级为下一分支同义 ASCII */
-    } else {
-        lv_label_set_text(hint, "LONG PRESS: EXIT");
-    }
-    lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -40);
+    s_menu.sel_applied = s_menu.sel;   /* 构建时已按 sel 贴高亮 */
+    ESP_LOGI(TAG, "menu_rebuild: page=%d rows=%d widgets=%u",
+             (int)s_menu.page, s_menu.row_cnt,
+             (unsigned)lv_obj_get_child_count(scr));
+    lv_obj_invalidate(scr);            /* DIRECT 模式强制整屏重绘入 menu_buf */
+}
 
-    ESP_LOGI(TAG, "menu_build: %u widgets on screen", (unsigned)lv_obj_get_child_count(scr));
-    lv_obj_invalidate(scr);   /* DIRECT 模式强制整屏重绘入 menu_buf */
+/* 高亮跟随 sel（菜单 tick；sel 变化才重贴，避免无谓失效区） */
+static void menu_apply_selection(void)
+{
+    if (s_menu.sel_applied == s_menu.sel) return;
+    for (int i = 0; i < s_menu.row_cnt && i < MENU_ROWS_MAX; i++)
+        if (s_menu.rows[i]) menu_style_row(s_menu.rows[i], i == s_menu.sel);
+    s_menu.sel_applied = s_menu.sel;
+}
+
+/* 菜单态 100ms 节拍（渲染任务）：排空侧键/换页请求 → 贴高亮 → 500ms 刷 BGM 状态。
+ * 所有会动控件树的操作都收敛到本回调（渲染任务、非 indev 上下文）执行 */
+static void menu_tick_cb(lv_timer_t *t)
+{
+    (void)t;
+    if (!s_br.menu_mode) return;
+
+    if (s_menu.req_exit) {
+        s_menu.req_exit = false;
+        menu_request_exit();
+        return;
+    }
+    if (s_menu.req_rebuild) {
+        s_menu.req_rebuild = false;
+        s_menu.page = s_menu.pend_page;
+        s_menu.sel  = s_menu.pend_sel;
+        menu_rebuild();
+        return;
+    }
+    if (s_menu.req_ok) {
+        s_menu.req_ok = false;
+        menu_activate(s_menu.sel);
+        return;
+    }
+    menu_apply_selection();
+    if (++s_menu.bgm_refr_div >= 5) {   /* 100ms×5 = 500ms */
+        s_menu.bgm_refr_div = 0;
+        menu_bgm_status_refresh();
+    }
 }
 
 int bridge_mode_menu(void)
@@ -252,7 +696,20 @@ int bridge_mode_menu(void)
                            LV_DISPLAY_RENDER_MODE_DIRECT);
     s_br.menu_mode = false;   /* 构建成功后才切菜单态：失败路径保持 POKER，绝不半切换 */
     s_br.md_valid = false;
-    menu_build();             /* 问题5：进入菜单即构建深色 UI（防白屏/黑屏） */
+    /* 选择器每次进入都回根页首行（真机口径：菜单是临时全屏窗口），
+     * 并清掉上一轮残留的按下/请求态（触摸边沿进菜单时 t_pressed 已随
+     * input 侧复位，这里再兜底一次） */
+    s_menu.page = MENU_PAGE_ROOT;
+    s_menu.sel = 0;
+    s_menu.sel_applied = -1;
+    s_menu.t_pressed = false;
+    s_menu.req_ok = false;
+    s_menu.req_exit = false;
+    s_menu.req_rebuild = false;
+    menu_rebuild();           /* E7：进入菜单即构建真实选择器（防白屏/黑屏） */
+    if (!s_menu.tick) {
+        s_menu.tick = lv_timer_create(menu_tick_cb, 100, NULL);  /* 高亮/请求/BGM 状态节拍 */
+    }
     s_br.menu_mode = true;    /* 构建成功后才切换态，失败路径保持 POKER */
     ESP_LOGI(TAG, "mode_menu: built, first tick will render frame 1");
     return RENDER_OK;

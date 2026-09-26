@@ -10,7 +10,9 @@ CONFIG_FREERTOS_HZ=1000
 CONFIG_COMPILER_OPTIMIZATION_PERF=y
 
 # TF 卡挂 FATFS：素材包/清单文件名超过 8.3，启用长文件名（heap 工作缓冲）
-CONFIG_FATFS_LFN_HEAP_ENABLED=y
+# 注意符号名必须是 CONFIG_FATFS_LFN_HEAP（choice 成员）；曾错写成 _ENABLED 导致静默失效
+CONFIG_FATFS_LFN_HEAP=y
+# CONFIG_FATFS_LFN_NONE is not set
 
 # 共享 I2C 五器件统一走 i2c_master 新 API（driver/i2c_master.h），
 # 显式关闭旧版 driver/i2c.h 避免符号/中断冲突
@@ -35,3 +37,10 @@ CONFIG_HEAP_ABORT_ON_ALLOC_FAIL=y
 
 # 内部 RAM 抢救：>4KB 的 malloc 进 PSRAM（LVGL 等大缓冲曾占满 182KB 内部堆，httpd/任务栈全挤死）
 CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096
+
+# ---- LVGL 内置字体（菜单真实化 E7）：28 号标题 + 20 号菜单项 + 16 号提示 ----
+# 仅改 defaults，主 sdkconfig 由主线程统一 regen 后生效；lvgl_bridge.c 内
+# 以 #if LV_FONT_MONTSERRAT_xx 兜底：未 regen 时自动回退 TF FONT 包，可编译
+CONFIG_LV_FONT_MONTSERRAT_16=y
+CONFIG_LV_FONT_MONTSERRAT_20=y
+CONFIG_LV_FONT_MONTSERRAT_28=y

@@ -15,6 +15,7 @@
 #include "asset_dl.h"
 
 #include <string.h>
+#include <strings.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/stat.h>
@@ -50,6 +51,7 @@ typedef struct {
     char     map_id[32];      /* BGMAP：地图 id */
     char     selector[12];    /* map/paperdoll/npc/clock（无则空） */
     uint8_t  font_px;         /* FONT：16/24/32 */
+    char     label[32];       /* 服务端 manifest label（选择器显示名） */
     uint32_t bytes;
     bool     fav;
     int64_t  last_used_ms;
@@ -109,12 +111,41 @@ static uint64_t rd_le64(const uint8_t *p)
 /* ------------------------------------------------------------------ */
 static const char *kind_dir(const char *kind)
 {
-    if (strcmp(kind, "PARTS") == 0)      return MP_TF_MINIPET_DIR "/parts";
-    if (strcmp(kind, "LAYOUT") == 0)     return MP_TF_MINIPET_DIR "/layout";
-    if (strcmp(kind, "BGMAP") == 0)      return MP_TF_MINIPET_DIR "/bg";
-    if (strcmp(kind, "FONT") == 0)       return MP_TF_MINIPET_DIR "/font";
-    if (strcmp(kind, "AUDIO_META") == 0) return MP_TF_MINIPET_DIR "/audio";
+    /* 大小写不敏感（服务端 ManifestBuilder 写 "Parts"/"Layout"/"Bgmap"——
+     * 原全大写比较永不匹配 → 设备从不下载素材包，2026-09-26 真机定稿） */
+    if (strcasecmp(kind, "PARTS") == 0)      return MP_TF_MINIPET_DIR "/parts";
+    if (strcasecmp(kind, "LAYOUT") == 0)     return MP_TF_MINIPET_DIR "/layout";
+    if (strcasecmp(kind, "BGMAP") == 0)      return MP_TF_MINIPET_DIR "/bg";
+    if (strcasecmp(kind, "FONT") == 0)       return MP_TF_MINIPET_DIR "/font";
+    if (strcasecmp(kind, "AUDIO_META") == 0) return MP_TF_MINIPET_DIR "/audio";
     return NULL;
+}
+
+static int kind_list(const char *kind, char hashes[][20], char labels[][32], int max)
+{
+    int n = 0;
+    for (int i = 0; i < s_file_cnt && n < max; i++) {
+        if (strcasecmp(s_files[i].kind, kind) != 0) continue;
+        if (strcmp(kind, "PARTS") == 0 &&
+            strcmp(s_files[i].selector, "clock") == 0) continue;   /* fontTime 非装扮 */
+        if (hashes) strlcpy(hashes[n], s_files[i].hash, 20);
+        if (labels) {
+            strlcpy(labels[n], s_files[i].label[0] ? s_files[i].label
+                                                   : s_files[i].hash, 32);
+        }
+        n++;
+    }
+    return n;
+}
+
+int asset_dl_bgmap_list(char hashes[][20], char labels[][32], int max)
+{
+    return kind_list("BGMAP", hashes, labels, max);
+}
+
+int asset_dl_parts_list(char hashes[][20], char labels[][32], int max)
+{
+    return kind_list("PARTS", hashes, labels, max);
 }
 
 static void ensure_dirs(void)
@@ -181,6 +212,8 @@ static void load_local_manifest(void)
                 strlcpy(lf->map_id, s, sizeof(lf->map_id));
             if ((s = cJSON_GetStringValue(cJSON_GetObjectItem(jf, "selector"))))
                 strlcpy(lf->selector, s, sizeof(lf->selector));
+            if ((s = cJSON_GetStringValue(cJSON_GetObjectItem(jf, "label"))))
+                strlcpy(lf->label, s, sizeof(lf->label));
             lf->font_px = (uint8_t)cJSON_GetNumberValue(cJSON_GetObjectItem(jf, "px"));
             lf->bytes = (uint32_t)cJSON_GetNumberValue(cJSON_GetObjectItem(jf, "bytes"));
             lf->fav = cJSON_IsTrue(cJSON_GetObjectItem(jf, "fav"));
@@ -222,6 +255,7 @@ static void save_local_manifest_locked(void)
         cJSON *jf = cJSON_CreateObject();
         cJSON_AddStringToObject(jf, "hash", s_files[i].hash);
         cJSON_AddStringToObject(jf, "kind", s_files[i].kind);
+        if (s_files[i].label[0]) cJSON_AddStringToObject(jf, "label", s_files[i].label);
         if (s_files[i].action[0])   cJSON_AddStringToObject(jf, "action", s_files[i].action);
         if (s_files[i].entity[0])   cJSON_AddStringToObject(jf, "entity", s_files[i].entity);
         if (s_files[i].map_id[0])   cJSON_AddStringToObject(jf, "map", s_files[i].map_id);
@@ -679,7 +713,7 @@ bool asset_dl_layout_path(const char *action, char *path, size_t cap)
     xSemaphoreTake(s_lock, portMAX_DELAY);
     int fallback = -1;
     for (int i = 0; i < s_file_cnt; i++) {
-        if (strcmp(s_files[i].kind, "LAYOUT") != 0) continue;
+        if (strcasecmp(s_files[i].kind, "LAYOUT") != 0) continue;
         if (strcmp(s_files[i].action, action) != 0) continue;
         if (strncmp(s_files[i].entity, "paperdoll", 9) == 0) {
             const char *dir = kind_dir("LAYOUT");
@@ -703,8 +737,20 @@ bool asset_dl_parts_path(const char *entity_or_null, char *path, size_t cap)
     bool ok = false;
     xSemaphoreTake(s_lock, portMAX_DELAY);
     int fallback = -1;
+    /* hash 直查优先（SET_PARTS 命令传 16 hex hash） */
+    if (entity_or_null && strlen(entity_or_null) >= 8) {
+        for (int i = 0; i < s_file_cnt; i++) {
+            if (strcasecmp(s_files[i].kind, "PARTS") != 0) continue;
+            if (strcasecmp(s_files[i].hash, entity_or_null) == 0) {
+                snprintf(path, cap, "%s/%s.mpk", MP_TF_MINIPET_DIR "/parts",
+                         s_files[i].hash);
+                xSemaphoreGive(s_lock);
+                return true;
+            }
+        }
+    }
     for (int i = 0; i < s_file_cnt; i++) {
-        if (strcmp(s_files[i].kind, "PARTS") != 0) continue;
+        if (strcasecmp(s_files[i].kind, "PARTS") != 0) continue;
         if (strcmp(s_files[i].selector, "clock") == 0) continue;   /* fontTime 非装扮 */
         if (entity_or_null && s_files[i].entity[0] &&
             strcmp(s_files[i].entity, entity_or_null) != 0) continue;
@@ -739,7 +785,7 @@ bool asset_dl_font_path(int size_px, char *path, size_t cap)
     bool ok = false;
     xSemaphoreTake(s_lock, portMAX_DELAY);
     for (int i = 0; i < s_file_cnt; i++) {
-        if (strcmp(s_files[i].kind, "FONT") != 0) continue;
+        if (strcasecmp(s_files[i].kind, "FONT") != 0) continue;
         if (s_files[i].font_px != (uint8_t)size_px) continue;
         const char *dir = kind_dir("FONT");
         snprintf(path, cap, "%s/%s.mpk", dir, s_files[i].hash);
@@ -755,7 +801,7 @@ bool asset_dl_fonttime_path(char *path, size_t cap)
     bool ok = false;
     xSemaphoreTake(s_lock, portMAX_DELAY);
     for (int i = 0; i < s_file_cnt; i++) {
-        if (strcmp(s_files[i].kind, "PARTS") != 0) continue;
+        if (strcasecmp(s_files[i].kind, "PARTS") != 0) continue;
         if (strcmp(s_files[i].selector, "clock") != 0) continue;
         const char *dir = kind_dir("PARTS");
         snprintf(path, cap, "%s/%s.mpk", dir, s_files[i].hash);
@@ -772,7 +818,7 @@ bool asset_dl_map_path(const char *hash_or_null, char *path, size_t cap)
     xSemaphoreTake(s_lock, portMAX_DELAY);
     int best = -1;
     for (int i = 0; i < s_file_cnt; i++) {
-        if (strcmp(s_files[i].kind, "BGMAP") != 0) continue;
+        if (strcasecmp(s_files[i].kind, "BGMAP") != 0) continue;
         if (hash_or_null) {
             if (strcmp(s_files[i].hash, hash_or_null) == 0) { best = i; break; }
             continue;
@@ -820,7 +866,7 @@ int asset_dl_map_strips(const char *bg_path,
         bool named = false;
         xSemaphoreTake(s_lock, portMAX_DELAY);
         for (int k = 0; k < s_file_cnt; k++) {
-            if (strcmp(s_files[k].kind, "PARTS") == 0 &&
+            if (strcasecmp(s_files[k].kind, "PARTS") == 0 &&
                 strtoull(s_files[k].hash, NULL, 16) == part_ref) {
                 const char *d = kind_dir("PARTS");
                 if (d) {
@@ -848,7 +894,7 @@ void asset_dl_set_active_map(const char *hash)
     if (!hash || !hash[0]) return;
     xSemaphoreTake(s_lock, portMAX_DELAY);
     for (int i = 0; i < s_file_cnt; i++) {
-        if (strcmp(s_files[i].kind, "BGMAP") == 0 &&
+        if (strcasecmp(s_files[i].kind, "BGMAP") == 0 &&
             strcmp(s_files[i].hash, hash) == 0) {
             if (s_files[i].map_id[0]) {
                 strlcpy(s_active_map, s_files[i].map_id, sizeof(s_active_map));

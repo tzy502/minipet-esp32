@@ -9,7 +9,8 @@
  *
  * 数据契约：display_blit() 像素缓冲 = 大端 RGB565（BSP_LCD_BIGENDIAN=1 一致）。
  * CO5300 QSPI 面板按 2 像素粒度寻址（官方 rounder 佐证）——blit/fill 区域
- * 在本驱动内向外取偶并越界 clamp，奇数区域经 PSRAM 暂存缓冲拷齐。
+ * 在本驱动内先 clamp 到屏内再取偶（右/下缘向内收尾），奇数区域经 PSRAM
+ * 暂存缓冲拷齐（与合成器 mark/compose 矩形同源，防右缘残影）。
  */
 #include "display_co5300.h"
 
@@ -50,17 +51,22 @@ static bool IRAM_ATTR color_tx_done_cb(esp_lcd_panel_io_handle_t io,
 static const uint16_t SW = 480;
 static const uint16_t SH = 480;
 
-/* 区域向外取偶（CO5300 2 像素寻址粒度），x2/y2 为含端坐标 */
+/* 区域 2 像素对齐（CO5300 寻址粒度），x1/y1/x2/y2 为含端坐标。
+ * 规则（右缘 480 残影根修，与合成器 mark/compose 统一）：
+ * 「先 clamp 到屏内，再决定奇偶」——右/下缘 clamp 到 SW-1/SH-1（天然为奇，
+ * 即向内收尾），然后才做向外取偶；屏内偶数端点 +1 后仍 ≤ 479。
+ * 修复前「先外扩后 clamp」：x2=480 会被顶到 481 的越屏中间态，aw 与源宽
+ * 错位转入 scratch 且源映射偏移，最终窗口与 mark/compose 矩形分歧。 */
 static void even_round(int *x1, int *y1, int *x2, int *y2)
 {
-    *x1 -= (*x1 & 1);
-    *y1 -= (*y1 & 1);
-    if ((*x2 & 1) == 0) (*x2)++;
-    if ((*y2 & 1) == 0) (*y2)++;
     if (*x1 < 0) *x1 = 0;
     if (*y1 < 0) *y1 = 0;
-    if (*x2 > SW - 1) *x2 = SW - 1;
+    if (*x2 > SW - 1) *x2 = SW - 1;      /* 先 clamp：杜绝越屏中间态 */
     if (*y2 > SH - 1) *y2 = SH - 1;
+    *x1 -= (*x1 & 1);                    /* 左/上缘向下取偶：0 即屏缘，向内收 */
+    *y1 -= (*y1 & 1);
+    if ((*x2 & 1) == 0) (*x2)++;         /* 屏内向外取偶：x2≤478 → ≤479 */
+    if ((*y2 & 1) == 0) (*y2)++;
 }
 
 esp_err_t display_init(void)
@@ -205,9 +211,21 @@ esp_err_t display_fill_rect(int16_t x, int16_t y, int16_t w, int16_t h,
 
     /* 行缓冲：内部 SRAM 静态分配，天然 DMA 可用。两行一组推送（2 行寻址粒度）。 */
     static uint8_t line[2][480 * 2];
+    /* 与 display_blit 同一条 2px 对齐规则（even_round：先 clamp 屏内再取偶）。
+     * 取偶后 x1/y1 恒偶、x2/y2 恒奇 → 窗口宽高恒偶，两行一组推送，
+     * 无需奇数收尾分支。修复点：旧实现手写奇数行收尾 [y+h-2, y+h)，
+     * y=0,h=1 时起点为 -1（RASET 负坐标 → 面板窗口未定义）；且列方向
+     * 从未对齐 2px 粒度（奇 x/奇 w 窗口直接下发）。 */
+    int x1 = x, y1 = y, x2 = x + w - 1, y2 = y + h - 1;
+    even_round(&x1, &y1, &x2, &y2);
+    const int aw = x2 - x1 + 1;          /* x1≥0 且 x2≤479 → aw ≤ 480 */
+    if (aw > (int)sizeof(line[0]) / 2) {
+        return ESP_ERR_INVALID_ARG;      /* 防御：缓冲按整屏宽定长 */
+    }
+
     const uint8_t hi = (uint8_t)(rgb565 >> 8);   /* 大端：高字节在前 */
     const uint8_t lo = (uint8_t)(rgb565 & 0xFF);
-    for (int i = 0; i < w; i++) {
+    for (int i = 0; i < aw; i++) {
         line[0][2 * i]     = hi;
         line[0][2 * i + 1] = lo;
         line[1][2 * i]     = hi;
@@ -219,12 +237,8 @@ esp_err_t display_fill_rect(int16_t x, int16_t y, int16_t w, int16_t h,
     }
 
     esp_err_t err = ESP_OK;
-    for (int16_t yy = y; yy + 2 <= y + h && err == ESP_OK; yy += 2) {
-        err = esp_lcd_panel_draw_bitmap(s_panel, x, yy, x + w, yy + 2, line);
-        if (err == ESP_OK) xSemaphoreTake(s_tx_done, pdMS_TO_TICKS(100));
-    }
-    if (((y + h) & 1) && err == ESP_OK) {        /* 奇数行收尾：借上一行组成 2 行 */
-        err = esp_lcd_panel_draw_bitmap(s_panel, x, y + h - 2, x + w, y + h, line);
+    for (int yy = y1; yy <= y2 && err == ESP_OK; yy += 2) {
+        err = esp_lcd_panel_draw_bitmap(s_panel, x1, yy, x2 + 1, yy + 2, line);
         if (err == ESP_OK) xSemaphoreTake(s_tx_done, pdMS_TO_TICKS(100));
     }
 

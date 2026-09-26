@@ -68,6 +68,21 @@ esp_err_t pmu_axp2101_write_reg(uint8_t reg, uint8_t val);
  */
 void pmu_axp2101_set_isr_callback(void (*cb)(void *arg), void *arg);
 
+/**
+ * @brief 查询 PWRON（PKEY）是否完成了一次【短按】（轮询，本板 IRQ 引脚未接线）
+ *
+ * 实现：读 IRQ 状态寄存器 0x44 的 bit0（PKEY 短按释放标志，XPowersLib 口径
+ * [核对]），置位即代表 PMU 硬件已捕获「按下沿+释放」的完整短按；读后写 1
+ * 清除，因此一次短按本接口只返回一次 true。状态位锁存与 IRQ 使能无关
+ * （使能位只门控 IRQ 引脚），未使能中断也可轮询。
+ *
+ * 注意：PWRON 短按不会导致关机（长按 >6s 才是硬关机，寄存器默认值），
+ * 运行期可安全用作底键输入。调用周期建议 100ms 级（事件有锁存，慢轮询不丢）。
+ *
+ * @return true = 捕获到一次新短按（再调返回 false，直到下一次短按）
+ */
+bool pmu_pwron_short_press(void);
+
 #ifdef __cplusplus
 }
 #endif

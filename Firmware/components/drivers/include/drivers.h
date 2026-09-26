@@ -42,3 +42,4 @@
 #include "codec_es8311.h"
 #include "sd_tf.h"
 #include "key_gpio18.h"
+#include "key_gpio0.h"
