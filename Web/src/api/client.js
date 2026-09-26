@@ -81,10 +81,8 @@ export function deletePreset(id) {
 // GET /admin/catalog?part={key}&gender={0|1} → { part, total, items: [{ id, name, icon, img? }] }
 // icon 已是完整 URL（/api/admin/thumb?type=part&...）；gender 仅 hair/face 生效，可省略
 // 404/503 不在此兜底，走 axios reject → 上方拦截器统一 serverError 通道
-export function getCatalog(part, gender) {
-  const params = { part }
-  if ((part === 'hair' || part === 'face') && gender !== undefined && gender !== null) params.gender = gender
-  return http.get('/admin/catalog', { params }).then((r) => r.data)
+export function getCatalog(part) {
+  return http.get('/admin/catalog', { params: { part } }).then((r) => r.data)
 }
 // 纸娃娃真实合成 PNG 的 URL（id 为 appearance.js buildPaperdollId 拼串），直接喂 <img>，不走 axios
 export function paperdollThumbUrl(id, size = 256) {

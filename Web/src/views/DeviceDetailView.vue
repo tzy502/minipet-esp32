@@ -101,7 +101,7 @@ async function ensureNames(key) {
   if (partNames.value[key]) return
   try {
     const cat = CATEGORIES.find((c) => c.key === key)
-    const data = await getCatalog(key, cat?.genderFilter ? draft.value.gender : undefined)
+    const data = await getCatalog(key)
     partNames.value[key] = Object.fromEntries(data?.items?.map((it) => [it.id, it.name]) ?? [])
   } catch { partNames.value[key] = {} }
 }
@@ -256,7 +256,7 @@ async function doOta() {
                 style="width: 120px"
                 @update:value="(v) => (draft = { ...draft, gender: v })"
               />
-              <span class="hint">发型/脸型列表按性别过滤</span>
+              <span class="hint">仅影响外观草稿的性别字段</span>
             </div>
             <div class="slot-grid">
               <div v-for="cat in CATEGORIES" :key="cat.key" class="slot-row">
@@ -308,7 +308,7 @@ async function doOta() {
         v-model:show="pickerShow"
         :model-value="draft[pickerPart]"
         :part="pickerPart"
-        :gender="draft.gender"
+        
         @update:model-value="onPick"
       />
 

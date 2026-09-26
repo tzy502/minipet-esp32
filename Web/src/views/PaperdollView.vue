@@ -52,13 +52,11 @@ function ensureNames() {
 }
 
 async function fetchPartNames(cat) {
-  // 发型/脸型目录按性别过滤（CATEGORIES.genderFilter 标记），其余类目与性别无关
-  const gender = cat.genderFilter ? draft.value.gender : undefined
-  const cacheKey = cat.genderFilter ? `${cat.key}|${gender}` : cat.key
+  const cacheKey = cat.key
   if (namesFetched.has(cacheKey) || namesFailed.has(cacheKey) || namesFetching.has(cacheKey)) return
   namesFetching.add(cacheKey)
   try {
-    const data = await getCatalog(cat.key, gender)
+    const data = await getCatalog(cat.key)
     namesFetched.add(cacheKey)
     const patch = {}
     for (const it of data?.items ?? []) {
@@ -295,7 +293,7 @@ onBeforeUnmount(() => {
       <div class="form-row">
         <span class="row-label">性别</span>
         <n-select v-model:value="draft.gender" :options="GENDERS" size="small" class="row-control" />
-        <span class="hint">切换后发型/脸型目录按性别重拉，已选不清空</span>
+        <span class="hint">仅影响外观草稿的性别字段</span>
       </div>
       <div class="form-row">
         <span class="row-label">皮肤</span>
