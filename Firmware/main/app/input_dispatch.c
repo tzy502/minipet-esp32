@@ -402,10 +402,21 @@ static bool touch_read_frame(touch_frame_t *f)
         return true;
     }
 
-    int rx = ((int)f->d[1] << 4) | (f->d[3] >> 4);      /* 12 位 X（旧驱动误当触点数） */
+    /* 有效性门（官方 esp_lcd_touch_cst9217 同款）：ACK=0xAB 且 d[0] 低半字节
+     * status==0x06 才是有效触摸——残留帧坐标是垃圾（真机坐标乱跳总根因） */
+    if (f->d[6] != 0xAB || (f->d[0] & 0x0F) != 0x06) {
+        f->touched = false;
+        f->x = s_last_x;  f->y = s_last_y;
+        f->raw_x = s_last_rx;  f->raw_y = s_last_ry;
+        return true;                                 /* 读到帧但非有效触摸 */
+    }
+
+    int rx = ((int)f->d[1] << 4) | (f->d[3] >> 4);      /* 12 位 X */
     int ry = ((int)f->d[2] << 4) | (f->d[3] & 0x0F);    /* 12 位 Y */
-    int sx = TOUCH_RANGE_PX - ry;                       /* mirror_y 后 swap（见上注释） */
-    int sy = rx;
+    /* 映射定稿（BSP 板级 swap_xy=1 + mirror_y=1，2026-09-26 真机校准）：
+     * 屏幕 X = raw Y；屏幕 Y = 480 - raw X */
+    int sx = ry;
+    int sy = TOUCH_RANGE_PX - rx;
     if (sx < 0) sx = 0;
     if (sx > TOUCH_RANGE_PX - 1) sx = TOUCH_RANGE_PX - 1;
     if (sy < 0) sy = 0;
@@ -440,6 +451,7 @@ static void touch_tick(void)
     static int fail_cnt;                  /* 触摸 I2C 连续读失败计数 */
     static int64_t fail_last_log_ms;
     static bool frame_fmt_logged;         /* 首帧字节转储（只打一次，防 count 位置翻车无据可查） */
+    static int64_t s_frame_stream_until;  /* 【帧流诊断】窗口 */
 
     if (state_machine_menu_open()) {
         /* E6 胶水定稿：菜单是独立全屏窗口，触摸归菜单不穿透——
@@ -472,10 +484,15 @@ static void touch_tick(void)
 
     if (!frame_fmt_logged) {
         frame_fmt_logged = true;
-        ESP_LOGI(TAG, "触摸首帧 [%02X %02X %02X %02X %02X %02X %02X %02X] n=%d"
-                      "（d[6] 期望≈0xAB，d[5]=触点数）",
+        s_frame_stream_until = mp_now_ms() + 8000;   /* 【帧流诊断】按下后 8s 逐帧记录 */
+        ESP_LOGI(TAG, "触摸首帧 [%02X %02X %02X %02X %02X %02X %02X %02X] n=%d",
                  f.d[0], f.d[1], f.d[2], f.d[3],
                  f.d[4], f.d[5], f.d[6], f.d[7], f.count);
+    }
+    if (mp_now_ms() < s_frame_stream_until) {
+        ESP_LOGI(TAG, "帧流 [%02X %02X %02X %02X %02X %02X %02X %02X] n=%d repack=(%d,%d)",
+                 f.d[0], f.d[1], f.d[2], f.d[3],
+                 f.d[4], f.d[5], f.d[6], f.d[7], f.count, f.raw_x, f.raw_y);
     }
 
     if (f.touched && !down) {
