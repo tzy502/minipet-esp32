@@ -1023,6 +1023,16 @@ void render_tick(void)
         mark_ent();                          /* 新位置 */
         s_last_drag_x = ox; s_last_drag_y = oy;
         any = true;
+        /* 【拖拽探针】旧/新偏移与标脏是否成对发生（真机残影定位） */
+        static int32_t plx, ply; static int64_t plt;
+        int64_t now = esp_timer_get_time();
+        if (now - plt > 300000) {
+            ESP_LOGW("probe", "drag old(%d,%d)->new(%d,%d) tilt=%d",
+                     s_last_drag_x - ox, s_last_drag_y - oy, ox, oy,
+                     (int)(g_tilt_mdeg / 1000));
+            plt = now;
+        }
+        (void)plx; (void)ply;
     }
 
     if (any) flush_dirty();
