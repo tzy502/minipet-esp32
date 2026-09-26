@@ -73,17 +73,16 @@ typedef struct {
  * 未经实测。若点不亮，用逻辑分析仪/官方 demo 逐条核对，重点 0x53/0xC4。
  */
 static const co5300_init_cmd_t s_init_cmds[] = {
-    {0xFE, {0x20},           1, 0},   /* 切到 Page1 */
-    {0x26, {0x08},           1, 0},   /* Gamma 模式（残留默认即可） */
-    {0xFE, {0x00},           1, 0},   /* 回到 Page0 */
-    {0xC4, {0x80},           1, 0},   /* 驱动能力/电荷泵（核对） */
-    {0x36, {0x00},           1, 0},   /* MADCTL：默认扫描方向；镜像/旋转改 bit7/6/5 */
-    {0x3A, {0x55},           1, 0},   /* COLMOD = RGB565 16bit */
-    {0x53, {0x28},           1, 0},   /* 显示写使能（Write Display ON，核对） */
-    {0x51, {0x00},           1, 0},   /* 亮度先 0，初始化完由应用抬升 */
-    {0x35, {0x00},           1, 0},   /* TE 帧同步输出：关闭（ tearing 由帧率控制） */
-    {0x11, {0x00},           0, 120}, /* Sleep Out，等待 >=120ms */
-    {0x29, {0x00},           0, 20},  /* Display On */
+    /* 对齐官方 demo（Arduino_CO5300.h co5300_init_operations，2026-09-26 比对）：
+     * 官方序列 = SLPOUT+120ms → FE 00 → C4 80 → 3A 55 → 53 20 → 63 FF → 29 → 51 D0 */
+    {0x11, {0x00},           0, 120}, /* Sleep Out，等待 >=120ms（官方第一步） */
+    {0xFE, {0x00},           1, 0},   /* Page0（官方 130 行） */
+    {0xC4, {0x80},           1, 0},   /* SPIMODECTL 0x80：QSPI 模式使能（官方 131 行） */
+    {0x3A, {0x55},           1, 0},   /* COLMOD = RGB565 16bit（官方 133 行） */
+    {0x53, {0x20},           1, 0},   /* WCTRLD1 0x20（官方 134 行；旧值 0x28） */
+    {0x63, {0xFF},           1, 0},   /* HBM 亮度 FF（官方 135 行） */
+    {0x29, {0x00},           0, 10},  /* Display On（官方 138 行） */
+    {0x51, {0xD0},           1, 0},   /* 亮度 0xD0=83%（官方 139 行；0 先黑屏易误判） */
 };
 
 /* ---------- 模块状态 ---------- */
@@ -235,7 +234,7 @@ esp_err_t display_init(void)
     xSemaphoreGive(s_lock);
 
     s_inited = true;
-    display_brightness(40); /* 默认亮度，应用可再调 */
+    display_brightness(80); /* 默认亮度，应用可再调 */
     ESP_LOGI(TAG, "CO5300 就绪 %ux%u QSPI@%dMHz",
              MINIPET_PROFILE_AMOLED216.width, MINIPET_PROFILE_AMOLED216.height,
              CO5300_SPI_HZ / 1000000);
