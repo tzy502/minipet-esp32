@@ -432,6 +432,7 @@ bool provision_portal_active(void)
     return s_portal_active;
 }
 
+
 /* 【临时诊断】内部堆布局转储：查 httpd 任务/listen 分配失败的真实内存状况 */
 static void dump_internal_heap(void)
 {
@@ -494,11 +495,21 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
 {
     (void)arg; (void)data;
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
+        int reason = 0;
+        if (data) {   /* 断开原因码：定位路由器踢/信标丢失/握手失败（真机 6s 掉线诊断） */
+            wifi_event_sta_disconnected_t *d = (wifi_event_sta_disconnected_t *)data;
+            reason = d->reason;
+        }
+        ESP_LOGW(TAG, "WiFi 断开 reason=%d（205=握手失败 201=无AP 8=离开 15=4路超时 202=认证失败）", reason);
         xEventGroupSetBits(s_wifi_events, WIFI_FAIL_BIT);
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t *e = (ip_event_got_ip_t *)data;
+        ESP_LOGI(TAG, "WiFi GOT_IP: " IPSTR, IP2STR(&e->ip_info.ip));
         xEventGroupSetBits(s_wifi_events, WIFI_GOT_IP_BIT);
     }
 }
+
+static volatile bool s_conn_busy;   /* connect_sta 并发门闩：poller 与 state_machine 会同时调用 */
 
 static void wifi_init_once(void)
 {
@@ -509,6 +520,9 @@ static void wifi_init_once(void)
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    /* RAM 存储：禁用 FLASH 自动重连（esp_wifi_start 会用旧配置自动连接，
+     * 随后 set_config 撞"connecting"状态 → abort → 无限重启，真机实证） */
+    ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
 
     ESP_ERROR_CHECK(esp_event_handler_register(
         WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED, wifi_event_handler, NULL));
@@ -676,22 +690,54 @@ esp_err_t provision_wifi_connect_sta(uint32_t timeout_ms)
     mp_nvs_get_str("wifi_pass", pass, sizeof(pass));
 
     wifi_init_once();
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    bool owner = false;
+    if (!s_conn_busy) { s_conn_busy = true; owner = true; }
+    if (!owner) {
+        /* 已有连接流程进行中：只共享等待其 GOT_IP 结果，绝不再动配置
+         * （真机实证：双调用并发 set_mode/disconnect 互相拆台 → 永连不上） */
+        EventBits_t bits = xEventGroupWaitBits(s_wifi_events, WIFI_GOT_IP_BIT,
+                                               pdFALSE, pdFALSE, pdMS_TO_TICKS(timeout_ms));
+        if (bits & WIFI_GOT_IP_BIT) return ESP_OK;
+        return ESP_FAIL;
+    }
+    esp_err_t e = esp_wifi_set_mode(WIFI_MODE_STA);
+    ESP_LOGI(TAG, "wifi: set_mode=%s", esp_err_to_name(e));
+    if (e != ESP_OK) { s_conn_busy = false; return e; }
+    esp_wifi_disconnect();                       /* 清掉进行中/已存的自动连接，安全幂等 */
+    {   /* 掩码回显：核对配网时存的密码是否正确（前2+后2可见） */
+        char masked[16] = { 0 };
+        size_t plen = strlen(pass);
+        if (plen <= 4) snprintf(masked, sizeof(masked), "(太短)");
+        else snprintf(masked, sizeof(masked), "%c%c****%c%c(%d位)",
+                      pass[0], pass[1], pass[plen-2], pass[plen-1], (int)plen);
+        ESP_LOGI(TAG, "wifi: ssid=%s pass=%s", ssid, masked);
+    }
 
     wifi_config_t sta = { 0 };
     strlcpy((char *)sta.sta.ssid, ssid, sizeof(sta.sta.ssid));
     strlcpy((char *)sta.sta.password, pass, sizeof(sta.sta.password));
-    sta.sta.threshold.authmode = pass[0] ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta));
+    sta.sta.threshold.authmode = pass[0] ? WIFI_AUTH_WPA_WPA2_PSK : WIFI_AUTH_OPEN;
+    /* WPA2/WPA3 混合路由器：声明 PMF 能力（required=false），否则 4 握手超时 reason=15 */
+    sta.sta.pmf_cfg.capable = true;
+    sta.sta.pmf_cfg.required = false;
+    e = esp_wifi_set_config(WIFI_IF_STA, &sta);
+    if (e != ESP_OK) {
+        ESP_LOGE(TAG, "set_config 失败: %s", esp_err_to_name(e));
+        return e;
+    }
 
     xEventGroupClearBits(s_wifi_events, WIFI_GOT_IP_BIT | WIFI_FAIL_BIT);
-    ESP_ERROR_CHECK(esp_wifi_start());
-    esp_wifi_connect();
+    e = esp_wifi_start();
+    ESP_LOGI(TAG, "wifi: start=%s", esp_err_to_name(e));
+    if (e != ESP_OK && e != ESP_ERR_INVALID_STATE) { s_conn_busy = false; return e; }
+    e = esp_wifi_connect();
+    ESP_LOGI(TAG, "wifi: connect=%s（等待 IP，最长 %u ms）", esp_err_to_name(e), (unsigned)timeout_ms);
 
     EventBits_t bits = xEventGroupWaitBits(
         s_wifi_events, WIFI_GOT_IP_BIT | WIFI_FAIL_BIT,
         pdFALSE, pdFALSE, pdMS_TO_TICKS(timeout_ms));
 
+    s_conn_busy = false;
     if (bits & WIFI_GOT_IP_BIT) return ESP_OK;
     return ESP_FAIL;
 }
@@ -720,3 +766,4 @@ bool provision_is_active(void)
 {
     return s_portal_active;
 }
+
