@@ -19,6 +19,7 @@
 
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>     /* strtoul（BGM_PLAYID 数字串） */
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -421,6 +422,18 @@ static void dispatch_action(const char *action)
     render_set_layout(path, loop);
 }
 
+/* 按 hash 换装扮（E13）：hash → parts 路径 → render_set_parts */
+static void dispatch_set_parts_by_hash(const char *hash)
+{
+    char path[MP_MPK_PATH_MAX];
+    if (!hash || !asset_dl_parts_path(hash, path, sizeof(path))) {
+        ESP_LOGW(TAG, "SET_PARTS：hash %s 无对应部件包", hash ? hash : "(null)");
+        return;
+    }
+    int rc = render_set_parts(path);
+    ESP_LOGI(TAG, "换装 %s rc=%d", path, rc);
+}
+
 static void dispatch_map(const char *hash)
 {
     char bg[MP_MPK_PATH_MAX];
@@ -529,6 +542,9 @@ void app_cmd_dispatch(const mp_cmd_t *cmd)
     case MP_CMD_SET_MAP:
         dispatch_map(cmd->s);
         break;
+    case MP_CMD_SET_PARTS:
+        dispatch_set_parts_by_hash(cmd->s);
+        break;
     case MP_CMD_BRIGHTNESS:
         display_brightness((uint8_t)cmd->a);
         g_mp_cfg.brightness = (uint8_t)cmd->a;
@@ -567,6 +583,18 @@ void app_cmd_dispatch(const mp_cmd_t *cmd)
         break;
     case MP_CMD_OTA_DONE:
         render_bubble_show("升级完成，重启中", RENDER_FONT_24);
+        break;
+    case MP_CMD_BGM_TOGGLE:                 /* BGM 控制：转调 bgm（audio_q 异步生效） */
+        bgm_toggle_pause();
+        break;
+    case MP_CMD_BGM_NEXT:
+        bgm_next();
+        break;
+    case MP_CMD_BGM_PREV:
+        bgm_prev();
+        break;
+    case MP_CMD_BGM_PLAYID:                 /* s=数字串曲目 id */
+        bgm_play_id((uint32_t)strtoul(cmd->s, NULL, 10));
         break;
     case MP_CMD_NET_STATE:
     case MP_CMD_BGM_STATE:

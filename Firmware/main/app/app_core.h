@@ -122,7 +122,8 @@ typedef enum {
     MP_CMD_SET_ACTION,      /* s=动作名            → render_set_layout        */
     MP_CMD_SET_EXPRESSION,  /* s=表情名            → render_set_expression    */
     MP_CMD_BUBBLE,          /* s=UTF-8 文本        → render_bubble_show       */
-    MP_CMD_SET_MAP,         /* s=bg hash           → render_set_map(+条带)    */
+    MP_CMD_SET_MAP,
+    MP_CMD_SET_PARTS,       /* s=parts hash → 换装扮（E13 每设备独立装扮） */         /* s=bg hash           → render_set_map(+条带)    */
     MP_CMD_BRIGHTNESS,      /* a=0..100            → display_brightness       */
     MP_CMD_REBOOT,          /* 服务端指令重启                                 */
     MP_CMD_OTA_BEGIN,       /* a=0..100 阶段提示   → render 气泡               */
@@ -136,6 +137,10 @@ typedef enum {
     MP_CMD_MENU_EXIT,       /* render_exit_menu                              */
     MP_CMD_CLOCK,           /* a=1 待机时钟浮现 / 0 隐藏（E9；锚点查 clock_table） */
     MP_CMD_BANNER,          /* a=1 顶部未配网横幅 s=文本 / a=0 隐藏（问题4）   */
+    MP_CMD_BGM_TOGGLE,      /* 播放/暂停切换 → bgm_toggle_pause（E8 设备端）  */
+    MP_CMD_BGM_NEXT,        /* 下一首（本地曲目表循环）→ bgm_next            */
+    MP_CMD_BGM_PREV,        /* 上一首（本地曲目表循环）→ bgm_prev            */
+    MP_CMD_BGM_PLAYID,      /* s=数字串曲目 id → bgm_play_id 选曲播放        */
 } mp_cmd_type_t;
 
 typedef struct {
@@ -157,7 +162,8 @@ typedef enum {
     MP_AUDIO_STOP,
     MP_AUDIO_NEXT,        /* 同源内切歌（E8 短路规则） */
     MP_AUDIO_PREV,
-    MP_AUDIO_VOL,         /* a=0..100 线性音量 */
+    MP_AUDIO_VOL,         /* a=0..100 线性音量（绝对设定） */
+    MP_AUDIO_VOLUME,      /* a=delta 音量增减（可负，bgm 内 clamp 0..100） */
     MP_AUDIO_SOURCE,      /* a=0 WZ 曲库 / 1 QQ 音乐（手动切类型才换源） */
 } mp_audio_msg_type_t;
 

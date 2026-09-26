@@ -109,7 +109,39 @@ void render_input_tilt(float tilt_deg);
 void render_set_drag_off(int32_t px);
 int32_t render_get_drag_off(void);
 void render_set_drag_off_y(int32_t py);
+/* 【校准】红线坐标系 + 触摸落点回显（tx,ty <0 = 不更新落点） */
+void render_calib_set(bool on, int16_t tx, int16_t ty);
 int32_t render_get_drag_off_y(void);
+
+/* ==================================================================== */
+/* 【菜单真实化 2026-09】菜单选择器对外钩子（lvgl_bridge.c 实现）          */
+/*                                                                      */
+/* 输入接线分工（主线程落地）：                                           */
+/*   - input_dispatch 在菜单态（state_machine_menu_open()）读触摸帧后调   */
+/*     lv_bridge_touch_feed(x, y, pressed)——touch_read_frame 本体不动；   */
+/*     LVGL pointer indev 已由 bridge_init 创建并消费喂入坐标。           */
+/*   - 侧键矩阵（短按，MENU 态）：顶键=确认 → render_menu_ok()；          */
+/*     中键=上移 → render_menu_nav(0)；底键=下移 → render_menu_nav(1)。   */
+/*     长按顶键（转 CLOCK_DOZE）归 input_dispatch 统一处理，不经本层。     */
+/*   - 非菜单态调用全部为安全 no-op。                                     */
+/*                                                                      */
+/* 跨任务约定：feed 写坐标+按下标志（单写者，先坐标后 pressed）；         */
+/*   nav 只写单字 sel；ok 置请求旗标——控件树操作全部由渲染任务内          */
+/*   菜单 100ms tick 排空执行，输入任务侧永不动 LVGL 对象。               */
+/* ==================================================================== */
+
+/* 触摸喂入（input 任务菜单态调用）：屏幕坐标 0..479（同 touch_read_frame
+ * 映射口径），pressed=false = 抬起帧 */
+void lv_bridge_touch_feed(int x, int y, bool pressed);
+
+/* 侧键导航（input 任务调用）：dir=0 选中项上移 / 1 下移（越界回绕）；
+ * 根页移动选中项，子页移动列表高亮 */
+void render_menu_nav(int dir);
+
+/* 侧键确认（input 任务调用，顶键短按）：根页=进入选中子页（Exit 行=收菜单，
+ * 经状态机 MP_SM_EV_MENU_KEY 通道）；Maps/Paperdoll 子页=执行选中条目并回
+ * 根页；BGM 子页=执行选中按钮动作 */
+void render_menu_ok(void);
 
 #ifdef __cplusplus
 }

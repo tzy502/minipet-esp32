@@ -49,11 +49,20 @@ void mp_http_init(void)
     }
     size_t len = strlen(s_server_url);
     while (len > 0 && s_server_url[len - 1] == '/') s_server_url[--len] = 0;
-    /* 配网页用户常省略 scheme（真机：192.168.3.46:38090 → parse url 失败）→ 读入即补 */
-    if (s_server_url[0] && strncmp(s_server_url, "http", 4) != 0) {
+    /* scheme 归一化（真机两坑）：①省略 scheme → 补 http://；②手机浏览器
+     * 自动升级 https:// → NAS 服务端为纯 HTTP，强制回 http（否则 TLS 握手
+     * 被重置 → abort 重启循环） */
+    if (s_server_url[0]) {
         char tmp[sizeof(s_server_url)];
-        snprintf(tmp, sizeof(tmp), "http://%s", s_server_url);
-        strlcpy(s_server_url, tmp, sizeof(s_server_url));
+        if (strncmp(s_server_url, "http://", 7) == 0) {
+            /* 已是 http，保持 */
+        } else if (strncmp(s_server_url, "https://", 8) == 0) {
+            snprintf(tmp, sizeof(tmp), "http://%s", s_server_url + 8);
+            strlcpy(s_server_url, tmp, sizeof(s_server_url));
+        } else {
+            snprintf(tmp, sizeof(tmp), "http://%s", s_server_url);
+            strlcpy(s_server_url, tmp, sizeof(s_server_url));
+        }
     }
 }
 

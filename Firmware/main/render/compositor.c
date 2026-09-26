@@ -100,9 +100,14 @@ static struct { bool active; uint16_t *px; int32_t w, h, x, y; } g_bub;
 static bool g_banner_on;
 static char g_banner_text[48];
 
+static void mark_rect(int32_t x, int32_t y, int32_t w, int32_t h);   /* 前向声明（校准层先于定义使用） */
+
 /* IMU 视差（input 任务异步写；对齐 int32 写原子） */
 static volatile int32_t g_tilt_mdeg;
-static volatile int32_t g_drag_off_x;   /* 拖拽：人物屏幕 x 偏移（1:1 跟手，px） */
+static volatile int32_t g_drag_off_x;
+static bool     g_calib_on;                 /* 【校准模式】红线坐标系 + 触摸落点回显 */
+static int16_t  g_calib_touch_x = -1;       /* 最近一次触摸落点（-1=无） */
+static int16_t  g_calib_touch_y = -1;   /* 拖拽：人物屏幕 x 偏移（1:1 跟手，px） */
 static volatile int32_t g_drag_off_y;   /* 拖拽：人物屏幕 y 偏移 */
 static int32_t s_last_ent_tilt;            /* 实体已按此 tilt 值摆放（问题7 跟随标脏） */
 
@@ -134,6 +139,7 @@ static void ent_disp_size(int32_t *dw, int32_t *dh)
     if (*dw > RC_ENT_W) *dw = RC_ENT_W;
     if (*dh > RC_ENT_H) *dh = RC_ENT_H;
     if (*dw > g_sw) *dw = g_sw;
+    if (*dh > g_sh) *dh = g_sh;
 }
 
 /* 倾斜/拖拽 → 实体 x 偏移可见反馈（问题6/7）：±8° ↔ ±8px */
@@ -164,6 +170,14 @@ void render_set_drag_off_y(int32_t py)
 
 int32_t render_get_drag_off_y(void) { return g_drag_off_y; }
 
+/* 【校准模式】红线=固件认为的底边(y=440)+竖直中线(x=240)；白点=最近触摸落点 */
+void render_calib_set(bool on, int16_t tx, int16_t ty)
+{
+    g_calib_on = on;
+    if (tx >= 0) { g_calib_touch_x = tx; g_calib_touch_y = ty; }
+    mark_rect(0, 0, g_sw, g_sh);             /* 叠加层变化 → 全屏重绘 */
+}
+
 /* 实体缓冲 → 屏幕摆放（问题2 修复）：
  * 世界 1x body 锚点 (0,0)（= 人物脚底基准，piece x/y 的原点）2x 后——
  *   水平钉在屏幕中心（+调参偏移 + tilt 可见偏移），
@@ -182,6 +196,32 @@ static void ent_screen_pos_at(int32_t tilt_mdeg, int32_t *sx, int32_t *sy)
 static void ent_screen_pos(int32_t *sx, int32_t *sy)
 {
     ent_screen_pos_at(g_tilt_mdeg, sx, sy);
+}
+
+/* 实体屏幕矩形（唯一权威）：mark 网格标脏 / compose 区域绘制 / display_blit
+ * 上窗三者必须同源。规则：「先 clamp 实体矩形到屏幕内，再交给后续路径」——
+ * 右/下缘向内收尾（clamp 到 g_sw/g_sh），绝不向外扩张越界。
+ * 右缘 480 残影根修：此前 mark_rect 内部 clamp、compose_region 的 min/max
+ * 收缩、display_blit 的 even_round 向外取偶三路各自为政，实体矩形右缘越过
+ * x=480 时（drag_off 靠近 +160）矩形分歧 → 残影。
+ * 输出：bx/by = 实体缓冲原点（未 clamp，可负/越屏，仅供 eidx=sx-bx 索引缓冲）；
+ *       ex/ey/dw/dh = 屏内显示窗 [ex,ex+dw)×[ey,ey+dh)（完全出屏时 dw/dh=0）。 */
+static void ent_screen_rect_at(int32_t tilt_mdeg,
+                               int32_t *bx, int32_t *by,
+                               int32_t *ex, int32_t *ey,
+                               int32_t *dw, int32_t *dh)
+{
+    ent_screen_pos_at(tilt_mdeg, bx, by);
+    ent_disp_size(dw, dh);
+    *ex = *bx; *ey = *by;
+    int32_t x1 = *ex + *dw, y1 = *ey + *dh;
+    if (*ex < 0) *ex = 0;               /* 左/上缘：向内收 */
+    if (*ey < 0) *ey = 0;
+    if (x1 > g_sw) x1 = g_sw;           /* 右/下缘：向内收尾，先 clamp 再谈对齐 */
+    if (y1 > g_sh) y1 = g_sh;
+    *dw = x1 - *ex;
+    *dh = y1 - *ey;
+    if (*dw <= 0 || *dh <= 0) { *dw = 0; *dh = 0; }
 }
 
 static void mark_rect(int32_t x, int32_t y, int32_t w, int32_t h)
@@ -204,9 +244,9 @@ static void mark_rect(int32_t x, int32_t y, int32_t w, int32_t h)
 
 static void mark_ent_at(int32_t tilt_mdeg)
 {
-    int32_t ex, ey, dw, dh;
-    ent_screen_pos_at(tilt_mdeg, &ex, &ey);
-    ent_disp_size(&dw, &dh);
+    int32_t bx, by, ex, ey, dw, dh;
+    ent_screen_rect_at(tilt_mdeg, &bx, &by, &ex, &ey, &dw, &dh);
+    (void)bx; (void)by;                  /* 缓冲原点仅 compose 索引用 */
     /* 探针（上屏侧嫌疑）：标脏包围盒变化才打 LOGD（1s 限频，防 tilt 连续
      * 变化刷屏；诊断期已结束，默认级别不输出）——帧静止排查时看这里：
      * bbox 应稳定覆盖实体显示区 */
@@ -221,7 +261,9 @@ static void mark_ent_at(int32_t tilt_mdeg)
                      "x%" PRId32, ex, ey, dw, dh);
         }
     }
-    mark_rect(ex, ey, dw, dh);
+    /* 已 clamp 的屏内矩形（与 compose_region 实体步同一来源）；
+     * 完全出屏（dw/dh=0）时 mark_rect 内部越界门同样拦截，双保险 */
+    if (dw > 0 && dh > 0) mark_rect(ex, ey, dw, dh);
 }
 
 static void mark_ent(void)
@@ -593,21 +635,41 @@ static void compose_region(int32_t x, int32_t y, int32_t w, int32_t h)
     /* 4) 地图时钟（场景层，实体之下） */
     clock_digits_compose(g_fb, g_sw, RC_SCALE, x, y, w, h);
 
-    /* 5) 实体缓冲（1bit 覆盖；显示区 = 画布尺寸×2 的摆放矩形） */
+    /* 【校准模式】红色底边线 y=440 + 竖直中线 x=240 + 中心十字 + 触摸落点白点 */
+    if (g_calib_on) {
+        const uint16_t red = 0xF800;
+        if (440 >= y && 440 < y + h)
+            for (int32_t c = x; c < x + w && c < g_sw; c++)
+                g_fb[(size_t)440 * g_sw + c] = red;
+        if (240 >= x && 240 < x + w)
+            for (int32_t r = y; r < y + h && r < g_sh; r++)
+                g_fb[(size_t)r * g_sw + 240] = red;
+        if (g_calib_touch_x >= 0) {
+            int32_t tx = g_calib_touch_x & ~1, ty = g_calib_touch_y & ~1;
+            for (int dy2 = 0; dy2 < 8; dy2++)
+                for (int dx2 = 0; dx2 < 8; dx2++)
+                    if (tx + dx2 < g_sw && ty + dy2 < g_sh)
+                        g_fb[(size_t)(ty + dy2) * g_sw + tx + dx2] = 0xFFFF;
+        }
+    }
+
+    /* 5) 实体缓冲（1bit 覆盖；显示区 = clamp 后的摆放矩形，与 mark_ent_at
+     * 完全同源（ent_screen_rect_at），右缘 480 处标脏/绘制不再分歧） */
     {
-        int32_t ex, ey, dw, dh;
-        ent_screen_pos(&ex, &ey);
-        ent_disp_size(&dw, &dh);
-        int32_t X0 = ex > x ? ex : x, Y0 = ey > y ? ey : y;
-        int32_t X1 = (ex + dw < x + w) ? ex + dw : x + w;
-        int32_t Y1 = (ey + dh < y + h) ? ey + dh : y + h;
-        for (int32_t sy = Y0; sy < Y1; sy++) {
-            uint32_t erow = (uint32_t)(sy - ey) * RC_ENT_W;
-            uint16_t *drow = g_fb + (size_t)sy * g_sw;
-            for (int32_t sx = X0; sx < X1; sx++) {
-                uint32_t eidx = erow + (uint32_t)(sx - ex);
-                if (rc_mask_bit(g_ent_cov, eidx))
-                    drow[sx] = g_ent_px[eidx];
+        int32_t bx, by, ex, ey, dw, dh;
+        ent_screen_rect_at(g_tilt_mdeg, &bx, &by, &ex, &ey, &dw, &dh);
+        if (dw > 0 && dh > 0) {
+            int32_t X0 = ex > x ? ex : x, Y0 = ey > y ? ey : y;
+            int32_t X1 = (ex + dw < x + w) ? ex + dw : x + w;
+            int32_t Y1 = (ey + dh < y + h) ? ey + dh : y + h;
+            for (int32_t sy = Y0; sy < Y1; sy++) {
+                uint32_t erow = (uint32_t)(sy - by) * RC_ENT_W;
+                uint16_t *drow = g_fb + (size_t)sy * g_sw;
+                for (int32_t sx = X0; sx < X1; sx++) {
+                    uint32_t eidx = erow + (uint32_t)(sx - bx);
+                    if (rc_mask_bit(g_ent_cov, eidx))
+                        drow[sx] = g_ent_px[eidx];
+                }
             }
         }
     }
