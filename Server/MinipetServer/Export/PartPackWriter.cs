@@ -33,11 +33,10 @@ namespace MiniPet.Export;
 public static class PartPackWriter
 {
     /// <summary>
-    /// 索引条目字节数：字段 u32+u16+u16+u16+i16+i16+u32 = 18B 顺序紧排。
-    /// （规格 §三 标注「20B」但字段和为 18B——按字段实长 18B 定稿，与回放读取器
-    /// SpecMpakParser 的顺序读取一致；若未来需要 20B 对齐再以 flag 位扩展。）
+    /// 索引条目字节数：字段 18B + 尾填充 2B = 20B（与固件 parse_parts / 规格 §三 的 20B 一致；
+    /// 2026-09-26 真机联调定稿——此前 18B 紧排导致固件字段错位 MPAK_ERR_FMT）。
     /// </summary>
-    public const int IndexEntrySize = 18;
+    public const int IndexEntrySize = 20;
 
     /// <summary>一个部件（位图 + 元数据）。调用方负责处置 Bitmap。</summary>
     public sealed class PartEntry
@@ -186,7 +185,8 @@ public static class PartPackWriter
             w.Write((ushort)hpx);
             w.Write((short)p.OriginX);
             w.Write((short)p.OriginY);
-            w.Write((uint)(indexLen + starts[i])); // payload 起算的数据区绝对偏移
+            w.Write((uint)starts[i]); // 位图数据区相对偏移（固件读取时 + parts_bmp_base，2026-09-26 真机定稿）
+            w.Write((ushort)0);                    // 索引项 20B 尾填充（与固件 parse_parts 对齐，2026-09-26 真机定稿）
         }
         foreach (var blob in blobs) w.Write(blob);
         w.Flush();

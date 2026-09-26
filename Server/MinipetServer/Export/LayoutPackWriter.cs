@@ -96,8 +96,7 @@ public static class LayoutPackWriter
                 w.Write(f.DelayMs);
                 w.Write(f.MoveDx);
                 w.Write(f.MoveDy);
-                w.Write((ushort)0); // pad
-                w.Write((uint)f.Pieces.Count);
+                w.Write((uint)f.Pieces.Count);   // 帧头 12B（无 pad，与固件一致）
                 foreach (var p in f.Pieces)
                 {
                     w.Write(p.PartId);
@@ -106,6 +105,7 @@ public static class LayoutPackWriter
                     w.Write(p.Y);
                     w.Write(p.Flip);
                     w.Write(p.Z);
+                    w.Write((byte)0);   // piece 12B 尾填充（与固件一致）
                 }
             }
         }

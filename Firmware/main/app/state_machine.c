@@ -202,6 +202,7 @@ void state_machine_boot(bool sd_ok, bool psram_ok)
     self_test(sd_ok, psram);
 
     /* 本地已有素材清单 → 让渲染任务立即从 TF 起播（离线也可跑，E11） */
+    ESP_LOGW(TAG, "boot: have_local=%d → 发 MANIFEST_SYNCED", (int)asset_dl_have_local_manifest());
     if (asset_dl_have_local_manifest()) {
         cmd_simple(MP_CMD_MANIFEST_SYNCED, NULL, 0, 0);
     }
@@ -410,6 +411,7 @@ static void dispatch_clock(int enable)
 static void dispatch_manifest_synced(void)
 {
     char path[MP_MPK_PATH_MAX];
+    ESP_LOGW(TAG, "dispatch_manifest_synced 进入");
 
     /* 字体三档（气泡 24 / 列表 16 / 标题 32，E12） */
     static const struct { render_font_t id; int px; } fonts[] = {
@@ -417,16 +419,24 @@ static void dispatch_manifest_synced(void)
     };
     for (size_t i = 0; i < sizeof(fonts) / sizeof(fonts[0]); i++) {
         if (asset_dl_font_path(fonts[i].px, path, sizeof(path))) {
+            ESP_LOGW(TAG, "set_font px=%d 开始 %s", fonts[i].px, path);
             render_set_font(fonts[i].id, path);
+            ESP_LOGW(TAG, "set_font px=%d 完成", fonts[i].px);
         }
     }
 
     /* 默认纸娃娃部件 + 站立布局（E13：每设备独立装扮） */
     if (asset_dl_parts_path(NULL, path, sizeof(path))) {
-        render_set_parts(path);
+        int prc = render_set_parts(path);
+        ESP_LOGW(TAG, "parts 路径=%s rc=%d", path, prc);
+    } else {
+        ESP_LOGE(TAG, "parts 路径查询失败（清单里没有 PARTS）");
     }
     /* 加载失败不黑屏：屏显文字提示（E11 素材故障 → dam 语义的文本版） */
-    if (!asset_dl_layout_path("stand1", path, sizeof(path)) ||
+    bool l_ok = asset_dl_layout_path("stand1", path, sizeof(path));
+    int lrc = -1;
+    if (l_ok) { lrc = render_set_layout(path, true); ESP_LOGW(TAG, "layout 路径=%s rc=%d", path, lrc); }
+    if (!l_ok || lrc != 0 ||
         !asset_dl_parts_path(NULL, path, sizeof(path))) {
         ESP_LOGE(TAG, "本地素材加载失败（parts/stand1 缺失）");
         transition(MP_ST_FATAL);
