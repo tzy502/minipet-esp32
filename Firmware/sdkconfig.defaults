@@ -18,3 +18,7 @@ CONFIG_I2C_ENABLE_LEGACY_DRIVERS=n
 
 # 任务看门狗：喂狗点在渲染心跳（app/ 负责），保留默认监控
 # CONFIG_ESP_TASK_WDT_TIMEOUT_S 默认 5s，够 30fps 心跳
+
+# ---- 分区表（E11 双 OTA，见 partitions.csv）----
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"

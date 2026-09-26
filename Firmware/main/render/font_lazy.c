@@ -47,10 +47,13 @@ static fl_inst_t *fl_self(const lv_font_t *font)
     return NULL;
 }
 
-/* ---------------- LVGL 回调 ---------------- */
+/* ---------------- LVGL 回调（v9.3 签名） ----------------
+ * 字形 codepoint 存 dsc->gid.index（内置 fmt_txt 同款模式），
+ * get_glyph_bitmap 阶段凭它反查缓存槽。
+ * A4 原样返回（req_raw_bitmap 路径），draw_buf 不需要（无解压格式）。 */
 
-static bool fl_glyph_dsc(const lv_font_t *font, uint32_t letter,
-                         uint32_t letter_next, lv_font_glyph_dsc_t *dsc)
+static bool fl_glyph_dsc(const lv_font_t *font, lv_font_glyph_dsc_t *dsc,
+                         uint32_t letter, uint32_t letter_next)
 {
     fl_inst_t *self = fl_self(font);
     if (!self || !self->open || !dsc) return false;
@@ -65,7 +68,8 @@ static bool fl_glyph_dsc(const lv_font_t *font, uint32_t letter,
         dsc->box_h        = 0;
         dsc->ofs_x        = 0;
         dsc->ofs_y        = 0;
-        dsc->bpp          = 4;
+        dsc->gid.index    = 0;
+        dsc->format       = LV_FONT_GLYPH_FORMAT_NONE;
         dsc->is_placeholder = 1;
         dsc->resolved_font = font;
         return true;
@@ -76,18 +80,21 @@ static bool fl_glyph_dsc(const lv_font_t *font, uint32_t letter,
     dsc->box_h        = g->h;
     dsc->ofs_x        = g->off_x;
     dsc->ofs_y        = -g->bearing_y; /* 向上为正 → LVGL 向下为正 */
-    dsc->bpp          = 4;             /* A4 */
+    dsc->gid.index    = letter;         /* 反查键：0 保留为无效 */
+    dsc->format       = LV_FONT_GLYPH_FORMAT_A4;
+    dsc->stride       = (g->w + 1) / 2; /* 4bpp 紧行长 == LVGL A4 行规则 */
     dsc->is_placeholder = 0;
     dsc->resolved_font = font;
     return true;
 }
 
-static const uint8_t *fl_glyph_bmp(const lv_font_t *font, uint32_t letter,
-                                   const lv_font_glyph_dsc_t *dsc)
+static const void *fl_glyph_bmp(lv_font_glyph_dsc_t *dsc, lv_draw_buf_t *draw_buf)
 {
-    fl_inst_t *self = fl_self(font);
+    (void)draw_buf;                     /* A4 原样透传，无解码目标缓冲需求 */
+    if (!dsc || dsc->gid.index == 0) return NULL;
+    uint32_t letter = dsc->gid.index;
+    fl_inst_t *self = fl_self(dsc->resolved_font);
     if (!self || !self->open) return NULL;
-    (void)dsc;
 
     const mpak_glyph_t *g;
     if (mpak_font_find_glyph(&self->mpk, letter, &g) != MPAK_OK) return NULL;

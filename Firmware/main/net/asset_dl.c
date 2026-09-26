@@ -824,7 +824,7 @@ int asset_dl_map_strips(const char *bg_path,
                 const char *d = kind_dir("PARTS");
                 if (d) {
                     snprintf(strip_paths[got], MP_MPK_PATH_MAX,
-                             "%s/%s.mpk", d, s_files[k].hash);
+                             "%s/%.64s.mpk", d, s_files[k].hash);  /* hash≤16 hex，%.64s 消截断告警 */
                     named = true;
                 }
                 break;

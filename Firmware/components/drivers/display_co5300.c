@@ -194,11 +194,11 @@ esp_err_t display_init(void)
         .clock_speed_hz = CO5300_SPI_HZ,
         .mode           = CO5300_SPI_MODE,
         .spics_io_num   = pins->lcd.cs,      /* GPIO12 */
-        .queue_depth    = 3,
+        .queue_size     = 3,                 /* IDF5：queue_depth 改名 queue_size */
         .command_bits   = 8,
         .address_bits   = 0,
         .dummy_bits     = 0,
-        .max_transfer_sz = 480 * 480 * 2 + 8,
+        /* max_transfer_sz 在 IDF5 属总线级（上方 bus_cfg 已设），器件级无此字段 */
         .flags          = SPI_DEVICE_HALFDUPLEX,
     };
     err = spi_bus_add_device(CO5300_SPI_HOST, &dev_cfg, &s_spi);

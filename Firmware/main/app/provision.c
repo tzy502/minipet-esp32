@@ -44,7 +44,7 @@ static bool           s_portal_active;
 static httpd_handle_t s_httpd;
 static TaskHandle_t   s_dns_task;
 static TaskHandle_t   s_portal_task;
-static EventGroup_t   s_wifi_events;
+static EventGroupHandle_t s_wifi_events;   /* IDF5：句柄类型是 EventGroupHandle_t */
 #define WIFI_GOT_IP_BIT   BIT0
 #define WIFI_FAIL_BIT     BIT1
 
@@ -328,15 +328,10 @@ static void wifi_start_ap(const char *ssid)
 /* ================================================================== */
 static bool sntp_and_set_rtc(void)
 {
-    esp_netif_sntp_config_t cfg = {
-        .ops = ESP_NETIF_SNTP_OPMODE_POLL,
-        .sources = {
-            ESP_NETIF_SNTP_SOURCE_URL("ntp://ntp.aliyun.com"),
-            ESP_NETIF_SNTP_SOURCE_URL("ntp://pool.ntp.org"),
-        },
-        .source_count = 2,
-    };
-    esp_netif_sntp_init(&cfg);
+    /* IDF 5.5 API：esp_sntp_config_t + DEFAULT_CONFIG 宏；服务器数组
+     * 大小 = CONFIG_LWIP_SNTP_MAX_SERVERS（当前 1），只放主用 ntp.aliyun.com */
+    esp_sntp_config_t cfg = ESP_NETIF_SNTP_DEFAULT_CONFIG("ntp.aliyun.com");
+    if (esp_netif_sntp_init(&cfg) != ESP_OK) return false;
     bool ok = (esp_netif_sntp_sync_wait(pdMS_TO_TICKS(15000)) == ESP_OK);
     esp_netif_sntp_deinit();
     if (!ok) return false;
