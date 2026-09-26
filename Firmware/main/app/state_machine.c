@@ -107,7 +107,13 @@ static void transition_locked(mp_state_t next)
             cmd_simple(MP_CMD_SET_EXPRESSION, MP_EXPR_BLINK, 0, 0);  /* 唤醒瞬目 */
         }
         post_banner_if_needed();     /* 问题4：无配置 → 常驻配网横幅 */
-        s_last_activity_ms = mp_now_ms();
+        /* 闲置计时只由用户交互/用户可达的场景切换刷新（boot/自检/菜单/唤醒/
+         * OTA 回滚）。OFFLINE→POKER 是 poller 回网驱动：路由器掐长轮询空闲
+         * 连接会让 poll 周期性失败重连，若在此刷新 s_last_activity_ms，
+         * 网络抖动会把「闲置」永远清零 → CLOCK_DOZE 永不进入（真机症状） */
+        if (prev != MP_ST_OFFLINE) {
+            s_last_activity_ms = mp_now_ms();
+        }
         break;
 
     case MP_ST_MENU:
@@ -267,6 +273,9 @@ bool state_machine_offline_mode(void)
     return !s_online;
 }
 
+/* 用户活动通知：只准交互通路调用（input_dispatch 触摸/按键/IMU）。
+ * 网络/后台任务禁用——poller 周期性收发不算用户活动，否则闲置计时被
+ * 永远清零，CLOCK_DOZE 永不进入（E9）。 */
 void state_machine_notify_activity(void)
 {
     s_last_activity_ms = mp_now_ms();
@@ -438,12 +447,20 @@ static bool clock_parts_path(char *path, size_t cap)
 
 static void dispatch_clock(int enable)
 {
-    char ft[MP_MPK_PATH_MAX];
     int16_t ax = 0, ay = 0;
     bool has = asset_dl_clock_anchor(&ax, &ay);   /* 无地图/无表项 → AUTO 居中 */
-    if (!clock_parts_path(ft, sizeof(ft))) return;   /* 素材未就绪 */
+    if (!enable) {
+        /* 收时钟（DOZE→POKER 唤醒）不依赖素材在位：fontTime 包可能已被 LRU
+         * 淘汰/尚未同步，若查路径失败直接 return，时钟永远收不掉 → 永久黑屏。
+         * render.h 契约：path=NULL 仅改锚点/开关 → 关闭必成功，
+         * render_set_clock 内部做全幅重合成（= 唤醒后强制重绘一帧，宠物恢复） */
+        render_set_clock(NULL, CLOCK_ANCHOR_AUTO, CLOCK_ANCHOR_AUTO, false);
+        return;
+    }
+    char ft[MP_MPK_PATH_MAX];
+    if (!clock_parts_path(ft, sizeof(ft))) return;   /* 素材未就绪：留在当前画面 */
     render_set_clock(ft, has ? ax : CLOCK_ANCHOR_AUTO,
-                     has ? ay : CLOCK_ANCHOR_AUTO, enable != 0);
+                     has ? ay : CLOCK_ANCHOR_AUTO, true);
 }
 
 /* 素材就绪（boot 本地清单 or 网络同步完成）→ 渲染层全量重绑 */

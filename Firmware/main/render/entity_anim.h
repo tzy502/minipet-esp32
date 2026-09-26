@@ -32,6 +32,7 @@ typedef struct {
     bool     blink_on;           /* blink 插播生效中 */
     int64_t  blink_until_us;
     int64_t  next_blink_us;
+    bool     delay_clamp_logged; /* 坏 delay 钳制告警只发一次（bind 时复位） */
 } rc_anim_t;
 
 typedef struct {

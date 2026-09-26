@@ -64,13 +64,15 @@ extern "C" {
 #define RC_BUBBLE_MAX_W     460
 #define RC_BUBBLE_MAX_H     160
 
-/* 未配网常驻横幅（问题4：POKER 态顶部 480×28 深色底白字，5x7 字体 ×2） */
+/* 未配网常驻横幅（问题4：POKER 态顶部 480×28 深色底白字，5x7 字体 ×2）
+ * 字形加 1px 黑描边（问题3：浅色地图/条带上白字可读性） */
 #define RC_BANNER_H         28
 #define RC_BANNER_SCALE     2
 #define RC_BANNER_PAD_X     8
 #define RC_BANNER_PAD_Y     7      /* (28 - 7*2)/2，垂直居中 */
 #define RC_BANNER_BG        0x2104 /* 深色底（#102020） */
 #define RC_BANNER_FG        0xFFFF /* 白字 */
+#define RC_BANNER_OUTLINE   0x0000 /* 1px 黑描边 */
 
 /* 1bit 掩码位序：MSB first（字节内 bit7 为首像素） */
 static inline bool rc_mask_bit(const uint8_t *mask, uint32_t idx)
