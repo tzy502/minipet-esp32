@@ -426,6 +426,7 @@ static void touch_tick(void)
     static int64_t down_ms;
     static bool longpress_fired;
     static bool drag_active;              /* 问题6：本次按住已进入水平拖动 */
+    static int16_t s_drag_last_x;         /* 拖拽跟手：上一帧手指 x（增量基准） */
 
     /* 菜单/时钟/配网态：触摸全归 LVGL，宠物交互（抚摸/拖拽/长按）不穿透
      * （真机：菜单里的长按再发 MENU_KEY → 菜单"关了又出现"） */
@@ -445,7 +446,7 @@ static void touch_tick(void)
          * 本任务停读（渲染层 LVGL indev 接管 touch_read），只复位状态 */
         if (drag_active) {
             drag_active = false;
-            render_input_tilt(0.0f);      /* 进菜单前先回中 */
+            render_set_drag_off(0);       /* 进菜单前人物回中 */
         }
         down = false;
         longpress_fired = false;
@@ -483,6 +484,7 @@ static void touch_tick(void)
         down_ms = mp_now_ms();
         longpress_fired = false;
         drag_active = false;
+        s_drag_last_x = f.x;
         /* 校准日志（每次按下沿一条）：原始帧 + 重组 raw + 映射值。
          * 核对目标：屏幕中心 → (240,240)、四角 → 对应角；不符时按
          * touch_read_frame 上方注释改两行映射即可 */
@@ -499,8 +501,10 @@ static void touch_tick(void)
             drag_active = true;
         }
         if (drag_active) {
-            float deg = ((float)dx * 8.0f) / (float)DRAG_TILT_FULL_PX;
-            render_input_tilt(deg);
+            /* 拖拽跟手：手指增量 1:1 移动人物（clamp ±160），不再绕 ±8° 映射 */
+            static int16_t last_x;
+            render_set_drag_off(render_get_drag_off() + ((int)f.x - last_x));
+            last_x = f.x;
             note_interaction();
             return;
         }
@@ -525,9 +529,8 @@ static void touch_tick(void)
         int dx = abs((int)f.x - (int)down_x);
         int dy = abs((int)f.y - (int)down_y);
         if (drag_active) {
-            /* 问题6：拖动结束 → 视差回中 */
+            /* 拖动结束 → 人物保持原地（跟手语义） */
             drag_active = false;
-            render_input_tilt(0.0f);
             note_interaction();
         } else if (!longpress_fired && dur < TAP_MAX_MS && dx < TAP_MOVE_PX && dy < TAP_MOVE_PX) {
             /* 轻点 = 抚摸：smile/love 随机 + 短气泡可见反馈（问题6）。

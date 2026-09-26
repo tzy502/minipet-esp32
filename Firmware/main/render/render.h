@@ -105,6 +105,9 @@ void render_banner_hide(void);
 
 /* ---------------- IMU 视差（input 任务可异步调用；int32 对齐写原子） --- */
 void render_input_tilt(float tilt_deg);
+/* 拖拽跟手：人物屏幕 x 偏移（px，1:1，clamp ±160）；get 供输入侧增量累计 */
+void render_set_drag_off(int32_t px);
+int32_t render_get_drag_off(void);
 
 #ifdef __cplusplus
 }
