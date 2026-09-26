@@ -12,7 +12,8 @@ namespace MinipetServer.Api;
 /// <summary>
 /// Web 管理端点（E4/E13，前缀 /api/admin）：设备卡片与配置 / 配对 / 缩略图 /
 /// 纸娃娃预设 CRUD / 曲库与音源管理（cookie 导入·健康·启停）/ 设置读写（WZ 校验）/
-/// 设备事件日志 / OTA 触发。局域网信任模型：v1 无鉴权。
+/// 设备事件日志 / OTA 触发 / 素材推送到设备（E7：地图/NPC 资产登记+切图）。
+/// 局域网信任模型：v1 无鉴权。
 /// </summary>
 public static class AdminEndpoints
 {
@@ -244,6 +245,89 @@ public static class AdminEndpoints
             return Results.Json(new { queued = true, seq = cmd.Seq, ver = body.Ver, url });
         });
 
+        // ── 素材推送到设备（E7/E13：地图/NPC 资产登记进该设备 manifest，可选直接切图）──
+        // body { kind: "map"|"npc", id: "200000100", switch: true }：
+        // 打包数秒（WZ 锁内）→ 后台 Task.Run，端点立即 202；顺序铁律 = 先登记资产 → 再
+        // BumpRev（设备长轮询被唤醒、拉到新 manifest）→ 最后 enqueue 切图指令（仅 map 且
+        // switch!=false；固件 poller.c 消费 {"t":"map","v":id} → MP_CMD_SET_MAP → dispatch_map），
+        // 反了设备会先收到切图指令而新 manifest 还没拉到。
+        g.MapPost("/devices/{id}/push", (string id, DevicePushRequest body, DeviceRegistry reg,
+            DeviceAssetService assets, WzService wz, DeviceManifestService mfst, CommandQueue queue,
+            DeviceEventLog eventLog, HealthReport health, Config.ServerPaths paths) =>
+        {
+            try
+            {
+                var dev = reg.Get(id);
+                if (dev == null) return NotFoundDevice(id);
+                var kind = body?.Kind?.Trim().ToLowerInvariant();
+                if (kind != "map" && kind != "npc")
+                    return Results.Json(new { error = "kind 必须是 map 或 npc" }, statusCode: 400);
+                var assetId = body?.Id?.Trim();
+                if (string.IsNullOrEmpty(assetId))
+                    return Results.Json(new { error = "id 必填（素材编号，如地图 200000100）" }, statusCode: 400);
+                // WZ 未加载 → 503（打包必然失败，提前拦；同 materials 目录降级口径）
+                if (!wz.IsLoaded)
+                    return Results.Json(new { error = "WZ 未加载（到「设置」页配置后重试）" }, statusCode: 503);
+
+                bool switchAfter = body?.Switch != false;
+                _ = Task.Run(() =>
+                {
+                    try
+                    {
+                        // 登记资产（幂等，内部 per-device 锁 + WZ 锁，打包数秒；同步方法，
+                        // 调用方放后台线程）→ bump rev（设备长轮询被唤醒、拉到新 manifest）
+                        // → 最后才 enqueue 切图指令（设备先拿到新 manifest 再收到 map 指令才稳）。
+                        bool generated = kind == "map"
+                            ? assets.EnsureMapAsync(id, assetId)
+                            : assets.EnsureNpcAsync(id, assetId);
+                        Console.WriteLine($"[DevicePush] 设备 {id} {kind} {assetId} 资产登记{(generated ? "完成（新打包）" : "跳过（已登记，幂等）")}");
+                        // 登记成功必 bump：manifest-assets.json 变了，rev 不动设备感知不到。
+                        // BumpRev 内部会往指令队列塞 manifest 唤醒指令 → 长轮询立即返回。
+                        mfst.BumpRev(id, kind == "map" ? $"资产变更：地图 {assetId}" : $"资产变更：NPC {assetId}");
+                        if (kind == "map" && switchAfter)
+                        {
+                            // SET_MAP 指令载荷 = BGMAP 资产 hash（固件 dispatch_map 按 hash 匹配
+                            // asset_dl_map_path，传地图 id 会静默留在旧地图）。设备拉 manifest/素材
+                            // 需要几秒，指令先到时 asset_dl 找不到 BGMAP 条目会静默失败且不自愈
+                            // （set_active_map 查无条目即返回）→ 双发：立即 + 15s 后重发一次
+                            //（局域网 BGMAP ~1MB <2s，15s 足够；幂等切换无害）。
+                            var bgHash = FindBgmapHash(paths, id, assetId);
+                            if (bgHash != null)
+                            {
+                                queue.Enqueue(id, "map", new { id = bgHash });
+                                _ = Task.Run(async () =>
+                                {
+                                    await Task.Delay(TimeSpan.FromSeconds(15));
+                                    queue.Enqueue(id, "map", new { id = bgHash });
+                                });
+                            }
+                            else
+                            {
+                                Console.Error.WriteLine($"[DevicePush] 设备 {id} 地图 {assetId} 未找到 BGMAP 条目，未发切图指令");
+                            }
+                        }
+                        eventLog.Append(id, kind == "map"
+                            ? $"推送地图 {assetId}（资产已登记）"
+                            : $"推送 NPC {assetId}（资产已登记）");
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.Error.WriteLine($"[DevicePush] 设备 {id} 推送 {kind} {assetId} 失败: {ex.Message}");
+                        health.RecordEvent(id, "push_error",
+                            JsonSerializer.SerializeToElement(new { kind, assetId, error = ex.Message }));
+                        eventLog.Append(id, $"推送失败：{kind} {assetId}（{ex.Message}）");
+                    }
+                });
+                return Results.Json(new { ok = true, note = "后台打包中，完成后自动下发" }, statusCode: 202);
+            }
+            catch (Exception ex)
+            {
+                // 同步段意外异常（含 DeviceAssetService 解析/前置检查抛错）→ 500 {error}
+                Console.Error.WriteLine($"[DevicePush] 设备 {id} 推送请求异常: {ex.Message}");
+                return Results.Json(new { error = ex.Message }, statusCode: 500);
+            }
+        });
+
         // 设备健康（E11：降级/错误事件聚合 → Web 可见）
         g.MapGet("/devices/{id}/health", (string id, DeviceRegistry reg, HealthReport health) =>
         {
@@ -302,6 +386,41 @@ public static class AdminEndpoints
     public sealed class OtaRequest
     {
         public string? Ver { get; set; }
+    }
+
+    /// <summary>
+    /// 素材推送请求体（POST /devices/{id}/push）：kind=map|npc；id=素材编号；
+    /// switch=登记成功后是否直接下发切图指令（仅 map 生效，缺省 true）。
+    /// </summary>
+    /// <summary>查设备 manifest-assets.json 里指定地图的 BGMAP 条目 hash（SET_MAP 指令载荷，固件按 hash 匹配）。</summary>
+    private static string? FindBgmapHash(Config.ServerPaths paths, string deviceId, string mapId)
+    {
+        try
+        {
+            var indexPath = Path.Combine(paths.ExportDirFor(deviceId), "manifest-assets.json");
+            if (!System.IO.File.Exists(indexPath)) return null;
+            var root = System.Text.Json.Nodes.JsonNode.Parse(System.IO.File.ReadAllText(indexPath)) as System.Text.Json.Nodes.JsonObject;
+            if (root?["assets"] is not System.Text.Json.Nodes.JsonObject assets) return null;
+            foreach (var kv in assets)
+            {
+                if (kv.Value is not System.Text.Json.Nodes.JsonObject e) continue;
+                var sel = e["selector"]?.GetValue<string>();
+                var map = e["map"]?.GetValue<string>();
+                var kind = e["kind"]?.GetValue<string>();
+                if (string.Equals(sel, "map", StringComparison.OrdinalIgnoreCase)
+                    && map == mapId && string.Equals(kind, "BGMAP", StringComparison.OrdinalIgnoreCase))
+                    return kv.Key;
+            }
+        }
+        catch (Exception ex) { Console.Error.WriteLine($"[DevicePush] 查 BGMAP hash 失败: {ex.Message}"); }
+        return null;
+    }
+
+    public sealed class DevicePushRequest
+    {
+        public string? Kind { get; set; }
+        public string? Id { get; set; }
+        public bool? Switch { get; set; }
     }
 
     public sealed class PresetUpsertRequest

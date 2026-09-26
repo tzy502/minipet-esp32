@@ -110,7 +110,9 @@ public sealed class PaperdollPackService
     {
         var o = new JsonObject
         {
-            ["kind"] = a.Kind.ToString().ToLowerInvariant(),
+            // 固件 asset_dl kind_dir 是 strcmp 大写白名单（PARTS/LAYOUT/BGMAP/FONT/AUDIO_META），
+            // 小写会被设备登记元数据但永不下载（2026-09-26 接缝审查修正）
+            ["kind"] = a.Kind.ToString().ToUpperInvariant(),
             ["bytes"] = a.ByteCount,
             ["file"] = a.FileName,
             ["url"] = $"/api/device/asset/{a.Hash:x16}",
