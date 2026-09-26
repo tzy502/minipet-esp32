@@ -149,6 +149,48 @@ int bridge_mode_poker(void)
     return RENDER_OK;
 }
 
+/* ---------------- MENU 深色菜单屏（问题5） ----------------
+ * 旧实现 enter_menu 后从未构建任何 LVGL 控件，LVGL 默认屏幕底色为白 →
+ * 整屏发白。现构建黑底菜单：标题 + 三行占位 + 底部退出提示。
+ * 须与 render_tick 同任务（render_enter_menu → bridge_mode_menu）调用。 */
+static void menu_build(void)
+{
+    lv_obj_t *scr = lv_screen_active();
+    lv_obj_set_style_bg_color(scr, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
+
+    const lv_font_t *f32 = font_lazy_get(FONT_ID_32);
+    const lv_font_t *f24 = font_lazy_get(FONT_ID_24);
+    const lv_font_t *f16 = font_lazy_get(FONT_ID_16);
+
+    lv_obj_t *title = lv_label_create(scr);
+    lv_obj_set_style_text_color(title, lv_color_hex(0xFFFFFF), 0);
+    if (f32) lv_obj_set_style_text_font(title, f32, 0);
+    lv_label_set_text(title, "MiniPet");
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 64);
+
+    static const char *rows[3] = { "Maps", "Paperdoll", "BGM" };   /* 占位项（E7） */
+    for (int i = 0; i < 3; i++) {
+        lv_obj_t *it = lv_label_create(scr);
+        lv_obj_set_style_text_color(it, lv_color_hex(0xE8E8EC), 0);
+        if (f24) lv_obj_set_style_text_font(it, f24, 0);
+        lv_label_set_text_fmt(it, "> %s", rows[i]);
+        lv_obj_align(it, LV_ALIGN_LEFT_MID, 110, -48 + i * 72);
+    }
+
+    lv_obj_t *hint = lv_label_create(scr);
+    lv_obj_set_style_text_color(hint, lv_color_hex(0x909098), 0);
+    if (f16) {
+        lv_obj_set_style_text_font(hint, f16, 0);
+        lv_label_set_text(hint, "长按退出");   /* [待真机验证] FONT 包需含这 4 个汉字字形，缺字时降级为下一分支同义 ASCII */
+    } else {
+        lv_label_set_text(hint, "LONG PRESS: EXIT");
+    }
+    lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -40);
+
+    lv_obj_invalidate(scr);   /* DIRECT 模式强制整屏重绘入 menu_buf */
+}
+
 int bridge_mode_menu(void)
 {
     if (!s_br.disp || !s_br.menu_buf) return RENDER_ERR_STATE;
@@ -158,6 +200,7 @@ int bridge_mode_menu(void)
                            LV_DISPLAY_RENDER_MODE_DIRECT);
     s_br.menu_mode = true;
     s_br.md_valid = false;
+    menu_build();             /* 问题5：进入菜单即构建深色 UI（防白屏/黑屏） */
     return RENDER_OK;
 }
 

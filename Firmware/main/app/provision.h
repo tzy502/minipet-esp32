@@ -25,6 +25,9 @@ extern "C" {
 /* NVS 是否已有 WiFi 配置（ssid+server 必须齐） */
 bool provision_has_config(void);
 
+/* SoftAP 热点名（"MiniPet-XXXX"，MAC 后 4 hex；屏显横幅提示共用，问题4） */
+void provision_get_ap_ssid(char *out, size_t cap);
+
 /* 用 NVS 配置连接 STA（阻塞 timeout_ms）。已连接则直接返回 OK。
  * 失败不断线重试（长退避由 poller 驱动）。 */
 esp_err_t provision_wifi_connect_sta(uint32_t timeout_ms);

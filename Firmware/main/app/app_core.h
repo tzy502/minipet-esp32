@@ -135,6 +135,7 @@ typedef enum {
     MP_CMD_MENU_ENTER,      /* render_enter_menu（E7 独立全屏，单写屏者让路） */
     MP_CMD_MENU_EXIT,       /* render_exit_menu                              */
     MP_CMD_CLOCK,           /* a=1 待机时钟浮现 / 0 隐藏（E9；锚点查 clock_table） */
+    MP_CMD_BANNER,          /* a=1 顶部未配网横幅 s=文本 / a=0 隐藏（问题4）   */
 } mp_cmd_type_t;
 
 typedef struct {

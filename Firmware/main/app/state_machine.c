@@ -18,6 +18,7 @@
 #include "state_machine.h"
 
 #include <string.h>
+#include <stdio.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -31,6 +32,7 @@ static const char *TAG = "sm";
 #include "hal_contract.h"
 #include "watchdog.h"
 #include "provision.h"
+#include "clock_digits.h"    /* CLOCK_ANCHOR_AUTO（问题3 默认居中锚点） */
 #include "http_client.h"
 #include "asset_dl.h"
 #include "ota.h"
@@ -51,6 +53,27 @@ static void cmd_simple(mp_cmd_type_t t, const char *s, int32_t a, int32_t b)
     if (s) strlcpy(c.s, s, sizeof(c.s));
     mp_post_cmd(&c);
 }
+
+/* 未配网常驻横幅（问题4）：进 POKER/OFFLINE 时无 WiFi 配置 → 顶部 480×28
+ * 深色底白字提示 SoftAP 热点名（5x7 内嵌字体只认大写 → SSID 转大写） */
+static void post_banner_if_needed(void)
+{
+    if (provision_has_config()) {
+        cmd_simple(MP_CMD_BANNER, NULL, 0, 0);      /* 已配网：隐藏 */
+        return;
+    }
+    char ssid[16];
+    provision_get_ap_ssid(ssid, sizeof(ssid));
+    for (char *p = ssid; *p; p++)
+        if (*p >= 'a' && *p <= 'z') *p = (char)(*p - 'a' + 'A');
+    char msg[48];
+    snprintf(msg, sizeof(msg), "WIFI AP: %s", ssid);
+    cmd_simple(MP_CMD_BANNER, msg, 1, 0);
+}
+
+/* 问题3：时钟图源路径——优先 fontTime 专属 PARTS 包（selector==clock），
+ * 缺省回退当前默认 PARTS 包（fontTime id 900..912 已内置于装扮包） */
+static bool clock_parts_path(char *path, size_t cap);
 
 static void transition_locked(mp_state_t next)
 {
@@ -83,6 +106,7 @@ static void transition_locked(mp_state_t next)
             cmd_simple(MP_CMD_CLOCK, NULL, 0, 0);               /* 收时钟 */
             cmd_simple(MP_CMD_SET_EXPRESSION, MP_EXPR_BLINK, 0, 0);  /* 唤醒瞬目 */
         }
+        post_banner_if_needed();     /* 问题4：无配置 → 常驻配网横幅 */
         s_last_activity_ms = mp_now_ms();
         break;
 
@@ -104,6 +128,7 @@ static void transition_locked(mp_state_t next)
         bgm_set_offline(true);
         cmd_simple(MP_CMD_NET_STATE, NULL, 0, 0);
         cmd_simple(MP_CMD_BUBBLE, "离线模式：本地缓存运行", 0, 0);
+        post_banner_if_needed();     /* 问题4：离线+未配网同样提示热点 */
         break;
 
     case MP_ST_OTA:
@@ -148,10 +173,13 @@ static void self_test(bool sd_ok, bool psram_ok)
     }
 
     /* 3) WiFi 配置：无配置但有本地素材 → 直接离线起播（出厂素材保底，
-     *    不让用户面对黑屏；portal 可经菜单键补配）。无素材 → 配网 + 屏显提示 */
+     *    不让用户面对黑屏）。无素材 → 配网 + 屏显提示 */
     if (!provision_has_config()) {
         if (asset_dl_have_local_manifest()) {
-            ESP_LOGW(TAG, "无 WiFi 配置但有本地素材 → 离线起播（配网稍后经菜单）");
+            /* 问题4：离线起播的同时把 SoftAP portal 拉起（旧实现 portal 没启动，
+             * 用户无从配网）；POKER on_enter 另发顶部常驻横幅提示热点名 */
+            ESP_LOGW(TAG, "无 WiFi 配置但有本地素材 → 离线起播 + 启动配网 portal");
+            provision_start_portal();
             transition(MP_ST_POKER);
             return;
         }
@@ -389,22 +417,33 @@ static void dispatch_map(const char *hash)
     if (n < 0) n = 0;
     render_set_map(bg, (n > 0) ? (const char **)strips : NULL, n);
 
-    /* 地图时钟锚点随地图切换预置（E9/R15；开关留待 CLOCK 指令） */
+    /* 地图时钟锚点随地图切换预置（E9/R15；开关留待 CLOCK 指令）。
+     * 问题3：无锚点 → CLOCK_ANCHOR_AUTO（渲染层整块居中屏幕 240,120） */
     char ft[MP_MPK_PATH_MAX];
     int16_t ax = 0, ay = 0;
     bool has_anchor = asset_dl_clock_anchor(&ax, &ay);
-    if (asset_dl_fonttime_path(ft, sizeof(ft))) {
-        render_set_clock(ft, has_anchor ? ax : 0, has_anchor ? ay : 0, false);
+    if (clock_parts_path(ft, sizeof(ft))) {
+        render_set_clock(ft, has_anchor ? ax : CLOCK_ANCHOR_AUTO,
+                         has_anchor ? ay : CLOCK_ANCHOR_AUTO, false);
     }
+}
+
+/* 问题3：时钟图源路径——优先 fontTime 专属 PARTS 包（selector==clock），
+ * 缺省回退当前默认 PARTS 包（fontTime id 900..912 已内置于装扮包） */
+static bool clock_parts_path(char *path, size_t cap)
+{
+    if (asset_dl_fonttime_path(path, cap)) return true;
+    return asset_dl_parts_path(NULL, path, cap);
 }
 
 static void dispatch_clock(int enable)
 {
     char ft[MP_MPK_PATH_MAX];
     int16_t ax = 0, ay = 0;
-    bool has = asset_dl_clock_anchor(&ax, &ay);   /* 无地图/无表项 → 0,0 居中 */
-    if (!asset_dl_fonttime_path(ft, sizeof(ft))) return;   /* 素材未就绪 */
-    render_set_clock(ft, has ? ax : 0, has ? ay : 0, enable != 0);
+    bool has = asset_dl_clock_anchor(&ax, &ay);   /* 无地图/无表项 → AUTO 居中 */
+    if (!clock_parts_path(ft, sizeof(ft))) return;   /* 素材未就绪 */
+    render_set_clock(ft, has ? ax : CLOCK_ANCHOR_AUTO,
+                     has ? ay : CLOCK_ANCHOR_AUTO, enable != 0);
 }
 
 /* 素材就绪（boot 本地清单 or 网络同步完成）→ 渲染层全量重绑 */
@@ -444,6 +483,10 @@ static void dispatch_manifest_synced(void)
         return;
     }
     dispatch_action(MP_ACTION_STAND);
+
+    /* 素材全量重绑后强制一次全屏重绘：清除面板自检色块/旧画面残留
+     * （无 BGMAP → 全屏填黑；有 BGMAP → static_back+tile），此后每帧走脏区 */
+    render_force_redraw();
 }
 
 void app_cmd_dispatch(const mp_cmd_t *cmd)
@@ -484,6 +527,11 @@ void app_cmd_dispatch(const mp_cmd_t *cmd)
         break;
     case MP_CMD_CLOCK:
         dispatch_clock(cmd->a);              /* E9 待机时钟浮现/收起 */
+        break;
+    case MP_CMD_BANNER:
+        /* 问题4：未配网常驻横幅（a=1 显示 s=文本 / a=0 隐藏） */
+        if (cmd->a) render_banner_show(cmd->s);
+        else render_banner_hide();
         break;
     case MP_CMD_OTA_BEGIN:
         render_bubble_show("固件升级中…", RENDER_FONT_24);

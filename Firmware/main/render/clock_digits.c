@@ -31,16 +31,25 @@ typedef struct {
 static struct {
     bool     enabled;
     bool     loaded;
+    bool     centered;          /* 问题3：无地图锚点 → 整块居中屏幕 (240,120) */
     mpak_t   mpk;
     cg_t     g[CLOCK_GLYPHS];
     int16_t  anchor_wx, anchor_wy;
     int32_t  scale;
+    int32_t  sw, sh;            /* 屏幕尺寸（clock_digits_set_screen，居中用） */
     /* 屏幕矩形缓存（compose 时按当前时间刷新） */
     int32_t  rx, ry, rw, rh;
     bool     rect_valid;
     /* 上次绘制状态（分/秒奇偶变化才标脏由合成器管理） */
     int      last_min, last_parity;
 } s_ck;
+
+void clock_digits_set_screen(int32_t w, int32_t h)
+{
+    s_ck.sw = w;
+    s_ck.sh = h;
+    if (s_ck.scale <= 0) s_ck.scale = RC_SCALE;
+}
 
 static uint32_t cg_stride(uint16_t w) { return ((uint32_t)w * 2u + 3u) & ~3u; }
 
@@ -113,6 +122,9 @@ int clock_digits_configure(const char *parts_path, int16_t anchor_wx,
     }
     s_ck.anchor_wx = anchor_wx;
     s_ck.anchor_wy = anchor_wy;
+    /* 问题3：无地图锚点（AUTO 哨兵）→ 整块居中屏幕 (240,120)，忽略官方地图偏移 */
+    s_ck.centered = (anchor_wx == CLOCK_ANCHOR_AUTO && anchor_wy == CLOCK_ANCHOR_AUTO);
+    if (s_ck.scale <= 0) s_ck.scale = RC_SCALE;
     s_ck.enabled   = enable && s_ck.loaded;
     s_ck.rect_valid = false;
     return MPAK_OK;
@@ -136,9 +148,10 @@ static void time_split(int *disp_h, bool *is_am, int *minute, int *parity)
 
 /*
  * 当前时间的字形序列（7 槽；comma 奇秒 → NULL 跳过但保留间距位）。
- * 返回序列长度；out_x 各槽世界 1x 左缘。
+ * 返回序列长度；out_x 各槽世界 1x 左缘；out_y0 块顶世界 1x y（居中/锚点统一）。
  */
-static int glyph_seq(const cg_t *out_g[7], int32_t out_x[7], bool *comma_on)
+static int glyph_seq(const cg_t *out_g[7], int32_t out_x[7], bool *comma_on,
+                     int32_t *out_y0)
 {
     int dh, mm, parity;
     bool am;
@@ -146,57 +159,72 @@ static int glyph_seq(const cg_t *out_g[7], int32_t out_x[7], bool *comma_on)
     *comma_on = (parity == 0);
 
     const cg_t *g_am = &s_ck.g[am ? 10 : 11];
-    int32_t x = (int32_t)s_ck.anchor_wx + CLOCK_OFF_X;
-    int n = 0;
-    int32_t sy = (int32_t)s_ck.anchor_wy + CLOCK_OFF_Y;
-    (void)sy; /* y 由 compose/get_rect 内部统一计算 */
-
-    /* am|pm → GAP=12 → H1 → H2 → comma → M1 → M2（数字间无额外间距） */
-    if (g_am->px) {
-        out_g[n] = g_am; out_x[n] = x; n++;
-        x += g_am->w;
-    }
-    x += CLOCK_AMPM_GAP;
-
     const cg_t *d1 = &s_ck.g[dh / 10];
     const cg_t *d2 = &s_ck.g[dh % 10];
     const cg_t *m1 = &s_ck.g[mm / 10];
     const cg_t *m2 = &s_ck.g[mm % 10];
     const cg_t *comma = &s_ck.g[12];
 
+    int32_t scale = (s_ck.scale > 0) ? s_ck.scale : RC_SCALE;
+    int32_t x, y0;
+    if (s_ck.centered) {
+        /* 问题3 默认锚点：整块（含 comma 恒占宽）居中于屏幕 (240,120)（屏 px）。
+         * 屏 px → 世界 1x（除 scale），comma 常驻宽度参与计算 → 闪烁不移位。 */
+        int32_t w_world = g_am->w + CLOCK_AMPM_GAP +
+                          d1->w + d2->w + comma->w + m1->w + m2->w;
+        int32_t h_world = d2->h;
+        int32_t cx_world = (int32_t)CLOCK_CENTER_SCREEN_X / scale;
+        int32_t cy_world = (int32_t)CLOCK_CENTER_SCREEN_Y / scale;
+        x  = cx_world - w_world / 2;
+        y0 = cy_world - h_world / 2;
+    } else {
+        /* 地图 clock_table 锚点 + 官方偏移（clock-display-spec） */
+        x  = (int32_t)s_ck.anchor_wx + CLOCK_OFF_X;
+        y0 = (int32_t)s_ck.anchor_wy + CLOCK_OFF_Y;
+    }
+
+    /* am|pm → GAP=12 → H1 → H2 → comma → M1 → M2（数字间无额外间距） */
+    int n = 0;
+    if (g_am->px) {
+        out_g[n] = g_am; out_x[n] = x; n++;
+        x += g_am->w;
+    }
+    x += CLOCK_AMPM_GAP;
+
     out_g[n] = d1; out_x[n] = x; n++; x += d1->w;
     out_g[n] = d2; out_x[n] = x; n++; x += d2->w;
     out_x[n] = x;               /* comma 槽位恒占宽（闪烁不移位） */
-    const cg_t *comma_used = *comma_on ? comma : NULL;
-    out_g[n] = comma_used; n++;
+    out_g[n] = *comma_on ? comma : NULL; n++;
     x += comma->w;
     out_g[n] = m1; out_x[n] = x; n++; x += m1->w;
     out_g[n] = m2; out_x[n] = x; n++;
+    if (out_y0) *out_y0 = y0;
     return n;
 }
 
 bool clock_digits_get_rect(int32_t *x, int32_t *y, int32_t *w, int32_t *h)
 {
     if (!s_ck.enabled) return false;
+    int32_t scale = (s_ck.scale > 0) ? s_ck.scale : RC_SCALE;
     const cg_t *seq[7];
     int32_t xs[7];
     bool comma_on;
-    int n = glyph_seq(seq, xs, &comma_on);
+    int32_t y0;
+    int n = glyph_seq(seq, xs, &comma_on, &y0);
     if (n <= 0) return false;
-    int32_t x0 = xs[0], x1 = xs[0] + seq[0]->w;
-    int32_t y0 = INT32_MAX, y1 = INT32_MIN;
+    int32_t x0 = INT32_MAX, x1 = INT32_MIN;
+    int32_t yy0 = INT32_MAX, yy1 = INT32_MIN;
     for (int i = 0; i < n; i++) {
         if (!seq[i]) continue;
-        int32_t gy = (int32_t)s_ck.anchor_wy + CLOCK_OFF_Y;
-        if (gy < y0) y0 = gy;
-        if (gy + seq[i]->h > y1) y1 = gy + seq[i]->h;
+        if (y0 < yy0) yy0 = y0;
+        if (y0 + seq[i]->h > yy1) yy1 = y0 + seq[i]->h;
         if (xs[i] < x0) x0 = xs[i];
         if (xs[i] + seq[i]->w > x1) x1 = xs[i] + seq[i]->w;
     }
-    if (y0 == INT32_MAX) return false;
-    *x = x0 * s_ck.scale; *y = y0 * s_ck.scale;
-    *w = (x1 - x0) * s_ck.scale;
-    *h = (y1 - y0) * s_ck.scale;
+    if (x0 == INT32_MAX || yy0 == INT32_MAX) return false;
+    *x = x0 * scale; *y = yy0 * scale;
+    *w = (x1 - x0) * scale;
+    *h = (yy1 - yy0) * scale;
     return true;
 }
 
@@ -210,8 +238,9 @@ void clock_digits_compose(uint16_t *fb, int32_t fb_w, int32_t scale,
     const cg_t *seq[7];
     int32_t xs[7];
     bool comma_on;
-    int n = glyph_seq(seq, xs, &comma_on);
-    int32_t sy = ((int32_t)s_ck.anchor_wy + CLOCK_OFF_Y) * scale;
+    int32_t y0;
+    int n = glyph_seq(seq, xs, &comma_on, &y0);
+    int32_t sy = y0 * scale;
 
     for (int i = 0; i < n; i++) {
         const cg_t *g = seq[i];

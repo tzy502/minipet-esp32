@@ -354,11 +354,9 @@ static void portal_task(void *arg)
 {
     (void)arg;
 
-    /* SSID = MiniPet-<MAC 后 4 hex> */
-    uint8_t mac[6] = { 0 };
-    esp_read_mac(mac, ESP_MAC_WIFI_SOFTAP);
+    /* SSID = MiniPet-<MAC 后 4 hex>（横幅提示共用 provision_get_ap_ssid） */
     char ssid[16];
-    snprintf(ssid, sizeof(ssid), "MiniPet-%02X%02X", mac[4], mac[5]);
+    provision_get_ap_ssid(ssid, sizeof(ssid));
 
     wifi_start_ap(ssid);
     s_portal_active = true;
@@ -419,6 +417,14 @@ static void portal_task(void *arg)
 /* ================================================================== */
 /* 公开 API                                                             */
 /* ================================================================== */
+void provision_get_ap_ssid(char *out, size_t cap)
+{
+    /* SSID = MiniPet-<SOFTAP MAC 后 4 hex>（portal 与屏显横幅共用） */
+    uint8_t mac[6] = { 0 };
+    esp_read_mac(mac, ESP_MAC_WIFI_SOFTAP);
+    snprintf(out, cap, "MiniPet-%02X%02X", mac[4], mac[5]);
+}
+
 bool provision_has_config(void)
 {
     char ssid[33], server[128];

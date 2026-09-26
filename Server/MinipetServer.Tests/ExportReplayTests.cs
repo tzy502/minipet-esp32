@@ -1,5 +1,7 @@
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Text.Json.Nodes;
+using MiniPet.Export;
 using MinipetServer.Tests.TestHelpers;
 using SkiaSharp;
 using Xunit;
@@ -10,28 +12,34 @@ namespace MinipetServer.Tests;
 /// <summary>
 /// M2 验收：MPAK 解包回放 vs PaperdollService 直渲染 逐像素对比（software-design.md M2 行）。
 ///
-/// 1) 回放对比：AssetExporter 导默认装扮 walk1 帧段 → Mpak 读取器解包 → 按布局 blit 回 SKBitmap（1x 域）
-///    → 与 PaperdollService.RenderFrame 同帧直渲染对比；允许 1bit alpha 量化差异，断言差异像素 &lt; 0.5%，
-///    差异数写入测试消息。
+/// 契约（AssetExporter 类头 / LayoutPackWriter 头注释明文）：LAYOUT piece x/y = 桌面版合成画布内
+/// piece 左上角绝对坐标（含 origin 平移与帧位移 move），画布包围盒 = 所有 piece 联合
+/// （manifest LAYOUT 条目 "bounds":[w,h]，1x 像素）；设备端渲染 = 画布 1x 合成 → 2x nearest →
+/// 屏幕水平居中/底对齐 40px（PlacementMath.cs）。
+///
+/// 1) 回放对比：AssetExporter 导默认装扮 walk1 帧段 → Mpak 读取器解包 → 按「画布绝对坐标 1x 合成」
+///    重建 bounds 尺寸位图 → 与 PaperdollService.RenderFrame 同帧输出同包围盒对齐逐像素对比；
+///    允许 1bit alpha 量化差异，断言差异像素 &lt; 2.5%，差异数写入测试消息。
 /// 2) 信封校验：篡改 payload 1 字节 → crc 必失败；content_hash 不匹配必失败。
 /// 3) LAYOUT 冒烟：全帧全 piece 的 part_id 都在 PARTS 索引中；每个 expr_group 的条目数 == expression_count。
-/// 4) alpha-ab/ 产物：同帧「1bit alpha 回放图」vs「直渲染参考图」两张 PNG 落盘（不断言，供人眼验收）。
+/// 4) 摆放数学：PlacementMath 2x 缩放 + 居中/底对齐落点（纯数学，固件参考实现契约锁）。
+/// 5) alpha-ab/ 产物：同帧「1bit alpha 回放图」vs「直渲染参考图」两张 PNG 落盘（不断言，供人眼验收）。
 /// </summary>
 public class ExportReplayTests
 {
     private const string Action = "walk1";
-    private const double MaxDiffPercent = 0.5; // < 0.5%
+    private const double MaxDiffPercent = 2.5; // 1bit alpha 容差 &lt; 2.5%
 
     // ═══════════════════════════════════════════════════════════
-    // 测试 1：回放 vs 直渲染 逐像素对比
+    // 测试 1：回放 vs 直渲染 逐像素对比（同包围盒对齐）
     // ═══════════════════════════════════════════════════════════
 
     [WzFact]
     public void Export_ReplayWalk1MatchesDirectRender()
     {
-        var (partsPkg, layoutPkg) = ExportAdapter.ExportDefaultWalk1();
-        var parts = ExportAdapter.UnpackParts(partsPkg);
-        var layout = ExportAdapter.UnpackLayout(layoutPkg);
+        var export = ExportAdapter.ExportDefaultWalk1Full();
+        var parts = ExportAdapter.UnpackParts(export.Parts);
+        var layout = ExportAdapter.UnpackLayout(export.Layout);
 
         Assert.True(parts.Count > 0, "PARTS 索引为空");
         Assert.True(layout.FrameCount > 0, "LAYOUT 无帧");
@@ -46,15 +54,28 @@ public class ExportReplayTests
 
         for (int f = 0; f < layout.FrameCount; f++)
         {
-            var (replay, repOx, repOy) = BlitFrame(layout, f, parts);
+            // 契约内性校验：x/y ∈ [0, bounds]，画布 = manifest bounds（一个动作一张，跨帧不抖）
+            var frame = layout.Frames[f];
+            foreach (var piece in frame.Pieces)
+            {
+                if (!parts.TryGetValue(piece.PartId, out var part))
+                    Assert.Fail($"f{f} part{piece.PartId} 缺失");
+                Assert.True(piece.X >= 0 && piece.Y >= 0
+                            && piece.X + part!.Width <= export.CanvasW && piece.Y + part.Height <= export.CanvasH,
+                    $"f{f} part{piece.PartId} 矩形 ({piece.X},{piece.Y},{part.Width}x{part.Height}) 越出画布 {export.CanvasW}x{export.CanvasH}（x/y 必须为画布绝对坐标）");
+            }
+
+            var replay = BlitFrame(layout, f, parts, export.CanvasW, export.CanvasH);
             var (direct, dirOx, dirOy, fw, fh) = doll.RenderFrame(appearance, Action, f, "default");
             Assert.NotNull(direct);
             Assert.True(fw > 0 && fh > 0, $"直渲染帧 {f} 尺寸异常 {fw}x{fh}");
+            Assert.True(fw == export.CanvasW && fh == export.CanvasH,
+                $"直渲染画布 {fw}x{fh} != 导出 bounds {export.CanvasW}x{export.CanvasH}（GetBounds 口径漂移）");
 
-            // 直渲染 canvas_x = piece.x + move；其返回 origin（-bounds.Left）不含 move → 补 move 对齐
-            var frame = layout.Frames[f];
+            // 同包围盒对齐：直渲染位图本就是 bounds 画布（像素坐标 = 画布坐标），回放画布同为
+            // bounds 尺寸、x/y 已含 move → 两侧 (0,0) 同为画布原点，逐像素直比，无需任何补偿
             var (diff, quant, count, qs, qb, qsoft) = CompareAligned(
-                direct!, dirOx + frame.MoveDx, dirOy + frame.MoveDy, replay, repOx, repOy);
+                direct!, 0, 0, replay, 0, 0);
             totalDiff += diff; totalQuant += quant; totalPixels += count;
             quantShade += qs; quantBlack += qb; quantSoft += qsoft;
             perFrame.Add($"f{f}:{diff}/{count}({(count == 0 ? 0 : diff * 100.0 / count):F3}%)");
@@ -73,6 +94,15 @@ public class ExportReplayTests
             $"回放 vs 直渲染【真实】差异像素 {totalDiff}/{totalPixels} = {pct:F4}%（阈值 {MaxDiffPercent}%）；" +
             $"1bit alpha 量化解释的差异 {totalQuant}（丢弃半透明 shade {quantShade} / 深色边缘硬化 {quantBlack} / 亮部软混合 {quantSoft}）；" +
             $"逐帧真实差异：{string.Join(", ", perFrame)}");
+
+        // manifest-assets.json 落盘契约：LAYOUT 条目带 bounds:[w,h]（JSON 数组，1x 像素）+ 默认动作引用
+        var entry = JsonNode.Parse(export.ManifestEntryJson)!;
+        var boundsArr = entry["bounds"] as JsonArray;
+        Assert.True(boundsArr != null && boundsArr.Count == 2,
+            $"manifest LAYOUT 条目 bounds 应为 [w,h] 数组，实际：{export.ManifestEntryJson}");
+        Assert.Equal(export.CanvasW, boundsArr[0]!.GetValue<int>());
+        Assert.Equal(export.CanvasH, boundsArr[1]!.GetValue<int>());
+        Assert.Equal(AssetExporter.DefaultAction, entry["defaultAction"]?.GetValue<string>());
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -175,58 +205,89 @@ public class ExportReplayTests
     }
 
     // ═══════════════════════════════════════════════════════════
-    // 回放 blit：按布局把部件画回 SKBitmap（1x 域）
+    // 测试 4：摆放数学（PlacementMath = 固件参考实现，纯数学无 WZ）
     // ═══════════════════════════════════════════════════════════
 
     /// <summary>
-    /// 把一帧 blit 到联合画布。piece 列表本身即绘制序（底→顶）；(x,y) 不含 move，
-    /// 绘制位置 = (x + move_dx, y + move_dy)（与 RenderFrame 的 canvas 坐标完全同轴）。
-    /// 返回 (位图, 画布坐标轴原点在图内的 x, y)，供与直渲染对齐比较。
+    /// 「2x 缩放 + 居中/底对齐摆放」坐标数学：断言缩放后包围盒落屏区间。
+    /// 真机口径（amoled216 = 480×480）：1x 画布 120×160 → 2x = 240×320 →
+    /// 落点 (120,120)，包围盒 [120,360)×[120,440)，底边距屏幕底边恰 40px，水平居中。
+    /// 固件必须照抄 PlacementMath.PlaceOnScreen 同一公式。
     /// </summary>
-    private static (SKBitmap Bmp, int OriginX, int OriginY) BlitFrame(ReplayLayout layout, int frameIdx,
-        IReadOnlyDictionary<uint, ReplayPart> parts)
+    [Fact]
+    public void Export_PlacementMath_ScaledCanvasCenteredAndBottomAligned()
+    {
+        // 契约常量锁：设备端渲染 = 1x 合成 → 2x nearest → 底对齐 40px
+        Assert.Equal(2, PlacementMath.Scale);
+        Assert.Equal(40, PlacementMath.BottomMargin);
+
+        const int screenW = 480, screenH = 480;         // amoled216 profile 实际屏幕
+        const int canvasW = 120, canvasH = 160;         // 典型纸娃娃画布（1x）
+        var (dstX, dstY) = PlacementMath.PlaceOnScreen(canvasW, canvasH, screenW, screenH);
+
+        int dstW = canvasW * PlacementMath.Scale, dstH = canvasH * PlacementMath.Scale;
+        Assert.Equal((screenW - dstW) / 2, dstX);       // 水平居中
+        Assert.Equal(screenH - PlacementMath.BottomMargin - dstH, dstY); // 底对齐 40px
+
+        // 缩放后包围盒 = [dstX, dstX+dstW) × [dstY, dstY+dstH)，必须完整落屏
+        Assert.Equal(240, dstW);
+        Assert.Equal(320, dstH);
+        Assert.True(dstX >= 0 && dstX + dstW <= screenW, $"水平越屏: [{dstX},{dstX + dstW}) vs 480");
+        Assert.True(dstY >= 0 && dstY + dstH <= screenH, $"垂直越屏: [{dstY},{dstY + dstH}) vs 480");
+        Assert.Equal(screenH - PlacementMath.BottomMargin, dstY + dstH); // 底边 = 屏底 - 40
+        Assert.Equal(dstX, screenW - dstX - dstW);                       // 左右留白对称 = 居中
+    }
+
+    [Fact]
+    public void Export_PlacementMath_OverwideCanvasOverflowsSymmetrically()
+    {
+        // 画布 2x 后宽于屏幕：公式不 clamp（与桌面观感一致，设备端裁剪），左右对称溢出
+        var (dstX, dstY) = PlacementMath.PlaceOnScreen(300, 100, 480, 480);
+        Assert.Equal((480 - 600) / 2, dstX);            // -60
+        Assert.Equal(480 - 40 - 200, dstY);             // 240
+        Assert.Equal(-dstX, dstX + 600 - 480);          // 左溢 60 == 右溢 60
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // 回放 blit：按布局把部件画回固定画布（1x 域，契约 = 设备端合成方式）
+    // ═══════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// 把一帧 blit 到「画布联合包围盒」尺寸的画布（canvasW×canvasH = manifest bounds）。
+    /// x/y 为画布绝对坐标（已含 origin 平移与 move）→ 直接画 (x, y)，无任何再偏移；
+    /// piece 列表本身即绘制序（底→顶）。返回位图，其 (0,0) 即画布原点。
+    /// </summary>
+    private static SKBitmap BlitFrame(ReplayLayout layout, int frameIdx,
+        IReadOnlyDictionary<uint, ReplayPart> parts, int canvasW, int canvasH)
     {
         var frame = layout.Frames[frameIdx];
         var ordered = ExportAdapter.PieceListIsDrawOrder
             ? frame.Pieces.ToList()                             // 列表序 = 权威绘制序
             : frame.Pieces.OrderByDescending(p => p.Z).ToList();
 
-        int mvX = ExportAdapter.MoveAppliedInPieceXY ? 0 : frame.MoveDx;
-        int mvY = ExportAdapter.MoveAppliedInPieceXY ? 0 : frame.MoveDy;
-
-        // 画布 = 全 piece 矩形联合（navel 系）
-        int minX = 0, minY = 0, maxX = 0, maxY = 0;
+        var buf = new byte[canvasW * canvasH * 4];      // 全 0 = 透明（BGRA straight）
         foreach (var p in ordered)
         {
             if (!parts.TryGetValue(p.PartId, out var part)) continue;
-            minX = Math.Min(minX, p.X + mvX); minY = Math.Min(minY, p.Y + mvY);
-            maxX = Math.Max(maxX, p.X + mvX + part.Width); maxY = Math.Max(maxY, p.Y + mvY + part.Height);
-        }
-        int w = Math.Max(1, maxX - minX), h = Math.Max(1, maxY - minY);
-
-        var buf = new byte[w * h * 4];                  // 全 0 = 透明（BGRA straight）
-        foreach (var p in ordered)
-        {
-            if (!parts.TryGetValue(p.PartId, out var part)) continue;
-            int bx0 = p.X + mvX - minX, by0 = p.Y + mvY - minY;
             for (int y = 0; y < part.Height; y++)
             {
+                int dy = p.Y + y;
+                if (dy < 0 || dy >= canvasH) continue;
                 for (int x = 0; x < part.Width; x++)
                 {
                     if (!part.IsOpaque(x, y)) continue;
                     var (r, g, b) = part.GetRgb565(x, y);
-                    int dx = p.Flip != 0 ? bx0 + part.Width - 1 - x : bx0 + x;
-                    int dy = by0 + y;
-                    if (dx < 0 || dy < 0 || dx >= w || dy >= h) continue;
-                    int i = (dy * w + dx) * 4;
+                    int dx = p.Flip != 0 ? p.X + part.Width - 1 - x : p.X + x;
+                    if (dx < 0 || dx >= canvasW) continue;
+                    int i = (dy * canvasW + dx) * 4;
                     buf[i] = b; buf[i + 1] = g; buf[i + 2] = r; buf[i + 3] = 255;
                 }
             }
         }
 
-        var bmp = new SKBitmap(w, h, SKColorType.Bgra8888, SKAlphaType.Unpremul);
+        var bmp = new SKBitmap(canvasW, canvasH, SKColorType.Bgra8888, SKAlphaType.Unpremul);
         Marshal.Copy(buf, 0, bmp.GetPixels(), buf.Length);
-        return (bmp, -minX, -minY);
+        return bmp;
     }
 
     /// <summary>

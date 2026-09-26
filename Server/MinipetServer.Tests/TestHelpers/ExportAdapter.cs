@@ -1,6 +1,7 @@
 using System.Buffers.Binary;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using MiniPet.Export;
 using MinipetServer.Models;
 using MinipetServer.Services;
@@ -16,11 +17,11 @@ namespace MinipetServer.Tests.TestHelpers;
 /// </summary>
 internal static class ExportAdapter
 {
-    // ── 布局约定（对齐 LayoutPackWriter 语义注释）──
+    // ── 布局约定（对齐 LayoutPackWriter 语义注释 / AssetExporter 类头契约）──
     /// <summary>LAYOUT 帧内 piece 列表本身即「绘制序」（底→顶，权威序），回放不再按 z 重排。</summary>
     public static bool PieceListIsDrawOrder => true;
-    /// <summary>LAYOUT piece (x,y) 不含帧位移 move：回放绘制位置 = (x + move_dx, y + move_dy)。</summary>
-    public static bool MoveAppliedInPieceXY => false;
+    /// <summary>LAYOUT piece (x,y) 已含帧位移 move（画布绝对坐标）：回放直接画 (x, y)，move 不得再加算。</summary>
+    public static bool MoveAppliedInPieceXY => true;
 
     // ═══ 默认装扮（男体 2000 / 发 30000 / 脸 20000，对齐桌面版默认与 M1 黑盒测试）═══
     public static CharacterAppearance DefaultAppearance() => new()
@@ -31,13 +32,23 @@ internal static class ExportAdapter
         Face = new ItemInfo { Id = "20000" },
     };
 
-    // ═══ 导出（AssetExporter.Run 全量跑一次，进程内缓存；取 walk1 LAYOUT + 装扮 PARTS）═══
-    private static readonly Lazy<(byte[] Parts, byte[] Layout)> _export = new(RunExport,
+    // ═══ 导出（AssetExporter.Run 全量跑一次，进程内缓存；取 walk1 LAYOUT + 装扮 PARTS + 画布 bounds）═══
+    private static readonly Lazy<DefaultExport> _export = new(RunExport,
         LazyThreadSafetyMode.ExecutionAndPublication);
 
-    public static (byte[] Parts, byte[] Layout) ExportDefaultWalk1() => _export.Value;
+    /// <summary>一次导出的回放素材：PARTS/LAYOUT 字节 + walk1 画布联合包围盒（manifest "bounds"，1x 像素）
+    /// + walk1 在 manifest-assets.json 的条目原文（校验 bounds/defaultAction 字段口径）。</summary>
+    public sealed record DefaultExport(byte[] Parts, byte[] Layout, int CanvasW, int CanvasH, string ManifestEntryJson);
 
-    private static (byte[] Parts, byte[] Layout) RunExport()
+    public static DefaultExport ExportDefaultWalk1Full() => _export.Value;
+
+    public static (byte[] Parts, byte[] Layout) ExportDefaultWalk1()
+    {
+        var e = _export.Value;
+        return (e.Parts, e.Layout);
+    }
+
+    private static DefaultExport RunExport()
     {
         var appearance = DefaultAppearance();
         string jsonPath = Path.Combine(Path.GetTempPath(), $"minipet-m2test-appearance-{Guid.NewGuid():N}.json");
@@ -62,7 +73,15 @@ internal static class ExportAdapter
                 a.Kind == MpakKind.Parts && a.Extra.TryGetValue("entity", out var ent) && (string?)ent == "paperdoll:default");
             Assert.NotNull(layout);
             Assert.NotNull(parts);
-            return (parts!.Bytes, layout!.Bytes);
+            var bounds = layout!.Extra.TryGetValue("bounds", out var b) ? b as int[] : null;
+            Assert.True(bounds is { Length: 2 } && bounds[0] > 0 && bounds[1] > 0,
+                "LAYOUT manifest 条目缺少 bounds:[w,h]（导出器契约字段）");
+
+            // manifest-assets.json 落盘口径：按 hash 取 walk1 LAYOUT 条目原文（含 bounds/defaultAction）
+            var manifestJson = File.ReadAllText(summary.AssetsManifestPath);
+            var entryJson = JsonNode.Parse(manifestJson)?["assets"]?[$"{layout.Hash:x16}"]?.ToJsonString()
+                ?? throw new Xunit.Sdk.XunitException($"manifest-assets.json 缺 walk1 LAYOUT 条目 {layout.Hash:x16}");
+            return new DefaultExport(parts!.Bytes, layout.Bytes, bounds![0], bounds[1], entryJson);
         }
         finally
         {

@@ -37,8 +37,15 @@ public static class ManifestBuilder
         if (!string.IsNullOrEmpty(a.Selector)) o["selector"] = a.Selector;
         foreach (var (k, v) in a.Extra)
         {
-            // 只收标量字符串（避免 JsonValue.Create<T> 的反射 resolver 依赖，net9 源码生成上下文不可用）
+            // 字符串直收；int[]（如 LAYOUT 条目的 "bounds":[w,h] 画布包围盒）→ JSON 数组；
+            // 其余标量 ToString（避免 JsonValue.Create<T> 的反射 resolver 依赖，net9 源码生成上下文不可用）
             if (v is string sv) o[k] = sv;
+            else if (v is int[] ia)
+            {
+                var arr = new JsonArray();
+                foreach (var i in ia) arr.Add(i);
+                o[k] = arr;
+            }
             else if (v != null) o[k] = v.ToString() ?? "";
         }
         return o;
