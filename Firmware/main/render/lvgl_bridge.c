@@ -12,6 +12,8 @@
 
 #include <lvgl.h>
 
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "font_lazy.h"
@@ -93,6 +95,10 @@ int bridge_init(int32_t screen_w, int32_t screen_h)
     memset(&s_br, 0, sizeof s_br);
     s_br.sw = screen_w;
     s_br.sh = screen_h;
+
+    /* LVGL 核心初始化——必须在任何 lv_* 调用之前（缺失 = tlsf 空池崩溃） */
+    lv_init();
+    lv_tick_set_cb((lv_tick_get_cb_t)xTaskGetTickCount);
 
     s_br.disp = lv_display_create((uint32_t)screen_w, (uint32_t)screen_h);
     if (!s_br.disp) {
