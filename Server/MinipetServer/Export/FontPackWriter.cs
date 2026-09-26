@@ -50,6 +50,7 @@ public static class FontPackWriter
         {
             w.Write(sizePx);
             w.Write((byte)4);
+            w.Write((ushort)0);   // 头部 8B 对齐填充（与固件 parse_font 一致）
             w.Write((uint)glyphs.Count);
             // 位图数据区紧随索引（无显式偏移：glyph 尺寸可推算 4bpp 行对齐长度）
             var blobs = new List<byte[]>(glyphs.Count);
@@ -63,6 +64,7 @@ public static class FontPackWriter
                 w.Write(g.Advance);
                 w.Write(g.OffX);
                 w.Write(g.BearingY);
+                w.Write((byte)0);   // glyph 12B 尾填充（与固件一致）
             }
             foreach (var b in blobs) w.Write(b);
         }

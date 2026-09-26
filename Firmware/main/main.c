@@ -29,6 +29,7 @@
 #include "freertos/queue.h"
 #include "nvs_flash.h"
 #include "esp_event.h"
+#include "esp_netif.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 
@@ -69,10 +70,12 @@ static void render_task(void *arg)
 {
     (void)arg;
     watchdog_subscribe_render_task();      /* 本任务上下文订阅 TWDT（E14） */
+    ESP_LOGW("rt", "render_task 起步");
 
     mp_cmd_t cmd;
     for (;;) {
         while (xQueueReceive(mp_cmd_q, &cmd, 0) == pdTRUE) {
+            ESP_LOGW("rt", "cmd 收到 type=%d", (int)cmd.type);
             app_cmd_dispatch(&cmd);
         }
         render_tick();                    /* 4.2 帧循环（30fps） */
@@ -101,6 +104,9 @@ void app_main(void)
     }
 
     ESP_ERROR_CHECK(esp_event_loop_create_default());
+    /* LWIP TCP/IP 线程启动（必需）：离线起播路径不经过配网，poller 仍会建
+     * socket（连接失败优雅返回）；不初始化 → tcpip mbox 断言崩溃 */
+    ESP_ERROR_CHECK(esp_netif_init());
 
     /* 三队列 */
     mp_event_q = xQueueCreate(MP_EVENT_Q_LEN, sizeof(mp_event_t));
@@ -128,6 +134,14 @@ void app_main(void)
     state_machine_init();
     render_init(&MINIPET_PROFILE_AMOLED216);   /* FATFS 挂载后、首 tick 前（render.h） */
 
+    /* 【临时诊断】面板直通测试：红 1.2s → 绿 1.2s。红绿可见=面板与驱动 OK，
+     * 黑屏=面板初始化问题。结论出来后删除本段。 */
+    display_fill_rect(0, 0, 480, 480, 0xF800);
+    vTaskDelay(pdMS_TO_TICKS(1200));
+    display_fill_rect(0, 0, 480, 480, 0x07E0);
+    vTaskDelay(pdMS_TO_TICKS(1200));
+    ESP_LOGW(TAG, "面板直通测试结束（应见过红/绿全屏）");
+
     /* 任务：PRO(0) 网络/后台 —— 4.1 */
     poller_start();        /* 长轮询+退避（内含 WiFi 回网重连） */
     events_start();        /* POST event */
@@ -135,9 +149,18 @@ void app_main(void)
     ota_start();           /* 双分区升级 */
     bgm_start();           /* BGM 解码+feeder+环形缓冲（codec_init 在内） */
 
-    /* 任务：APP(1) 渲染+交互 —— 4.1 */
-    xTaskCreatePinnedToCore(render_task, "render", 32768, NULL, 5, NULL, 1);
-    xTaskCreatePinnedToCore(input_task, "input", 8192, NULL, 4, NULL, 1);
+    /* 任务：APP(1) 渲染+交互 —— 4.1（提前到大内存消耗者之前创建：
+     * 内部 RAM 碎片化下 32K 栈分配失败过，16K/4K 实测可起） */
+    BaseType_t rc = xTaskCreatePinnedToCore(render_task, "render", 16384, NULL, 5, NULL, 1);
+    if (rc != pdPASS) {
+        ESP_LOGE(TAG, "render 任务创建失败 rc=%d internal=%u", rc,
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+    }
+    rc = xTaskCreatePinnedToCore(input_task, "input", 4096, NULL, 4, NULL, 1);
+    if (rc != pdPASS) {
+        ESP_LOGE(TAG, "input 任务创建失败 rc=%d internal=%u", rc,
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+    }
 
     /* 自检 + 初始迁移（BOOT→SELF_TEST→…；阻塞含 WiFi/服务端探测） */
     bool psram_ok = (heap_caps_get_total_size(MALLOC_CAP_SPIRAM) > 0);

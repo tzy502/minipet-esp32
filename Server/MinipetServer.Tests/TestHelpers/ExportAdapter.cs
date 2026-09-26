@@ -111,6 +111,7 @@ internal static class SpecMpakParser
         for (int i = 0; i < partCount; i++)
         {
             index[i] = (r.U32(), r.U16(), r.U16(), r.U16(), r.I16(), r.I16(), r.U32());
+            _ = r.U16();   // 索引项 20B 尾填充
         }
         var parts = new Dictionary<uint, ReplayPart>();
         foreach (var e in index)
@@ -118,8 +119,9 @@ internal static class SpecMpakParser
             int pxCount = e.W * e.H;
             int pitch = (e.W * 2 + 3) / 4 * 4;            // RGB565 行对齐 4B
             var pixels = new ushort[pxCount];
-            // offset = payload 起算的数据区绝对偏移（PartPackWriter.Build 语义）
-            int recStart = (int)e.Offset;
+            // offset = 位图数据区相对偏移；换算成 payload 内绝对位置需加索引区长度
+            int indexLen = 4 + index.Length * 20;
+            int recStart = indexLen + (int)e.Offset;
             for (int y = 0; y < e.H; y++)
             {
                 int rowOff = recStart + y * pitch;
@@ -155,8 +157,7 @@ internal static class SpecMpakParser
         {
             int delay = (int)r.U32();
             short dx = r.I16(), dy = r.I16();
-            _ = r.U16();                               // pad
-            uint pieceCount = r.U32();
+            uint pieceCount = r.U32();                 // 帧头 12B（无 pad）
             var pieces = new List<ReplayPiece>();
             for (int i = 0; i < pieceCount; i++)
             {
@@ -165,6 +166,7 @@ internal static class SpecMpakParser
                 short x = r.I16(), y = r.I16();
                 byte flip = r.U8();
                 sbyte z = r.I8();
+                _ = r.U8();                            // piece 12B 尾填充
                 pieces.Add(new ReplayPiece { PartId = partId, ExprIndex = exprIndex, X = x, Y = y, Flip = flip, Z = z });
             }
             frames.Add(new ReplayFrame { DelayMs = delay, MoveDx = dx, MoveDy = dy, Pieces = pieces });

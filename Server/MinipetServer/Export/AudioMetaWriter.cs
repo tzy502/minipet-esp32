@@ -48,6 +48,7 @@ public static class AudioMetaWriter
                 w.Write(t.Id);
                 LayoutPackWriter.WriteFixedString(w, t.Title, TitleSize);
                 w.Write(t.Source);
+                w.Write(new byte[3]);   // 108B 轨目对齐填充（与固件 parse_audio 一致）
                 w.Write(t.DurationS);
             }
         }

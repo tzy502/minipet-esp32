@@ -151,8 +151,10 @@ int font_lazy_init(font_id_t id, const char *mpk_path)
     fl_inst_t *self = &s_inst[id];
     font_lazy_deinit(id);
 
+    ESP_LOGW("font", "font_lazy_init open %s", mpk_path);
     int rc = mpak_open(&self->mpk, mpk_path, 0 /* hash 比对由调用方决定 */,
                        MPAK_KIND_FONT);
+    ESP_LOGW("font", "mpak_open rc=%d", rc);
     if (rc != MPAK_OK) return rc;
 
     const mpak_font_t *ft = self->mpk.u.font;

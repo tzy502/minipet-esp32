@@ -20,7 +20,7 @@ public enum MpakKind : ulong
 ///
 /// 布局（全部小端、4B 对齐原则）：
 /// <code>
-/// [16B]  MAGIC "MPAK"(4B) + version u16(=1) + flags u16
+/// [16B]  MAGIC "MPAK"(4B) + version u16(=1) + flags u16 + 零填充 8B
 /// [ 8B]  kind          u64（MpakKind）
 /// [ 8B]  content_hash  u64（xxhash64(payload)，manifest 身份）
 /// [ 4B]  payload_len   u32
@@ -37,7 +37,7 @@ public enum MpakKind : ulong
 public static class Mpak
 {
     public const ushort CurrentVersion = 1;
-    public const int HeaderSize = 32;   // 4+2+2 + 8 + 8 + 4 + 4
+    public const int HeaderSize = 40;   // magic块16(4+2+2+8零填充) + kind 8 + hash 8 + len 4 + reserved 4 —— 与固件 40B 头一致（真机联调定稿 2026-09-26）
     public const int TrailerSize = 8;   // crc32c + zero
 
     private static ReadOnlySpan<byte> Magic => "MPAK"u8;
@@ -85,6 +85,7 @@ public static class Mpak
             w.Write(Magic);
             w.Write(CurrentVersion);
             w.Write(flags);
+            w.Write(0UL);               // magic 块补齐 16B 的零填充（固件按 16B 块游标）
             w.Write((ulong)kind);
             w.Write(hash);
             w.Write((uint)payload.Length);
@@ -140,6 +141,7 @@ public static class Mpak
         ushort version = r.ReadUInt16();
         if (version != CurrentVersion) return ReadError.BadVersion;
         ushort flags = r.ReadUInt16();
+        r.BaseStream.Position += 8;     // 跳过 magic 块 16B 的零填充
         var kind = (MpakKind)r.ReadUInt64();
         ulong hash = r.ReadUInt64();
         uint payloadLen = r.ReadUInt32();
