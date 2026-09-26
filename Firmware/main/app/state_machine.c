@@ -290,6 +290,14 @@ void state_machine_handle(mp_sm_event_t ev)
 
     switch (ev) {
     case MP_SM_EV_MENU_KEY:
+        /* 400ms 硬限速：真机一次按压曾产生 6 连发（400ms 间隔）导致菜单关了又开。
+         * 人手不可能 400ms 内两次有效按压 */
+        {
+            static int64_t s_last_menu_key_ms;
+            int64_t now = mp_now_ms();
+            if (now - s_last_menu_key_ms < 400) break;
+            s_last_menu_key_ms = now;
+        }
         switch (s_state) {
         case MP_ST_POKER:
         case MP_ST_OFFLINE:      /* 离线也可开菜单：只显本地缓存项（E7/E11） */

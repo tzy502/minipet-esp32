@@ -30,7 +30,7 @@ public static class AdminCatalogEndpoints
     {
         var g = app.MapGroup("/api/admin");
 
-        g.MapGet("/catalog", (string? part, string? gender, WzService wz) =>
+        g.MapGet("/catalog", (string? part, WzService wz) =>
         {
             // part 必须是 16 装备槽 + 皮肤 之一
             if (part == null || !Parts.TryGetValue(part, out var def))
@@ -43,13 +43,10 @@ public static class AdminCatalogEndpoints
             if (!wz.IsLoaded)
                 return Results.Json(new { error = "WZ 未加载" }, statusCode: 503);
 
-            // gender 仅对发型/脸型生效；缺省或非 0/1 = 不过滤
-            int? genderFilter = null;
-            if ((def.Key == "hair" || def.Key == "face") && (gender == "0" || gender == "1"))
-                genderFilter = gender == "0" ? 0 : 1;
-
+            // 2026-09-26 用户拍板：不分性别，发型/脸型全量展示（对齐桌面版最终行为），
+            // MatchesGender 千位表退役（保留历史实现见 git）
             EnsureSubscribed(wz);
-            var items = GetOrBuild(wz, def, genderFilter);
+            var items = GetOrBuild(wz, def);
             return Results.Json(new { part = def.Key, total = items.Count, items });
         });
     }
@@ -106,10 +103,10 @@ public static class AdminCatalogEndpoints
         ["skin"] = new("skin", "皮肤", "Body", PartKind.Skin),
     };
 
-    // ── 结果缓存：per (part, genderFilter)，WZ 重载整体失效 ─────────────────────
+    // ── 结果缓存：per part，WZ 重载整体失效 ─────────────────────
 
     private static readonly object _cacheLock = new();
-    private static Dictionary<(string Part, int? Gender), List<object>> _cache = new();
+    private static Dictionary<string, List<object>> _cache = new();
     // 本地代际：WzReloaded 时自增；构建前后比对不符不发布（构建期间 WZ 重载 → 结果过期，下个请求重建）
     private static int _gen;
     // 已订阅的 WzService 实例（DI 单例正常恒为同一实例；换实例时解绑重订并清缓存）
@@ -141,16 +138,16 @@ public static class AdminCatalogEndpoints
 
     /// <summary>取缓存；未命中则锁外全量构建（并发首建可能重复算一次，无害——
     /// WzLib 内部自有锁，且 GetItemName 有自身缓存），完成后代际相符才发布。</summary>
-    private static List<object> GetOrBuild(WzService wz, PartDef def, int? genderFilter)
+    private static List<object> GetOrBuild(WzService wz, PartDef def)
     {
-        var key = (def.Key, genderFilter);
+        var key = def.Key;
         int gen;
         lock (_cacheLock)
         {
             if (_cache.TryGetValue(key, out var cached)) return cached;
             gen = _gen;
         }
-        var built = Build(wz, def, genderFilter);
+        var built = Build(wz, def);
         lock (_cacheLock)
         {
             if (gen == _gen) _cache[key] = built;
@@ -160,7 +157,7 @@ public static class AdminCatalogEndpoints
 
     // ── 构建：裸 id 枚举 → 性别过滤 → 数值排序 → 查中文名出 DTO ────────────────
 
-    private static List<object> Build(WzService wz, PartDef def, int? genderFilter)
+    private static List<object> Build(WzService wz, PartDef def)
     {
         var ids = def.Kind switch
         {
@@ -175,10 +172,6 @@ public static class AdminCatalogEndpoints
                 .Select(c => (Id: c.Id, Img: (string?)null))
                 .ToList(),
         };
-
-        // 性别过滤只发生在发型/脸型（GetOrBuild 的 key 已保证仅这两类带 genderFilter）
-        if (genderFilter.HasValue)
-            ids = ids.Where(e => MatchesGender(def.Key, e.Id, genderFilter.Value)).ToList();
 
         // 数值升序；解析失败排最后（OrderBy/ThenBy 稳定排序 → 失败者保持原相对顺序）
         ids = ids.Select(e => (e, ok: int.TryParse(e.Id, out var n), n))
@@ -206,7 +199,7 @@ public static class AdminCatalogEndpoints
     public static int WarmupAll(WzService wz)
     {
         int total = 0;
-        foreach (var def in Parts.Values) total += GetOrBuild(wz, def, null).Count;
+        foreach (var def in Parts.Values) total += GetOrBuild(wz, def).Count;
         return total;
     }
 

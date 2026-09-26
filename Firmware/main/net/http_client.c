@@ -49,6 +49,12 @@ void mp_http_init(void)
     }
     size_t len = strlen(s_server_url);
     while (len > 0 && s_server_url[len - 1] == '/') s_server_url[--len] = 0;
+    /* 配网页用户常省略 scheme（真机：192.168.3.46:38090 → parse url 失败）→ 读入即补 */
+    if (s_server_url[0] && strncmp(s_server_url, "http", 4) != 0) {
+        char tmp[sizeof(s_server_url)];
+        snprintf(tmp, sizeof(tmp), "http://%s", s_server_url);
+        strlcpy(s_server_url, tmp, sizeof(s_server_url));
+    }
 }
 
 const char *mp_http_server_url(void) { return s_server_url[0] ? s_server_url : NULL; }
@@ -122,6 +128,9 @@ static int build_url(char *buf, size_t cap, const char *path_or_url)
 {
     if (path_or_url[0] == 'h' && strncmp(path_or_url, "http", 4) == 0) {
         snprintf(buf, cap, "%s", path_or_url);       /* 绝对 URL（OTA/BGM 直链） */
+    } else if (path_or_url[0] != '/') {
+        /* 配网页用户常省略 scheme（如 192.168.3.46:38090）→ 补 http://（真机定稿） */
+        snprintf(buf, cap, "http://%s", path_or_url);
     } else {
         const char *base = mp_http_server_url();
         if (!base) return -1;
