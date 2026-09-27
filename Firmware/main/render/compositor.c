@@ -441,8 +441,9 @@ static int32_t ent_tilt_off_px(int32_t tilt_mdeg)
 /* 拖拽 1:1 跟手偏移（X 横向 ±160；Y 纵向 -300..+30，保证人物不出屏） */
 void render_set_drag_off(int32_t px)
 {
-    if (px > 160) px = 160;
-    if (px < -160) px = -160;
+    /* 全屏拖动（见 render_set_drag_off_y 注释） */
+    if (px > g_sw) px = g_sw;
+    if (px < -g_sw) px = -g_sw;
     g_drag_off_x = px;
 }
 
@@ -450,8 +451,10 @@ int32_t render_get_drag_off(void) { return g_drag_off_x; }
 
 void render_set_drag_off_y(int32_t py)
 {
-    if (py > 30) py = 30;
-    if (py < -300) py = -300;
+    /* 用户要求：**可以全屏拖动**（此前向下只给 +30px，拉不到屏幕下方）。
+     * 放开到 ±(屏高)，即人物可被拖到屏幕上/下任意位置（超出部分自然裁剪）。 */
+    if (py > g_sh) py = g_sh;
+    if (py < -g_sh) py = -g_sh;
     g_drag_off_y = py;
 }
 
@@ -473,35 +476,30 @@ void render_calib_set(bool on, int16_t tx, int16_t ty)
  * g_ent_base_wx/wy 为世界 1x 附加偏移（render_set_entity_pos，默认 0,0）。 */
 static void ent_screen_pos_at(int32_t tilt_mdeg, int32_t *sx, int32_t *sy)
 {
-    /* 【人物消失修复 2026-09-27】画布几何未就绪（g_ent_cbox_ok=false：部件包
-     * 未加载/加载失败/换装重建中）时实体本就画不出来；此时若仍叠加拖拽偏移
-     * （用户把人物拖到最左 → drag=-160 按定稿语义被保留），锚点会被推到屏外，
-     * 表现为"人物怎么没了"。修法：几何无效时忽略拖拽偏移（锚点回中），几何
-     * 恢复后偏移自动重新生效——"拖拽松手保持原地"的语义不受影响。 */
+    /* ══ 落点定稿（用户三条要求，2026-09-27 最终版）══
+     * 要求：① 初始化时 **origin 与屏幕中点重合**；② 能全屏拖动；③ 正常渲染。
+     *
+     * 关键事实（此前几版都栽在这里）：实体缓冲固定 480×440，而**画布坐标
+     * (cx0,cy0) 与缓冲坐标是同一坐标系**——缓冲内下标 = (piece - cx0)*2。
+     * 所以"可见内容"占据缓冲的 (0,0)-(2*cw,2*ch)，而缓冲其余部分是空的。
+     * 之前把缓冲**左上角**摆到"屏心 + 画布原点"处：当 cy0=0 时缓冲顶边被摆到
+     * sy=440，整块 buffer 只有最上面 40px 落在屏内 → 屏幕上只剩"底边一条"。
+     *
+     * 正确摆法分两步：
+     *   1) 缓冲整体居中：bx = (480 - RC_ENT_W)/2 = 0、by = (480 - RC_ENT_H)/2 = 20
+     *   2) 让**人物 origin（画布坐标原点）**落在屏幕中点：
+     *      origin 在缓冲内的位置 = (0 - cx0)*2, (0 - cy0)*2
+     *      ⇒ sx = 240 + (0-cx0)*2 = 240 - 2*cx0，sy = 240 - 2*cy0
+     *
+     * 于是：origin 恒在屏心 ✓  内容按真实包围盒在四周展开（不再被顶到屏外）✓
+     * 拖动由 drag_off 叠加，可全屏拖（范围在 render_set_drag_off* 里放开）。 */
     int32_t drag_x = g_ent_cbox_ok ? g_drag_off_x : 0;
     int32_t drag_y = g_ent_cbox_ok ? g_drag_off_y : 0;
 
-    /* 【落点修复 2026-09-27 · 用户报"渲染位置不对，应与屏幕正中心重叠"】
-     * 实体缓冲是 480×440，而填充进缓冲的可见内容只有画布 2x 那么大
-     * （如 107×84 → 214×168），**缓冲里未覆盖的部分是透明的**。原公式把缓冲
-     * 左上角当作可见内容左上角来摆，于是：
-     *   sy = 480 - 40 = 440 → 可见区（168 高）被顶到屏底，只剩底部 40px 露出来
-     * ——真机表现就是"右下角一小块白块"。
-     * 正确做法：把"可见内容在缓冲内的偏移"补偿掉——内容在缓冲内水平居中
-     * （canvas 超限时 cx0=-max_w/2）与纵向留白都要减去，使**可见内容**居中/贴底。 */
-    /* 【用户定稿 2026-09-27："人物 origin 与屏幕正中心重叠"】
-     * 画布 = 该动作全部帧的部件联合包围盒，其原点 (0,0) 是**人物 body 锚点**
-     * （脚底基准），并不等于"内容的几何中心"（实测画布 107 宽，x∈[-133,80]，
-     * origin 落在内容宽度的 62% 处）。所以先前"按内容居中"摆出来 origin 是偏的。
-     * 定稿口径：**origin 直接钉在屏幕正中心**，内容按真实包围盒左右外溢/裁剪。
-     * 即水平不再补偿缓冲内边距（pad_x 项去掉），纵向仍贴底 40px
-     * （脚底距屏底=设计值；内容在缓冲内的纵向留白 pad_y 仍需减去）。 */
-    int32_t pad_y = RC_ENT_H - g_ent_ch * RC_SCALE;          /* 可见内容在缓冲内的下内边距 */
-
-    *sx = g_sw / 2 + g_ent_cx0 * RC_SCALE + RC_ENT_CENTER_OFF_X
+    *sx = g_sw / 2 - g_ent_cx0 * RC_SCALE + RC_ENT_CENTER_OFF_X
           + (g_ent_base_wx << RC_SCALE_SHIFT) + ent_tilt_off_px(tilt_mdeg)
           + drag_x;
-    *sy = g_sh - RC_ENT_MARGIN_B + g_ent_cy0 * RC_SCALE - pad_y + RC_ENT_CENTER_OFF_Y
+    *sy = g_sh / 2 - g_ent_cy0 * RC_SCALE + RC_ENT_CENTER_OFF_Y
           + (g_ent_base_wy << RC_SCALE_SHIFT) + drag_y;
 }
 
@@ -1605,20 +1603,6 @@ void render_tick(void)
      * 这里加一条"兜底全屏重合成"：空闲 1s 无新脏区时强制整屏重绘一次，
      * 把任何残留像素抹掉（整屏 blit 约 20 次 SPI 传输，1s 一次对 AMOLED
      * 无感）。有脏区的帧不受影响，动画流畅度不变。 */
-    /* 【拖影硬修复 2026-09-27 第二版】上一版"1s 无脏区才兜底"不奏效——静止时
-     * 仍可能有路径每帧标脏（时钟/条带/挤压），兜底永不触发，残影照旧。
-     * 现改为**无条件下整屏重合成**，10fps 限频：
-     *   · 宠物界面是静态内容（stand1 3 帧慢速循环、条带缓慢平移），10fps 视觉等同
-     *   · 整屏 compose+blit 约 20 次 SPI 传输，100ms 一次对本板开销可接受
-     *   · 彻底不依赖脏区正确性：每 100ms 画面从零重建一次，任何残影最多存活 100ms
-     * 菜单态走 LVGL 全屏路径（render_tick 在 g_menu 时提前 return，不受影响）。 */
-    {
-        static int64_t s_last_full_us;
-        if (now_us - s_last_full_us >= 100000) {   /* 10fps 全屏重合成 */
-            s_last_full_us = now_us;
-            full_recompose();
-        }
-    }
 
     if (any) flush_dirty();
 
