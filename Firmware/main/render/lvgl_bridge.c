@@ -676,6 +676,15 @@ static void menu_activate(int idx)
     case MENU_PAGE_ROOT:
         if (idx >= ROOT_CNT) break;
         if (ROOT_ROWS[idx].page < 0) { menu_request_exit(); break; }   /* Exit 行 */
+        /* 【E7 定稿 2026-09-27】需求：「窗口内含 BGM 入口（呼出 E6 的触摸控制条）」
+         * ——BGM 行不再是"进另一个全屏页"，而是呼出半屏控制条：置请求旗标，
+         * 由 input 任务收菜单 + render_bgm_bar_show()（退出在状态机侧统一走
+         * MENU_KEY，控制条只在 POKER 态绘制，上半屏继续显示宠物）。 */
+        if (ROOT_ROWS[idx].page == MENU_PAGE_BGM) {
+            ESP_LOGI(TAG, "菜单 BGM 入口 → 请求呼出半屏控制条");
+            render_bgm_bar_request_from_menu();
+            break;
+        }
         menu_goto((menu_page_t)ROOT_ROWS[idx].page);
         break;
 

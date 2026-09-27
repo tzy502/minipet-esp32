@@ -21,6 +21,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdarg.h>
 
 #include "esp_log_level.h"
 

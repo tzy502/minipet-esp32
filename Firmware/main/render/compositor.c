@@ -26,6 +26,7 @@
 #include "font_lazy.h"
 #include "font5x7.h"
 #include "lvgl_bridge.h"
+#include "bgm.h"          /* E6：半屏 BGM 控制条读真实播放态/音量/曲目名 */
 #include "render.h"
 
 #include "esp_heap_caps.h"
@@ -103,6 +104,289 @@ static int64_t g_banner_expire_us;         /* 定时横幅到期时刻（us；0=
                                             * render_banner_show_for 用，render_tick 到期自动隐藏） */
 
 static void mark_rect(int32_t x, int32_t y, int32_t w, int32_t h);   /* 前向声明（校准层先于定义使用） */
+
+/* ===== BGM 半屏控制条（E6 定稿）=====
+ * 需求原文：「BGM 播放控制 = 触摸（半屏控制条：播放/暂停/切歌/音量），由选择器内
+ * BGM 入口或宠物区长按呼出」。
+ *
+ * 此前实现是「长按 → 打开全屏菜单 BGM 页」——功能可达但不是"半屏控制条"，
+ * 需求缺口核对列为 E6 未实现项。这里按定稿做成真正的半屏叠加层：
+ *   - 屏幕下半 220px 深色面板（上半仍看得见宠物），呼吸式 0.6s 淡出
+ *   - 5 个控件：播放/暂停 · 上一首 · 下一首 · 音量- · 音量+，横排
+ *   - 触摸点选 + 侧键（中键移光标、顶键确认、底键退出），与菜单同一套侧键语义
+ *   - 操作后 3s 无动作自动收起；上半屏触摸 = 收起（不穿透到宠物交互）
+ * 状态全部读 bgm_* 真实接口，无本地副本。 */
+#define RC_OV_H          220        /* 面板高度（屏幕下半） */
+#define RC_OV_PANEL_BG   0x101018u
+#define RC_OV_TITLE_FG   0xE6E6F0u
+#define RC_OV_INFO_FG    0x9AA0B4u
+#define RC_OV_DIVIDER    0x3C4658u
+#define RC_OV_ITEM_BG    0x1E2433u
+#define RC_OV_ITEM_SEL   0x2E7D6Bu
+#define RC_OV_ITEM_FG    0xD8DEE9u
+#define RC_OV_HINT_FG    0x6E7686u
+#define RC_OV_ITEMS      5
+#define RC_OV_AUTO_HIDE_MS 3000     /* 操作后无动作自动收起 */
+#define RC_OV_TAP_MOVE_PX  24       /* 触摸移动超过此值不算点选（防拖拽误触） */
+
+static bool     g_ov_on;
+static int      g_ov_sel;                       /* 0..4 控件光标 */
+static int64_t  g_ov_expire_us;                 /* 自动收起时刻（us） */
+static char     g_ov_title[32];                 /* 曲目名快照（bgm_current_title 非线程安全时兜底） */
+static uint8_t  g_ov_vol;                       /* 音量快照 */
+static uint8_t  g_ov_state;                     /* mp_bgm_state_t 快照 */
+static bool     g_ov_offline;                   /* 离线：面板提示 SOURCE DOWN */
+static char     g_ov_cmd[48];                   /* 最近一次操作回显（"NEXT"/"VOL 60"…） */
+static int64_t  g_ov_cmd_until_us;
+
+/* ---------------- BGM 控制条辅助（仅合成/渲染任务调用） ---------------- */
+
+static void ov_fill(int32_t x, int32_t y, int32_t w, int32_t h, uint16_t color)
+{
+    if (x < 0) { w += x; x = 0; }
+    if (y < 0) { h += y; y = 0; }
+    if (x + w > g_sw) w = g_sw - x;
+    if (y + h > g_sh) h = g_sh - y;
+    if (w <= 0 || h <= 0) return;
+    for (int32_t r = y; r < y + h; r++) {
+        uint16_t *drow = g_fb + (size_t)r * g_sw;
+        for (int32_t c = x; c < x + w; c++) drow[c] = color;
+    }
+}
+
+/* 5×7 字模文本（与横幅同库同缩放口径；仅 ASCII，小写转大写）
+ * 先整趟 1px 描边再整趟填充：AMOLED 上纯色细字可读性差 */
+static void ov_text(const char *s, int32_t x0, int32_t y0, int32_t scale,
+                    uint16_t fg, uint16_t outline)
+{
+    if (!s) return;
+    for (int pass = 0; pass < 2; pass++) {
+        int32_t gx = x0;
+        for (const char *p = s; *p && gx < g_sw; p++) {
+            unsigned char u = (unsigned char)*p;
+            if (u >= 'a' && u <= 'z') u -= 32;
+            if (u >= 128) u = '?';
+            const uint8_t *cols = MP_FONT5X7[u];
+            for (int col = 0; col < MP_FONT_GLYPH_W; col++) {
+                for (int row = 0; row < MP_FONT_GLYPH_H; row++) {
+                    if (!(cols[col] & (1u << row))) continue;
+                    int32_t px = gx + col * scale;
+                    int32_t py = y0 + row * scale;
+                    if (pass == 0) ov_fill(px - 1, py - 1, scale + 2, scale + 2, outline);
+                    else           ov_fill(px, py, scale, scale, fg);
+                }
+            }
+            gx += (MP_FONT_GLYPH_W + 1) * scale;
+        }
+    }
+}
+
+static int32_t ov_text_w(const char *s, int32_t scale)
+{
+    int32_t n = 0;
+    if (s) for (const char *p = s; *p; p++) n++;
+    return n > 0 ? n * (MP_FONT_GLYPH_W + 1) * scale : 0;
+}
+
+static const char *const RC_OV_LABELS[RC_OV_ITEMS] = {
+    "PLAY", "PREV", "NEXT", "VOL -", "VOL +",
+};
+
+/* 光标切换（侧键/触摸） */
+void render_bgm_bar_nav(int dir)
+{
+    if (!g_ov_on) return;
+    g_ov_sel = (g_ov_sel + (dir > 0 ? 1 : RC_OV_ITEMS - 1)) % RC_OV_ITEMS;
+    g_ov_expire_us = esp_timer_get_time() + (int64_t)RC_OV_AUTO_HIDE_MS * 1000;
+    mark_rect(0, g_sh - RC_OV_H, g_sw, RC_OV_H);
+}
+
+/** 执行第 idx 个控件（触摸点选与顶键确认共用）。 */
+void render_bgm_bar_activate(int idx)
+{
+    if (!g_ov_on || idx < 0 || idx >= RC_OV_ITEMS) return;
+    g_ov_sel = idx;
+    switch (idx) {
+    case 0: {
+        bool playing = bgm_toggle_pause();
+        snprintf(g_ov_cmd, sizeof(g_ov_cmd), "%s", playing ? "PLAYING" : "PAUSED");
+        ESP_LOGI("bgmbar", "控制条：播放/暂停 → %s", g_ov_cmd);
+        break;
+    }
+    case 1:
+        bgm_prev();
+        snprintf(g_ov_cmd, sizeof(g_ov_cmd), "PREV");
+        ESP_LOGI("bgmbar", "控制条：上一首");
+        break;
+    case 2:
+        bgm_next();
+        snprintf(g_ov_cmd, sizeof(g_ov_cmd), "NEXT");
+        ESP_LOGI("bgmbar", "控制条：下一首");
+        break;
+    case 3:
+        bgm_volume_add(-10);
+        snprintf(g_ov_cmd, sizeof(g_ov_cmd), "VOL %u", (unsigned)bgm_volume_get());
+        ESP_LOGI("bgmbar", "控制条：音量 - → %u", (unsigned)bgm_volume_get());
+        break;
+    default:
+        bgm_volume_add(+10);
+        snprintf(g_ov_cmd, sizeof(g_ov_cmd), "VOL %u", (unsigned)bgm_volume_get());
+        ESP_LOGI("bgmbar", "控制条：音量 + → %u", (unsigned)bgm_volume_get());
+        break;
+    }
+    g_ov_cmd_until_us = esp_timer_get_time() + 1200000;   /* 回显 1.2s */
+    g_ov_expire_us    = esp_timer_get_time() + (int64_t)RC_OV_AUTO_HIDE_MS * 1000;
+    mark_rect(0, g_sh - RC_OV_H, g_sw, RC_OV_H);
+}
+
+/** 呼出半屏控制条（宠物区长按 / 选择器 BGM 入口）。 */
+void render_bgm_bar_show(void)
+{
+    if (!g_inited) return;
+    if (!g_ov_on) {
+        g_ov_sel = 0;
+        ESP_LOGI("bgmbar", "半屏控制条呼出（上半屏仍显示宠物，高 %dpx）", RC_OV_H);
+    }
+    g_ov_on = true;
+    g_ov_cmd[0] = 0;
+    g_ov_cmd_until_us = 0;
+    /* 快照 BGM 真实状态 */
+    g_ov_state   = (uint8_t)bgm_get_state();
+    g_ov_vol     = bgm_volume_get();
+    g_ov_offline = bgm_source_greyed(bgm_get_source());
+    strlcpy(g_ov_title, bgm_current_title(), sizeof(g_ov_title));
+    g_ov_expire_us = esp_timer_get_time() + (int64_t)RC_OV_AUTO_HIDE_MS * 1000;
+    mark_rect(0, g_sh - RC_OV_H, g_sw, RC_OV_H);
+}
+
+void render_bgm_bar_hide(void)
+{
+    if (!g_ov_on) return;
+    g_ov_on = false;
+    ESP_LOGI("bgmbar", "控制条收起");
+    mark_rect(0, g_sh - RC_OV_H, g_sw, RC_OV_H);
+}
+
+bool render_bgm_bar_showing(void) { return g_ov_on; }
+int  render_bgm_bar_sel(void)     { return g_ov_sel; }
+
+/* 【E7】选择器内 BGM 入口的跨任务请求旗标（渲染任务置位 / input 任务消费） */
+static volatile bool s_bar_req_from_menu;
+void render_bgm_bar_request_from_menu(void) { s_bar_req_from_menu = true; }
+bool render_bgm_bar_take_menu_request(void)
+{
+    if (!s_bar_req_from_menu) return false;
+    s_bar_req_from_menu = false;
+    return true;
+}
+
+/** 触摸命中测试：返回控件号（0..4）或 -1（未命中按钮；调用方按"点空白=收起"处理）。
+ *  布局常量与 ov_draw 第 3 行严格同源（bx=16 / gap=8 / by=+86 / bh=62）。 */
+int render_bgm_bar_item_at(int x, int y)
+{
+    if (!g_ov_on) return -1;
+    int32_t py0 = g_sh - RC_OV_H;
+    const int32_t gap = 8, bx = 16, by = py0 + 86, bh = 62;
+    const int32_t bw = (g_sw - bx * 2 - gap * (RC_OV_ITEMS - 1)) / RC_OV_ITEMS;
+    if (y < by || y >= by + bh) return -1;
+    for (int i = 0; i < RC_OV_ITEMS; i++) {
+        int32_t ix = bx + i * (bw + gap);
+        if (x >= ix && x < ix + bw) return i;
+    }
+    return -1;
+}
+
+/** 控制条周期维护（渲染任务 tick）：过期收起 + 状态变化重绘。 */
+static void ov_tick(int64_t now_us)
+{
+    if (!g_ov_on) return;
+    /* 离线：BGM 静音降级中，控制条无意义 → 自动收起 */
+    if (bgm_source_greyed(bgm_get_source())) {
+        render_bgm_bar_hide();
+        return;
+    }
+    bool need = false;
+    /* 3s 无动作自动收起（上半屏仍要看宠物，不常驻占屏） */
+    if (now_us >= g_ov_expire_us) {
+        render_bgm_bar_hide();
+        return;
+    }
+    uint8_t st  = (uint8_t)bgm_get_state();
+    uint8_t vol = bgm_volume_get();
+    const char *ti = bgm_current_title();
+    if (st != g_ov_state || vol != g_ov_vol || strcmp(ti, g_ov_title) != 0) {
+        g_ov_state = st;
+        g_ov_vol   = vol;
+        strlcpy(g_ov_title, ti, sizeof(g_ov_title));
+        need = true;
+    }
+    if (g_ov_cmd_until_us && now_us >= g_ov_cmd_until_us) {
+        g_ov_cmd[0] = 0;
+        g_ov_cmd_until_us = 0;
+        need = true;
+    }
+    if (need) mark_rect(0, g_sh - RC_OV_H, g_sw, RC_OV_H);
+}
+
+/* 面板绘制（在 compose_region 内被调用；x/y/w/h 是本次脏区裁剪框） */
+static void ov_draw(int32_t x, int32_t y, int32_t w, int32_t h)
+{
+    if (!g_ov_on) return;
+    int32_t py0 = g_sh - RC_OV_H;
+    int32_t py1 = g_sh;
+    if (y + h <= py0 || y >= py1) return;      /* 脏区不涉及面板 */
+    (void)w;
+
+    ov_fill(0, py0, g_sw, RC_OV_H, RC_OV_PANEL_BG);
+    ov_fill(0, py0, g_sw, 2, RC_OV_DIVIDER);   /* 顶边分隔线：与宠物区的视觉边界 */
+
+    /* 第 1 行：曲目名（无表/未播放 → NO TRACK） */
+    char line[64];
+    const char *title = g_ov_title[0] ? g_ov_title : "NO TRACK";
+    snprintf(line, sizeof(line), "BGM  %.26s", title);
+    ov_text(line, 16, py0 + 14, 3, RC_OV_TITLE_FG, RC_OV_PANEL_BG);
+
+    /* 第 2 行：真实状态（播放态 / 音量 / 音源） */
+    {
+        static const char *const stn[] = { "IDLE", "PLAYING", "PAUSED", "FAILED" };
+        const char *st = (g_ov_state <= 3) ? stn[g_ov_state] : "?";
+        snprintf(line, sizeof(line), "%s  VOL %u  SRC %.4s",
+                 st, (unsigned)g_ov_vol, bgm_source_name());
+        ov_text(line, 16, py0 + 46, 2, RC_OV_INFO_FG, RC_OV_PANEL_BG);
+    }
+    /* 操作回显（1.2s）右对齐第 2 行 */
+    if (g_ov_cmd[0]) {
+        int32_t wpx = ov_text_w(g_ov_cmd, 2);
+        ov_text(g_ov_cmd, g_sw - 16 - wpx, py0 + 46, 2, RC_OV_ITEM_SEL, RC_OV_PANEL_BG);
+    }
+
+    /* 第 3 行：5 个控件横排（等宽；选中项实心底 + 前缀光标） */
+    {
+        const int32_t gap = 8;
+        const int32_t bx  = 16;
+        const int32_t bw  = (g_sw - bx * 2 - gap * (RC_OV_ITEMS - 1)) / RC_OV_ITEMS;
+        const int32_t by  = py0 + 86;
+        const int32_t bh  = 62;
+        for (int i = 0; i < RC_OV_ITEMS; i++) {
+            int32_t ix = bx + i * (bw + gap);
+            bool sel = (i == g_ov_sel);
+            ov_fill(ix, by, bw, bh, sel ? RC_OV_ITEM_SEL : RC_OV_ITEM_BG);
+            /* 控件文字居中（> 光标额外占 2 字符宽，避免选中项文字跳动） */
+            const char *lab = RC_OV_LABELS[i];
+            int32_t lw = ov_text_w(lab, 2);
+            int32_t tx = ix + (bw - lw) / 2;
+            ov_text(lab, tx, by + (bh - MP_FONT_GLYPH_H * 2) / 2, 2,
+                    RC_OV_ITEM_FG, sel ? RC_OV_ITEM_SEL : RC_OV_ITEM_BG);
+            if (sel) ov_text(">", ix + 6, by + (bh - MP_FONT_GLYPH_H * 2) / 2, 2,
+                             RC_OV_TITLE_FG, RC_OV_ITEM_SEL);
+        }
+    }
+
+    /* 第 4 行：操作提示（侧键口径与菜单一致） */
+    ov_text("TOP:OK  MID:MOVE  BOT/UP-TAP:EXIT", 16, py0 + RC_OV_H - 30, 2,
+            RC_OV_HINT_FG, RC_OV_PANEL_BG);
+}
+
 
 /* IMU 视差（input 任务异步写；对齐 int32 写原子） */
 static volatile int32_t g_tilt_mdeg;
@@ -594,6 +878,36 @@ static void banner_fill_block(int32_t px0, int32_t py0, int32_t grow,
     }
 }
 
+/* 实体层合成（POKER 常规路径与 CLOCK_DOZE 睡眠态共用）。
+ * darken_pct>0：整体降亮 = 睡眠观感（RGB565 各通道按比例缩放，黑底上近似
+ * 屏幕调光，省电语义不变）。覆盖位图 g_ent_cov 为 1bit，未覆盖处保持底层像素。 */
+static void ent_compose(int32_t x, int32_t y, int32_t w, int32_t h, int darken_pct)
+{
+    int32_t bx, by, ex, ey, dw, dh;
+    ent_screen_rect_at(g_tilt_mdeg, &bx, &by, &ex, &ey, &dw, &dh);
+    if (dw <= 0 || dh <= 0) return;
+    int32_t X0 = ex > x ? ex : x, Y0 = ey > y ? ey : y;
+    int32_t X1 = (ex + dw < x + w) ? ex + dw : x + w;
+    int32_t Y1 = (ey + dh < y + h) ? ey + dh : y + h;
+    for (int32_t sy = Y0; sy < Y1; sy++) {
+        uint32_t erow = (uint32_t)(sy - by) * RC_ENT_W;
+        uint16_t *drow = g_fb + (size_t)sy * g_sw;
+        for (int32_t sx = X0; sx < X1; sx++) {
+            uint32_t eidx = erow + (uint32_t)(sx - bx);
+            if (!rc_mask_bit(g_ent_cov, eidx)) continue;
+            uint16_t c = g_ent_px[eidx];
+            if (darken_pct > 0) {
+                uint32_t r5 = (c >> 11) & 0x1F, g6 = (c >> 5) & 0x3F, b5 = c & 0x1F;
+                r5 = r5 * (uint32_t)darken_pct / 100u;
+                g6 = g6 * (uint32_t)darken_pct / 100u;
+                b5 = b5 * (uint32_t)darken_pct / 100u;
+                c = (uint16_t)((r5 << 11) | (g6 << 5) | b5);
+            }
+            drow[sx] = c;
+        }
+    }
+}
+
 static void compose_region(int32_t x, int32_t y, int32_t w, int32_t h)
 {
     if (x < 0) { w += x; x = 0; }
@@ -603,12 +917,18 @@ static void compose_region(int32_t x, int32_t y, int32_t w, int32_t h)
     if (w <= 0 || h <= 0) return;
 
     /* 0) CLOCK_DOZE（问题3/E9）：AMOLED 纯黑背景只数字发光——
-     * 时钟激活即 doze 语义（enable 仅由 CLOCK_DOZE 进出指令驱动），
-     * 黑底 + 时钟，跳过条带/tile/实体/气泡/横幅 */
+     * 时钟激活即 doze 语义（enable 仅由 CLOCK_DOZE 进出指令驱动）。
+     *
+     * 【E9 缺口补齐 2026-09-27】需求原文：「无人交互 N 分钟 → **宠物睡眠态**
+     * + WZ 数字时钟浮现 … AMOLED 纯黑背景只数字发光（省电）」。
+     * 此前本分支画完数字就 return：宠物完全不画（缺口核对记为 E9 未实现项
+     * 「sleep-pet state」），真机表现是黑屏上只有时间，用户看不到宠物睡了。
+     * 现改为：黑底 → 时钟数字 → 宠物（darken 降亮=睡眠观感，省电语义保持）。 */
     if (clock_digits_active()) {
         for (int32_t r = y; r < y + h; r++)
             memset(g_fb + (size_t)r * g_sw + x, 0, (size_t)w * 2u);
         clock_digits_compose(g_fb, g_sw, RC_SCALE, x, y, w, h);
+        ent_compose(x, y, w, h, RC_SLEEP_DARKEN);
         return;
     }
 
@@ -719,24 +1039,7 @@ static void compose_region(int32_t x, int32_t y, int32_t w, int32_t h)
 
     /* 5) 实体缓冲（1bit 覆盖；显示区 = clamp 后的摆放矩形，与 mark_ent_at
      * 完全同源（ent_screen_rect_at），右缘 480 处标脏/绘制不再分歧） */
-    {
-        int32_t bx, by, ex, ey, dw, dh;
-        ent_screen_rect_at(g_tilt_mdeg, &bx, &by, &ex, &ey, &dw, &dh);
-        if (dw > 0 && dh > 0) {
-            int32_t X0 = ex > x ? ex : x, Y0 = ey > y ? ey : y;
-            int32_t X1 = (ex + dw < x + w) ? ex + dw : x + w;
-            int32_t Y1 = (ey + dh < y + h) ? ey + dh : y + h;
-            for (int32_t sy = Y0; sy < Y1; sy++) {
-                uint32_t erow = (uint32_t)(sy - by) * RC_ENT_W;
-                uint16_t *drow = g_fb + (size_t)sy * g_sw;
-                for (int32_t sx = X0; sx < X1; sx++) {
-                    uint32_t eidx = erow + (uint32_t)(sx - bx);
-                    if (rc_mask_bit(g_ent_cov, eidx))
-                        drow[sx] = g_ent_px[eidx];
-                }
-            }
-        }
-    }
+    ent_compose(x, y, w, h, 0);
 
     /* 6) 气泡（不透明矩形位图） */
     if (g_bub.active) {
@@ -756,8 +1059,11 @@ static void compose_region(int32_t x, int32_t y, int32_t w, int32_t h)
      * 等价 字符-' ' 起点式表），每字符 5 列字节、无 stride，bit0=顶行。
      * 问题3 可读性加固：先整趟 1px 黑描边（块外扩 1px）再整趟白字填充。 */
     if (g_banner_on) {
-        int32_t by0 = y > 0 ? y : 0;
-        int32_t by1 = (y + h < RC_BANNER_H) ? y + h : RC_BANNER_H;
+        /* 【用户反馈 2026-09-27】"横幅下次调低一点 肉眼看不到"——真机照片实证：
+         * y=0 起画的横幅被 AMOLED 圆角/边框切掉，只看到一条发光边。现整体下移到
+         * RC_BANNER_Y（圆角安全区），文字行按同一偏移画。 */
+        int32_t by0 = (y > RC_BANNER_Y) ? y : RC_BANNER_Y;
+        int32_t by1 = (y + h < RC_BANNER_Y + RC_BANNER_H) ? y + h : RC_BANNER_Y + RC_BANNER_H;
         if (by0 < by1) {
             for (int32_t r = by0; r < by1; r++) {
                 uint16_t *drow = g_fb + (size_t)r * g_sw;
@@ -774,7 +1080,7 @@ static void compose_region(int32_t x, int32_t y, int32_t w, int32_t h)
                         for (int row = 0; row < MP_FONT_GLYPH_H; row++) {
                             if (!(cols[col] & (1u << row))) continue;
                             int32_t px0 = gx + col * RC_BANNER_SCALE;
-                            int32_t py0 = RC_BANNER_PAD_Y + row * RC_BANNER_SCALE;
+                            int32_t py0 = RC_BANNER_Y + RC_BANNER_PAD_Y + row * RC_BANNER_SCALE;
                             banner_fill_block(px0, py0,
                                               pass == 0 ? 1 : 0,
                                               pass == 0 ? RC_BANNER_OUTLINE
@@ -787,6 +1093,9 @@ static void compose_region(int32_t x, int32_t y, int32_t w, int32_t h)
             }
         }
     }
+
+    /* 8) BGM 半屏控制条（E6）：最顶层叠加，仅占屏幕下半（上半宠物照常合成） */
+    ov_draw(x, y, w, h);
 }
 
 /* ================= 脏区：标脏 16×16 块 → 单一包围盒（问题1） =================
@@ -1201,9 +1510,12 @@ void render_tick(void)
     if (g_banner_on && g_banner_expire_us != 0 && now_us >= g_banner_expire_us) {
         g_banner_expire_us = 0;
         g_banner_on = false;
-        mark_rect(0, 0, g_sw, RC_BANNER_H);   /* 横幅带整条标脏，下层重铺 */
+        mark_rect(0, RC_BANNER_Y, g_sw, RC_BANNER_H);   /* 横幅带整条标脏，下层重铺 */
         any = true;
     }
+
+    /* 6) BGM 半屏控制条（E6）：自动收起 / BGM 状态变化重绘 */
+    ov_tick(now_us);
 
     if (any) flush_dirty();
 
@@ -1496,12 +1808,12 @@ void render_bubble_hide(void)
 int render_banner_show(const char *text)
 {
     if (!g_inited) return RENDER_ERR_STATE;
-    if (g_banner_on) mark_rect(0, 0, g_sw, RC_BANNER_H);
+    if (g_banner_on) mark_rect(0, RC_BANNER_Y, g_sw, RC_BANNER_H);
     g_banner_on = true;
     g_banner_expire_us = 0;    /* 常驻：清定时横幅计时，防 show_for 残留到期误隐藏配网横幅 */
     g_banner_text[0] = 0;
     if (text) strlcpy(g_banner_text, text, sizeof(g_banner_text));
-    mark_rect(0, 0, g_sw, RC_BANNER_H);
+    mark_rect(0, RC_BANNER_Y, g_sw, RC_BANNER_H);
     return RENDER_OK;
 }
 
@@ -1510,7 +1822,7 @@ void render_banner_hide(void)
     if (!g_inited || !g_banner_on) return;
     g_banner_on = false;
     g_banner_expire_us = 0;
-    mark_rect(0, 0, g_sw, RC_BANNER_H);
+    mark_rect(0, RC_BANNER_Y, g_sw, RC_BANNER_H);
 }
 
 /* 定时横幅（输入层 VOL± 反馈）：显示 text 并在 duration_ms 后由 render_tick

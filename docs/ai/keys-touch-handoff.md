@@ -189,3 +189,172 @@ E (2707) bridge: font 1 not loaded (render_set_font first)
 **待办（下一轮）**：
 - 内部堆水位探针（`wifi_init_once` 已打）逐项定位占用方
 - 考虑：SDL/日志缓冲瘦身、LVGL 缓冲部分移 PSRAM、`CONFIG_LOG` 等级降级
+
+---
+
+## 七、【E14】设备发现 + 设备日志上报：服务端侧接口需求
+
+> 本节由固件侧改动（Firmware/，2026-09-28）引出。**固件已实现，服务端未实现**；
+> 下述端点/服务名是接口契约，需服务端补齐后「Web 可拉取设备日志」「设备自动
+> 发现服务端」才真正闭环。固件侧代码位置已逐条标注，便于对照。
+
+### 7.1 mDNS：服务端必须广告 `_minipet._tcp`
+
+**需求原文（E14）**：「mDNS：设备可发现服务端（配网页手输地址的补充，可选启用）」
+
+**设备侧行为（已实现）**：`Firmware/main/net/mdns_discover.c`
+（`mp_mdns_discover_server()`，由 `app/state_machine.c` 自检期调用）
+
+- 只在两种情况下查询：①NVS `srv_url` 为空（用户在配网页留空服务器地址）；
+  ②`srv_url` 有值但 `hello` 连不上（服务端换 IP / 地址写错）
+- **手输地址优先**：`srv_url` 有效且 hello 成功时一次 mDNS 都不发
+- 服务名：**`_minipet._tcp`**（= `_minipet._tcp.local`，PTR/SRV/TXT）
+- 超时：PTR 查询 1.1s；若该响应里没带 A 记录，再按 hostname 补一次 A 查询
+  1.1s（合计 ~2.2s 上限）。失败**静默**（不刷日志、不重试、不拖慢启动）
+- 命中后地址**不写 NVS**（避免顶掉手输配置 / DHCP 换 IP 后永远用旧值），
+  只作本次运行的兜底
+- 命中会打一条 INFO：`I (xxxx) mdns: 发现服务端: http://<ip>:<port> instance=... host=...`
+
+**服务端需实现（.NET 9）**：
+
+1. 广告服务类型 `_minipet._tcp`，端口 = 服务端 HTTP 监听端口（默认 **38090**）
+2. **SRV 的 target/hostname 必须能被 A 记录解析**（设备在 PTR 响应未带 A 记录时
+   会用 hostname 补查 A）。实践要点：广告时直接带上主机 A 记录，成功率最高
+3. 建议 TXT（当前固件不读，预留给服务端版本协商）：
+   - `ver=1`（协议版本，对应固件 `MP_PROTO_VER`）
+   - `path=/api/device`（端点前缀）
+   - `name=<服务端展示名>`（Web 里给用户看）
+4. 实现库选型（三选一，按维护性排序）：
+   - **`Makaretu.Dns`**（NuGet，最常用）：`new ServiceProfile(...)` +
+     `ServiceDiscovery.Advertise(profile)`，跨平台、纯托管、无外部依赖；
+     注意它同时做 responder 与 resolver，只需 Advertise 即可
+   - **`Tmds.MDns`**：轻量，但只做浏览器（browse）+ 有限广告能力，
+     若它不支持「自定义 SRV target + A 记录」则要自己补一条 A 记录
+   - 系统级 Zeroconf（Linux `avahi-daemon` + `/etc/avahi/services/minipet.service`
+     或 Windows Bonjour/`dnssd`）：不用改 C# 代码，但要求部署环境装 daemon，
+     容器里还需 `--net=host` 或放行 UDP 5353 组播 —— **推荐作为兜底方案**
+5. 网络前提（无论哪种实现）：服务端主机与设备**同一二层广播域**，UDP **5353**
+   组播（224.0.0.251 / ff02::fb）双向可达；Docker 桥接网络默认收不到组播，
+   部署侧需 `network_mode: host`（`docker-compose.example.yml` 可参考）
+6. **不需要**服务端主动发现设备；设备不做 responder（不广告自己）
+
+**验证方式（服务端自测，不依赖设备）**：
+- Linux/Mac：`avahi-browse -rt _minipet._tcp` 或 `dns-sd -B _minipet._tcp`
+- 期望看到实例名与端口；`dns-sd -L <instance> _minipet._tcp` 能看到
+  hostname + port + TXT
+
+### 7.2 设备日志：需新增两个端点
+
+**需求原文（E14）**：「日志：设备环形日志缓冲，Web 可拉取（排障不用插线）；
+串口日志仅开发期」
+
+**固件侧行为（已实现）**：
+- `Firmware/main/app/logbuf.c`：**定长槽位环**，152 槽 × 216B ≈ **32.8KB，全在 PSRAM**
+  （`heap_caps_malloc(MALLOC_CAP_SPIRAM)`，内部动态堆常驻占用 0），经
+  `esp_log_set_vprintf()` 挂接，每槽存（`seq` 递增序号 + `t` 设备毫秒 +
+  `ts` epoch 毫秒 + `lvl` + `tag` + 文本 ≤168B）；满则覆盖最旧（最旧序号 =
+  最新 − 151）；写路径不阻塞、不递归、不新建任务、ISR 内自动跳过
+- 上报：`Firmware/main/net/http_client.c` 的 `mp_http_device_log_step()`，
+  由**已在跑的 poller 任务**周期调用（`net/poller.c`，不新建任务）：
+  20s 心跳；出现 E 级日志或首次上报立即触发；失败退避 60s 重传
+  （失败**不推进游标** → 不丢日志）；单次 4s 超时，绝不拖慢长轮询
+- 单批上限约 4.6KB（≈20 条），一条塞不进就留到下一批（游标滚动推进）
+- 环容量语义：设备最多保留**最近 152 条**日志；服务端若不及时收，被覆盖的
+  那部分就永久缺失（这是「环形缓冲」的固有取舍，排障场景够用）
+
+**服务端需实现（两个端点）**：
+
+#### (1) `POST /api/device/log` —— 设备增量上报（设备 → 服务端）
+
+请求体（`Content-Type: application/json`）：
+
+```json
+{
+  "proto": 1,
+  "deviceId": "44BD8D60DAC0",
+  "since": 128,             // 设备上次成功送达的最大 seq；本次上报 seq > since
+  "count": 3,
+  "logs": [
+    { "seq": 129, "ts": 1769999999123, "t": 45678, "lvl": "I",
+      "tag": "poller", "msgHex": "68656c6c6f" },
+    { "seq": 130, "ts": 1769999999500, "t": 46055, "lvl": "W",
+      "tag": "provision", "msgHex": "..." }
+  ]
+}
+```
+
+字段说明（**字段名大小写必须完全一致**，System.Text.Json web 默认 camelCase 绑定）：
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `proto` | int | 协议版本（当前恒 1） |
+| `deviceId` | string | hello 返回的 deviceId（与 poll/event 同口径） |
+| `since` | uint32 | 设备侧上次成功送达的 seq；服务端可用于去重校验 |
+| `count` | int | `logs` 数组长度 |
+| `logs[].seq` | uint32 | **设备内单调递增**序号（重启从 0 重新开始，见「遗留」7.3） |
+| `logs[].ts` | uint64 | epoch 毫秒；**系统时间未校准时是开机毫秒**（值 << 1.7e12 即为未校时） |
+| `logs[].t` | uint32 | 设备开机毫秒（本地时基，恒单调） |
+| `logs[].lvl` | string(1) | `E`/`W`/`I`/`D`/`V` |
+| `logs[].tag` | string | ESP-IDF 日志 TAG（≤15 字符） |
+| `logs[].msgHex` | string | **日志正文的 hex（UTF-8 字节的十六进制小写）**，非明文 |
+
+**为什么 `msgHex` 而不是明文**：固件侧要零堆分配、零转义地序列化任意日志文本
+（日志里含引号/换行/中文），hex 编码是最省事且不丢字节的做法。
+**服务端处理要点**：`Convert.FromHexString(msgHex)` → UTF-8 解码 → 存文本。
+（若嫌 hex 占空间，可协商改成明文 + 服务端 `JsonElement` 原样收；固件侧改一行。）
+
+**响应约定**：
+
+| 状态码 | 含义 | 设备行为 |
+|---|---|---|
+| `200` | 已接收（body 可为 `{"ok":true}` 或空） | 推进游标 `since = logs[^1].seq` |
+| 其他 | 拒收/未实现 | **不推进游标**，60s 后整批重传（幂等：seq 去重即可） |
+
+**幂等要求**：设备会重传（网络抖动/服务端 404），服务端应按
+`(deviceId, seq)` 去重后追加，或按 seq 覆盖写；重复批次不得产生重复行。
+
+#### (2) `GET /api/admin/device-logs/{id}` —— Web 拉取（Web → 服务端）
+
+需求：Web 端「排障不用插线」看设备日志。
+
+- `{id}` = 服务端设备记录 id（Web 现有设备列表的主键口径），**不是** 设备 UUID；
+  也可额外提供 `GET /api/admin/device-logs/by-uuid/{uuid}`
+- 建议查询参数：`?sinceSeq=<n>&limit=<n>&level=<E|W|I>&tag=<tag>`
+  （`sinceSeq` 与设备侧 `seq` 同口径，便于 Web 增量轮询）
+- 建议响应：
+
+```json
+{
+  "deviceId": "44BD8D60DAC0",
+  "lastSeq": 131,
+  "clockSynced": true,
+  "items": [
+    { "seq": 129, "tsUtc": "2026-09-28T10:12:03.123Z", "t": 45678,
+      "lvl": "I", "tag": "poller", "msg": "poll ok" }
+  ]
+}
+```
+
+- 服务端需**每设备保留有界环缓**（建议 ≥512 行或 ≥64KB，超出丢最旧）——
+  需求原文即「设备环形日志缓冲」，服务端是设备环缓的持久化副本；
+  若直接落库，建议加索引 `(deviceId, seq)` 并定期裁剪
+
+### 7.3 遗留与待真机验证（固件侧已知项）
+
+1. **`seq` 在设备重启后从 0 重新开始**（环缓在 RAM）。服务端若按 seq 去重，
+   需按「连接会话/启动周期」分段，或允许同 seq 覆盖写。若要求跨重启单调，
+   固件侧可改为把 seq 存 NVS（有写放大，需权衡）——**待服务端口径确定后再定**
+2. **`ts` 在校时前是开机毫秒**（RTC 未校准场景，见本文 §6.2）。Web 展示需按
+   `ts < 1.7e12` 判未校时，回退用「服务端接收时间」
+3. **mDNS 发现只在开机期做（1 次）+ hello 失败后兜底 1 次**，不在 poller 里
+   周期重试。若「设备先开机、服务端后启动」且 `srv_url` 为空，需重启设备才会
+   再发现（设计取舍：不给心跳路径加 mDNS 延迟）。若要覆盖该场景，服务端补上
+   `_minipet._tcp` 广告后，可在 poller 的离线分支加「每 60s 一次发现」——
+   注意 mDNS 查询最坏阻塞 2.2s，必须与心跳解耦。
+4. **`msgHex` 使 body 体积翻倍**（每条正文 ×2）：单批因此约 20 条。
+   若服务端愿意收明文（`JsonElement` 原样存），把 `http_client.c` 的
+   `log_msg_to_hex()` 换成转义即可，单批条数可翻倍。
+5. 上述两个端点与 mDNS 广告**均未在真机验证**（本轮仅 `idf.py build` 通过 +
+   代码路径自检 + 主机 harness 逻辑验证；真机验证受网络环境阻塞）。真机首验
+   建议看两条证据：① 串口/环日志出现 `I (xxx) mdns: 发现服务端: http://...`；
+   ② 服务端出现 `POST /api/device/log` 且 200。

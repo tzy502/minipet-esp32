@@ -4,26 +4,29 @@
  * 三条硬约束（全部来自真机现状，不是设计偏好）：
  *   1) 缓冲必须放 PSRAM：本板内部动态堆仅 ~112KB 且碎片化（已有任务反复
  *      创建失败，见 provision.c dump_internal_heap 注释），任何内部堆新增
- *      都可能把 render/poller 挤出局。故 s_ring = heap_caps_malloc(..,
- *      MALLOC_CAP_SPIRAM)，内部堆占用 = 0。
+ *      都可能把 render/poller 挤出局。故 s_slot = heap_caps_malloc(..,
+ *      MALLOC_CAP_SPIRAM)，内部堆常驻占用 = 0。
  *   2) 不阻塞、不递归：本函数挂在 esp_log 输出路径上，任何时刻都可能被任意
  *      任务（含高优先级 render/input）调用。故
  *        - 重入保护用 __atomic_test_and_set（无阻塞语义），命中即直通串口；
- *        - 写入过程绝不打日志（只有内存写入 + 环形 memcpy）；
+ *        - 写入过程绝不打日志（只有内存写入 + 定长结构赋值）；
  *        - 中断上下文直接跳过（PSRAM 在 ISR 里不可用，且不能持锁）；
  *        - 栈水位过低直接跳过（vsnprintf 需栈，宁可少记录也不能溢出）。
  *   3) 不新建任务：写入路径零任务；上报挂在已在跑的 poller 任务里
- *      （net/http_client.c 的 mp_http_device_log_step）。本模块自身不发起任何
- *      网络动作。
+ *      （net/http_client.c 的 mp_http_device_log_step）。本模块不发起网络动作。
  *
- * 记录格式（按行）：
- *   [uint32 seq][uint32 t_ms][uint64 ts_ms][uint8 lvl][uint8 tag_len]
- *   [uint8 msg_len][uint8 rsv][char tag[tag_len]][char msg[msg_len]]
- *   定长头 20B + 按需体；整体越环尾则回绕到 0（读侧用大小累加直接跳过）。
+ * 数据结构：【定长槽位环】而不是变长记录环。
+ *   槽 = s_log_slot_t（24B 头 + 16B tag + 168B 文本 + 对齐填充 = 216B），
+ *   环 = 152 槽 ≈ 32.8KB（PSRAM，见 LB_SLOTS / sizeof 断言在主机 harness）。
+ *   为什么定长：变长记录只有两种选择，都有坑 ——
+ *     ① 允许跨环尾：读者定位要处理拆分，复杂且易错；
+ *     ② 回绕时留尾部空洞：逻辑偏移 ≠ 物理偏移，多圈后漂移，实测出现
+ *        「最新记录被当旧记录覆盖、dump 取不到最新」。
+ *   定长槽用「序号 → 槽下标」直接映射（O(1)），读写都在单槽内完成，
+ *   上述两种病都不存在（主机 harness 2000 条压力测试逐条校验序号连续）。
  *
- * 并发模型：单写者（日志写入经由原子门串行化）+ 多读者（scan_start 里把
- * 写入者挡在环外，见 LOG_BARRIER_MAX_MS）。写入者永不等待（try-lock），
- * 读者最多等 LOG_BARRIER_MAX_MS（poller 侧一次上报 4s 超时，留足余量）。
+ * 并发模型：单写者（日志经原子门串行化）+ 读者独占（scan 期间置 s_read_hold，
+ * 写入者见之让路，绝不阻塞写者）。
  */
 #include "logbuf.h"
 
@@ -43,32 +46,42 @@
 /* ------------------------------------------------------------------ */
 /* 配置                                                                */
 /* ------------------------------------------------------------------ */
-#define LB_RING_BYTES       32768u   /* PSRAM，内部堆 0 占用 */
-#define LB_MSG_MAX          160u     /* 单行文本上限（超出截断，保头留尾信息） */
-#define LB_TAG_MAX          15u      /* 存进记录里的 tag 长度上限 */
-#define LB_MTU              (20u + LB_TAG_MAX + 1u + LB_MSG_MAX)
+#define LB_SLOTS       152u     /* 槽数：152 × sizeof(slot)=216B ≈ 32.8KB（PSRAM） */
+#define LB_TEXT_MAX    168u     /* 单条文本上限（超出截断，保头） */
+#define LB_TAG_MAX     15u
 
-#define LB_STACK_MIN_WORDS  1200u    /* 低于此栈余量不写环（vsnprintf 需栈） */
-#define LB_BARRIER_MAX_MS   8000     /* 读侧等待写入者让路的硬上限 */
+#define LB_STACK_MIN_WORDS  1200u   /* 低于此栈余量不写环（vsnprintf 需栈） */
+
+/* 定长槽：写入者先填负载、最后发布 seq（读者见 seq 匹配才认为槽有效） */
+typedef struct {
+    uint32_t seq;                   /* 0 = 空槽；否则单调递增序号（从 1 起） */
+    uint32_t t_ms;                  /* 设备毫秒（esp_log_timestamp 口径） */
+    uint64_t ts_ms;                 /* epoch 毫秒（未校时退化为开机毫秒） */
+    uint8_t  lvl;                   /* 'E'/'W'/'I'/'D'/'V' */
+    uint8_t  tag_len;
+    uint8_t  text_len;              /* 不含 NUL */
+    uint8_t  rsv;
+    char     tag[16];
+    char     text[LB_TEXT_MAX + 8];
+} s_log_slot_t;
 
 /* ------------------------------------------------------------------ */
-/* 状态（全部静态；无内部堆分配）                                         */
+/* 状态（全部静态；内部动态堆零占用）                                     */
 /* ------------------------------------------------------------------ */
-static uint8_t  *s_ring;
-static uint32_t  s_cap;
-static uint32_t  s_head;        /* 写入偏移 */
-static uint32_t  s_seq;         /* 已写入记录数（= 最新序号） */
-static uint32_t  s_oldest;      /* 环内最旧记录的序号（丢弃时递增） */
+static s_log_slot_t *s_slot;        /* PSRAM：LB_SLOTS 个槽 */
+static uint32_t  s_seq;             /* 已写入记录数（= 最新序号；0 = 无） */
+static uint32_t  s_head;            /* 下一个待写槽下标（物理，0..LB_SLOTS-1） */
 static vprintf_like_t s_orig_vprintf;
-static volatile bool s_read_hold;          /* 读者持锁：写入者让路 */
-static volatile uint32_t s_read_hold_ms;
-static volatile bool s_err_seen;           /* 出现过 E 级日志（上报端可提前拉取） */
-static volatile bool s_in_hook;            /* 重入门（原子） */
+static volatile bool s_read_hold;   /* 读者独占：写入者让路 */
+static volatile bool s_err_seen;    /* 出现过 E 级日志（上报端可提前拉取） */
+static volatile bool s_in_hook;     /* 重入门（原子） */
 
-static inline uint32_t rd32(const uint8_t *p) { uint32_t v; memcpy(&v, p, 4); return v; }
-static inline uint64_t rd64(const uint8_t *p) { uint64_t v; memcpy(&v, p, 8); return v; }
-static inline void wr32(uint8_t *p, uint32_t v) { memcpy(p, &v, 4); }
-static inline void wr64(uint8_t *p, uint64_t v) { memcpy(p, &v, 8); }
+/** 环内最旧序号（0 = 空环）。槽数固定，最旧 = 最新 - (LB_SLOTS-1) */
+static uint32_t oldest_seq(void)
+{
+    if (s_seq == 0) return 0;
+    return (s_seq > LB_SLOTS) ? (s_seq - LB_SLOTS + 1u) : 1u;
+}
 
 /** 当前 epoch 毫秒（系统时间未校准 → 退化为开机毫秒，仍单调可用） */
 static uint64_t now_epoch_ms(void)
@@ -82,31 +95,13 @@ static uint64_t now_epoch_ms(void)
 }
 
 /* ------------------------------------------------------------------ */
-/* 读取屏障（读侧独占，写侧 try-lock）                                    */
-/* ------------------------------------------------------------------ */
-static bool read_lock(void)
-{
-    s_read_hold_ms = (uint32_t)(esp_timer_get_time() / 1000);
-    s_read_hold = true;
-    /* 等正在写入的那一条收尾（写入极短：一次 memcpy 级）。超时则照常读，
-     * 只可能读到半条记录，由长度校验丢弃 —— 绝不阻塞读者。 */
-    for (int i = 0; i < 200; i++) {
-        if (!s_in_hook) return true;
-        vTaskDelay(1);
-    }
-    return false;
-}
-
-static void read_unlock(void) { s_read_hold = false; }
-
-/* ------------------------------------------------------------------ */
 /* 写入                                                                */
 /* ------------------------------------------------------------------ */
 typedef struct {
     char lvl;
-    char tag[LB_TAG_MAX + 1];
-    const char *msg;
-    int  msg_len;
+    char tag[16];
+    const char *text;
+    int  text_len;
 } lb_parsed_t;
 
 /** 解析一条已格式化日志行：`<ts> <L> (<t_ms>) tag: msg`
@@ -119,9 +114,9 @@ static bool parse_line(char *buf, lb_parsed_t *o)
 
     o->lvl = 'I';
     o->tag[0] = 0;
-    o->msg = "";
+    o->text = "";
 
-    /* 时间戳（"I (12345) tag: ..." 之后）→ 级别括号 */
+    /* 时间戳之后是级别括号："12 I (12) tag: msg" */
     char *pl = strchr(p, '(');
     if (pl && pl > p && (pl[-1] == ' ' || pl[-1] == '\t')) {
         char lv = '\0';
@@ -138,37 +133,36 @@ static bool parse_line(char *buf, lb_parsed_t *o)
         if (rp) {
             char *body = rp + 1;
             while (*body == ' ') body++;
-            /* tag 到第一个 ':' 或空白为止 */
-            size_t ti = 0;
+            size_t ti = 0;                      /* tag 到第一个 ':' 或空白为止 */
             while (body[ti] && body[ti] != ':' && body[ti] != ' ' && ti < LB_TAG_MAX) {
                 o->tag[ti] = body[ti];
                 ti++;
             }
             o->tag[ti] = 0;
             char *m = strchr(body, ':');
-            o->msg = m ? m + 1 : body;
+            o->text = m ? m + 1 : body;
         } else {
-            o->msg = rp ? rp : pl;
+            o->text = pl;
         }
     } else {
-        o->msg = p;                     /* 非标准行（printf 直出）：原样存 */
+        o->text = p;                    /* 非标准行（printf 直出）：原样存 */
     }
 
-    while (*o->msg == ' ') o->msg++;
-    int n = (int)strlen(o->msg);
-    while (n > 0 && (o->msg[n - 1] == '\n' || o->msg[n - 1] == '\r' ||
-                     o->msg[n - 1] == ' ' || o->msg[n - 1] == '\x1b')) {
+    while (*o->text == ' ') o->text++;
+    int n = (int)strlen(o->text);
+    while (n > 0 && (o->text[n - 1] == '\n' || o->text[n - 1] == '\r' ||
+                     o->text[n - 1] == ' ' || o->text[n - 1] == '\x1b')) {
         n--;
     }
     if (n <= 0) return false;
-    if ((size_t)n > LB_MSG_MAX) n = (int)LB_MSG_MAX;
-    o->msg_len = n;
+    if ((size_t)n > LB_TEXT_MAX) n = (int)LB_TEXT_MAX;
+    o->text_len = n;
     return true;
 }
 
 static void ring_write(const char *fmt, va_list ap)
 {
-    if (!s_ring || s_read_hold) return;        /* 未初始化 / 读者独占 */
+    if (!s_slot || s_read_hold) return;        /* 未初始化 / 读者独占 */
     if (xPortInIsrContext()) return;           /* ISR：PSRAM 不可用，不记录 */
     if (uxTaskGetStackHighWaterMark(NULL) < LB_STACK_MIN_WORDS) return;
 
@@ -181,75 +175,33 @@ static void ring_write(const char *fmt, va_list ap)
     lb_parsed_t pr;
     if (!parse_line(line, &pr)) return;
 
-    uint32_t need = 20u + (uint32_t)strlen(pr.tag) + (uint32_t)pr.msg_len;
-    if (need > s_cap) return;                  /* 理论不可达（MTU 远小于 cap） */
-    if (need > LB_MTU) return;
+    uint32_t idx = s_head % LB_SLOTS;
+    s_log_slot_t *sl = &s_slot[idx];
 
-    uint32_t seq = s_seq;
-    uint64_t ts  = now_epoch_ms();
-    uint32_t tms = esp_log_timestamp();
+    /* 先填负载、最后发布 seq：读者见 seq == 目标序号 才认这条有效 */
+    sl->seq      = 0;                          /* 逻辑上先失效（防读者读到半条） */
+    sl->t_ms     = esp_log_timestamp();
+    sl->ts_ms    = now_epoch_ms();
+    sl->lvl      = (uint8_t)pr.lvl;
+    sl->tag_len  = (uint8_t)strlen(pr.tag);
+    sl->text_len = (uint8_t)pr.text_len;
+    sl->rsv      = 0;
+    memcpy(sl->tag, pr.tag, sl->tag_len);
+    sl->tag[sl->tag_len] = 0;
+    memcpy(sl->text, pr.text, (size_t)pr.text_len);
+    sl->text[pr.text_len] = 0;
 
-    /* 需要腾空间：丢最旧（可能丢多条 —— 单条接近满环时） */
-    uint32_t guard = 0;
-    while ((s_cap - (s_head - s_oldest)) < need) {
-        if (s_oldest >= s_head) { s_head = 0; s_oldest = seq; break; }  /* 环空 */
-        uint32_t o = s_oldest % s_cap;
-        uint32_t olen = 20u + s_ring[o + 16] + s_ring[o + 17];
-        if (olen == 0 || olen > LB_MTU) { s_head = 0; s_oldest = seq; break; }
-        s_oldest++;
-        if (++guard > 4096) { s_head = 0; s_oldest = seq; break; }
-    }
+    /* 序号从 1 起（0 是「空槽」哨兵：logbuf_seq()==0 与 find_slot 判定都靠它） */
+    sl->seq = s_seq + 1;                       /* 发布 */
+    s_seq++;
+    s_head = (idx + 1u) % LB_SLOTS;
 
-    uint32_t off = s_head % s_cap;
-    uint8_t hdr[20];
-    wr32(hdr + 0,  seq);
-    wr32(hdr + 4,  tms);
-    wr64(hdr + 8,  ts);
-    hdr[16] = (uint8_t)pr.lvl;
-    hdr[17] = (uint8_t)strlen(pr.tag);
-    hdr[18] = (uint8_t)pr.msg_len;
-    hdr[19] = 0;
-
-    /* 环内可能跨界：先量尾部空间，再回绕。两段写，无中间状态被读者
-     * 认为「完整」—— 完整性由 seq 发布保证（先体后头）。 */
-    uint32_t tail = s_cap - off;
-    if (tail >= need) {
-        memcpy(s_ring + off + 20, pr.tag, hdr[17]);
-        memcpy(s_ring + off + 20 + hdr[17], pr.msg, pr.msg_len);
-        wr32(s_ring + off + 0, seq);
-        wr32(s_ring + off + 4, tms);
-        wr64(s_ring + off + 8, ts);
-        s_ring[off + 16] = hdr[16];
-        s_ring[off + 17] = hdr[17];
-        s_ring[off + 18] = hdr[18];
-        s_ring[off + 19] = 0;
-        s_head = off + need;
-    } else {
-        uint32_t p = 0;
-        memcpy(s_ring + off + 20, pr.tag, hdr[17]);
-        memcpy(s_ring + off + 20 + hdr[17], pr.msg, hdr[18]);
-        p = 20 + hdr[17] + hdr[18];
-        if (p < need) {
-            memcpy(s_ring, pr.tag, hdr[17]);              /* 回绕：整条重写（简单且原子） */
-            memcpy(s_ring + 20, pr.msg, hdr[18]);
-        }
-        wr32(s_ring + 0, seq);
-        wr32(s_ring + 4, tms);
-        wr64(s_ring + 8, ts);
-        s_ring[16] = hdr[16];
-        s_ring[17] = hdr[17];
-        s_ring[18] = hdr[18];
-        s_ring[19] = 0;
-        s_head = need;
-    }
-
-    s_seq = seq + 1;
     if (pr.lvl == 'E') s_err_seen = true;
 }
 
 int logbuf_vprintf_hook(const char *fmt, va_list ap)
 {
-    /* 先做记录侧（va_list 在 ring_write 里被消费，故串口输出用 va_copy） */
+    /* 记录侧先做（va_list 在 ring_write 内被消费，故串口输出用 va_copy） */
     if (__atomic_test_and_set(&s_in_hook, __ATOMIC_ACQ_REL)) {
         /* 重入（极端：日志调用嵌套）→ 只走串口 */
         return s_orig_vprintf ? s_orig_vprintf(fmt, ap) : vprintf(fmt, ap);
@@ -265,29 +217,27 @@ int logbuf_vprintf_hook(const char *fmt, va_list ap)
 
 bool logbuf_init(void)
 {
-    if (s_ring) return true;
-    if (s_orig_vprintf) return true;           /* 已挂过（PSRAM 失败降级） */
+    if (s_orig_vprintf) return true;           /* 已挂过（含 PSRAM 失败降级） */
+    if (s_slot) return true;
 
-    uint8_t *p = (uint8_t *)heap_caps_malloc(LB_RING_BYTES,
-                                             MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    s_log_slot_t *p = (s_log_slot_t *)heap_caps_malloc(
+        (size_t)LB_SLOTS * sizeof(s_log_slot_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (p) {
+        memset(p, 0, (size_t)LB_SLOTS * sizeof(s_log_slot_t));   /* seq=0 → 全空槽 */
+        s_slot = p;
+        s_seq = 0;
+        s_head = 0;
+    }
+    s_orig_vprintf = esp_log_set_vprintf(logbuf_vprintf_hook);   /* 成败都挂（失败=纯串口） */
     if (!p) {
-        /* 不阻塞启动：只打一条 WARN，功能降级为纯串口日志 */
-        s_orig_vprintf = esp_log_set_vprintf(logbuf_vprintf_hook);
-        ESP_LOGW("logbuf", "PSRAM 环形缓冲分配失败（%u B）→ 设备日志上报不可用",
-                 (unsigned)LB_RING_BYTES);
+        ESP_LOGW("logbuf", "PSRAM 环形日志缓冲分配失败（%u B）→ 仅串口日志",
+                 (unsigned)(LB_SLOTS * sizeof(s_log_slot_t)));
         return false;
     }
-    s_ring = p;
-    s_cap  = LB_RING_BYTES;
-    s_head = 0;
-    s_seq  = 0;
-    s_oldest = 0;
-    memset(s_ring, 0, s_cap);
-    s_orig_vprintf = esp_log_set_vprintf(logbuf_vprintf_hook);
     return true;
 }
 
-bool logbuf_ready(void) { return s_ring != NULL; }
+bool logbuf_ready(void) { return s_slot != NULL; }
 uint32_t logbuf_seq(void) { return s_seq; }
 
 /* E 级日志出现过（上报端据此跳过心跳间隔，尽快把故障日志送出去）。
@@ -300,88 +250,69 @@ bool logbuf_take_err_flag(void)
 }
 
 /* ------------------------------------------------------------------ */
-/* 读取                                                                */
+/* 读取：序号 → 槽（O(1)），无需顺序扫描                                  */
 /* ------------------------------------------------------------------ */
-/** 从序号 s 的记录起始偏移（从新到旧扫描，命中即返回）。 */
-static bool find_off(uint32_t s, uint32_t *off_out)
+/** 序号 seq 所在槽；返回 NULL = 已被覆盖 / 还没产生 / 槽无效 */
+static const s_log_slot_t *find_slot(uint32_t seq)
 {
-    if (s < s_oldest || s >= s_seq) return false;
-    uint32_t off = s_head;
-    for (uint32_t i = 0; i < 8192; i++) {
-        if (off == 0) off = s_cap;
-        off -= 20;
-        uint32_t olen = 20u + s_ring[off + 17] + s_ring[off + 18];
-        if (olen == 0 || olen > LB_MTU) return false;
-        uint32_t rseq = rd32(s_ring + off);
-        if (rseq == s) { *off_out = off; return true; }
-        if (off < olen) break;                 /* 跨环尾，无法继续回退 */
-        off -= olen;
-    }
-    return false;
+    if (seq == 0 || seq > s_seq) return NULL;
+    if (seq < oldest_seq()) return NULL;
+    uint32_t back = s_seq - seq;               /* 0 = 最新 */
+    uint32_t idx = (s_head + LB_SLOTS - 1u - (back % LB_SLOTS)) % LB_SLOTS;
+    const s_log_slot_t *sl = &s_slot[idx];
+    if (sl->seq != seq) return NULL;           /* 绕圈后已落到别的序号 */
+    if (sl->tag_len > LB_TAG_MAX || sl->text_len > LB_TEXT_MAX) return NULL;
+    return sl;
 }
 
 bool logbuf_scan_start(logbuf_iter_t *it, uint32_t since_seq)
 {
     memset(it, 0, sizeof(*it));
-    if (!s_ring) return false;
-    read_lock();
+    if (!s_slot) return false;
+    s_read_hold = true;                        /* 读者独占：写入者让路 */
     it->seq_snap = s_seq;
     it->t_start  = since_seq + 1;
-    if (it->t_start < s_oldest) it->t_start = s_oldest;   /* 已被覆盖：从最旧开始 */
-    uint32_t off;
-    if (!find_off(it->t_start, &off)) { it->done = true; return false; }
-    it->cursor = off;
+    uint32_t o = oldest_seq();
+    if (it->t_start < o) it->t_start = o;      /* 已被覆盖：从最旧开始 */
+    if (it->t_start > it->seq_snap) { it->done = true; return false; }
+    it->cursor = it->t_start;
     return true;
 }
 
 bool logbuf_scan_next(logbuf_iter_t *it, logbuf_rec_t *out)
 {
-    if (!it || it->done || !s_ring) return false;
-    for (;;) {
-        uint32_t off = it->cursor;
-        if (off >= s_cap) off = 0;
-        uint32_t olen = 20u + s_ring[off + 17] + s_ring[off + 18];
-        if (olen == 0 || olen > LB_MTU || s_seq == 0) { it->done = true; return false; }
-        uint32_t rseq = rd32(s_ring + off);
-        if (rseq >= it->seq_snap) { it->done = true; return false; }
-
-        uint32_t tag_len = s_ring[off + 17];
-        uint32_t msg_len = s_ring[off + 18];
-        if (off + 19u + tag_len + msg_len > s_cap) { it->done = true; return false; }
-
-        out->seq    = rseq;
-        out->t_ms   = rd32(s_ring + off + 4);
-        out->ts_ms  = rd64(s_ring + off + 8);
-        out->lvl    = (char)s_ring[off + 16];
-        uint32_t tl = tag_len > sizeof(out->tag) - 1 ? (uint32_t)sizeof(out->tag) - 1 : tag_len;
-        memcpy(out->tag, s_ring + off + 20, tl);
-        out->tag[tl] = 0;
-        out->msg    = (const char *)(s_ring + off + 20 + tag_len);
-
-        it->cursor = off + 20u + tag_len + msg_len;
-        if (it->cursor >= s_cap) it->cursor -= s_cap;
-        return true;
-    }
+    if (!it || it->done || !s_slot) return false;
+    if (it->cursor > it->seq_snap) { it->done = true; return false; }
+    const s_log_slot_t *sl = find_slot(it->cursor);
+    if (!sl) { it->done = true; return false; }  /* 断档（被覆盖）：停止，不跳号 */
+    out->seq    = sl->seq;
+    out->t_ms   = sl->t_ms;
+    out->ts_ms  = sl->ts_ms;
+    out->lvl    = (char)sl->lvl;
+    memcpy(out->tag, sl->tag, sizeof(out->tag));
+    out->tag[sizeof(out->tag) - 1] = 0;
+    out->msg    = sl->text;
+    it->cursor++;
+    return true;
 }
 
 void logbuf_scan_end(logbuf_iter_t *it)
 {
     if (it) it->done = true;
-    read_unlock();
+    s_read_hold = false;
 }
 
 size_t logbuf_dump_since(uint32_t since_seq, char *out, size_t cap)
 {
     if (!out || cap < 2) return 0;
     out[0] = 0;
-    if (!s_ring) return 0;
+    if (!s_slot) return 0;
     size_t used = 0;
     logbuf_iter_t it;
     if (!logbuf_scan_start(&it, since_seq)) { logbuf_scan_end(&it); return 0; }
     logbuf_rec_t r;
     while (logbuf_scan_next(&it, &r)) {
-        /* msg 非 NUL 结尾（指向环内），用 snprintf 精度截断 */
-        int w = snprintf(out + used, cap - used, "%lu %c %s: %.160s\n",
+        int w = snprintf(out + used, cap - used, "%lu %c %s: %s\n",
                          (unsigned long)r.seq, r.lvl, r.tag, r.msg);
         if (w <= 0) break;
         if ((size_t)w >= cap - used) { used = cap - 1; break; }

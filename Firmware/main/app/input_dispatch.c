@@ -558,6 +558,11 @@ static void touch_tick(void)
     static int64_t down_ms;
     static bool longpress_fired;
     static bool drag_active;              /* 问题6：本次按住已进入水平拖动 */
+    /* 【E6 半屏控制条】手势归属：按下沿定格本次手势是否归控制条（控制条是叠加层，
+     * 不冻结宠物态，中途改判会与拖拽/抚摸语义打架）；bar_item_fired = 本次按压
+     * 已触发过某个按钮（按住不放不重复执行）。 */
+    static bool gesture_on_bar;
+    static bool bar_item_fired;
 
     /* 菜单/时钟/配网态：触摸全归 LVGL，宠物交互（抚摸/拖拽/长按）不穿透
      * （真机：菜单里的长按再发 MENU_KEY → 菜单"关了又出现"） */
@@ -639,6 +644,11 @@ static void touch_tick(void)
         down_ms = mp_now_ms();
         longpress_fired = false;
         drag_active = false;
+        /* 【E6 半屏控制条】本次手势是否起于控制条已显示时。整个手势的路由在
+         * 按下沿定格：控制条是叠加层（不冻结宠物态），若中途判定会与宠物
+         * 拖拽/抚摸语义打架。 */
+        gesture_on_bar = render_bgm_bar_showing();
+        bar_item_fired = false;
         /* 【四角标定】raw 与映射后成对输出（500ms 限频防连点刷屏）：真机依次
          * 按四角+中心，对照白点回显位置读本日志，据实测改 touch_read_frame
          * 里的两行映射（现口径 sx=raw_y, sy=480−raw_x，见上方分析） */
@@ -678,6 +688,24 @@ static void touch_tick(void)
         render_calib_set(true, f.x, f.y);    /* 标定期：落点回显（白点=当前候选落点） */
 #endif
     } else if (f.touched && down) {
+        /* 【E6 半屏控制条】手势起于控制条 → 触摸全部归控制条：
+         * 点中按钮=立刻执行（不等抬起，按压反馈更跟手）；拖动/点空白=收起。
+         * 不穿透到宠物区（需求：「菜单/控制层内所有触摸都归它，不穿透」）。 */
+        if (gesture_on_bar) {
+            int item = render_bgm_bar_item_at(f.x, f.y);
+            if (item >= 0) {
+                if (!bar_item_fired) {
+                    bar_item_fired = true;
+                    render_bgm_bar_activate(item);
+                }
+            } else if (abs((int)f.x - (int)down_x) >= TAP_MOVE_PX ||
+                       abs((int)f.y - (int)down_y) >= TAP_MOVE_PX) {
+                render_bgm_bar_hide();
+                gesture_on_bar = false;   /* 已收起：剩余手势交回宠物语义 */
+            }
+            note_interaction();
+            return;
+        }
         int dx = (int)f.x - (int)down_x;
         /* 问题6：按住并水平拖动（≥TAP_MOVE_PX）→ 倾斜视差同款效果：
          * dx ±60px 线性映射 ±8°（render_input_tilt 内部再 clamp），
@@ -702,14 +730,18 @@ static void touch_tick(void)
             (mp_now_ms() - down_ms) >= LONGPRESS_MS &&
             abs((int)f.x - (int)down_x) < TAP_MOVE_PX &&
             abs((int)f.y - (int)down_y) < TAP_MOVE_PX) {
-            /* 宠物区长按 → 呼出选择器（E6 的 BGM 控制条入口在 E7 菜单内：
-             * 渲染层契约未提供独立控制条 API，长按直达菜单=BGM 入口） */
+            /* 【E6 定稿 2026-09-27】宠物区长按 = 呼出 BGM【半屏控制条】
+             * （需求原文：「半屏控制条：播放/暂停/切歌/音量」，由选择器内 BGM
+             * 入口或宠物区长按呼出）。此前实现是"长按 → 打开全屏菜单"，属于
+             * 功能可达但形态不符，E6 缺口核对里记为未实现——改为直接呼出
+             * 下半屏控制条：上半屏照常显示宠物，3s 无操作自动收起。
+             * 离线（BGM 静音降级）时无意义 → 不呼出。 */
             longpress_fired = true;
-            /* 仅宠物态长按呼出菜单：菜单态的触摸归 LVGL（否则菜单里的长按
-             * 会再发 MENU_KEY 把菜单切走——"关了又出现"真机根因，2026-09-26） */
-            if (state_machine_current() == MP_ST_POKER ||
-                state_machine_current() == MP_ST_OFFLINE) {
-                state_machine_handle(MP_SM_EV_MENU_KEY);
+            ESP_LOGI(TAG, "宠物区长按 → 呼出 BGM 半屏控制条");
+            if (!state_machine_offline_mode()) {
+                render_bgm_bar_show();
+            } else {
+                ESP_LOGW(TAG, "离线：BGM 已静音降级，控制条不呼出");
             }
             note_interaction();
         }
@@ -718,6 +750,19 @@ static void touch_tick(void)
         int64_t dur = mp_now_ms() - down_ms;
         int dx = abs((int)f.x - (int)down_x);
         int dy = abs((int)f.y - (int)down_y);
+        /* 【E6 半屏控制条】手势起于控制条：短点空白/面板外 = 收起（不抚摸宠物）；
+         * 点中按钮已按下沿执行（bar_item_fired）。*/
+        if (gesture_on_bar) {
+            gesture_on_bar = false;
+            if (!bar_item_fired && !drag_active &&
+                dur < TAP_MAX_MS && dx < TAP_MOVE_PX && dy < TAP_MOVE_PX) {
+                ESP_LOGI(TAG, "控制条：点空白 → 收起");
+                render_bgm_bar_hide();
+            }
+            drag_active = false;
+            note_interaction();
+            return;
+        }
         if (drag_active) {
             /* 拖动结束 → 人物保持原地（跟手语义） */
             drag_active = false;
@@ -745,6 +790,15 @@ static void touch_tick(void)
 static void key_fire_menu_toggle(void)
 {
     mp_state_t before = state_machine_current();
+
+    /* 【E6 半屏控制条】控制条显示时，顶键=确认当前控件（侧键口径与菜单一致：
+     * 顶=OK 中=移光标 底=收起），不打开菜单。 */
+    if (render_bgm_bar_showing()) {
+        ESP_LOGI(TAG, "顶键：控制条确认第 %d 项", render_bgm_bar_sel());
+        render_bgm_bar_activate(render_bgm_bar_sel());
+        return;
+    }
+
     if (before == MP_ST_MENU) {
         /* 菜单真实化：MENU 态顶键短按=确认当前项（LVGL 内部处理），
          * 退出菜单走屏上 Exit 项（post MENU_EXIT → 状态机回 POKER） */
@@ -831,6 +885,7 @@ static void key_tick(void)
 static int64_t s_k0_pressed_ms;      /* 菜单内该键按下时刻（长按判定） */
 static bool    s_k0_long_fired;      /* 本次按压已触发长按 */
 static bool    s_k0_wait_release;    /* 正在等释放（短按=下移在释放时执行） */
+static bool    s_k0_bar_mode;        /* 【E6】本次按压归 BGM 控制条（否则归菜单） */
 
 static void key0_menu_hold_tick(void);   /* 定义见下（前向声明） */
 
@@ -868,11 +923,21 @@ static void key0_tick(void)
         s_k0_pressed_ms = mp_now_ms();
         s_k0_long_fired = false;
         s_k0_wait_release = true;
+        s_k0_bar_mode = false;
         (void)render_menu_nav;
         return;
     }
     if (st == MP_ST_CLOCK_DOZE) {
         state_machine_notify_activity(); /* DOZE：先唤醒回 POKER */
+        return;
+    }
+    /* 【E6 半屏控制条】控制条显示时，底键（GPIO0）= 光标左移（短按）/收起（长按），
+     * 与菜单内「短按移动 · 长按退出」同构，用户不用记两套。 */
+    if (render_bgm_bar_showing()) {
+        s_k0_pressed_ms = mp_now_ms();
+        s_k0_long_fired = false;
+        s_k0_wait_release = true;
+        s_k0_bar_mode = true;
         return;
     }
     /* POKER/OFFLINE：音量减（用户定稿：桌宠页中/底键=音量加减） */
@@ -881,13 +946,16 @@ static void key0_tick(void)
     render_banner_show_for("VOL -", 1500);   /* 定时横幅：1.5s 后渲染侧自动隐藏 */
 }
 
-/* 菜单内该键的"按住时长"状态机（key0_tick 每次调用都跑，含无按下沿的轮询帧） */
+/* 菜单内该键的"按住时长"状态机（key0_tick 每次调用都跑，含无按下沿的轮询帧）。
+ * 【E6】BGM 半屏控制条复用同一套：短按=光标左移，长按=收起控制条。 */
 #define K0_LONG_MS 800
 static void key0_menu_hold_tick(void)
 {
     if (!s_k0_wait_release) return;
     mp_state_t st = state_machine_current();
-    if (st != MP_ST_MENU) {                 /* 已不在菜单：清状态 */
+    bool on_bar = render_bgm_bar_showing();
+    /* 菜单态与"控制条显示中"两种归属，都不在则清状态 */
+    if (st != MP_ST_MENU && !on_bar) {
         s_k0_wait_release = false;
         return;
     }
@@ -896,17 +964,27 @@ static void key0_menu_hold_tick(void)
 
     if (still_down && !s_k0_long_fired && held >= K0_LONG_MS) {
         s_k0_long_fired = true;
-        ESP_LOGI(TAG, "底键长按（≥%dms）→ 退出菜单", K0_LONG_MS);
-        extern void render_menu_request_exit(void);
-        render_menu_request_exit();
+        if (on_bar) {
+            ESP_LOGI(TAG, "底键长按（≥%dms）→ 收起 BGM 控制条", K0_LONG_MS);
+            render_bgm_bar_hide();
+        } else {
+            ESP_LOGI(TAG, "底键长按（≥%dms）→ 退出菜单", K0_LONG_MS);
+            extern void render_menu_request_exit(void);
+            render_menu_request_exit();
+        }
         return;
     }
     if (!still_down) {                      /* 释放 */
         s_k0_wait_release = false;
         if (!s_k0_long_fired) {
-            ESP_LOGI(TAG, "底键短按 → 菜单光标下移");
-            extern int render_menu_nav_down(void);
-            render_menu_nav_down();
+            if (s_k0_bar_mode) {
+                ESP_LOGI(TAG, "底键短按 → 控制条光标左移");
+                render_bgm_bar_nav(0);
+            } else {
+                ESP_LOGI(TAG, "底键短按 → 菜单光标下移");
+                extern int render_menu_nav_down(void);
+                render_menu_nav_down();
+            }
         }
         s_k0_long_fired = false;
     }
@@ -1240,6 +1318,14 @@ void input_dispatch_task(void *arg)
         }
 
         keyscan_probe_retry();
+        /* 【E7】菜单 BGM 入口请求：收菜单 + 呼出半屏控制条（消费点唯一，避免
+         * 渲染任务与输入任务同时改状态） */
+        if (render_bgm_bar_take_menu_request()) {
+            ESP_LOGI(TAG, "菜单 BGM 入口：收菜单并呼出半屏控制条");
+            state_machine_handle(MP_SM_EV_MENU_KEY);   /* MENU → POKER */
+            render_bgm_bar_show();
+            note_interaction();
+        }
         touch_tick();
         key_tick();
         key0_tick();              /* 中键 GPIO0：音量减（用户定稿，BGM 切换已废弃） */

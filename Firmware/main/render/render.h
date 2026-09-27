@@ -106,6 +106,31 @@ void render_banner_hide(void);
  * 自动隐藏；重复调用刷新文本与计时。常驻横幅（配网）仍走 render_banner_show */
 int  render_banner_show_for(const char *text, uint32_t duration_ms);
 
+/* ---------------- BGM 半屏控制条（E6 定稿；POKER 态下半屏叠加层） ----------
+ * 需求原文：「BGM 播放控制 = 触摸（半屏控制条：播放/暂停/切歌/音量），由选择器
+ * 内 BGM 入口或宠物区长按呼出」。与菜单（全屏窗口）不同，本层只占屏幕下半
+ * 220px，上半仍正常合成宠物；3s 无操作自动收起。CLOCK_DOZE/MENU 态不绘制。
+ *
+ * 上下文约定：show/hide/nav/activate 由 input 任务调用（只写自身状态 + 标脏），
+ * 控件绘制由渲染任务的 compose/flush 完成；控制条维护 tick 挂在 render_tick 内。 */
+void render_bgm_bar_show(void);
+void render_bgm_bar_hide(void);
+bool render_bgm_bar_showing(void);
+/* 光标移动（中键）与确认（顶键）：dir>0 右移 / dir<=0 左移，越界回绕 */
+void render_bgm_bar_nav(int dir);
+/* 执行第 idx 个控件（0=播放/暂停 1=上一首 2=下一首 3=音量- 4=音量+） */
+void render_bgm_bar_activate(int idx);
+int  render_bgm_bar_sel(void);
+/* 触摸命中测试：返回控件号 0..4，-1 = 点在面板空白/面板外（调用方按"收起"处理）。
+ * 布局常量与绘制同源，input 侧不重复算坐标。 */
+int  render_bgm_bar_item_at(int x, int y);
+/* 【E7 定稿】选择器内 BGM 入口请求：菜单"BGM"行确认后置位，input 任务在菜单
+ * 态排空 → 退出菜单（MP_SM_EV_MENU_KEY）+ 呼出半屏控制条。需求口径是"窗口内含
+ * BGM 入口（呼出 E6 的触摸控制条）"，控制条画在 POKER 态（上半屏仍在合成宠物），
+ * 故入口动作 = 收菜单 + 呼出控制条，而不是留在全屏菜单里再画一条控制条。 */
+void render_bgm_bar_request_from_menu(void);
+bool render_bgm_bar_take_menu_request(void);
+
 /* ---------------- IMU 视差（input 任务可异步调用；int32 对齐写原子） --- */
 void render_input_tilt(float tilt_deg);
 /* 拖拽跟手：人物屏幕 x 偏移（px，1:1，clamp ±160）；get 供输入侧增量累计 */

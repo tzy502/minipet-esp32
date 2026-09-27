@@ -39,6 +39,7 @@
 #include "esp_log.h"
 #include "nvs.h"
 #include "esp_system.h"
+#include "esp_heap_caps.h"      /* 内部堆取证：SoftAP 早启/晚启的剩余内存对比 */
 #include "cJSON.h"
 
 #include "app_core.h"
@@ -450,6 +451,7 @@ static void dump_internal_heap(void)
 
 static void start_httpd(void)
 {
+    if (s_httpd) return;                 /* 幂等：早启路径已起好就直接返回 */
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.uri_match_fn = httpd_uri_match_wildcard;    /* 通配捕获所有探测路径 */
     cfg.max_uri_handlers = 4;
@@ -598,9 +600,40 @@ static void wifi_init_once(void)
     seed_time_from_rtc_once();   /* 问题7：断网冷启动用 RTC 种子系统时钟（一次性） */
 }
 
-static void wifi_start_ap(const char *ssid)
+/* SoftAP 已启动标记：main.c 的早启路径与 portal_task 共用本函数（幂等）。
+ * 不幂等就会二次 esp_wifi_stop/start，把已 up 的 beacon 再分一次 → 内部堆
+ * 挤爆（真机 Reset WiFi 后无线重启的崩溃现场之一）。 */
+static bool s_ap_up;
+
+/** SoftAP 启动/重配（幂等）。ssid 为空 → 自动取 MiniPet-<MAC4>。 */
+static esp_err_t wifi_start_ap(const char *ssid_in)
 {
+    char ssid[16];
+    if (ssid_in && ssid_in[0]) {
+        strlcpy(ssid, ssid_in, sizeof(ssid));
+    } else {
+        provision_get_ap_ssid(ssid, sizeof(ssid));
+    }
+
     wifi_init_once();
+
+    if (s_ap_up) {
+        /* 仅重下 SSID 配置，不 stop/start：避免 beacon/管理帧缓冲二次分配 */
+        wifi_config_t ap = { 0 };
+        strlcpy((char *)ap.ap.ssid, ssid, sizeof(ap.ap.ssid));
+        ap.ap.ssid_len = (uint8_t)strlen(ssid);
+        ap.ap.channel = 6;
+        ap.ap.authmode = WIFI_AUTH_OPEN;
+        ap.ap.max_connection = 2;
+        esp_err_t r = esp_wifi_set_config(WIFI_IF_AP, &ap);
+        ESP_LOGW(TAG, "SoftAP 已在跑，只更新配置：%s", esp_err_to_name(r));
+        return r;
+    }
+
+    ESP_LOGW(TAG, "起 SoftAP 前内部堆 空闲=%u 最大块=%u",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+
     esp_wifi_stop();    /* 失败重开路径下 WiFi 可能仍以 STA 模式在跑，先停干净 */
     /* APSTA：STA 口保持 up 才能扫周围 WiFi（GET /scan）。
      * 扫描逐信道跳转时 SoftAP 客户端短暂卡顿 —— 页面已提示「正在扫描…」 */
@@ -613,6 +646,11 @@ static void wifi_start_ap(const char *ssid)
     ap.ap.max_connection = 2;
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap));
     ESP_ERROR_CHECK(esp_wifi_start());
+    s_ap_up = true;
+    ESP_LOGW(TAG, "SoftAP 已启动：起后内部堆 空闲=%u 最大块=%u",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+    return ESP_OK;
 }
 
 /* ================================================================== */
@@ -720,6 +758,73 @@ void provision_wifi_preinit(void)
     wifi_init_once();   /* 幂等：只建 esp_netif + esp_wifi_init，不连接 */
 }
 
+/* 【真机根因修复 #2 · 2026-09-27】SoftAP 起了、portal 任务却建不起来 →
+ * 192.168.4.1 打不开（用户实测："重新配对以后没出现显示配对页 并且
+ * 192.168.4.1 进不去"）。真机日志链：
+ *     起 SoftAP 前 空闲=74751 最大块=31732     ← 早启修好后的现场
+ *     SoftAP 已启动  空闲=69331 最大块=30708
+ *     portal 任务创建失败（空闲=4955 最大块=3444）  ← 渲染任务(12K 栈)+LVGL
+ *                                                    +codec/I2S+各网络任务
+ *                                                    把 64KB 切成碎片
+ * 单靠"重试"救不回来（没有释放源），因此把【配网所必需的两样东西】提前到
+ * 堆最干净的窗口建好：
+ *   ① SoftAP（provision_ap_early_start_if_needed，已有）
+ *   ② httpd 服务（配网页本体，栈 6~8KB —— 这是真正建不起的那个）
+ *   ③ dns53 captive 劫持（3KB）
+ * portal 任务本身只做"等 /save → 拆 AP → 连 STA → 重启"，不再承担建服务。 */
+void provision_portal_early_start_if_needed(void)
+{
+    if (provision_has_config()) return;
+
+    ESP_LOGW(TAG, "无配网凭据 → 提前起 portal 三件套（AP + httpd + dns53），"
+                  "内部堆 空闲=%u 最大块=%u",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+
+    esp_err_t ar = wifi_start_ap(NULL);
+    if (ar != ESP_OK) ESP_LOGE(TAG, "SoftAP 早启失败：%s", esp_err_to_name(ar));
+
+    start_httpd();            /* 幂等：已启动直接返回 */
+
+    if (!s_dns_task) {
+        if (xTaskCreate(dns_hijack_task, "dns53", 3072, NULL, 4, &s_dns_task) != pdPASS) {
+            s_dns_task = NULL;
+            ESP_LOGE(TAG, "dns53 早启失败（captive 劫持退化：仍需手动访问 192.168.4.1）");
+        }
+    }
+
+    ESP_LOGW(TAG, "portal 早启完成：AP=%s httpd=%s dns=%s（空闲=%u 最大块=%u）",
+             esp_err_to_name(ar),
+             s_httpd ? "up" : "down",
+             s_dns_task ? "up" : "down",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+}
+
+/* 【真机修复 2026-09-27】Reset WiFi / 首次开机（NVS 无配网凭据）后无线重启：
+ *   W (1519) wifi:Init max length of beacon: 752/752
+ *   W (1519) wifi:alloc eb len=752 type=4 fail
+ *   Guru Meditation Error: Core 0 panic'ed (LoadProhibited)  EXCVADDR=0x2c
+ * 崩点在 SoftAP 启动：beacon 缓冲分配失败后 WiFi 驱动空指针解引用。
+ * 根因不是"没内存"而是"没在正确时刻要内存"——portal_task 在渲染任务(12K 栈
+ * +整屏 canvas/菜单缓冲)、bgm(16K 栈 + I2S DMA)、es8311 都建好之后才起 AP，
+ * 那时内部堆已被切碎（同一份日志里相邻一行就是 "bgm 任务首建失败（内部堆挤压）"）。
+ *
+ * 因此：无配网凭据（必然要进 portal）时，把 SoftAP 提前到渲染/BGM 之前启动，
+ * 让 beacon/管理帧缓冲在堆最干净的窗口一次拿到；portal_task 里的
+ * wifi_start_ap() 变成幂等更新（不再 stop/start）。仅"无凭据"分支早启：
+ * 有凭据时不需要 AP，早启只会白占 ~10KB 内部堆。 */
+void provision_ap_early_start_if_needed(void)
+{
+    if (provision_has_config()) return;
+
+    ESP_LOGW(TAG, "无配网凭据 → 提前启动 SoftAP（在渲染/BGM 分配之前）");
+    esp_err_t r = wifi_start_ap(NULL);
+    if (r != ESP_OK) {
+        ESP_LOGE(TAG, "SoftAP 早启失败：%s（portal_task 会再试一次）", esp_err_to_name(r));
+    }
+}
+
 static volatile bool s_rtc_started;
 bool provision_rtc_task_running(void) { return s_rtc_started; }
 
@@ -787,13 +892,26 @@ static void portal_task(void *arg)
 {
     (void)arg;
 
+    /* 【阶段日志】此前任务静默启动：真机"热点页打不开"时日志里查不到卡在哪一步
+     * （起栈→dns→httpd→等待保存），现每一步都留痕。 */
+    ESP_LOGW(TAG, "portal_task 起步：内部堆 空闲=%u 最大块=%u",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+
     /* SSID = MiniPet-<MAC 后 4 hex>（横幅提示共用 provision_get_ap_ssid） */
     char ssid[16];
     provision_get_ap_ssid(ssid, sizeof(ssid));
 
-    wifi_start_ap(ssid);
+    esp_err_t ar = wifi_start_ap(ssid);
+    ESP_LOGW(TAG, "portal_task: AP 就绪=%s (ssid=%s)", esp_err_to_name(ar), ssid);
     s_portal_active = true;
-    xTaskCreate(dns_hijack_task, "dns53", 3072, NULL, 4, &s_dns_task);
+    /* httpd/dns53 通常已由 provision_portal_early_start_if_needed 在开机早段
+     * 起好（那时堆干净）；这里是兜底：早启没跑或失败时再试一次。 */
+    if (!s_dns_task &&
+        xTaskCreate(dns_hijack_task, "dns53", 3072, NULL, 4, &s_dns_task) != pdPASS) {
+        ESP_LOGE(TAG, "dns53 任务创建失败（captive portal 域名劫持退化：仍需手动访问 192.168.4.1）");
+        s_dns_task = NULL;
+    }
     start_httpd();
 
     ESP_LOGI(TAG, "portal up: ssid=%s ip=192.168.4.1 last_fail=%d",
@@ -964,12 +1082,95 @@ esp_err_t provision_wifi_connect_sta(uint32_t timeout_ms)
     return ESP_FAIL;
 }
 
+/* 【真机根因 2026-09-27】portal 任务建不起来 → 配网页永远打不开（用户"重置后
+ * 连热点都配不上"的下半段）。实测证据（本次启动日志）：
+ *     起 SoftAP 前 空闲=74751 最大块=31732
+ *     SoftAP 已启动  空闲=69331 最大块=30708
+ *     portal 任务创建失败（空闲=4955 最大块=3444）
+ * SoftAP → portal 之间被渲染任务(12K 栈)+LVGL 对象池+Codec/I2S 吃掉 ~64KB，
+ * 只剩 3.4KB 最大块，6144 固定栈必然失败（旧实现还不检查返回码 → 静默）。
+ *
+ * 对策：① 栈自适应降档（6144 → 4096）；② 失败不当场放弃——挂 2s 周期重试，
+ * 因为该窗口内的临时分配（LVGL 首帧、素材懒加载）随后会释放；③ 每次重试都
+ * 留日志，真机排障一眼看到"卡在内存"而不是"功能没写"。
+ * 上限 60 次（2 分钟）后停手：常驻却永远建不起来只会白刷日志。 */
+#define PORTAL_TASK_STACK     6144
+#define PORTAL_TASK_STACK_MIN 4096
+#define PORTAL_RETRY_MS       2000
+#define PORTAL_RETRY_MAX      60
+static esp_timer_handle_t s_portal_retry_timer;
+static int                s_portal_retry_left;
+
+static void portal_task(void *arg);
+
+/** 建 portal 任务（幂等）。返回 true = 已就绪。 */
+static bool portal_task_try(void)
+{
+    if (s_portal_task) return true;
+    static const uint32_t stacks[] = { PORTAL_TASK_STACK, PORTAL_TASK_STACK_MIN };
+    for (size_t i = 0; i < sizeof(stacks) / sizeof(stacks[0]); i++) {
+        BaseType_t rc = xTaskCreatePinnedToCore(portal_task, "portal", stacks[i], NULL,
+                                                4, &s_portal_task, tskNO_AFFINITY);
+        if (rc == pdPASS) {
+            ESP_LOGW(TAG, "portal 任务已创建（栈 %u，内部堆 空闲=%u 最大块=%u）",
+                     (unsigned)stacks[i],
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                     (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+            return true;
+        }
+    }
+    return false;
+}
+
+static void portal_retry_cb(void *arg)
+{
+    (void)arg;
+    if (s_portal_task) {                       /* 已被别处建起：收工 */
+        if (s_portal_retry_timer) { esp_timer_delete(s_portal_retry_timer); s_portal_retry_timer = NULL; }
+        return;
+    }
+    if (portal_task_try()) {
+        if (s_portal_retry_timer) { esp_timer_delete(s_portal_retry_timer); s_portal_retry_timer = NULL; }
+        return;
+    }
+    if (--s_portal_retry_left <= 0) {
+        ESP_LOGE(TAG, "portal 任务重试窗口耗尽——配网页不可用（内部堆 空闲=%u 最大块=%u）",
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+        esp_timer_delete(s_portal_retry_timer);
+        s_portal_retry_timer = NULL;
+        return;
+    }
+    ESP_LOGW(TAG, "portal 任务仍建不起（余 %d 次，空闲=%u 最大块=%u）",
+             s_portal_retry_left,
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+}
+
 void provision_start_portal(void)
 {
     if (s_portal_task) return;
     s_portal_active = true;
-    xTaskCreatePinnedToCore(portal_task, "portal", PORTAL_TASK_STACK, NULL,
-                            4, &s_portal_task, tskNO_AFFINITY);
+    if (portal_task_try()) return;
+
+    /* 首次失败：转为周期重试（等待该窗口的临时分配释放） */
+    if (!s_portal_retry_timer) {
+        ESP_LOGE(TAG, "portal 任务创建失败（内部堆 空闲=%u 最大块=%u）→ 转 %dms 周期重试",
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+                 PORTAL_RETRY_MS);
+        s_portal_retry_left = PORTAL_RETRY_MAX;
+        esp_timer_create_args_t ta = {
+            .callback = portal_retry_cb,
+            .name = "portalretry",
+        };
+        if (esp_timer_create(&ta, &s_portal_retry_timer) == ESP_OK) {
+            esp_timer_start_periodic(s_portal_retry_timer, (uint64_t)PORTAL_RETRY_MS * 1000ULL);
+        } else {
+            s_portal_retry_timer = NULL;
+            ESP_LOGE(TAG, "portal 重试定时器也创建失败——配网页不可用");
+        }
+    }
 }
 
 void provision_stop(void)

@@ -67,12 +67,20 @@ extern "C" {
 /* 未配网常驻横幅（问题4：POKER 态顶部 480×28 深色底白字，5x7 字体 ×2）
  * 字形加 1px 黑描边（问题3：浅色地图/条带上白字可读性） */
 #define RC_BANNER_H         28
+/* 【用户反馈 2026-09-27】横幅原先贴 y=0 画，真机被 AMOLED 圆角/边框切掉
+ * （照片里只剩一条发光边，"肉眼看不到"）。下移到圆角安全区。 */
+#define RC_BANNER_Y         46
 #define RC_BANNER_SCALE     2
 #define RC_BANNER_PAD_X     8
 #define RC_BANNER_PAD_Y     7      /* (28 - 7*2)/2，垂直居中 */
 #define RC_BANNER_BG        0x2104 /* 深色底（#102020） */
 #define RC_BANNER_FG        0xFFFF /* 白字 */
 #define RC_BANNER_OUTLINE   0x0000 /* 1px 黑描边 */
+
+/* 【E9】CLOCK_DOZE 睡眠态宠物亮度（百分比）：需求「宠物睡眠态 + 数字时钟 +
+ * AMOLED 纯黑背景只数字发光（省电）」——时钟态把宠物降亮合成，既看得见宠物
+ * 睡着，又保持黑底省电口径。 */
+#define RC_SLEEP_DARKEN     35
 
 /* 1bit 掩码位序：MSB first（字节内 bit7 为首像素） */
 static inline bool rc_mask_bit(const uint8_t *mask, uint32_t idx)

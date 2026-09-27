@@ -37,6 +37,7 @@ builder.Services.AddSingleton<WzService>();              // WZ 读取（catalog 
 builder.Services.AddSingleton<MusicCatalogService>();    // WZ 曲库目录（BGM 曲目列表/决策共用）
 builder.Services.AddSingleton<ThumbService>();           // 64×64 缩略图 + 磁盘缓存（part/paperdoll 走真实渲染）
 builder.Services.AddSingleton<PresetStore>();            // 纸娃娃预设（data/presets/）
+builder.Services.AddSingleton<FavoritesStore>();          // 素材收藏（E4：data/config/favorites.json，Web 探测到即启用同步）
 builder.Services.AddSingleton<PaperdollPackService>();   // petConfig → 设备装扮资产包（换装下发链路）
 builder.Services.AddSingleton<FontPackService>();       // 16/24/32 三档 FONT 包（E12 字体链，hello 自动补）
 builder.Services.AddSingleton<DeviceAssetService>();     // 地图/NPC → 设备资产登记（E7 选择器/推送）

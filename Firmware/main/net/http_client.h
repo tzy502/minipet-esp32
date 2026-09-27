@@ -43,7 +43,8 @@ const char *mp_http_server_url(void);
 void mp_http_set_server_url(const char *url);
 
 /* E14 设备日志增量上报一步（POST /api/device/log）。由已在跑的 poller 任务
- * 周期调用（不新建任务）：20s 心跳，E 级日志或首报则立即；失败退避重传。 */
+ * 周期调用（不新建任务）：20s 心跳，E 级日志或首报则立即；失败退避重传，
+ * 仅 HTTP 200 才推进游标（不丢日志）。单批 ≤4.6KB（msgHex 使正文体积 ×2）。 */
 void mp_http_device_log_step(void);
 
 /* 设备 UUID（"AABBCCDDEEFF"，efuse MAC，开机生成，稳定不变） */

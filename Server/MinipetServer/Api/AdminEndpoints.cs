@@ -107,8 +107,18 @@ public static class AdminEndpoints
         g.MapGet("/thumb", (ThumbService thumbs, string type, string id, string? folder = null, string? img = null, int? size = null)
             => Results.File(thumbs.GetOrCreatePng(type, id, folder, img, size), "image/png"));
 
-        // ── 纸娃娃预设 CRUD（data/presets/，供设备选择器「纸娃娃 tab」，E7/E4）──
-        g.MapGet("/presets", (PresetStore presets) => Results.Json(new { presets = presets.List() }));
+        // ── 素材收藏（E4「地图选择含收藏」；Web 探测到端点即自动从 localStorage
+        //    单机模式切到服务端同步，client.js 的 FAVORITES_PATH 契约）──
+        g.MapGet("/materials/favorites", (FavoritesStore favs)
+            => Results.Json(new { favorites = favs.Get() }));
+        g.MapPut("/materials/favorites", (FavoritesRequest body, FavoritesStore favs) =>
+        {
+            // body.favorites 缺失 = 清空（整表替换语义，与 Web 全量上传一致）
+            var saved = favs.Replace(body?.Favorites);
+            return Results.Json(new { ok = true, favorites = saved });
+        });
+
+        // ── 纸娃娃预设 CRUD（data/presets/，供设备选择器「纸娃娃 tab」，E7/E4）──        g.MapGet("/presets", (PresetStore presets) => Results.Json(new { presets = presets.List() }));
         g.MapPost("/presets", (PresetUpsertRequest body, PresetStore presets) =>
         {
             if (string.IsNullOrWhiteSpace(body?.Name))
@@ -615,6 +625,12 @@ public static class AdminEndpoints
         public JsonElement? Data { get; set; }
     }
 
+    /// <summary>PUT /materials/favorites：{ favorites: { map:[], mob:[], npc:[] } }（整表替换）。</summary>
+    public sealed class FavoritesRequest
+    {
+        public Dictionary<string, List<string>>? Favorites { get; set; }
+    }
+
     // ── 视图组装 ──────────────────────────────────────────────────────────
 
     private static object DeviceCard(DeviceRecord d, DeviceRegistry reg, HealthReport health)
@@ -740,4 +756,110 @@ public sealed class PresetStore
     }
 
     private string FileOf(string id) => Path.Combine(_dir, StorageUtil.SafeFileId(id) + ".json");
+}
+
+/// <summary>
+/// 素材收藏存取（E4「地图选择含收藏」/ E7 选择器收藏 tab）。
+/// 落盘 data/config/favorites.json，形态与 Web 契约严格一致：
+///   { "favorites": { "map": ["200000100", …], "mob": [...], "npc": [...] } }
+///
+/// 背景：Web 侧收藏原本只有 localStorage 单机模式——client.js 明确写着
+/// 「服务端**当前没有**收藏存储/端点（AdminEndpoints.cs 无 /materials/favorites 路由）」，
+/// 探测不到就退回本机。服务端补上本端点后，Web 无需改动即自动启用同步
+/// （接口需求见 Web/docs/interfaces-needed-from-server.md §T7）。
+///
+/// 约定：桶名固定三桶（与 Web FAVORITE_BUCKETS 同源）；未知桶名只接受不落盘之外
+/// 不做特殊处理（原样保留，便于将来加桶）；id 逐个 trim + 去重 + 上限保护，
+/// 防 Web 侧异常写入把文件撑爆。
+/// </summary>
+public sealed class FavoritesStore
+{
+    private const int MaxIdsPerBucket = 500;
+    private static readonly string[] Buckets = { "map", "mob", "npc" };
+
+    private readonly string _file;
+    private readonly object _lock = new();
+    private Dictionary<string, List<string>> _buckets = new();
+
+    public FavoritesStore(Config.ServerPaths paths)
+    {
+        _file = Path.Combine(paths.ConfigDir, "favorites.json");
+        Directory.CreateDirectory(paths.ConfigDir);
+        Load();
+    }
+
+    private void Load()
+    {
+        try
+        {
+            var doc = StorageUtil.ReadJson<FavoritesDoc>(_file);
+            _buckets = Normalize(doc?.Favorites);
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[Favorites] 读取失败，按空收藏继续: {ex.Message}");
+            _buckets = Normalize(null);
+        }
+    }
+
+    /// <summary>GET 用：永远返回三桶齐全的对象（缺失桶 = 空数组，前端不用判 undefined）。</summary>
+    public Dictionary<string, List<string>> Get()
+    {
+        lock (_lock) return _buckets.ToDictionary(kv => kv.Key, kv => new List<string>(kv.Value));
+    }
+
+    /// <summary>PUT 用：整表替换（Web 侧本来就把三桶全量发上来）。返回落盘后的形态。</summary>
+    public Dictionary<string, List<string>> Replace(Dictionary<string, List<string>>? incoming)
+    {
+        lock (_lock)
+        {
+            _buckets = Normalize(incoming);
+            StorageUtil.AtomicWriteAllText(_file,
+                JsonSerializer.Serialize(new FavoritesDoc { Favorites = _buckets }, StorageUtil.JsonOpts));
+            return _buckets.ToDictionary(kv => kv.Key, kv => new List<string>(kv.Value));
+        }
+    }
+
+    private static Dictionary<string, List<string>> Normalize(Dictionary<string, List<string>>? src)
+    {
+        var outp = new Dictionary<string, List<string>>();
+        foreach (var b in Buckets)
+        {
+            var list = new List<string>();
+            if (src != null && src.TryGetValue(b, out var ids) && ids != null)
+            {
+                foreach (var raw in ids)
+                {
+                    var id = raw?.Trim();
+                    if (string.IsNullOrEmpty(id)) continue;
+                    if (!list.Contains(id)) list.Add(id);
+                    if (list.Count >= MaxIdsPerBucket) break;
+                }
+            }
+            outp[b] = list;
+        }
+        // 未知桶原样保留（将来加桶时旧数据不丢），同样做去重与上限
+        if (src != null)
+        {
+            foreach (var kv in src)
+            {
+                if (outp.ContainsKey(kv.Key)) continue;
+                var list = new List<string>();
+                foreach (var raw in kv.Value ?? new List<string>())
+                {
+                    var id = raw?.Trim();
+                    if (string.IsNullOrEmpty(id) || list.Contains(id)) continue;
+                    list.Add(id);
+                    if (list.Count >= MaxIdsPerBucket) break;
+                }
+                outp[kv.Key] = list;
+            }
+        }
+        return outp;
+    }
+
+    private sealed class FavoritesDoc
+    {
+        public Dictionary<string, List<string>> Favorites { get; set; } = new();
+    }
 }

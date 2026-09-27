@@ -46,6 +46,7 @@
 #include "asset_dl.h"
 #include "ota.h"
 #include "bgm.h"
+#include "logbuf.h"      /* E14 设备环形日志（PSRAM） */
 
 static const char *TAG = "main";
 
@@ -187,6 +188,11 @@ static void app_main_task(void *arg)
      * socket（连接失败优雅返回）；不初始化 → tcpip mbox 断言崩溃 */
     ESP_ERROR_CHECK(esp_netif_init());
 
+    /* E14 设备环形日志：尽早上电（越早，Web 能拉到的启动期日志越全）。
+     * 缓冲在 PSRAM（32KB，内部动态堆 0 占用）；挂 esp_log vprintf，
+     * 串口输出不受影响。失败仅降级（不阻塞启动）。 */
+    logbuf_init();
+
     /* 三队列 */
     mp_event_q = xQueueCreate(MP_EVENT_Q_LEN, sizeof(mp_event_t));
     mp_cmd_q   = xQueueCreate(MP_CMD_Q_LEN, sizeof(mp_cmd_t));
@@ -220,6 +226,17 @@ static void app_main_task(void *arg)
      * → 无限重启、WiFi 从未初始化 → 设备永不 poll（"服务器重启后不重连"总根因）。
      * 这里在任务创建前先把 WiFi 栈建好（幂等；后续 provision_* 调用直接复用）。 */
     provision_wifi_preinit();
+
+    /* 【Reset WiFi 后无线重启修复 2026-09-27】无配网凭据 → 这里就把 SoftAP 起了。
+     * 崩因与修复口径见 provision.h 的 provision_ap_early_start_if_needed 注释：
+     * portal_task 起 AP 太晚（渲染/BGM 之后），beacon 缓冲分配失败 → WiFi 驱动
+     * 空指针 → rst:0xc 无限重启。必须在 render_init 与各任务创建之前。 */
+    provision_ap_early_start_if_needed();
+
+    /* 【配网页可用性修复 2026-09-27】httpd(6~8KB 栈) 必须同样在这个干净窗口
+     * 建好：等渲染任务/LVGL/codec 起来后内部堆只剩 5KB/最大块 3.4KB，portal
+     * 任务建不起来 → 用户 Reset WiFi 后连上热点却打不开 192.168.4.1（真机实测）。 */
+    provision_portal_early_start_if_needed();
 
     state_machine_init();
     render_init(&MINIPET_PROFILE_AMOLED216);   /* FATFS 挂载后、首 tick 前（render.h） */

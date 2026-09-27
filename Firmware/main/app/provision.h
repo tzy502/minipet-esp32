@@ -55,6 +55,31 @@ void provision_rtc_resync_start(void);
  * WiFi 永不初始化 → 设备永不 poll。幂等，后续 provision_* 复用同一实例。 */
 void provision_wifi_preinit(void);
 
+/* 【启动早期 · 真机崩溃修复】无配网凭据时提前启动 SoftAP。
+ *
+ * 背景：Reset WiFi/首次开机后设备无线重启，崩点为空指针（EXCVADDR=0x2c），
+ * 现场日志 `wifi:alloc eb len=752 type=4 fail` → SoftAP 的 beacon 缓冲没分到，
+ * WiFi 驱动随后解引用空指针。原因：portal_task 起 AP 时，渲染任务 + 整屏缓冲
+ * + BGM/I2S DMA 已把内部堆切碎（相邻日志即 "bgm 任务首建失败（内部堆挤压）"）。
+ *
+ * 契约：必须在渲染/BGM 任务创建【之前】调用（main.c 紧接 provision_wifi_preinit
+ * 之后）。有配网凭据时本函数空转（不需要 AP，也不白占内部堆）。幂等。 */
+void provision_ap_early_start_if_needed(void);
+
+/* 【启动早期 · 配网页可用性修复】无配网凭据时提前建好 portal 三件套
+ * （SoftAP + httpd 配网页 + dns53 captive 劫持）。
+ *
+ * 背景（真机实测 2026-09-27）：用户 Reset WiFi 后连热点却打不开 192.168.4.1。
+ * 日志链：起 SoftAP 前内部堆 空闲=74751/最大块=31732 → SoftAP 起后 69331/30708
+ * → portal 任务创建失败（空闲=4955 最大块=3444）。渲染任务(12K 栈)+LVGL+codec/
+ * I2S+各网络任务把内部堆切成碎片，6KB 级 httpd 栈再也建不起来（旧实现还静默）。
+ * 因此 6~8KB 的 httpd 必须在这个干净窗口建好；portal 任务本身只负责
+ * "等 /save → 拆 AP → 连 STA → 重启"，不再承担建服务。
+ *
+ * 契约：必须在渲染/BGM 任务创建【之前】调用（main.c 紧接 ap_early_start 之后）。
+ * 有配网凭据时空转。幂等（httpd/dns 各自查重）。 */
+void provision_portal_early_start_if_needed(void);
+
 /* E14：恢复出厂配网（清 WiFi/服务器地址/轮询游标后重启 → 进 SoftAP portal）。 */
 void provision_factory_reset(void);
 

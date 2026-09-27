@@ -3,4 +3,11 @@
 dependencies:
   lvgl/lvgl: "^9"
   waveshare/esp32_s3_touch_amoled_2_16: "^2.0.1"
+  ## E14 mDNS：IDF 5.5 不内置 mdns（sdkconfig 里的 CONFIG_LWIP_DNS_SUPPORT_MDNS_QUERIES
+  ## 只是 DNS 解析，不是服务发现），服务发现能力由 registry 组件提供。
+  ## 约束 "^1.2.2" 实际解析到 1.13.1（见 dependencies.lock，该文件 gitignore）；
+  ## 代码只依赖 mdns_init/mdns_free/mdns_query_ptr/mdns_query_a 与 mdns_result_t
+  ## 的 hostname/port/addr 字段 —— 这些在 1.2.2 → 1.13.1 之间签名未变（已比对
+  ## 两个版本的头文件 + 编译验证）。
+  espressif/mdns: "^1.2.2"
   idf: ">=5.5"

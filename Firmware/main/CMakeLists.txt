@@ -50,6 +50,7 @@ idf_component_register(
         lwip               # sockets（DNS 劫持）/SNTP
         app_update         # esp_ota_ops（E11 双分区）
         json               # cJSON（协议/E2 全 JSON 端点）
+        mdns               # E14 服务端发现（espressif/mdns，见 idf_component.yml）
         esp_timer
         esp_system
         esp_common
