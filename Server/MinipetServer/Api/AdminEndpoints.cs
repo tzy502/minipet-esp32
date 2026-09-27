@@ -700,6 +700,8 @@ public static class AdminEndpoints
         public string? TrackId { get; set; }
         /// <summary>点播曲名（可选，仅用于事件日志与设备偏好展示）。</summary>
         public string? TrackTitle { get; set; }
+        /// <summary>点播曲目所属音源（可选，"wz"/"qq"）：与设备当前音源不同时先补发 source 指令。</summary>
+        public string? Source { get; set; }
     }
 
     public sealed class PresetUpsertRequest
