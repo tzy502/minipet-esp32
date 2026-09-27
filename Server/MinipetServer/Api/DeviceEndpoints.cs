@@ -124,6 +124,7 @@ public static class DeviceEndpoints
             pairingCode = code,
             config = new
             {
+                imuSensitivity = th.ImuSensitivity,   /* E4：倍率，有效阈值 = 阈值 ÷ 灵敏度 */
                 imuDeadzoneDeg = th.ImuDeadzoneDeg,
                 tapLightG = th.TapLightG,
                 tapHardG = th.TapHardG,

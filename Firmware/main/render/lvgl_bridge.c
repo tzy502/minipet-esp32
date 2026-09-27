@@ -382,8 +382,24 @@ void render_menu_nav(int dir)
         return;
     }
     int old = s_menu.sel;
-    if (dir) s_menu.sel = (s_menu.sel + 1) % s_menu.row_cnt;
-    else     s_menu.sel = (s_menu.sel + s_menu.row_cnt - 1) % s_menu.row_cnt;
+    /* 【2026-09-27 真机】原为回绕（wrap）：根页在第 0 行按"上移"会跳到最后一
+     * 行，用户观感是"上移无效/光标乱跳"。改为【到边界停住】——首行上移、
+     * 末行下移都不再动作；且仅在真正移动时打日志（限位时打一条 WARN 便于取证）。 */
+    if (dir) {
+        if (s_menu.sel + 1 >= s_menu.row_cnt) {
+            ESP_LOGW("menu", "nav(%d) 已到末行 %d/%d：停住（不回绕）",
+                     dir, s_menu.sel, s_menu.row_cnt);
+            return;
+        }
+        s_menu.sel += 1;
+    } else {
+        if (s_menu.sel <= 0) {
+            ESP_LOGW("menu", "nav(%d) 已到首行 0/%d：停住（不回绕）",
+                     dir, s_menu.row_cnt);
+            return;
+        }
+        s_menu.sel -= 1;
+    }
     ESP_LOGI("menu", "nav(%d) sel %d→%d/%d（100ms 内贴高亮）", dir, old, s_menu.sel, s_menu.row_cnt);
 }
 
@@ -932,15 +948,25 @@ static void menu_rebuild(void)
 static void menu_apply_selection(void)
 {
     if (s_menu.sel_applied == s_menu.sel) return;
+    int styled = 0;
     for (int i = 0; i < s_menu.row_cnt && i < MENU_ROWS_MAX; i++) {
         if (!s_menu.rows[i]) continue;
         if (!s_menu.row_enabled[i]) {
             menu_style_row_disabled(s_menu.rows[i], i == s_menu.sel);  /* 光标可见 */
+            styled++;
             continue;
         }
         menu_style_row(s_menu.rows[i], i == s_menu.sel);
+        styled++;
     }
     s_menu.sel_applied = s_menu.sel;
+    /* 【取证探针 2026-09-27】用户报"光标没动"：把"贴了哪些行、贴到第几行"变成
+     * 日志事实。styled/row_cnt 不符 = rows[] 空洞；sel 变化但日志连续出现 = tick
+     * 在跑、样式已改 → 问题在重绘（DIRECT 缓冲失效范围）而非逻辑。 */
+    ESP_LOGI("menu", "高亮已贴：sel=%d/%d styled=%d rows=%d childs=%u",
+             s_menu.sel, s_menu.row_cnt, styled,
+             (s_menu.rows[s_menu.sel] != NULL) ? 1 : 0,
+             (unsigned)lv_obj_get_child_count(lv_screen_active()));
 }
 
 /* 菜单态 100ms 节拍（渲染任务）：排空侧键/触摸/换页请求 → 贴高亮 → 轮询下载

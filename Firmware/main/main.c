@@ -39,6 +39,7 @@
 #include "hal_contract.h"
 #include "watchdog.h"
 #include "state_machine.h"
+#include "provision.h"
 #include "input_dispatch.h"
 #include "poller.h"
 #include "events.h"
@@ -60,6 +61,7 @@ mp_app_config_t g_mp_cfg = {
     .tilt_debounce_ms  = 300,      /* E6：300ms 防抖 */
     .tap_light_g       = 2.0f,     /* E6：<2g */
     .tap_hard_g        = 4.0f,     /* E6：≥4g */
+    .imu_sensitivity   = 1.0f,     /* E4：IMU 灵敏度倍率（1.0=出厂；hello config 可覆盖） */
     .brightness        = 80,
 };
 
@@ -250,6 +252,10 @@ void app_main(void)
     /* 自检 + 初始迁移（BOOT→SELF_TEST→…；阻塞含 WiFi/服务端探测） */
     bool psram_ok = (heap_caps_get_total_size(MALLOC_CAP_SPIRAM) > 0);
     state_machine_boot(sd_ok, psram_ok);
+
+    /* E9 常态化校时：自检后启动（内部等 STA 连上才动作；时间已有效则转 6h 周期）。
+     * 真机缺口见 provision.c 的 rtc_resync_task 注释（待机时钟恒 --:--）。 */
+    provision_rtc_resync_start();
 
     /* 开机事件上报（E11：健康状态 Web 可见） */
     mp_post_event_simple(MP_EVT_BOOT, sd_ok ? 1 : 0, 0, MP_FIRMWARE_VERSION);

@@ -45,6 +45,10 @@ bool provision_is_active(void);
 /* portal（SoftAP+HTTP 配网）处于活动态（供 poller 挂起轮询用） */
 bool provision_portal_active(void);
 
+/* E9 常态化校时：起后台任务，系统时间无效（RTC 未校准）时按窗口触发 SNTP
+ * 并回写 PCF85063；成功/有效后转 6 小时周期。幂等，可重复调用。 */
+void provision_rtc_resync_start(void);
+
 #ifdef __cplusplus
 }
 #endif

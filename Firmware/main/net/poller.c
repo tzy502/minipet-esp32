@@ -31,10 +31,12 @@ static const char *TAG = "poller";
 #define BACKOFF_MIN_MS  1000
 #define BACKOFF_MAX_MS  60000    /* E11: 60s 封顶 */
 #define POLL_TIMEOUT_MS 65000    /* 服务端 hold 50s + 余量 */
+#define POLL_TIMEOUT_RETRY_MS 5000   /* 超时（-1）后的快速重试间隔：保住心跳新鲜度 */
 
 static uint32_t s_since;         /* 指令游标（服务端 rev 序列；NVS 持久化） */
 static uint32_t s_local_rev;     /* 已见 manifest rev（asset_dl 维护本地副本） */
 static bool     s_reported_online;
+static int      s_last_poll_status;   /* 最近一次 poll 的 HTTP 状态（-1=超时） */
 
 /* ------------------------------------------------------------------ */
 /* 单条指令落地                                                          */
@@ -114,8 +116,7 @@ static bool resp_collect(void *ctx, const char *data, size_t len)
 
 static bool do_poll_once(void)
 {
-    char path[POLL_PATH_LEN];
-    /* poll 端点服务端必填 deviceId（DeviceEndpoints.cs HandlePoll 签名
+    char path[POLL_PATH_LEN];    /* poll 端点服务端必填 deviceId（DeviceEndpoints.cs HandlePoll 签名
      * string deviceId）——真机实证：不带参 400，设备从此只有 hello 没有心跳
      * （服务端日志只见「hello 心跳」、online 转 false、指令队列永不消费）。 */
     snprintf(path, sizeof(path), "/api/device/poll?deviceId=%s&since=%lu",
@@ -126,7 +127,15 @@ static bool do_poll_once(void)
 
     int status = mp_http_get(path, POLL_TIMEOUT_MS, resp_collect, &ctx);
     if (status != 200) {
-        ESP_LOGW(TAG, "poll failed: %d", status);
+        /* 【心跳抖动修复 2026-09-27】status=-1 = 客户端超时（服务端长轮询 hold
+         * 未在期限内返回/响应丢失），并非网络故障——此时设备其实健在。
+         * 原实现一律走指数退避（最长 60s），叠加 poll 自身的 50s hold 后，
+         * 单次超时即造成 lastSeen 空窗 >90s → 服务端 OnlineWindow(90s) 判离线，
+         * 表现为「配对成功但没心跳 / 状态忽上忽下」。现由 do_poll_once 把
+         * 超时与真失败区分开，交给调用方选择退避策略。 */
+        ESP_LOGW(TAG, "poll failed: %d%s", status,
+                 status == -1 ? "（超时：视为心跳抖动，快速重试）" : "");
+        s_last_poll_status = status;
         return false;
     }
 
@@ -241,6 +250,15 @@ static void poller_task(void *arg)
     (void)arg;
     uint32_t backoff_ms = BACKOFF_MIN_MS;
 
+    /* 【心跳缺失最终根因 2026-09-27】本任务在 app_main 里先于
+     * state_machine_boot() 启动，而 HTTP 服务器地址只在 state_machine_boot
+     * 里经 mp_http_init() 装载（NVS srv_url）。此前 poller 自身不初始化 →
+     * mp_http_server_url() 恒 NULL → http_txn() 首行 `if (!url) return -1`
+     * 静默返回，设备【从不轮询】且连失败日志都没有：服务端只见开机那一刻
+     * 的 hello，online 随后转 false（"配对成功但没有心跳"）。
+     * mp_http_init 幂等（仅按需填 uuid/读 NVS），此处主动调用保证轮询可用。 */
+    mp_http_init();
+
     mp_nvs_get_u32("poll_since", &s_since);
     s_local_rev = asset_dl_local_rev();   /* 本地 manifest rev 起点（可能落后于 asset 任务装载，差一次冗余同步无妨） */
 
@@ -262,12 +280,21 @@ static void poller_task(void *arg)
         bool ok = do_poll_once();
 
         if (ok) {
+            s_last_poll_status = 200;
             backoff_ms = BACKOFF_MIN_MS;          /* 成功复位退避 */
             if (!s_reported_online) {
                 s_reported_online = true;
                 state_machine_handle(MP_SM_EV_NET_ONLINE);
             }
         } else {
+            /* 【心跳新鲜度】超时（-1）≠ 网络故障：只等 5s 就重试，避免 60s 退避
+             * 把 lastSeen 空窗拖过服务端 90s 在线窗口（真机"状态忽上忽下"根因）。
+             * 真失败（连接被拒/无路由等）仍走指数退避，保护 lwip 缓冲。 */
+            if (s_last_poll_status == -1) {
+                vTaskDelay(pdMS_TO_TICKS(POLL_TIMEOUT_RETRY_MS));
+                backoff_ms = BACKOFF_MIN_MS;      /* 超时不累积退避 */
+                continue;                          /* 仍在线：不报 NET_OFFLINE */
+            }
             vTaskDelay(pdMS_TO_TICKS(backoff_ms));
             if (backoff_ms < BACKOFF_MAX_MS) backoff_ms *= 2;
             if (s_reported_online) {

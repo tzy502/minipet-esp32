@@ -58,12 +58,32 @@ public sealed class BgmConfig
 public sealed class DeviceThresholdsConfig
 {
     [JsonPropertyName("_comment")]
-    public string Comment { get; set; } = "设备阈值：IMU 死区（度）/ 轻拍（g）/ 重拍（g）/ 无人交互转待机时钟（分钟）——设备表可按设备覆盖";
+    public string Comment { get; set; } = "设备阈值：IMU 灵敏度 / 死区（度）/ 轻拍（g）/ 重拍（g）/ 无人交互转待机时钟（分钟）——设备表可按设备覆盖";
+
+    /// <summary>
+    /// IMU 灵敏度（E4 设置页要求；Web 侧已就绪并探测此字段启用输入框）：
+    /// 倍率，有效阈值 = 阈值 ÷ 灵敏度。1.0 = 出厂口径；&gt;1 更灵敏，&lt;1 更迟钝。
+    /// </summary>
+    public double ImuSensitivity { get; set; } = 1.0;
 
     public double ImuDeadzoneDeg { get; set; } = 8;
     public double TapLightG { get; set; } = 2.0;
     public double TapHardG { get; set; } = 4.0;
     public int IdleToClockMin { get; set; } = 5;
+}
+
+/// <summary>
+/// 随机台词气泡（E12）：静置 idleSec 秒后由服务端挑一条 lines 下发 bubble 指令。
+/// Web 设置页已就绪（探测 config.speech 是否存在决定整卡启用/禁用）。
+/// </summary>
+public sealed class SpeechConfig
+{
+    [JsonPropertyName("_comment")]
+    public string Comment { get; set; } = "随机台词气泡（E12）：enabled 开关 / idleSec 静置秒数 / lines 台词库（单条 UTF-8 ≤95 字节，固件 mp_cmd_t.s=char[96]）";
+
+    public bool Enabled { get; set; }
+    public int IdleSec { get; set; } = 300;
+    public List<string> Lines { get; set; } = new();
 }
 
 public sealed class ClockConfig
@@ -85,6 +105,8 @@ public sealed class MinipetConfig
     public BgmConfig Bgm { get; set; } = new();
     public DeviceThresholdsConfig Device { get; set; } = new();
     public ClockConfig Clock { get; set; } = new();
+    /// <summary>随机台词气泡（E12）；Web 设置页按此段是否存在启用对应卡片。</summary>
+    public SpeechConfig Speech { get; set; } = new();
 }
 
 public sealed class ConfigChangedEventArgs : EventArgs
@@ -226,6 +248,9 @@ public sealed class ConfigService : IDisposable
             c.Bgm = incoming.Bgm;
             c.Device = incoming.Device;
             c.Clock = incoming.Clock;
+            // 台词气泡必须在 Replace 里显式搬运：Web 全量回传若被丢弃，设置页
+            // 存了也读不回来（Web 侧按 config.speech 是否存在判断是否启用该卡片）。
+            c.Speech = incoming.Speech ?? new SpeechConfig();
         }, validateWzPath);
 
     private void ScheduleReload()
@@ -289,6 +314,12 @@ public sealed class ConfigService : IDisposable
         c.Bgm ??= new BgmConfig();
         c.Device ??= new DeviceThresholdsConfig();
         c.Clock ??= new ClockConfig();
+        c.Speech ??= new SpeechConfig();
+        c.Speech.Lines ??= new List<string>();
+        /* 灵敏度夹取到合理区间（0.2–3.0）：0/负数会让有效阈值发散，过大等于关闭判定 */
+        if (c.Device.ImuSensitivity < 0.2) c.Device.ImuSensitivity = 0.2;
+        if (c.Device.ImuSensitivity > 3.0) c.Device.ImuSensitivity = 3.0;
+        if (c.Speech.IdleSec < 30) c.Speech.IdleSec = 30;
         c.Clock.MapOffsets = new Dictionary<string, int[]>(c.Clock.MapOffsets ?? new Dictionary<string, int[]>(), StringComparer.Ordinal);
         c.Wz.DataPath ??= "";
         c.QqMusic.Cookie ??= "";

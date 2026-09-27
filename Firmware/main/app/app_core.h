@@ -190,6 +190,9 @@ typedef struct {
     uint32_t tilt_debounce_ms;   /* E6  300ms 防抖 */
     float    tap_light_g;        /* E6  <2g alert+bewildered */
     float    tap_hard_g;         /* E6  ≥4g hit */
+    /* E4 IMU 灵敏度（倍率，Web 可配；hello config.imuSensitivity 下发）：
+     * 有效阈值 = 名义阈值 ÷ 灵敏度。1.0 = 出厂口径；>1 更灵敏，<1 更迟钝。 */
+    float    imu_sensitivity;
     uint8_t  brightness;         /* 默认背光 */
 } mp_app_config_t;
 

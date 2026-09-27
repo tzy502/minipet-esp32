@@ -236,7 +236,12 @@ static void tilt_fsm_tick(const imu_accel_t *a)
     s_roll_deg = roll;
     s_pitch_deg = pitch;
 
-    uint8_t bits = tilt_bits_from_angles(roll, pitch, g_mp_cfg.imu_deadzone_deg);
+    /* E4 灵敏度同样作用于倾斜死区：有效死区 = 名义死区 ÷ 灵敏度
+     * （灵敏度越高 → 死区越小 → 更小的倾斜即触发视差/动作） */
+    float sens = g_mp_cfg.imu_sensitivity;
+    if (sens < 0.2f) sens = 0.2f;
+    if (sens > 3.0f) sens = 3.0f;
+    uint8_t bits = tilt_bits_from_angles(roll, pitch, g_mp_cfg.imu_deadzone_deg / sens);
     if (bits != s_tilt_candidate) {
         s_tilt_candidate = bits;
         s_tilt_cand_since_ms = mp_now_ms();
@@ -299,14 +304,22 @@ static void force_tick(const imu_accel_t *a)
     float mag = sqrtf(a->x_g * a->x_g + a->y_g * a->y_g + a->z_g * a->z_g);
     int32_t mg = (int32_t)(mag * 1000.0f);
 
+    /* E4 IMU 灵敏度：倍率作用于名义阈值（有效阈值 = 名义 ÷ 灵敏度）。
+     * 兜底夹取到 0.2–3.0，防手改 NVS/服务端异常值把判定打飞。 */
+    float sens = g_mp_cfg.imu_sensitivity;
+    if (sens < 0.2f) sens = 0.2f;
+    if (sens > 3.0f) sens = 3.0f;
+    const float thr_hard  = g_mp_cfg.tap_hard_g  / sens;
+    const float thr_light = g_mp_cfg.tap_light_g / sens;
+
     /* --- 轻拍 / 大力拍打（加速度峰值分级） --- */
-    if (mag >= g_mp_cfg.tap_hard_g) {
+    if (mag >= thr_hard) {
         /* ≥4g：hit 表情 */
         mp_post_event_simple(MP_EVT_TAP_HARD, mg, 0, NULL);
         input_trigger_expression(MP_EXPR_HIT, 1500);
         note_interaction();
         return;
-    } else if (mag > 1.25f && mag < g_mp_cfg.tap_light_g) {
+    } else if (mag > 1.25f && mag < thr_light) {
         /* <2g：alert 动作 + bewildered 表情（E6） */
         mp_post_event_simple(MP_EVT_TAP_LIGHT, mg, 0, NULL);
         post_action(MP_ACTION_ALERT);

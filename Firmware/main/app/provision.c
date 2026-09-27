@@ -649,6 +649,71 @@ static bool sntp_and_set_rtc(void)
     return true;
 }
 
+/* ------------------------------------------------------------------ */
+/* E9 常态化校时（2026-09-27 补）                                        */
+/* ------------------------------------------------------------------ */
+/* 真机实测缺口：`clock: 时间未同步：系统时间无效且 RTC 未校准，时钟显示 --:--`
+ * ——SNTP 此前只在配网流程跑一次；已配网设备若 RTC 电池失效/OS 标志置位（未校准），
+ * 开机只剩"读 RTC 种子"路径，永远等不到校时，待机时钟恒 --:--。
+ *
+ * 本任务：联网后在前 2 分钟窗口内每 30s 检查一次系统时间，无效（<2020）即触发
+ * 一次 SNTP（阻塞 15s，但本任务独立于 poller，不阻塞心跳），成功后写 RTC；
+ * 此后每 6 小时再校一次（长期不断电的漂移补偿）。离线时静默等待，不刷日志。 */
+#define RTC_RESYNC_FAST_WINDOW_MS  (2u * 60u * 1000u)
+#define RTC_RESYNC_FAST_PERIOD_MS  (30u * 1000u)
+#define RTC_RESYNC_SLOW_PERIOD_MS  (6u * 60u * 60u * 1000u)
+#define RTC_VALID_YEAR_MIN         120      /* tm_year >= 120 → 2020 起算有效 */
+
+static void rtc_resync_task(void *arg)
+{
+    (void)arg;
+    const int64_t boot_ms = mp_now_ms();
+    bool have_time = false;
+
+    for (;;) {
+        time_t now_s = time(NULL);
+        struct tm tmv = { 0 };
+        gmtime_r(&now_s, &tmv);
+        bool valid = (tmv.tm_year >= RTC_VALID_YEAR_MIN);
+
+        if (valid) {
+            if (!have_time) {
+                have_time = true;
+                ESP_LOGI(TAG, "系统时间有效（epoch=%lld）→ 校时转 6h 周期",
+                         (long long)now_s);
+            }
+            vTaskDelay(pdMS_TO_TICKS(RTC_RESYNC_SLOW_PERIOD_MS));
+            continue;
+        }
+
+        /* 时间无效：启动 2 分钟窗口内 30s 快试，之后降到 10 分钟，
+         * 避免无网时反复起 SNTP 任务刷日志 */
+        int64_t wait_ms = (mp_now_ms() < boot_ms + RTC_RESYNC_FAST_WINDOW_MS)
+                              ? RTC_RESYNC_FAST_PERIOD_MS
+                              : (int64_t)RTC_RESYNC_FAST_PERIOD_MS * 20;
+        vTaskDelay(pdMS_TO_TICKS(wait_ms));
+
+        if (!s_sta_connected) continue;          /* 没网不浪费 15s */
+        ESP_LOGW(TAG, "系统时间未同步（RTC 未校准）→ 触发常态化 SNTP 校时");
+        if (sntp_and_set_rtc()) {
+            have_time = true;
+            ESP_LOGI(TAG, "常态化校时成功，待机时钟可用");
+            vTaskDelay(pdMS_TO_TICKS(RTC_RESYNC_SLOW_PERIOD_MS));
+        }
+    }
+}
+
+void provision_rtc_resync_start(void)
+{
+    static bool started;
+    if (started) return;
+    started = true;
+    if (xTaskCreatePinnedToCore(rtc_resync_task, "rtcsync", 4096, NULL,
+                                tskIDLE_PRIORITY + 1, NULL, 0 /* PRO */) != pdPASS) {
+        ESP_LOGW(TAG, "rtcsync 任务创建失败（内部堆挤压）——待机时钟可能显示 --:--");
+    }
+}
+
 /* ================================================================== */
 /* portal 主任务：起栈 → 等 /save 通知 → 拆栈 → STA+NTP+RTC → 重启       */
 /* ================================================================== */

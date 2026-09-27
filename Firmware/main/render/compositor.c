@@ -188,11 +188,19 @@ void render_calib_set(bool on, int16_t tx, int16_t ty)
  * g_ent_base_wx/wy 为世界 1x 附加偏移（render_set_entity_pos，默认 0,0）。 */
 static void ent_screen_pos_at(int32_t tilt_mdeg, int32_t *sx, int32_t *sy)
 {
+    /* 【人物消失修复 2026-09-27】画布几何未就绪（g_ent_cbox_ok=false：部件包
+     * 未加载/加载失败/换装重建中）时实体本就画不出来；此时若仍叠加拖拽偏移
+     * （用户把人物拖到最左 → drag=-160 按定稿语义被保留），锚点会被推到屏外，
+     * 表现为"人物怎么没了"。修法：几何无效时忽略拖拽偏移（锚点回中），几何
+     * 恢复后偏移自动重新生效——"拖拽松手保持原地"的语义不受影响。 */
+    int32_t drag_x = g_ent_cbox_ok ? g_drag_off_x : 0;
+    int32_t drag_y = g_ent_cbox_ok ? g_drag_off_y : 0;
+
     *sx = g_sw / 2 + g_ent_cx0 * RC_SCALE + RC_ENT_CENTER_OFF_X
           + (g_ent_base_wx << RC_SCALE_SHIFT) + ent_tilt_off_px(tilt_mdeg)
-          + g_drag_off_x;
+          + drag_x;
     *sy = g_sh - RC_ENT_MARGIN_B + g_ent_cy0 * RC_SCALE + RC_ENT_CENTER_OFF_Y
-          + (g_ent_base_wy << RC_SCALE_SHIFT) + g_drag_off_y;
+          + (g_ent_base_wy << RC_SCALE_SHIFT) + drag_y;
 }
 
 static void ent_screen_pos(int32_t *sx, int32_t *sy)

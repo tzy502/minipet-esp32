@@ -338,6 +338,12 @@ int mp_http_hello(void)
             g_mp_cfg.tap_light_g = (float)d;
         if (json_num2(cfg, "tapHardG", NULL, &d))
             g_mp_cfg.tap_hard_g = (float)d;
+        /* E4 IMU 灵敏度（0.2–3.0 由服务端夹取；此处再兜底一次防手改配置发散） */
+        if (json_num2(cfg, "imuSensitivity", NULL, &d)) {
+            if (d < 0.2) d = 0.2;
+            if (d > 3.0) d = 3.0;
+            g_mp_cfg.imu_sensitivity = (float)d;
+        }
     }
 
     /* E13：首配对码（服务端入册后返回，已绑定则无此字段）。
