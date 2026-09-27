@@ -795,12 +795,17 @@ public sealed class AssetExporter
     /// 渲染期告警（条带素材缺失等）追加进 warnings；地图加载失败/产物为空抛
     /// InvalidOperationException。clock_table 建议值不在此返回（由 ClockTableSeeder/配置管理）。
     /// </summary>
-    public List<ExportedAsset> ExportMapAssets(string mapId, List<string>? warnings = null)
+    public List<ExportedAsset> ExportMapAssets(string mapId, List<string>? warnings = null,
+        DeviceProfile? deviceProfile = null)
     {
         if (string.IsNullOrWhiteSpace(mapId)) throw new ArgumentException("地图 id 不能为空", nameof(mapId));
         if (!_wz.IsLoaded) throw new InvalidOperationException("WZ 未加载（先调用 WzService.LoadWz）");
         var summary = new ExportSummary();
-        ExportMap(mapId.Trim(), new DeviceProfile(), summary);
+        /* 【E13 缺口补齐 2026-09-27】原先恒用 `new DeviceProfile()`（默认 480×480），
+         * 即"导出忽略设备上报 profile" —— hello 里 device.profile{w,h,shape,psram}
+         * 完全没参与烘焙。现在调用方（DeviceAssetService）把该设备记录里的
+         * profile 传进来；为空才回落到默认（ViewportW/H 内部有 480 兜底）。 */
+        ExportMap(mapId.Trim(), deviceProfile ?? new DeviceProfile(), summary);
         warnings?.AddRange(summary.Warnings);
         if (summary.Assets.Count == 0)
             throw new InvalidOperationException(

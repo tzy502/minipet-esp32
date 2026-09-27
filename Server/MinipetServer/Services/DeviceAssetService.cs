@@ -26,10 +26,30 @@ public sealed class DeviceAssetService
     private readonly ServerPaths _paths;
     private readonly ConcurrentDictionary<string, object> _deviceLocks = new();
 
-    public DeviceAssetService(WzService wz, ServerPaths paths)
+    private readonly Device.DeviceRegistry _reg;   // E13：取设备 hello 上报的 profile
+
+    public DeviceAssetService(WzService wz, ServerPaths paths, Device.DeviceRegistry reg)
     {
         _wz = wz ?? throw new ArgumentNullException(nameof(wz));
         _paths = paths ?? throw new ArgumentNullException(nameof(paths));
+        _reg = reg ?? throw new ArgumentNullException(nameof(reg));
+    }
+
+    /// <summary>服务端设备记录里的 profile → 导出器 DeviceProfile（E13）。
+    /// 字段口径与 hello 一致（w/h/shape/psram/audio）；null 或 w/h 缺失返回 null，
+    /// 由导出器回落默认 480×480。 */
+    private static MiniPet.Export.DeviceProfile? ToExportProfile(Device.DeviceProfile? p)
+    {
+        if (p == null || p.W <= 0 || p.H <= 0) return null;
+        return new MiniPet.Export.DeviceProfile
+        {
+            Name = $"device-reported-{p.W}x{p.H}",
+            W = p.W,
+            H = p.H,
+            Shape = string.IsNullOrWhiteSpace(p.Shape) ? "square" : p.Shape,
+            PsramMb = p.Psram,
+            Audio = p.Audio,
+        };
     }
 
     /// <summary>
@@ -50,7 +70,10 @@ public sealed class DeviceAssetService
             if (HasEntry(root, selector: "map", key: "map", value: mapId)) return false;
 
             var warnings = new List<string>();
-            var assets = new AssetExporter(_wz).ExportMapAssets(mapId, warnings);
+            /* E13：按该设备 hello 上报的 profile 烘焙（w/h/shape/psram/audio）；
+ * 取不到才回落默认 480×480（见 AssetExporter.ExportMapAssets 注释）。 */
+            var devProfile = _reg.Get(deviceId)?.Profile;
+            var assets = new AssetExporter(_wz).ExportMapAssets(mapId, warnings, ToExportProfile(devProfile));
             MergeAndWrite(deviceDir, root, assets);
             return true;
         }
