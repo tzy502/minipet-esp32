@@ -10,9 +10,13 @@
  *   PORT        监听端口（默认 5199）
  *   API_TARGET  后端基址（默认 http://<NAS_IP>:38090）
  *   MINIPET_MOCK=1
- *       —— 模拟「服务端已补齐 T2/T4/T5 缺口」后的响应，用于验证前端的
+ *       —— 模拟「服务端已补齐 T2/T4/T5/T6 缺口」后的响应，用于验证前端的
  *          「探测到就启用」分支（真实服务端目前没有这些端点/字段）：
  *          1) POST /api/admin/devices/{id}/command → 202 { ok, seq, type, value }
+ *             bgm（T6）：value 白名单 play/pause/resume/stop/next/prev/vol，
+ *             vol 需 n∈[0,100]；其余值 400「bgm 的 value 非法」——
+ *             探测哨兵 __probe__ 正落此分支，用于验证「已认 bgm type 只是拒了 value」
+ *             时前端判「端点在位」而非「端点缺失」。
  *          2) GET  /api/admin/settings → 真实响应 + device.imuSensitivity + speech 段
  *          3) GET  /api/admin/devices/{id} → 真实响应 + thresholds.imuSensitivity
  *             （服务端真加了字段时，详情页与设置页都会带出来）
@@ -104,6 +108,23 @@ const server = http.createServer(async (req, res) => {
       const body = JSON.parse((await readBody(req)).toString() || '{}')
       if (!body.type || !body.value) {
         return send(res, 400, JSON.stringify({ error: 'type 与 value 必填' }), { 'content-type': 'application/json' })
+      }
+      // 1b) bgm（T6）：模拟「服务端已按接口清单放行 bgm」后的形态——
+      //     value 白名单 + vol 走 n；哨兵值 __probe__ 落到 value 非法分支（400），
+      //     前端必须据此判定「bgm 这个 type 已认」→ 端点在位（而非端点缺失）。
+      if (body.type === 'bgm') {
+        const values = ['play', 'pause', 'resume', 'stop', 'next', 'prev', 'vol']
+        if (!values.includes(body.value)) {
+          return send(res, 400, JSON.stringify({ error: `bgm 的 value 非法：${body.value}（可用：${values.join('/')}）`, mocked: true }), {
+            'content-type': 'application/json',
+          })
+        }
+        if (body.value === 'vol' && !(body.n >= 0 && body.n <= 100)) {
+          return send(res, 400, JSON.stringify({ error: 'bgm vol 需要 n∈[0,100]', mocked: true }), { 'content-type': 'application/json' })
+        }
+        return send(res, 202, JSON.stringify({ ok: true, seq: 42, type: 'bgm', value: body.value, n: body.n, mocked: true }), {
+          'content-type': 'application/json',
+        })
       }
       return send(res, 202, JSON.stringify({ ok: true, seq: 42, type: body.type, value: body.value, mocked: true }), {
         'content-type': 'application/json',

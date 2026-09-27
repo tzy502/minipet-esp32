@@ -192,7 +192,10 @@ public static class DeviceEndpoints
             deviceId,
             since,
             lastSeq = queue.GetLastSeq(deviceId),
-            commands,
+            // 线上形状：默认 {seq,type,payload}（不变）；bgm vol/source 这类只能走固件
+            // handle_cmd 的指令由 DeviceCommand.Legacy 投影成旧口径 {seq,t,v,n}（无 type 字段，
+            // poller.c 见 type 缺失即直通 handle_cmd）。详见 DeviceCommand.Legacy 注释。
+            commands = commands.Select(c => c.ToWire()).ToList(),
             waitedMs = sw.ElapsedMilliseconds,
             // 设备素材 diff 依据（poller.c：mrev != 本地 rev → asset_dl_request_sync 立即拉包）——
             // 此前响应缺此字段，设备恒读 0，manifest 变更只能靠设备重启兜底

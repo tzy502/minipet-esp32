@@ -14,6 +14,11 @@
  *   T3 素材页/设备页推送入口与 202/错误分支
  *   T4 IMU 灵敏度：服务端无字段 → 输入禁用且不随 PUT 下发（mock 实例下 → 启用）
  *   T5 随机台词气泡：服务端无 speech 段 → 禁用占位（mock 实例下 → 配置段在位）
+ *   T6 曲库页「设备播放控制」卡（E8 附加）：服务端未放行 bgm → 播放/暂停/切歌/音量按钮
+ *      全禁用 + 卡内接口需求（真实服务端实测 400「type 非法：bgm」）；
+ *      mock 实例（服务端按 §T6 放行 bgm）→ 探针把「400 bgm 的 value 非法」判为端点在位、
+ *      按钮全启用、点击真实发出 POST .../command {type:"bgm",...} 并显示 seq。
+ *      ⚠ 真实实例上会点一次「存为设备偏好」——请求体用该设备**当前**音量（幂等，不改动实际偏好）。
  */
 import { spawn } from 'node:child_process'
 import fs from 'node:fs'
@@ -151,6 +156,15 @@ window.__mini = {
     return item ? item.querySelector('input') : null;
   },
   checkboxByText: (t) => [...document.querySelectorAll('.n-checkbox')].find(c => c.textContent.includes(t)),
+  bgmCard: () => window.__mini.cardByTitle('设备播放控制'),
+  bgmBtn: (k) => document.querySelector('button[data-bgm="' + k + '"]'),
+  bgmButtons: () => [...document.querySelectorAll('button[data-bgm]')].filter(b => b.dataset.bgm !== 'pref').map(b => ({ k: b.dataset.bgm, disabled: b.disabled })),
+  bgmTag: () => {
+    const c = window.__mini.bgmCard();
+    if (!c) return 'no-card';
+    const m = c.innerText.match(/端点在位|端点不支持 bgm|端点入参不符|未探测到/);
+    return m ? m[0] : '';
+  },
   bodyText: () => document.body.innerText,
   toastText: () => [...document.querySelectorAll('.n-message__content')].map(e => e.textContent).join(' | '),
 };
@@ -265,6 +279,51 @@ async function main() {
     })()`)
     record('T3 设备详情有推送卡片', pushCard.exists && /push/.test(pushCard.text), pushCard.text.replace(/\n/g, ' ').slice(0, 110))
 
+    // ── T6：曲库页「设备播放控制」卡（真实服务端：未放行 bgm）──────────────
+    await cdp.goto(`${BASE}/music`)
+    await cdp.eval(PAGE_HELPERS)
+    await cdp.waitFor(
+      `['端点在位','端点不支持 bgm','未探测到'].includes(window.__mini.bgmTag())`,
+      25000,
+      'bgm 控制卡探测完成',
+    )
+    const bgmReal = await cdp.eval(`(() => {
+      const card = window.__mini.bgmCard();
+      const bs = window.__mini.bgmButtons();
+      const txt = card ? card.innerText : '';
+      return {
+        card: !!card,
+        tag: window.__mini.bgmTag(),
+        btns: bs.length,
+        keys: bs.map(b => b.k).join(','),
+        disabled: bs.filter(b => b.disabled).length,
+        prefEnabled: !(window.__mini.bgmBtn('pref') || { disabled: true }).disabled,
+        need: txt.includes('/api/admin/devices/') && txt.includes('command') && txt.includes('§T6'),
+        readonly: txt.includes('BGM 偏好：源'),
+        online: document.body.innerText.includes('设备离线') || document.body.innerText.includes('设备在线'),
+      };
+    })()`)
+    record(
+      'T6 真实实例：未放行 bgm → 6 播放键+下发音量 全禁用 + 接口需求',
+      bgmReal.card && bgmReal.tag === '端点不支持 bgm' && bgmReal.btns === 7 && bgmReal.disabled === 7 &&
+        bgmReal.keys === 'play,pause,resume,stop,prev,next,vol' && bgmReal.need && bgmReal.readonly && bgmReal.online,
+      JSON.stringify(bgmReal),
+    )
+    record('T6 真实实例：「存为设备偏好」可用（PUT 通道已在位）', bgmReal.prefEnabled === true, `prefEnabled=${bgmReal.prefEnabled}`)
+    await cdp.shot(path.join(SHOT_DIR, 't6-music-bgm-missing.png'))
+
+    // 真实点一次「存为设备偏好」：请求体音量 = 该设备**当前**偏好值（幂等，不改实际偏好）
+    await cdp.eval(`(() => { window.__mini.bgmBtn('pref').click(); return true })()`)
+    await sleep(2500)
+    const prefRun = await cdp.eval(`(() => { const c = window.__mini.bgmCard(); return { toast: window.__mini.toastText(), text: c ? c.innerText : '' } })()`)
+    record(
+      'T6 真实实例：存为设备偏好 → PUT 200 + 真实请求/响应回显',
+      /音量已写入设备偏好/.test(prefRun.toast) && /HTTP 200/.test(prefRun.text) &&
+        /PUT \/api\/admin\/devices\/[^ ]+ body \{"bgm":\{"volume":\d+\}\}/.test(prefRun.text),
+      `toast=${prefRun.toast} | ${(prefRun.text.match(/HTTP 200[^\n]*/) || [''])[0]}`.slice(0, 240),
+    )
+    await cdp.shot(path.join(SHOT_DIR, 't6-music-bgm-pref-saved.png'))
+
     // ── T5：设置页台词占位 + T4 设置页灵敏度占位 ─────────────────────────
     await cdp.goto(`${BASE}/settings`)
     await cdp.eval(PAGE_HELPERS)
@@ -369,6 +428,48 @@ async function main() {
       })()`)
       record('T5 mock：speech 段在位 → 表单启用', m5.tag === '配置段在位' && !m5.sensDisabled && /加油/.test(m5.lines), JSON.stringify(m5))
       await cdp.shot(path.join(SHOT_DIR, 't5-mock-speech.png'))
+
+      // ── T6 mock：服务端按接口清单放行 bgm → 探针判「端点在位」、全键可点 ──
+      await cdp.goto(`${MOCK_BASE}/music`)
+      await cdp.eval(PAGE_HELPERS)
+      await cdp.waitFor(
+        `['端点在位','端点不支持 bgm','未探测到'].includes(window.__mini.bgmTag())`,
+        25000,
+        'mock bgm 控制卡探测',
+      )
+      const bgmMock = await cdp.eval(`(() => {
+        const card = window.__mini.bgmCard();
+        const bs = window.__mini.bgmButtons();
+        return { tag: window.__mini.bgmTag(), btns: bs.length, disabled: bs.filter(b => b.disabled).length,
+                 note: card ? (card.innerText.match(/哨兵值被拒[^\\n]*/) || [''])[0] : '' };
+      })()`)
+      record(
+        'T6 mock：放行 bgm（哨兵被 value 白名单拒）→ 判端点在位 + 7 键全启用',
+        bgmMock.tag === '端点在位' && bgmMock.btns === 7 && bgmMock.disabled === 0 && /哨兵值被拒/.test(bgmMock.note),
+        JSON.stringify(bgmMock),
+      )
+      await cdp.shot(path.join(SHOT_DIR, 't6-mock-bgm-ok.png'))
+
+      // 点「播放」→ mock 202 → 结果行显示真实请求体 + seq
+      await cdp.eval(`(() => { window.__mini.bgmBtn('play').click(); return true })()`)
+      await sleep(1500)
+      const playRun = await cdp.eval(`(() => { const c = window.__mini.bgmCard(); return { toast: window.__mini.toastText(), text: c ? c.innerText : '' } })()`)
+      record(
+        'T6 mock：点播放 → POST {type:"bgm",value:"play"} → 202 seq 42',
+        /播放已下发/.test(playRun.toast) && /"type":"bgm","value":"play"/.test(playRun.text) && /seq 42/.test(playRun.text),
+        `toast=${playRun.toast} | ${(playRun.text.match(/HTTP 202[^\n]*/) || [''])[0]}`.slice(0, 240),
+      )
+
+      // 点「下发音量」→ mock 202（带 n）
+      await cdp.eval(`(() => { window.__mini.bgmBtn('vol').click(); return true })()`)
+      await sleep(1500)
+      const volRun = await cdp.eval(`(() => { const c = window.__mini.bgmCard(); return { toast: window.__mini.toastText(), text: c ? c.innerText : '' } })()`)
+      record(
+        'T6 mock：点下发音量 → POST {type:"bgm",value:"vol",n:50} → 202 seq 42',
+        /音量下发已下发/.test(volRun.toast) && /"value":"vol","n":\d+/.test(volRun.text) && /seq 42/.test(volRun.text),
+        `toast=${volRun.toast} | ${(volRun.text.match(/HTTP 202[^\n]*/) || [''])[0]}`.slice(0, 240),
+      )
+      await cdp.shot(path.join(SHOT_DIR, 't6-mock-bgm-sent.png'))
     } else {
       console.log('SKIP  mock 实例检查（未提供 --mock-base）')
     }

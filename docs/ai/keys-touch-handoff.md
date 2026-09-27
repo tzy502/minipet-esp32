@@ -138,3 +138,54 @@ if (tst != MP_ST_POKER && tst != MP_ST_OFFLINE) {
 55e73ce fix(fw+server): 心跳双根因 / 菜单光标回绕 / 人物消失 / IMU灵敏度 / 常态化校时
 bd4d3e8 fix(fw+server+web): 真机主链路打通 + 菜单/触摸/裂纹修复 + E4/E7/E12 缺口补全
 ```
+
+---
+
+## 六、2026-09-27 第二轮：网络层根因链（环境阻塞）
+
+### 6.1 结论：设备被 AP 拒绝在**认证阶段**（非固件逻辑）
+
+```
+I (1612) wifi:state: init -> auth (0xb0)
+I (2613) wifi:state: auth -> init (0x200)      ← 认证失败回退
+W (2614) provision: WiFi 断开 reason=2
+```
+
+- `reason=2` = AP 未响应/拒绝认证帧；**密码错会是 15/202**，所以不是凭据问题
+- Mac 侧同一 AP 完全正常（`ping <LAN_IP>` 0% 丢包），AP 本身在线
+- 设备历史（2026-09-26T18:04Z）曾成功 poll，说明硬件与凭据曾经可用
+
+**已排除**：
+1. 服务端地址配置 —— 设备日志实证 `hello 目标 http=http://<NAS_IP>:38090`（正确）
+2. 服务端监听/防火墙 —— 0.0.0.0:38090 监听中，Mac curl 22ms 通
+3. lwip 参数 —— `MAX_SOCKETS=16 / TCP_MSL=3000 / RECVMBOX=12` 已在 build header 生效
+4. GPIO 冲突 —— 误配 GPIO33/34（Octal PSRAM 脚）已撤销
+5. WiFi 省电 —— 已挪到 GOT_IP 之后调用（`WIFI_PS_NONE`）
+6. PMF/认证阈值 —— 两边一致，threshold 已放宽到 `WIFI_AUTH_WPA_WPA2_PSK`
+
+**建议用户侧动作（任一即可）**：
+- 重启路由器/AP（清理该客户端的异常状态）
+- 或对设备**重新配网**：`idf.py erase-flash`（会清 NVS → 设备进 SoftAP `MiniPet-XXXX`，手机连上填 WiFi + 服务器地址）
+
+### 6.2 内部堆挤压（第二阻塞）
+
+```
+W (1075) provision: RTC 未校准（首次上电或读数无效），系统时钟暂为 1970，等 SNTP 校准
+W (2601) provision: rtcsync 任务创建失败（内部堆挤压）→ 稍后重试
+W (2607) bgm: bgm 任务首建失败（内部堆挤压），转 10s 周期自愈重试
+E (1486) es8311: I2S 初始化失败: ESP_ERR_NO_MEM
+E (2707) bridge: font 1 not loaded (render_set_font first)
+```
+
+`wifi_init_once` 时实测 **内部堆空闲 108KB / 最大块 34KB**。表现：
+- **待机时钟恒 `--:--`**（校时任务起不来，已改为可重试）
+- BGM 任务起不来 → 无声
+- I2S 初始化失败 → 无声
+- 气泡字体加载失败 → 气泡走 5x7 兜底
+
+**已做的缓解**：清掉全部常驻诊断探针（keyscan/key0/axp2101/菜单帧/高亮/flush/ENTPOS）、
+校时任务栈 4096→3072 且失败可重试。
+
+**待办（下一轮）**：
+- 内部堆水位探针（`wifi_init_once` 已打）逐项定位占用方
+- 考虑：SDL/日志缓冲瘦身、LVGL 缓冲部分移 PSRAM、`CONFIG_LOG` 等级降级

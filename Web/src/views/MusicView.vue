@@ -146,7 +146,7 @@ const deviceInfo = ref(null) // GET /admin/devices/{id} 的 device（含 bgm / o
 const devLogs = ref([])
 const devLoadError = ref('')
 
-const bgmSupport = ref('unknown') // unknown | ok | missing | mismatch
+const bgmSupport = ref('unknown') // unknown | ok | missing
 const bgmProbeNote = ref('')
 const bgmProbeBusy = ref(false)
 const bgmBusy = ref('') // 正在下发的 bgm 值 / 'vol' / 'pref'
@@ -164,10 +164,11 @@ const deviceOnline = computed(() => !!selectedDevice.value?.online)
 const bgmDisabled = computed(() => bgmSupport.value === 'missing' || !deviceId.value)
 const bgmPref = computed(() => deviceInfo.value?.bgm ?? null)
 
+// 只有「放行 / 未放行 / 未判定」三态：bgm 的哨兵探针被 value 白名单拒绝（400）属
+// 正确实现的预期响应 → 归「端点在位」（原文记在 bgmProbeNote 里），不设 mismatch 态。
 const SUPPORT_TAG = {
   ok: { type: 'success', label: '端点在位' },
   missing: { type: 'error', label: '端点不支持 bgm' },
-  mismatch: { type: 'warning', label: '端点入参不符' },
   unknown: { type: 'default', label: '未探测到' },
 }
 const supportTag = computed(() => SUPPORT_TAG[bgmSupport.value] ?? SUPPORT_TAG.unknown)
@@ -228,11 +229,10 @@ async function probeBgm() {
     if (r.supported === false) {
       bgmSupport.value = 'missing'
       bgmProbeNote.value = `HTTP ${r.status}${r.error ? `：${r.error}` : ''}`
-    } else if (r.supported === true && r.status >= 400) {
-      bgmSupport.value = 'mismatch'
-      bgmProbeNote.value = `HTTP ${r.status}：${r.error || ''}`
     } else if (r.supported === true) {
       bgmSupport.value = 'ok'
+      // 哨兵值被 value 白名单拒（400）属正确实现的预期响应：记原文，不算失败
+      if (r.probeRejected) bgmProbeNote.value = `哨兵值被拒（预期）：HTTP ${r.status}：${r.error || ''}`
     } else {
       bgmSupport.value = 'unknown'
       bgmProbeNote.value = r.error || '无法判定（网络不可达？）'
@@ -270,7 +270,7 @@ async function sendBgm(value, label, opts = {}) {
     const text = errText(e)
     if (status === 404 || status === 405 || status === 501) bgmSupport.value = 'missing'
     else if (status === 400 && /bgm/i.test(text) && /type[\s=:：]*[^，,。;\s]{0,12}?(非法|不支持|未知|无效)/i.test(text)) bgmSupport.value = 'missing'
-    else if (status === 400) bgmSupport.value = 'mismatch'
+    else if (status === 400) bgmSupport.value = 'ok' // 端点认 bgm，只是拒了这次入参（原文见下）
     bgmProbeNote.value = `HTTP ${status ?? '—'}：${text}`
     lastResult.value = { type: 'error', text: `HTTP ${status ?? '—'} · POST ${cmdPath.value} body ${bodyText} → ${text}` }
     message.error(text)
@@ -412,13 +412,10 @@ onBeforeUnmount(() => clearInterval(refreshTimer))
             <div>完整清单：<code>Web/docs/interfaces-needed-from-server.md</code> §T6</div>
           </div>
         </n-alert>
-        <n-alert v-else-if="bgmSupport === 'mismatch'" type="warning" :show-icon="false" size="small">
-          端点已认 <code>bgm</code> 但拒绝了本次入参（{{ bgmProbeNote }}）—— 请对照
-          <code>Web/docs/interfaces-needed-from-server.md</code> §T6 核对 value 白名单 / n 范围。
-        </n-alert>
         <n-alert v-else-if="bgmSupport === 'unknown'" type="info" :show-icon="false" size="small">
           未能判定端点是否放行 bgm（{{ bgmProbeNote || '网络不可达' }}）：按钮未禁用，点击后按真实响应提示。
         </n-alert>
+        <div v-else-if="bgmProbeNote" class="hint">探测：{{ bgmProbeNote }}</div>
 
         <div class="hint">
           E8 定稿：控制入口在<b>设备触摸屏</b>（菜单内 BGM 入口 → 半屏控制条），Web 的职责是曲库/歌单/cookie；

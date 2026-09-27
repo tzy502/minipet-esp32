@@ -1,5 +1,6 @@
 using System.IO;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using MinipetServer.Config;
 
 namespace MinipetServer.Device;
@@ -12,6 +13,39 @@ public sealed class DeviceCommand
     public string Type { get; set; } = "";
     public JsonElement? Payload { get; set; }
     public DateTime EnqueuedAtUtc { get; set; } = DateTime.UtcNow;
+
+    /// <summary>
+    /// 固件「旧口径」标记（非空 → poll 响应按 {seq,t,v,n} 下发，**不带 type 字段**）。
+    /// 背景（poller.c 两条解析路径）：
+    ///   · 现代口径 {type,payload} → 专用解析分支（poller.c:191-221）。bgm 在该分支只实现
+    ///     play/pause/resume/stop/next/prev 六个字符串值，**没有 vol/source**；
+    ///   · 旧口径 {t,v,n}（无 type 键）→ `if (!t) { handle_cmd(jc); continue; }` 直通
+    ///     handle_cmd（poller.c:77-88），那里才有 bgm vol（音量绝对值 n∈[0,100]）与
+    ///     source（n: 0=WZ/1=QQ）。
+    /// 因此音量/音源只能走本字段；写成 {"type":"bgm","payload":{"n":50}} 会被固件静默忽略
+    /// （payload 非字符串 → cJSON_IsString(vitem) 为假）。
+    /// </summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public LegacyCommand? Legacy { get; set; }
+
+    /// <summary>旧口径三元组（poller.c handle_cmd 期望的顶层 t/v/n）。</summary>
+    public sealed class LegacyCommand
+    {
+        /// <summary>指令名（固件 t）：目前仅 "bgm"。</summary>
+        public string T { get; set; } = "";
+        /// <summary>指令值（固件 v）：固件原样 strcmp——"vol" / "source"。</summary>
+        public string? V { get; set; }
+        /// <summary>数值参数（固件 n）。</summary>
+        public int? N { get; set; }
+    }
+
+    /// <summary>
+    /// poll 响应里的线上形状：默认原样 {seq,type,payload,...}；Legacy 指令投影为
+    /// {seq,t,v,n}（无 type → 固件直通 handle_cmd）。
+    /// </summary>
+    public object ToWire() => Legacy is { } l
+        ? new { seq = Seq, t = l.T, v = l.V, n = l.N }
+        : (object)this;
 }
 
 /// <summary>
@@ -77,6 +111,31 @@ public sealed class CommandQueue
                 Seq = ++st.LastSeq,
                 Type = type,
                 Payload = StorageUtil.ToElement(payload),
+            };
+            st.Pending.Add(cmd);
+            PersistLocked(st);
+            st.Signal.TrySetResult();
+            st.Signal = NewSignal();
+            return cmd;
+        }
+    }
+
+    /// <summary>
+    /// 入队「固件旧口径」指令（{t,v,n}，无 type 字段）——仅 bgm vol/source 用：
+    /// 现代 {type,payload} 分支的 bgm 没有 vol/source 实现（详见 DeviceCommand.Legacy）。
+    /// Type 仍记 "bgm"（队列持久化/事件日志可读），线上形状由 Legacy 决定。
+    /// </summary>
+    public DeviceCommand EnqueueLegacy(string deviceId, string t, string v, int? n)
+    {
+        var st = GetState(deviceId);
+        lock (st.Gate)
+        {
+            var cmd = new DeviceCommand
+            {
+                Seq = ++st.LastSeq,
+                Type = t,
+                Payload = StorageUtil.ToElement(new { v, n }),
+                Legacy = new DeviceCommand.LegacyCommand { T = t, V = v, N = n },
             };
             st.Pending.Add(cmd);
             PersistLocked(st);

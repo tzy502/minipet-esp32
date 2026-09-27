@@ -161,9 +161,9 @@ export function sendBgmCommand(deviceId, value, opts = {}) {
 /**
  * 探测 admin 指令端点是否放行 type=bgm（曲库页播放控制卡开卡/「重新检测」用）。
  * 语义：POST {"type":"bgm","value":"__probe__"}（哨兵值，设备零副作用）。
- * 返回 { supported: true | false | null, status?, error? }
- *   true  = 放行（2xx；或 400 但拒绝理由不是「type 非法：bgm」——例如 value 白名单不符，
- *           说明 bgm 这个 type 已认，只是拒绝了哨兵值）
+ * 返回 { supported: true | false | null, status?, error?, probeRejected? }
+ *   true  = 放行 bgm。含「400 但不是『type 非法：bgm』」的情形（例：哨兵值被 value 白名单拒
+ *           ——对一个正确的实现来说这是**预期**响应，故 probeRejected=true 而非判失败）
  *   false = 404/405/501 路由不存在；或 400 且错误文案明确说「type 非法/不支持：bgm」
  *           （服务端 AdminEndpoints.cs:281-284 白名单当前就是这一形态）
  *   null  = 网络不可达等无法判定
@@ -181,7 +181,7 @@ export async function probeBgmCommand(deviceId) {
     const typeRejected =
       /bgm/i.test(msg) && /type[\s=:：]*[^，,。;\s]{0,12}?(非法|不支持|未知|无效)/i.test(msg)
     if (status === 400 && typeRejected) return { supported: false, status, error: msg }
-    if (status) return { supported: true, status, error: msg }
+    if (status) return { supported: true, status, error: msg, probeRejected: true }
     return { supported: null, error: msg }
   }
 }
