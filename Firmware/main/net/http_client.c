@@ -427,17 +427,28 @@ int mp_http_hello(void)
  * 增量语义：body 带 since（上次成功送达的最大序号），服务端按 seq 去重/排序即可；
  * 只有成功（HTTP 200）才推进游标，失败下轮重传（不丢日志）。
  *
- * 内存：body 缓冲是文件级 static（.bss，不占内部【动态】堆、不占 PSRAM，
- * 一次分配永驻，规避碎片化导致的运行期 malloc 失败 —— 本板已有前车之鉴）。 */
+ * 【2026-09-27 改】body/hex 两个缓冲原为 .bss（内部 DRAM 常驻 5.6KB）。真机实测
+ * 该常驻量直接导致"IP 拿到了但 hello 发不出去"：启动末期内部堆只剩 ~7KB/最大块
+ * 3KB，HTTP 客户端建连所需的工作内存拿不到。现改为 PSRAM 懒分配（首次上报时
+ * 一次分配、失败则本次跳过下轮再试），把内部堆完整让给网络栈。 */
 
 /* 单条日志的 msg 走 hex（json_escape 的替代：零堆分配、零栈大数组；
  * 不可打印字节/引号/换行都不需要再转义；服务端 hex→UTF-8 即可）。
  * 唯一读者是 poller 任务（单线程），故 scratch 用文件级 static 复用。 */
-static char s_log_hex[LOG_HEX_MAX * 2 + 1];
+static char *s_log_hex;      /* PSRAM 懒分配（LOG_HEX_MAX*2+1） */
+
+static bool log_scratch_alloc(void)
+{
+    if (!s_log_hex) {
+        s_log_hex = heap_caps_malloc(LOG_HEX_MAX * 2 + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    }
+    return s_log_hex != NULL;
+}
 
 static void log_msg_to_hex(const char *msg)
 {
     static const char HEX[] = "0123456789abcdef";
+    if (!s_log_hex) return;
     size_t slen = strlen(msg);
     size_t sn = slen > LOG_HEX_MAX ? LOG_HEX_MAX : slen;      /* 超长截断（保头） */
     size_t hl = 0;
@@ -470,8 +481,10 @@ void mp_http_device_log_step(void)
 
     s_log_last_try_ms = now_ms;
 
-    static char body[LOG_BODY_CAP];
-    int off = snprintf(body, sizeof(body),
+    static char *body;
+    if (!body) body = heap_caps_malloc(LOG_BODY_CAP, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!body || !log_scratch_alloc()) return;      /* PSRAM 不足：本轮跳过，下轮再试 */
+    int off = snprintf(body, LOG_BODY_CAP,
                        "{\"proto\":%d,\"deviceId\":\"%s\",\"since\":%lu,\"logs\":[",
                        MP_PROTO_VER, s_device_id, (unsigned long)s_log_sent_seq);
 
@@ -481,7 +494,7 @@ void mp_http_device_log_step(void)
     if (logbuf_scan_start(&it, s_log_sent_seq)) {
         logbuf_rec_t rec;
         while (logbuf_scan_next(&it, &rec)) {
-            if (off <= 0 || (size_t)off >= sizeof(body) - 640) break;   /* 留余量给尾部 */
+            if (off <= 0 || (size_t)off >= (size_t)LOG_BODY_CAP - 640) break;   /* 留余量给尾部 */
             log_msg_to_hex(rec.msg);
             char one[LOG_HEX_MAX * 2 + 160];
             int w = snprintf(one, sizeof(one),
@@ -490,7 +503,7 @@ void mp_http_device_log_step(void)
                              (unsigned long)rec.seq, (unsigned long long)rec.ts_ms,
                              (unsigned long)rec.t_ms, rec.lvl, rec.tag, s_log_hex);
             if (w <= 0 || (size_t)w >= sizeof(one)) continue;   /* 不该发生：跳过 */
-            if (off + w + 3 >= (int)sizeof(body)) break;
+            if (off + w + 3 >= LOG_BODY_CAP) break;
             if (n) body[off++] = ',';
             memcpy(body + off, one, (size_t)w);
             off += w;
@@ -502,7 +515,7 @@ void mp_http_device_log_step(void)
 
     if (n == 0) return;                                  /* 一条都塞不进：等缓冲腾挪 */
 
-    off += snprintf(body + off, sizeof(body) - (size_t)off, "],\"count\":%d}", n);
+    off += snprintf(body + off, (size_t)LOG_BODY_CAP - (size_t)off, "],\"count\":%d}", n);
 
     char resp[LOG_RESP_CAP];
     int status = mp_http_post_json(LOG_PATH, body, resp, sizeof(resp), LOG_POST_TIMEOUT);
