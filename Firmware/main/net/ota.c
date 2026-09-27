@@ -10,6 +10,7 @@
 #include "freertos/task.h"
 #include "freertos/queue.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 #include "esp_system.h"
 #include "esp_ota_ops.h"
 
@@ -145,16 +146,38 @@ static void ota_task(void *arg)
 /* ------------------------------------------------------------------ */
 /* 公开 API                                                             */
 /* ------------------------------------------------------------------ */
+/* 【按需拉起 2026-09-27】OTA 任务原本开机常驻 6144B 栈，而它只在收到 OTA
+ * 指令时才需要跑（设备可能几个月不升级一次）。本板内部 DRAM 运行期只剩
+ * ~1.6KB 最大连续块 → 长轮询事务（需 4~8KB）因此失败 → 服务端一直显示 offline。
+ * 改为：ota_start() 只建队列（几百字节），任务在**首次收到 OTA 指令**时才创建。
+ * 代价：升级开始时的任务创建若因碎片失败，会重试一次（见下），但常规运行不再白占。 */
+static bool ota_task_up;
+
+static bool ota_task_try(void)
+{
+    if (ota_task_up) return true;
+    if (xTaskCreatePinnedToCore(ota_task, "ota", 6144, NULL,
+                                1 /* 最低优先级——4.1 */, NULL, 0 /* PRO */) == pdPASS) {
+        ota_task_up = true;
+        ESP_LOGW(TAG, "ota 任务按需创建成功（收到升级指令）");
+        return true;
+    }
+    ESP_LOGE(TAG, "ota 任务创建失败（内部堆 空闲=%u 最大块=%u）→ 本次升级放弃",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+    return false;
+}
+
 void ota_start(void)
 {
     s_req_q = xQueueCreate(2, sizeof(ota_req_t));
-    xTaskCreatePinnedToCore(ota_task, "ota", 6144, NULL,
-                            1 /* 最低优先级——4.1 */, NULL, 0 /* PRO */);
+    /* 不在这里建任务：见上方注释（按需拉起省 6KB 常驻） */
 }
 
 void mp_ota_offer(const char *ver, const char *url)
 {
     if (!s_req_q || !ver || !url || url[0] == 0) return;
+    if (!ota_task_try()) return;      /* 按需拉起（失败即放弃本次升级） */
     ota_req_t req;
     strlcpy(req.ver, ver, sizeof(req.ver));
     strlcpy(req.url, url, sizeof(req.url));
