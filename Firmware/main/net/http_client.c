@@ -33,6 +33,7 @@ static const char *TAG = "http";
 static char s_server_url[128];      /* 无结尾斜杠 */
 static char s_uuid[13];             /* 12 hex + NUL */
 static char s_device_id[40];        /* hello 返回；未注册时 = s_uuid */
+static volatile bool s_hello_done;
 static char s_pairing_code[8];      /* hello 下发的 6 位配对码（暂存，字体绑定后重显） */
 
 /* ------------------------------------------------------------------ */
@@ -72,6 +73,7 @@ void mp_http_init(void)
 const char *mp_http_server_url(void) { return s_server_url[0] ? s_server_url : NULL; }
 const char *mp_http_uuid(void)       { return s_uuid; }
 const char *mp_http_device_id(void)  { return s_device_id; }
+bool mp_http_hello_done(void) { return s_hello_done; }
 const char *mp_http_pairing_code(void)    { return s_pairing_code; }
 
 /* ------------------------------------------------------------------ */
@@ -293,6 +295,10 @@ static bool json_num2(const cJSON *obj, const char *primary,
 
 int mp_http_hello(void)
 {
+    /* 【真机修复 2026-09-27】hello 自身也依赖 srv_url 已装载，而它只被
+     * state_machine_boot 调用——若轮询/其它任务先调 hello 会静默失败。
+     * mp_http_init 幂等，这里主动兜底。 */
+    mp_http_init();
     if (!mp_http_server_url()) return -1;
 
     const minipet_profile_t *prof = &MINIPET_PROFILE_AMOLED216;
@@ -366,6 +372,7 @@ int mp_http_hello(void)
     }
 
     cJSON_Delete(r);
+    s_hello_done = true;
     ESP_LOGI(TAG, "hello ok, deviceId=%s", s_device_id);
     return 0;
 }

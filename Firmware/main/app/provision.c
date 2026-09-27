@@ -567,6 +567,10 @@ static void wifi_init_once(void)
 {
     if (s_wifi_inited) return;
 
+    ESP_LOGW(TAG, "wifi_init_once：内部堆 空闲=%u 最大块=%u",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+
     esp_netif_create_default_wifi_sta();
     esp_netif_create_default_wifi_ap();
 
@@ -703,6 +707,11 @@ static void rtc_resync_task(void *arg)
     }
 }
 
+void provision_wifi_preinit(void)
+{
+    wifi_init_once();   /* 幂等：只建 esp_netif + esp_wifi_init，不连接 */
+}
+
 void provision_rtc_resync_start(void)
 {
     static bool started;
@@ -764,6 +773,11 @@ static void portal_task(void *arg)
 
     xEventGroupClearBits(s_wifi_events, WIFI_GOT_IP_BIT | WIFI_FAIL_BIT);
     ESP_ERROR_CHECK(esp_wifi_start());
+    /* 【真机连不通修复 2026-09-27】关闭 WiFi 省电（WIFI_PS_NONE）：
+     * 默认 WIFI_PS_MIN_MODEM 会让 TCP 建连/长轮询偶发 `select() timeout` 与
+     * `wifi:m f null`（真机实证：socket 建得出但 connect 超时 → hello 失败 →
+     * 设备长期不在线）。本设备常插电使用，省电收益远小于连通性。 */
+    esp_wifi_set_ps(WIFI_PS_NONE);
     esp_wifi_connect();
 
     EventBits_t bits = xEventGroupWaitBits(

@@ -49,6 +49,12 @@ bool provision_portal_active(void);
  * 并回写 PCF85063；成功/有效后转 6 小时周期。幂等，可重复调用。 */
 void provision_rtc_resync_start(void);
 
+/* 【启动早期】只建 WiFi 栈（esp_netif + esp_wifi_init），不连接、不阻塞。
+ * 必须在渲染任务/LVGL 大缓冲之前调用：本板内部堆 ~143KB，晚调会让
+ * esp_netif_create_default_wifi_sta() 返回 ESP_ERR_NO_MEM → abort 无限重启，
+ * WiFi 永不初始化 → 设备永不 poll。幂等，后续 provision_* 复用同一实例。 */
+void provision_wifi_preinit(void);
+
 #ifdef __cplusplus
 }
 #endif

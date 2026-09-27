@@ -265,6 +265,17 @@ static void poller_task(void *arg)
     for (;;) {
         extern bool provision_portal_active(void);   /* portal 期间停轮询：无配置时对不可达服务端的重试会耗尽 lwip 缓冲（listen ENOBUFS 根因） */
         while (provision_portal_active()) vTaskDelay(pdMS_TO_TICKS(1000));
+
+        /* 【真机根因 2026-09-27】本任务在 app_main 里先于 state_machine_boot()
+         * 启动，而 deviceId 是 hello 从服务端取回的。此前会在 hello 之前就用
+         * UUID 匿名回退值发 poll → 服务端 404「未注册设备」→ 设备永远回不到
+         * 在线（真机日志：poll?deviceId=44BD8D60DAC0&since=0 + HTTP_CONNECT 失败）。
+         * 现等 hello 完成再轮询；hello 未完成时不做请求、只低频等待。 */
+        if (!mp_http_hello_done()) {
+            vTaskDelay(pdMS_TO_TICKS(500));
+            continue;
+        }
+
         /* WiFi 掉线先重连（OFFLINE 期间唯一回网驱动，E11） */
         if (!provision_wifi_connect_sta(15000)) {
             /* 连不上家网：慢退避重试，不忙转 */
@@ -307,5 +318,15 @@ static void poller_task(void *arg)
 
 void poller_start(void)
 {
-    xTaskCreatePinnedToCore(poller_task, "poller", 4096, NULL, 3, NULL, 0 /* PRO */);
+    /* 【真机栈溢出修复 2026-09-27】原栈 4096 太小：poller 内要跑
+     * `mp_http_get` → esp_http_client + esp-tls 握手（内部深调用链）+
+     * http_txn 里 malloc(READ_CHUNK) 与 cJSON 解析响应。
+     * 真机症状（服务端恢复后设备仍不重连）：任务静默卡死/栈破坏 →
+     * 连 `poll failed` 日志都打不出，同时网络栈报 `wifi:m f null` 92 次/20s。
+     * 提栈到 8192（失败则回退 4096 保证任务至少存在）。 */
+    if (xTaskCreatePinnedToCore(poller_task, "poller", 8192, NULL, 3, NULL,
+                                0 /* PRO */) != pdPASS) {
+        ESP_LOGW(TAG, "poller 8K 栈任务创建失败 → 回退 4096");
+        xTaskCreatePinnedToCore(poller_task, "poller", 4096, NULL, 3, NULL, 0);
+    }
 }

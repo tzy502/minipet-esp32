@@ -830,30 +830,8 @@ static void key0_menu_hold_tick(void);   /* 定义见下（前向声明） */
 static void key0_tick(void)
 {
     key0_menu_hold_tick();               /* 菜单内：按住时长状态机（长按退出/短按下移） */
-    /* 【中键取证 2026-09-27】用户实测"中键理论向上但没反应"。为区分
-     * 「按键根本没接到 GPIO0」与「接到了但被消抖/分支吃掉」：
-     * 每 2s 打印 GPIO0 原始电平 + 按下沿累计数；电平变化即时打印。
-     * 探针纯只读，不改变下面任何行为。 */
-    static int64_t s_probe_ms;
-    static uint32_t s_edge_cnt;
-    static int s_last_lvl = -1;          /* -1=未采样 */
-
-    int lvl = key_gpio0_pressed() ? 0 : 1;
-    if (s_last_lvl < 0) {
-        s_last_lvl = lvl;
-        ESP_LOGW(TAG, "中键 GPIO0 初值=%d（0=低/按下，1=高/松开）", lvl);
-    } else if (lvl != s_last_lvl) {
-        s_last_lvl = lvl;
-        ESP_LOGW(TAG, "中键 GPIO0 跳变 → %d", lvl);
-    }
-    if (mp_now_ms() - s_probe_ms >= 3000) {
-        s_probe_ms = mp_now_ms();
-        ESP_LOGI("key0", "取证 GPIO0=%d 按下沿累计=%u", lvl, (unsigned)s_edge_cnt);
-    }
-
     if (!key_gpio0_tick()) return;       /* 消抖后的按下沿事件（一次/按压） */
-    s_edge_cnt++;
-    ESP_LOGI(TAG, "中键（GPIO0）按下沿");
+    ESP_LOGI(TAG, "底键（GPIO0）按下沿");
     {
         /* 【中键取证】NVS 累计计数 + 按下时状态机状态：计数证明通路，
          * 状态字节裁决"菜单里没反应"是按键没到还是分支走错 */
@@ -944,7 +922,7 @@ static void key0_menu_hold_tick(void)
  *     SYS_OUT，wiki 列为板上网络、用途存疑）、GPIO47/48（S3 空脚，wiki 表
  *     未列出，防板上另有走线；未连时上拉读 1 恒定，无害）。
  */
-#define MP_KEY_SCAN_PROBE 1
+#define MP_KEY_SCAN_PROBE 0   /* 诊断期结束：常驻扫描探针占内部堆，已定位按键归属 */
 
 #if MP_KEY_SCAN_PROBE
 #include "driver/gpio.h"

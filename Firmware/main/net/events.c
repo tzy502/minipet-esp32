@@ -87,6 +87,24 @@ static void events_task(void *arg)
             n++;
         }
 
+        /* 【真机 socket 耗尽修复 2026-09-27】本任务在 app_main 里先于
+         * state_machine_boot() 启动，开机事件（BOOT/MANIFEST_SYNCED…）在网络
+         * 还没就绪（WiFi 未拿 IP）时就发起 POST：
+         *   mp_http_tx_fail ... errno=105 (No buffer space available)
+         * 这会占满 lwip socket 池，导致紧随其后的 hello 也建不出 socket
+         * （errno=105）→ 设备永远不在线。
+         * 修法：等 hello 成功（deviceId 就绪 + 网络可用）再上报；等待期间
+         * 事件继续在队列里排着（不丢，队列满则由 mp_post_event_simple 丢弃）。 */
+        if (!mp_http_hello_done()) {
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            /* 网络未就绪：把已取出的事件放回队列（队列满即丢，与既有"有界损失"
+             * 口径一致），下一轮再试。绝不在此处发请求。 */
+            for (int i = n - 1; i >= 0; i--) {
+                if (xQueueSend(mp_event_q, &batch[i], 0) != pdTRUE) break;
+            }
+            continue;
+        }
+
         /* 【契约对齐 + 网络风暴修复 2026-09-27】
          * 服务端 DeviceEventRequest（DeviceEndpoints.cs:54-62）是【单事件】形状
          * {deviceId,type,tsUtc,data,hashes}，旧的 {events:[...],cache:[...]} 数组
@@ -167,5 +185,5 @@ static void events_task(void *arg)
 
 void events_start(void)
 {
-    xTaskCreatePinnedToCore(events_task, "events", 4096, NULL, 3, NULL, 0 /* PRO */);
+    xTaskCreatePinnedToCore(events_task, "events", 8192, NULL, 3, NULL, 0 /* PRO */);   /* 8192：同 poller，HTTP POST 需 TLS 深栈（原 4096 偏紧）*/
 }

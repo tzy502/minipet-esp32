@@ -210,6 +210,17 @@ static void app_main_task(void *arg)
 
     /* 应用层 */
     input_dispatch_init();
+
+    /* 【真机 NO_MEM 根因修复 2026-09-27】WiFi/esp_netif 必须在【渲染任务与
+     * LVGL 大缓冲之前】初始化：本板内部堆仅 ~143KB，渲染任务(12K)+菜单整屏
+     * 缓冲(PSRAM)+LVGL 初始化会把内部堆切碎，之后 state_machine_boot() 里的
+     * wifi_init_once() 调 esp_netif_create_default_wifi_sta() 分配失败：
+     *   ESP_ERROR_CHECK failed: esp_err_t 0x101 (ESP_ERR_NO_MEM)
+     *   file: "./main/app/provision.c" line 574 / func: wifi_init_once → abort()
+     * → 无限重启、WiFi 从未初始化 → 设备永不 poll（"服务器重启后不重连"总根因）。
+     * 这里在任务创建前先把 WiFi 栈建好（幂等；后续 provision_* 调用直接复用）。 */
+    provision_wifi_preinit();
+
     state_machine_init();
     render_init(&MINIPET_PROFILE_AMOLED216);   /* FATFS 挂载后、首 tick 前（render.h） */
 

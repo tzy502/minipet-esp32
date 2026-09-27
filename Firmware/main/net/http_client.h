@@ -42,6 +42,10 @@ const char *mp_http_uuid(void);
 
 /* 注册返回的 deviceId（hello 之前返回 UUID 兜底） */
 const char *mp_http_device_id(void);
+
+/* hello 是否已成功（deviceId 已从服务端取回）。poller 必须先等它，
+ * 否则会用 UUID 匿名回退值去 poll → 服务端 404 → 永远回不到在线。 */
+bool mp_http_hello_done(void);
 const char *mp_http_pairing_code(void);   /* hello 下发的配对码（未配对时非空） */
 
 /* 流式 GET：path 为完整路径（"/api/device/..."）或绝对 URL（OTA/BGM 下发时）。
