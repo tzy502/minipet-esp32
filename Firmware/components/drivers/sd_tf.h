@@ -33,6 +33,10 @@ int sd_unmount(void);
 /** @brief 当前是否已挂载可读 */
 bool sd_is_mounted(void);
 
+/** 当前是否在**内部 Flash 出厂素材**模式（TF 卡缺失/挂载失败后回退）。
+ *  用于"没有 TF 卡就渲染默认形象 + 默认地图并屏上提示"的需求判定。 */
+bool sd_tf_is_flash_fallback(void);
+
 #ifdef __cplusplus
 }
 #endif

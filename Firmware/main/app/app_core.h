@@ -47,6 +47,11 @@ extern "C" {
 #define MP_DEFAULT_SRV_URL    ""
 #endif
 
+/* 无 TF 卡（出厂素材模式）时默认渲染的地图 id（需求：默认地图 000010000）。 */
+#ifndef MP_DEFAULT_MAP_ID
+#define MP_DEFAULT_MAP_ID     "000010000"
+#endif
+
 #define MP_TF_MINIPET_DIR     MP_TF_ROOT "/minipet"
 #define MP_TF_MANIFEST        MP_TF_MINIPET_DIR "/manifest.json"
 #define MP_TF_FIRMWARE_DIR    MP_TF_MINIPET_DIR "/firmware"   /* 4.4 */

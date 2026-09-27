@@ -16,6 +16,7 @@
  * app_cmd_dispatch() 落地（含 hash→路径 解析，见 asset_dl 查询面）。
  */
 #include "state_machine.h"
+#include "sd_tf.h"
 
 #include <string.h>
 #include <stdio.h>
@@ -251,6 +252,19 @@ static void self_test(bool sd_ok, bool psram_ok)
         transition(MP_ST_WIFI_PROVISION);
         watchdog_text_persist("NO WIFI CONFIG", "AP: MINIPET-XXXX");
         return;   /* portal 完成后自行重启 */
+    }
+
+    /* 【无 TF 卡提示 + 默认渲染 2026-09-27】SD 卡不在时固件走内部 Flash 的
+     * 出厂素材分区（sd_tf.c 的 fallback）：此时渲染的是出厂默认形象与默认地图，
+     * 内容不会随 Web 换装变化。需求（胶水）：没有 TF 卡就渲染默认，
+     * 地图默认 000010000，并且**屏上明确提示没有 TF 卡**，别让用户以为坏了。 */
+    if (sd_tf_is_flash_fallback()) {
+        ESP_LOGW(TAG, "无 TF 卡（内部 Flash 出厂素材模式）→ 渲染出厂默认形象 + 默认地图 %s",
+                 MP_DEFAULT_MAP_ID);
+        render_banner_show("NO TF CARD - FACTORY ASSETS");   /* 常驻横幅（配网页横幅同通道） */
+        mp_cmd_t mc = { .type = MP_CMD_SET_MAP };
+        strlcpy(mc.s, MP_DEFAULT_MAP_ID, sizeof(mc.s));
+        mp_post_cmd(&mc);
     }
 
     /* 4) WiFi 连接（20s）；失败 → OFFLINE（TF 缓存跑，poller 后台回网） */

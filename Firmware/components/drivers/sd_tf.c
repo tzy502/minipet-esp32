@@ -149,6 +149,11 @@ int sd_unmount(void)
     return 0;
 }
 
+bool sd_tf_is_flash_fallback(void)
+{
+    return s_on_flash;      /* 由 sd_mount() 的 Flash 回退分支置位 */
+}
+
 bool sd_is_mounted(void)
 {
     return s_mounted;

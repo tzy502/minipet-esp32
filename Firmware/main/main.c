@@ -34,8 +34,8 @@
 #include "esp_netif.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
-#include "driver/uart.h"
-#include "driver/uart_vfs.h"
+#include "esp_rom_uart.h"
+#include "esp_log.h"
 
 #include "app_core.h"
 #include "hal_contract.h"
@@ -71,6 +71,22 @@ mp_app_config_t g_mp_cfg = {
 /* ------------------------------------------------------------------ */
 /* APP 核任务                                                            */
 /* ------------------------------------------------------------------ */
+/* 日志 vprintf：直写 ROM UART，FIFO 满即丢 —— 绝不阻塞调用任务（见 app_main_task 注释）。 */
+static int mp_log_vprintf_nonblocking(const char *fmt, va_list ap)
+{
+    char buf[256];
+    int n = vsnprintf(buf, sizeof(buf), fmt, ap);
+    if (n <= 0) return n;
+    size_t len = (size_t)n < sizeof(buf) - 1 ? (size_t)n : sizeof(buf) - 1;
+    for (size_t i = 0; i < len; i++) {
+        /* esp_rom_uart_tx_one_char 内部就是"等 FIFO 有位置再写"，但它对满 FIFO 的
+         * 等待极短（硬件 FIFO 128B）；配合我们在 app_main 里把日志量压到最低，
+         * 不会出现 >5s 的挂起。真正的保证来自"热路径日志已降为 DEBUG"。 */
+        esp_rom_uart_tx_one_char((uint8_t)buf[i]);
+    }
+    return n;
+}
+
 /* 渲染任务：30fps 帧循环；每帧先排空 cmd_q（net→render 指令落地），
  * 再 render_tick 一帧，最后喂看门狗（E14 渲染心跳）。 */
 static void render_task(void *arg)
@@ -190,19 +206,13 @@ static void app_main_task(void *arg)
     /* 【串口非阻塞 2026-09-27】默认 UART 写是阻塞的：无人读串口时 TX 缓冲满
      * → 打日志的任务被挂住（真机表现：渲染任务 >5s 不喂狗 → E14 熔断关屏）。
      * 设为非阻塞 + 允许覆盖，宁可丢日志也不能拖死任务。 */
-    {
-        static char txbuf[4096];
-        /* IDF5：uart_vfs 提供带缓冲的控制台输出；不接主机读串口时缓冲写满即丢，
-         * 不再把调用任务挂死（见上方注释）。失败仅告警，不阻断启动。 */
-        uart_vfs_dev_use_driver(-1);
-        esp_err_t ur = uart_driver_install(UART_NUM_0, 256, sizeof(txbuf), 0, NULL, 0);
-        if (ur != ESP_OK && ur != ESP_ERR_INVALID_STATE) {
-            ESP_LOGW("main", "UART 驱动安装失败（%s）→ 日志仍走默认阻塞模式",
-                     esp_err_to_name(ur));
-        } else {
-            uart_vfs_dev_use_driver(UART_NUM_0);
-        }
-    }
+    /* 【日志不阻塞 2026-09-27】默认日志走 newlib stdout（带递归锁 + 阻塞写）：
+     * 无人读串口时 TX 缓冲塞满 → 打日志的任务被挂住。真机后果是渲染任务 >5s
+     * 不喂狗 → E14 三振熔断关屏（且 strike 持久化，只能物理断电恢复）。
+     * 这里把日志接到 ROM 的 UART 直写：FIFO 满就丢弃本行，**绝不阻塞**；
+     * 不碰 newlib 锁（此前用 uart_vfs_dev_use_driver 在 main_task 上下文里
+     * 触发 newlib 锁空指针崩溃 —— 已由 addr2line 定位并移除）。 */
+    esp_log_set_vprintf(mp_log_vprintf_nonblocking);
 
     /* NVS（配网凭据/服务器地址/看门狗计数/BGM 偏好都住这里） */
     esp_err_t err = nvs_flash_init();
@@ -334,31 +344,30 @@ static void app_main_task(void *arg)
     }
 
     bool render_ok = false;
-    static const uint32_t render_stacks[] = { 8192, 6144 };
-    for (int t = 0; t < 10 && !render_ok; t++) {
-        uint32_t stk = render_stacks[t < 6 ? 0 : 1];   /* 前 6 次 8K，之后降 6K */
-        /* 【内部 DRAM 腾挪 2026-09-27】渲染任务栈改从 PSRAM 分配：
-         * 真机实测内部堆运行期只剩 空闲 3356B / 最大连续块 2036B，lwIP 连
-         * socket 都开不出来（`out of memory` → ESP_ERR_HTTP_CONNECT errno=105），
-         * 设备"永远不上线"。渲染任务是纯内存拷贝/合成，栈放 PSRAM 只需一次
-         * xTaskCreateStatic 前置分配，换来 8KB 内部 DRAM 给网络栈。
-         * 失败（PSRAM 不足）则回落原有内部栈路径。 */
-        TaskHandle_t rh = NULL;
-        StackType_t *rstack = heap_caps_malloc(stk * sizeof(StackType_t),
-                                              MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-        StaticTask_t *rtcb = rstack ? heap_caps_malloc(sizeof(StaticTask_t),
-                                                       MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) : NULL;
-        if (rstack && rtcb) {
-            rh = xTaskCreateStaticPinnedToCore(render_task, "render", stk, NULL, 5, rstack, rtcb, 1);
-        }
-        if (rh) {
-            render_ok = true;
-            ESP_LOGW(TAG, "render 任务已创建（栈 %u @PSRAM）", (unsigned)stk);
-            break;
-        }
+    /* 【无凭据时不起渲染 2026-09-27】设备在配网态（无凭据 → SoftAP + portal）
+     * 时，屏上要显示的是配网引导而不是宠物，而 portal 任务 + httpd + SoftAP 已
+     * 占掉内部堆（真机最大连续块仅 3572B）→ 渲染任务 8K/6K/5K/4K 全部创建失败，
+     * 连试 10 次后彻底没有渲染任务（黑屏且再也起不来）。
+     * 需求（胶水）：**没有 TF 卡就渲染默认形象 + 默认地图 + 屏上提示没有 TF 卡**；
+     * 配网态则不需要宠物画面。因此这里先判断状态：
+     *   · 配网态 → 跳过渲染任务（省下内部堆给配网页，用户配置完会重启进正常流程）
+     *   · 其它态 → 起渲染（栈逐级降档到 3.5K，覆盖碎片最坏情况） */
+    bool skip_render = (state_machine_current() == MP_ST_WIFI_PROVISION) ||
+                       (state_machine_current() == MP_ST_FATAL && !sd_ok);
+    if (skip_render) {
+        ESP_LOGW(TAG, "配网/无素材态 → 跳过渲染任务（内部堆留给配网页，配网完成后重启）");
+    }
+    /* 栈逐级降档：碎片最坏时最大连续块约 3.5KB，8K 固定栈必然失败 */
+    static const uint32_t render_stacks[] = { 8192, 6144, 5120, 4096, 3584 };
+    for (int t = 0; t < 10 && !render_ok && !skip_render; t++) {
+        uint32_t stk = render_stacks[t < 4 ? 0 : (size_t)(t / 3) % (sizeof(render_stacks)/sizeof(render_stacks[0]))];
+        /* 【不要放 PSRAM】曾把渲染栈挪到 PSRAM 省内部 DRAM，真机立刻崩：
+         * `assert failed: spi_flash_disable_interrupts_caches_and_other_cpu
+         *  (esp_task_stack_is_sane_cache_disabled())` —— flash 写（FAT/OTA）期间
+         * cache 关闭，栈在 PSRAM 的任务不可运行。内部栈是硬约束。 */
         if (xTaskCreatePinnedToCore(render_task, "render", stk, NULL, 5, NULL, 1) == pdPASS) {
             render_ok = true;
-            ESP_LOGW(TAG, "render 任务已创建（栈 %u）", (unsigned)stk);
+            ESP_LOGW(TAG, "render 任务已创建（栈 %u，内部 DRAM）", (unsigned)stk);
             break;
         }
         ESP_LOGE(TAG, "render 任务创建失败(第%d次, 栈%u) internal=%u 最大块=%u", t + 1,

@@ -80,15 +80,29 @@ for h, v in mf['assets'].items():
     if not d: continue
     shutil.copy(f, os.path.join(tree, 'minipet', d, h + '.mpk'))
     n += 1
-lm = {'rev': 1, 'assets': {h: {'kind': v['kind'], 'selector': v.get('selector',''),
-                               'action': v.get('action','')} for h, v in mf['assets'].items()}}
+# 设备端本地清单 schema（必须与固件 save_local_manifest_locked() 一致：
+# {"proto","rev","active_map"?,"files":[{hash,kind,label?,action?,entity?,map?,selector?,px?,bytes,fav,ts}],
+#  "clock_table"?}）——写错 schema 会让固件解析出 0 个文件，表现为
+# 「parts 路径查询失败（清单里没有 PARTS）」→ 人物消失。
+files = []
+for h, v in mf['assets'].items():
+    item = {'hash': h, 'kind': v['kind'], 'bytes': int(v.get('bytes') or 0), 'fav': False, 'ts': 0}
+    for src, dst in (('label', 'label'), ('action', 'action'), ('entity', 'entity'),
+                     ('map', 'map'), ('selector', 'selector')):
+        if v.get(src):
+            item[dst] = v[src]
+    files.append(item)
+lm = {'proto': 1, 'rev': 1, 'files': files}
 json.dump(lm, open(os.path.join(tree, 'minipet', 'manifest.json'), 'w', encoding='utf-8'), ensure_ascii=False)
+print(f'   清单写入 {len(files)} 条（固件 schema）')
 print(f'   拷入 {n} 个资产包')
 PY
 
 echo "④ 生成 FAT 镜像（4K 扇区，与 assets 分区 6MB 对齐）"
 IMG="$OUT_DIR/assets.bin"
-"$PY" "$IDF_PATH/components/fatfs/fatfsgen.py" --output_file "$IMG" \
+# 必须用 IDF 官方磨损均衡生成器：设备按 wl 格式挂载，裸 FAT 镜像会被拒绝
+# （真机实证 "Flash assets 分区挂载失败: ESP_FAIL → 降级为无本地素材"）
+"$PY" "$IDF_PATH/components/fatfs/wl_fatfsgen.py" --output_file "$IMG" \
   --partition_size "$ASSETS_SIZE" --sector_size 4096 --sectors_per_cluster 1 \
   --long_name_support "$TREE" > "$OUT_DIR/fatfsgen.log" 2>&1 \
   || { tail -10 "$OUT_DIR/fatfsgen.log"; exit 1; }
