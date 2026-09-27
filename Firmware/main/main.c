@@ -157,7 +157,10 @@ void mp_orient_calib_tap(void)
  * 表现为设备每 ~2.7s 一轮重启循环（网络 GOT_IP 那一刻崩）。
  * 修法：app_main 只做"起一个带大栈的 app_main_task"，全部启动逻辑搬进去。
  * 大栈分配失败时回退到原行为（原栈上直接跑），至少不改变既有可用性。 */
-#define MP_MAIN_STACK  12288
+#define MP_MAIN_STACK  10240   /* 【内部堆腾挪 2026-09-27】原 12288：本板内部堆
+                                * 启动末期只剩几百字节最大块，SoftAP 的 DHCP/
+                                * 管理帧与配网页都被饿死（真机：Mac 关联成功但
+                                * 拿不到 IP）。该任务只做 init，10K 实测足够 */
 
 static void app_main_task(void *arg);
 

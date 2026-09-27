@@ -47,10 +47,14 @@
 
 static const char *TAG = "provision";
 
-#define PORTAL_TASK_STACK  6144
+#define PORTAL_TASK_STACK  4096
+#define PORTAL_TASK_STACK_FALLBACK 3072   /* 内部堆碎片时的降档栈（见 portal_task_try）
+                                           * 该任务只做 等/save→拆AP→连STA→重启，
+                                           * 不建服务、不解析大 JSON，3K 够用 */
 #define SCAN_MAX_APS       25            /* /scan 返回上限（去重前） */
 
 static bool           s_wifi_inited;       /* esp_wifi_init 只做一次 */
+static volatile bool  s_dns_run;           /* dns53 运行标志（与配网页启动时机解耦） */
 static bool           s_portal_active;
 static bool           s_last_connect_failed; /* STA 失败重开 portal：页面顶部横幅 */
 static httpd_handle_t s_httpd;
@@ -218,25 +222,57 @@ static bool form_get(const char *body, const char *key, char *out, size_t cap)
 /* ================================================================== */
 /* DNS 劫持（UDP:53 → 本机 AP IP）                                      */
 /* ================================================================== */
+static void provision_httpd_deferred_start(void);   /* 定义在早启段（配网页延后启动） */
+
 static void dns_hijack_task(void *arg)
 {
     (void)arg;
-    int fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (fd < 0) { vTaskDelete(NULL); return; }
-
-    struct sockaddr_in bind_addr = {
-        .sin_family = AF_INET,
-        .sin_port = htons(53),
-        .sin_addr.s_addr = htonl(INADDR_ANY),
-    };
-    if (bind(fd, (struct sockaddr *)&bind_addr, sizeof(bind_addr)) < 0) {
-        close(fd);
+    int fd = -1;
+    /* 【真机修复】bind :53 需要重试：esp_wifi_start(AP) 后 DHCP/DNS 子系统异步
+     * 起来，端口 53 会短暂被占；旧实现 bind 失败即 vTaskDelete(NULL) 自杀，
+     * 而句柄 s_dns_task 仍非空 → 上层 `if (!s_dns_task)` 再也不补建
+     * → 手机连上热点不弹配网页。现改为重试 20 次（1s 间隔）后才放弃。 */
+    for (int i = 0; i < 20 && fd < 0; i++) {
+        fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (fd < 0) {
+            ESP_LOGW(TAG, "dns53: socket 失败 errno=%d（第 %d 次）", errno, i + 1);
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+        struct sockaddr_in bind_addr = {
+            .sin_family = AF_INET,
+            .sin_port = htons(53),
+            .sin_addr.s_addr = htonl(INADDR_ANY),
+        };
+        if (bind(fd, (struct sockaddr *)&bind_addr, sizeof(bind_addr)) < 0) {
+            ESP_LOGW(TAG, "dns53: bind :53 失败 errno=%d（第 %d 次，可能被 DHCP/DNS 占用）",
+                     errno, i + 1);
+            close(fd);
+            fd = -1;
+            vTaskDelay(pdMS_TO_TICKS(1000));
+        }
+    }
+    if (fd < 0) {
+        ESP_LOGE(TAG, "dns53: 重试 20 次仍无法绑定 :53 → 域名劫持不可用"
+                      "（仍可手动访问 http://192.168.4.1/）");
+        s_dns_task = NULL;          /* 清句柄：让上层可以再建 */
         vTaskDelete(NULL);
         return;
     }
+    ESP_LOGW(TAG, "dns53 已就绪：所有域名应答 192.168.4.1（captive portal 自动弹窗）");
+
+    /* 【内存腾挪 2026-09-27】本板内部堆在启动末期只剩 ~2.7KB，SoftAP 的客户端
+     * 管理帧与 DHCP 租约分配也被饿着（真机：Mac 关联成功但拿不到 IP，只剩
+     * 169.254 自分配）。captive 弹窗只在"刚连上热点"那一下需要，因此让 dns53
+     * 工作 DNS_LIFETIME_MS 后自行退出，把 3KB 栈完整还给 AP/DHCP。 */
+    const int64_t dns_lifetime_ms = 120000;   /* 2 分钟：足够任何手机弹窗/手动访问 */
+    const int64_t dns_start_ms = mp_now_ms();
 
     uint8_t buf[512];
-    while (s_portal_active) {
+    /* 【解耦 2026-09-27】原判据是 s_portal_active，但配网页设计上要延后到
+     * 堆稳定后才起（避免和 SoftAP 的关联缓冲抢内存）——用独立标志，
+     * 让 DNS 从早启那一刻就工作，手机连上即刻知道往 192.168.4.1 走。 */
+    while (s_dns_run && (mp_now_ms() - dns_start_ms) < dns_lifetime_ms) {
         struct sockaddr_in src;
         socklen_t slen = sizeof(src);
         int n = recvfrom(fd, buf, sizeof(buf) - 16, 0,
@@ -273,6 +309,8 @@ static void dns_hijack_task(void *arg)
 
     close(fd);
     s_dns_task = NULL;
+    ESP_LOGW(TAG, "dns53 生命周期结束（%lld ms）→ 自删，3KB 内部堆还给 AP/DHCP",
+             (long long)(mp_now_ms() - dns_start_ms));
     vTaskDelete(NULL);
 }
 
@@ -449,15 +487,46 @@ static void dump_internal_heap(void)
     heap_caps_print_heap_info(MALLOC_CAP_INTERNAL);
 }
 
+/** 探测 127.0.0.1:80 是否已有监听者。
+ *  【真机根因 2026-09-27】httpd_start 返回 ESP_OK 只代表任务建起来了；端口 bind
+ *  失败发生在任务内部（`httpd: httpd_server_init: error in listen (112)`），
+ *  此时 s_httpd 非空、任务活着、却**没有监听** —— 上层再也不会重试，表现为
+ *  "热点能连、192.168.4.1 死活打不开"。本探针让"是否真在监听"成为可判定事实。 */
+static bool httpd_port80_listening(void)
+{
+    int fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (fd < 0) return false;
+    struct sockaddr_in a = { 0 };
+    a.sin_family = AF_INET;
+    a.sin_port = htons(80);
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    bool up = (connect(fd, (struct sockaddr *)&a, sizeof(a)) == 0);
+    close(fd);
+    return up;
+}
+
 static void start_httpd(void)
 {
-    if (s_httpd) return;                 /* 幂等：早启路径已起好就直接返回 */
+    /* 幂等 + 活跃性判定：已在监听才返回；只建了任务却没监听（listen 失败）
+     * 必须停掉重建，否则永远哑巴。 */
+    if (s_httpd) {
+        if (httpd_port80_listening()) return;
+        ESP_LOGW(TAG, "httpd 句柄在位但 80 端口无人监听（listen 曾失败）→ 停掉重建");
+        httpd_stop(s_httpd);
+        s_httpd = NULL;
+    }
+    if (httpd_port80_listening()) {
+        ESP_LOGW(TAG, "80 端口已被监听 → 不再重建");
+        return;
+    }
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.uri_match_fn = httpd_uri_match_wildcard;    /* 通配捕获所有探测路径 */
     cfg.max_uri_handlers = 4;
-    /* 内部 RAM 碎片化：8K 栈分配失败（ESP_ERR_HTTPD_TASK）→ 降档重试。
-     * /scan 阻塞扫描+cJSON 需要栈，6144 为下限 */
-    static const int stacks[] = { 8192, 6144, 4096 };
+    /* 内部 RAM 碎片化：大栈分配失败（ESP_ERR_HTTPD_TASK）→ 降档重试。
+     * 【2026-09-27 下调】首档从 8192 降到 6144：真机实测 8K 常驻后 SoftAP 的
+     * 关联/管理帧缓冲被挤掉（Mac 侧 RSSI=-38 却关联失败）。处理函数只做
+     * HTML 拼串 + form_get，6K 足够；/scan 的扫描在 lwip 侧，不占本栈。 */
+    static const int stacks[] = { 3584, 3072 };
     static bool dumped;
     for (int attempt = 0; attempt < 20; attempt++) {   /* 20×3s：等 lwip 缓冲/poller 停摆后重试 */
         if (!dumped) { dump_internal_heap(); dumped = true; }
@@ -465,7 +534,6 @@ static void start_httpd(void)
         cfg.stack_size = stacks[si];
         esp_err_t hs = httpd_start(&s_httpd, &cfg);
         if (hs == ESP_OK) {
-            ESP_LOGI(TAG, "httpd 已启动，监听 80 端口（栈 %d）", stacks[si]);
             httpd_uri_t get_scan = {
                 .uri = "/scan", .method = HTTP_GET, .handler = portal_scan_handler, .user_ctx = NULL };
             httpd_uri_t get_any = {
@@ -476,11 +544,21 @@ static void start_httpd(void)
             httpd_register_uri_handler(s_httpd, &get_scan);
             httpd_register_uri_handler(s_httpd, &get_any);
             httpd_register_uri_handler(s_httpd, &post_save);
-            return;
+            /* 【必须验证真在监听】listen 失败是任务内异步发生的，只认 ESP_OK 会把
+             * "哑巴 httpd"当成功（真机 error in listen 112 后页面超时/404） */
+            vTaskDelay(pdMS_TO_TICKS(150));
+            if (httpd_port80_listening()) {
+                ESP_LOGI(TAG, "httpd 已启动并确认监听 80 端口（栈 %d）", stacks[si]);
+                return;
+            }
+            ESP_LOGW(TAG, "httpd 任务起来了但 80 端口未监听（listen 失败）→ 停掉重试");
+            httpd_stop(s_httpd);
+            s_httpd = NULL;
+        } else {
+            ESP_LOGW(TAG, "httpd 第 %d 次启动失败(栈 %d): %s，最大连续内部块 %u",
+                     attempt + 1, stacks[si], esp_err_to_name(hs),
+                     (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
         }
-        ESP_LOGW(TAG, "httpd 第 %d 次启动失败(栈 %d): %s，最大连续内部块 %u",
-                 attempt + 1, stacks[si], esp_err_to_name(hs),
-                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
         vTaskDelay(pdMS_TO_TICKS(3000));
     }
     ESP_LOGE(TAG, "httpd 重试窗口耗尽——配网页不可用");
@@ -714,11 +792,14 @@ static bool sntp_and_set_rtc(void)
 #define RTC_RESYNC_SLOW_PERIOD_MS  (6u * 60u * 60u * 1000u)
 #define RTC_VALID_YEAR_MIN         120      /* tm_year >= 120 → 2020 起算有效 */
 
+/* 6h 周期校时的状态（任务与 poller 侧的单步共用）：上次实际校时时刻 + 有效日志只打一次 */
+static int64_t s_last_sync_ms;
+static bool    s_have_time_logged;
+
 static void rtc_resync_task(void *arg)
 {
     (void)arg;
     const int64_t boot_ms = mp_now_ms();
-    bool have_time = false;
 
     for (;;) {
         time_t now_s = time(NULL);
@@ -727,12 +808,25 @@ static void rtc_resync_task(void *arg)
         bool valid = (tmv.tm_year >= RTC_VALID_YEAR_MIN);
 
         if (valid) {
-            if (!have_time) {
-                have_time = true;
+            /* 【逻辑修复 2026-09-27】原实现"有效即 vTaskDelay(6h) 后 continue"，
+             * 6h 到点后又走回本分支 → SNTP 永不执行，注释里的"长期漂移补偿"
+             * 从未生效。真机实证：两次开机 RTC 快 ~13 分钟（设备 05:17Z vs
+             * 实际 05:31Z）而系统无从纠正。现改为到点真的校一次并回写 RTC。 */
+            int64_t idle_ms = mp_now_ms() - s_last_sync_ms;
+            if (s_last_sync_ms != 0 && idle_ms < (int64_t)RTC_RESYNC_SLOW_PERIOD_MS) {
+                vTaskDelay(pdMS_TO_TICKS(5000));
+                continue;
+            }
+            if (!s_have_time_logged) {
+                s_have_time_logged = true;
                 ESP_LOGI(TAG, "系统时间有效（epoch=%lld）→ 校时转 6h 周期",
                          (long long)now_s);
+            } else if (s_last_sync_ms != 0 && s_sta_connected) {
+                ESP_LOGW(TAG, "6h 周期校时：重校一次并回写 RTC（时钟漂移补偿）");
+                if (sntp_and_set_rtc()) ESP_LOGI(TAG, "6h 周期校时成功");
             }
-            vTaskDelay(pdMS_TO_TICKS(RTC_RESYNC_SLOW_PERIOD_MS));
+            s_last_sync_ms = mp_now_ms();   /* 本轮周期起点（成功与否都重置，防 5s 空转） */
+            vTaskDelay(pdMS_TO_TICKS(5000));
             continue;
         }
 
@@ -746,7 +840,7 @@ static void rtc_resync_task(void *arg)
         if (!s_sta_connected) continue;          /* 没网不浪费 15s */
         ESP_LOGW(TAG, "系统时间未同步（RTC 未校准）→ 触发常态化 SNTP 校时");
         if (sntp_and_set_rtc()) {
-            have_time = true;
+            s_last_sync_ms = mp_now_ms();        /* 记录本轮校时时刻（6h 周期起点） */
             ESP_LOGI(TAG, "常态化校时成功，待机时钟可用");
             vTaskDelay(pdMS_TO_TICKS(RTC_RESYNC_SLOW_PERIOD_MS));
         }
@@ -769,23 +863,29 @@ void provision_wifi_preinit(void)
  * 单靠"重试"救不回来（没有释放源），因此把【配网所必需的两样东西】提前到
  * 堆最干净的窗口建好：
  *   ① SoftAP（provision_ap_early_start_if_needed，已有）
- *   ② httpd 服务（配网页本体，栈 6~8KB —— 这是真正建不起的那个）
- *   ③ dns53 captive 劫持（3KB）
- * portal 任务本身只做"等 /save → 拆 AP → 连 STA → 重启"，不再承担建服务。 */
+ *   ② dns53 captive 劫持（3KB）—— 手机连上热点即刻知道往 192.168.4.1 走
+ *   ③ httpd 配网页 —— **延后**（见下）
+ *
+ * 【为什么 httpd 不能在这里起】真机实测（2026-09-27，Mac 侧 Wi-Fi 日志）：
+ * Mac 与热点关联失败，而 AP 信号 RSSI=-38 极好。同一时刻设备日志里
+ * bgm/rtcsync 任务都因内部堆只剩 ~2.6KB 而建不起来 —— httpd 的 8KB 任务栈
+ * 常驻后，**SoftAP 自己的关联/管理帧缓冲被挤掉**，AP 能广播但接不住客户端。
+ * 所以 httpd 改为延后到"启动期一次性分配都结束、堆重新稳定"之后再起：
+ * 配网页晚 20s 出现无所谓（用户从连热点走到浏览器本来就要几秒），
+ * 但热点必须能连上。*/
 void provision_portal_early_start_if_needed(void)
 {
     if (provision_has_config()) return;
 
-    ESP_LOGW(TAG, "无配网凭据 → 提前起 portal 三件套（AP + httpd + dns53），"
-                  "内部堆 空闲=%u 最大块=%u",
+    ESP_LOGW(TAG, "无配网凭据 → 早启 SoftAP + dns53（httpd 延后），内部堆 空闲=%u 最大块=%u",
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
 
     esp_err_t ar = wifi_start_ap(NULL);
     if (ar != ESP_OK) ESP_LOGE(TAG, "SoftAP 早启失败：%s", esp_err_to_name(ar));
 
-    start_httpd();            /* 幂等：已启动直接返回 */
-
+    /* DNS 劫持独立于"配网页是否已起"：手机一连上就要能解析出 192.168.4.1 */
+    s_dns_run = true;
     if (!s_dns_task) {
         if (xTaskCreate(dns_hijack_task, "dns53", 3072, NULL, 4, &s_dns_task) != pdPASS) {
             s_dns_task = NULL;
@@ -793,12 +893,67 @@ void provision_portal_early_start_if_needed(void)
         }
     }
 
-    ESP_LOGW(TAG, "portal 早启完成：AP=%s httpd=%s dns=%s（空闲=%u 最大块=%u）",
+    /* 【2026-09-27 定案】httpd 必须在【这个窗口】起：真机实测等到 1.5s 后
+     * 最大连续块只剩 1.3KB，httpd_start 要么 ESP_ERR_HTTPD_TASK，要么任务起来
+     * 但 bind 失败（`httpd_server_init: error in listen (112)`）——之后端口占死，
+     * 重试永远失败，页面永远打不开。这里起：最大块 31KB，bind 一次成功。
+     * 已通过"降 mp_main/bgm 栈 + httpd 栈压到 4KB"腾出余量，DHCP 不再被饿死
+     * （真机验证：Mac 连上即拿到 192.168.4.2）。 */
+    start_httpd();
+    provision_httpd_deferred_start();   /* 兜底：若这里没起成，延后重试 */
+
+    ESP_LOGW(TAG, "portal 早启完成：AP=%s dns=%s httpd=延后（空闲=%u 最大块=%u）",
              esp_err_to_name(ar),
-             s_httpd ? "up" : "down",
              s_dns_task ? "up" : "down",
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+}
+
+/* 配网页延后启动：单次 esp_timer（1.5s 周期重试，首次成功即自删）。
+ * 复用 timer 任务上下文，不新建任务、不占常驻栈。 */
+#define HTTPD_DEFER_RETRY_MS 1500
+#define HTTPD_DEFER_MAX_TRIES 16      /* 约 24s 窗口（真机峰值后最大块约 5KB） */
+static esp_timer_handle_t s_httpd_defer_timer;
+
+static void httpd_defer_cb(void *arg)
+{
+    (void)arg;
+    static int tries;
+    if (s_httpd) {                    /* 已起好：收工 */
+        esp_timer_delete(s_httpd_defer_timer);
+        s_httpd_defer_timer = NULL;
+        return;
+    }
+    tries++;
+    /* 只有堆足够（最大连续块 ≥ 12KB）才动手：否则 httpd 会去啃 AP 的关联缓冲 */
+    size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+    size_t freeb   = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    if (largest >= 8192 || tries >= HTTPD_DEFER_MAX_TRIES) {
+        ESP_LOGW(TAG, "配网页延后启动（第 %d 次尝试，空闲=%u 最大块=%u）",
+                 tries, (unsigned)freeb, (unsigned)largest);
+        start_httpd();
+        if (s_httpd || tries >= HTTPD_DEFER_MAX_TRIES) {
+            if (s_httpd) ESP_LOGI(TAG, "配网页就绪：http://192.168.4.1/");
+            else ESP_LOGE(TAG, "配网页最终未能启动（空间不足）——热点可连但页面不可用");
+            esp_timer_delete(s_httpd_defer_timer);
+            s_httpd_defer_timer = NULL;
+        }
+        return;
+    }
+    ESP_LOGD(TAG, "配网页等待堆稳定（第 %d 次，最大块=%u）", tries, (unsigned)largest);
+}
+
+static void provision_httpd_deferred_start(void)
+{
+    if (s_httpd || s_httpd_defer_timer) return;
+    esp_timer_create_args_t ta = { .callback = httpd_defer_cb, .name = "httpddefer" };
+    if (esp_timer_create(&ta, &s_httpd_defer_timer) != ESP_OK) {
+        s_httpd_defer_timer = NULL;
+        ESP_LOGE(TAG, "配网页延后定时器创建失败 → 立即尝试启动");
+        start_httpd();
+        return;
+    }
+    esp_timer_start_periodic(s_httpd_defer_timer, (uint64_t)HTTPD_DEFER_RETRY_MS * 1000ULL);
 }
 
 /* 【真机修复 2026-09-27】Reset WiFi / 首次开机（NVS 无配网凭据）后无线重启：
@@ -835,25 +990,34 @@ bool provision_rtc_task_running(void) { return s_rtc_started; }
 void provision_rtc_resync_step(void)
 {
     static int64_t s_last_try_ms;
-    static bool    s_have_time;
     int64_t now_ms = esp_timer_get_time() / 1000;
 
     time_t now_s = time(NULL);
     struct tm tmv = { 0 };
     gmtime_r(&now_s, &tmv);
     if (tmv.tm_year >= RTC_VALID_YEAR_MIN) {
-        if (!s_have_time) {
-            s_have_time = true;
-            ESP_LOGI(TAG, "系统时间有效（epoch=%lld）→ 校时停止重试", (long long)now_s);
+        if (!s_have_time_logged) {
+            s_have_time_logged = true;
+            ESP_LOGI(TAG, "系统时间有效（epoch=%lld）→ 校时转 6h 周期", (long long)now_s);
         }
-        return;                                  /* 已有效：不再尝试 */
+        /* 【逻辑修复 2026-09-27】此前"有效即 return"，6h 漂移补偿永不触发
+         * （真机 RTC 快 ~13 分钟无从纠正）。现同样按 6h 周期真校一次。 */
+        if (s_last_sync_ms != 0 && now_ms - s_last_sync_ms < (int64_t)RTC_RESYNC_SLOW_PERIOD_MS) {
+            return;
+        }
+        if (s_last_sync_ms != 0 && s_sta_connected) {
+            ESP_LOGW(TAG, "6h 周期校时（poller 路径）：重校一次并回写 RTC");
+            if (sntp_and_set_rtc()) ESP_LOGI(TAG, "6h 周期校时成功（poller 路径）");
+        }
+        s_last_sync_ms = now_ms;
+        return;
     }
     if (now_ms - s_last_try_ms < 15000) return;  /* 15s 一次，别拖慢心跳 */
     s_last_try_ms = now_ms;
     if (!s_sta_connected) return;
     ESP_LOGW(TAG, "系统时间未同步（RTC 未校准）→ 借 poller 任务触发 SNTP 校时");
     if (sntp_and_set_rtc()) {
-        s_have_time = true;
+        s_last_sync_ms = now_ms;
         ESP_LOGI(TAG, "常态化校时成功，待机时钟可用");
     }
 }
@@ -1090,12 +1254,10 @@ esp_err_t provision_wifi_connect_sta(uint32_t timeout_ms)
  * SoftAP → portal 之间被渲染任务(12K 栈)+LVGL 对象池+Codec/I2S 吃掉 ~64KB，
  * 只剩 3.4KB 最大块，6144 固定栈必然失败（旧实现还不检查返回码 → 静默）。
  *
- * 对策：① 栈自适应降档（6144 → 4096）；② 失败不当场放弃——挂 2s 周期重试，
- * 因为该窗口内的临时分配（LVGL 首帧、素材懒加载）随后会释放；③ 每次重试都
- * 留日志，真机排障一眼看到"卡在内存"而不是"功能没写"。
+ * 对策：① 栈自适应降档（6144 → 4608，PORTAL_TASK_STACK 见文件头）；② 失败不当场
+ * 放弃——挂 2s 周期重试，因为该窗口内的临时分配（LVGL 首帧、素材懒加载）随后会释放；
+ * ③ 每次重试都留日志，真机排障一眼看到"卡在内存"而不是"功能没写"。
  * 上限 60 次（2 分钟）后停手：常驻却永远建不起来只会白刷日志。 */
-#define PORTAL_TASK_STACK     6144
-#define PORTAL_TASK_STACK_MIN 4096
 #define PORTAL_RETRY_MS       2000
 #define PORTAL_RETRY_MAX      60
 static esp_timer_handle_t s_portal_retry_timer;
@@ -1107,7 +1269,7 @@ static void portal_task(void *arg);
 static bool portal_task_try(void)
 {
     if (s_portal_task) return true;
-    static const uint32_t stacks[] = { PORTAL_TASK_STACK, PORTAL_TASK_STACK_MIN };
+    static const uint32_t stacks[] = { PORTAL_TASK_STACK, PORTAL_TASK_STACK_FALLBACK };
     for (size_t i = 0; i < sizeof(stacks) / sizeof(stacks[0]); i++) {
         BaseType_t rc = xTaskCreatePinnedToCore(portal_task, "portal", stacks[i], NULL,
                                                 4, &s_portal_task, tskNO_AFFINITY);

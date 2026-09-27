@@ -793,7 +793,7 @@ static void bgm_task_retry_cb(void *arg)
 {
     (void)arg;
     if (s_task_up) return;
-    if (xTaskCreatePinnedToCore(bgm_task, "bgm", 16384, NULL, 3,
+    if (xTaskCreatePinnedToCore(bgm_task, "bgm", 12288, NULL, 3,
                                 NULL, 0 /* PRO */) == pdPASS) {
         s_task_up = true;
         ESP_LOGI(TAG, "bgm 任务延迟创建成功（内部堆已回稳）");
@@ -826,7 +826,7 @@ void bgm_start(void)
     /* 24K 栈是内部堆大客户（render 12K 已先行分配）：开机挤压窗口期可能
      * 拿不到连续块（真机 3/3 boot 全败）。首试失败不阻塞开机，转 10s 周期
      * 自愈定时器，内部堆回稳后自动补建（否则 BGM 静默不可用）。 */
-    if (xTaskCreatePinnedToCore(bgm_task, "bgm", 16384, NULL, 3,
+    if (xTaskCreatePinnedToCore(bgm_task, "bgm", 12288, NULL, 3,
                                 NULL, 0 /* PRO */) == pdPASS) {
         s_task_up = true;
     } else {

@@ -70,3 +70,13 @@ CONFIG_MDNS_ENABLE_DEBUG_PRINTS=n
 # 静默，排障时可临时把 LOG_DEFAULT_LEVEL 调到 Debug —— 不改代码即可调）。
 # 此处**不改** LOG_MAXIMUM_LEVEL：既有 events/驱动的 ESP_LOGD 依赖它（避免
 # 「修 A 坏 B」，见 AGENTS 硬规矩 1）。
+
+# 【内部堆腾挪 2026-09-27】WiFi 驱动收发缓冲池缩容
+# 真机根因：默认 16 动态 TX + 16 动态 RX（每块 ~1.6KB）长期占满内部堆，导致
+# 启动末期只剩 ~1KB 最大连续块 → SoftAP 侧 `wifi:mem fail`，
+# httpd 回包时 `httpd_sock_err: error in send : 113 (EHOSTUNREACH)`，
+# 配网页永远只有响应头没有 body（用户症状："192.168.4.1 打不开"）。
+# 本设备并发连接极少（1 个手机 / poller 单连接），8/8/4 足够。
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=4
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=8
+CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=8
