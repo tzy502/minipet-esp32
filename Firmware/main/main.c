@@ -35,6 +35,8 @@
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "esp_rom_uart.h"
+#include "soc/soc.h"
+#include "soc/usb_serial_jtag_reg.h"
 #include "esp_log.h"
 
 #include "app_core.h"
@@ -78,11 +80,18 @@ static int mp_log_vprintf_nonblocking(const char *fmt, va_list ap)
     int n = vsnprintf(buf, sizeof(buf), fmt, ap);
     if (n <= 0) return n;
     size_t len = (size_t)n < sizeof(buf) - 1 ? (size_t)n : sizeof(buf) - 1;
+    /* 【真·非阻塞 · 且写对通道 2026-09-27】两处纠正：
+     * ① 板子控制台是 **USB-Serial-JTAG**（CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y），
+     *    不是 UART0 —— 之前往 0x3FF40000 写等于写进没人用的外设，日志全丢；
+     * ② 日志写入必须**不阻塞**：没人读串口时（设备挂墙上、无监视器）USB-JTAG 的
+     *    IN FIFO 填满后，默认写路径会把调用任务挂死 → 渲染任务 >5s 不喂狗 →
+     *    看门狗三振 `esp_restart()`，表现为设备每 ~2.5 分钟自我复位
+     *    （服务端事件日志里 `boot` 与 `pickup` 成对出现的真因）。
+     * 这里直接写 USB-Serial-JTAG 的 EP1 数据寄存器，并在 CONF 里置 WR_DONE；
+     * FIFO 满则由硬件丢弃，**绝不阻塞**。 */
     for (size_t i = 0; i < len; i++) {
-        /* esp_rom_uart_tx_one_char 内部就是"等 FIFO 有位置再写"，但它对满 FIFO 的
-         * 等待极短（硬件 FIFO 128B）；配合我们在 app_main 里把日志量压到最低，
-         * 不会出现 >5s 的挂起。真正的保证来自"热路径日志已降为 DEBUG"。 */
-        esp_rom_uart_tx_one_char((uint8_t)buf[i]);
+        REG_WRITE(USB_SERIAL_JTAG_EP1_REG, (uint32_t)(uint8_t)buf[i]);
+        REG_WRITE(USB_SERIAL_JTAG_EP1_CONF_REG, USB_SERIAL_JTAG_WR_DONE);
     }
     return n;
 }
