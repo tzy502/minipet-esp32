@@ -803,6 +803,23 @@ static void recompose_entity(void)
     ent_canvas_update();
 
     const mpak_frame_t *fr = &lt->frames[g_anim.frame_idx];
+    /* 【渲染取证 2026-09-27】用户报"人物渲染不对（白块+红线）"且无 not-in-PARTS
+     * 告警 → 说明部件都能解析，但画出来的东西不对。这里每 3s 打一条"本帧画了多少
+     * piece、画布多大、覆盖多少像素"，把"是不是只画了少数几件/画布尺寸不对"
+     * 变成事实（限频避免刷屏）。 */
+    {
+        static int64_t s_rp_ms;
+        int64_t now_ms = esp_timer_get_time() / 1000;
+        if (now_ms - s_rp_ms > 3000) {
+            s_rp_ms = now_ms;
+            ESP_LOGW(TAG, "实体渲染：action=%s 帧 %u/%u pieces=%u 画布 cbox=(%d,%d %dx%d) "
+                          "原点=(%d,%d) tilt=%d",
+                     lt->action, (unsigned)g_anim.frame_idx, (unsigned)lt->frame_count,
+                     (unsigned)fr->piece_count,
+                     (int)g_ent_cx0, (int)g_ent_cy0, (int)g_ent_cw, (int)g_ent_ch,
+                     (int)g_ent_base_wx, (int)g_ent_base_wy, (int)g_tilt_mdeg);
+        }
+    }
     /* 帧内 piece 列表顺序 = 权威绘制序（导出端按桌面 RenderFrame 底→顶排列：
      * OrderByDescending(ZIndex)，z 字段仅诊断参考）→ 顺序画，不再排序 */
     uint32_t miss = 0, total = 0;
@@ -825,6 +842,15 @@ static void recompose_entity(void)
      * piece 全部解析失败，画出来就是"人物没了"（用户报障）。这里在渲染期兜底：
      * 单帧命中率过低即判定错配，立刻请求一次素材全量同步（带节流），
      * 让设备几秒内自己把配套 PARTS 拉回来，不需要用户做任何事。 */
+    {
+        static int64_t s_rp2_ms;
+        int64_t now_ms2 = esp_timer_get_time() / 1000;
+        if (now_ms2 - s_rp2_ms > 3000) {
+            s_rp2_ms = now_ms2;
+            ESP_LOGW(TAG, "实体渲染结果：total=%u miss=%u（部件解析失败数）",
+                     (unsigned)total, (unsigned)miss);
+        }
+    }
     if (total > 0 && miss * 2 > total) {
         static int64_t s_mismatch_last_ms;
         int64_t now_ms = esp_timer_get_time() / 1000;
