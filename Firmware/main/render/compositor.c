@@ -399,6 +399,7 @@ static int32_t s_last_ent_tilt;            /* 实体已按此 tilt 值摆放（�
 
 /* 脏区网格（16×16 标记；问题1：合帧后合并为单一包围盒上屏） */
 static uint8_t  g_mark[RC_GRID_MAX];
+static volatile uint32_t g_mark_calls;   /* 标脏调用计数（兜底清屏判据） */
 static int      g_gw, g_gh;
 static time_t   g_last_clock_t;
 
@@ -551,6 +552,7 @@ static void mark_rect(int32_t x, int32_t y, int32_t w, int32_t h)
     for (int cy = cy0; cy <= cy1; cy++)
         for (int cx = cx0; cx <= cx1; cx++)
             g_mark[cy * g_gw + cx] = 1;
+    g_mark_calls++;          /* 兜底清屏用：见 render_tick 的 1s 全屏重合成 */
 }
 
 static void mark_ent_at(int32_t tilt_mdeg)
@@ -1596,6 +1598,24 @@ void render_tick(void)
 
     /* 6) BGM 半屏控制条（E6）：自动收起 / BGM 状态变化重绘 */
     ov_tick(now_us);
+
+    /* 【拖影兜底清屏 2026-09-27】用户报"人物有拖影（双影）"且反复未被脏区修复
+     * 覆盖住。脏区机制一旦有任一路径漏标（实体位移/条带/气泡/时钟切换），
+     * 旧像素就会永久留在 AMOLED 上形成双影——排查成本高、用户可见度极高。
+     * 这里加一条"兜底全屏重合成"：空闲 1s 无新脏区时强制整屏重绘一次，
+     * 把任何残留像素抹掉（整屏 blit 约 20 次 SPI 传输，1s 一次对 AMOLED
+     * 无感）。有脏区的帧不受影响，动画流畅度不变。 */
+    {
+        static int64_t s_last_full_us;
+        static uint32_t s_last_calls;
+        if (g_mark_calls != s_last_calls) {
+            s_last_calls = g_mark_calls;      /* 本帧有标脏：正常走脏区路径 */
+            s_last_full_us = now_us;
+        } else if (now_us - s_last_full_us > 1000000) {
+            s_last_full_us = now_us;          /* 1s 没标过脏：兜底整屏重绘 */
+            full_recompose();
+        }
+    }
 
     if (any) flush_dirty();
 
