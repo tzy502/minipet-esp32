@@ -42,6 +42,7 @@ const char *mp_http_uuid(void);
 
 /* 注册返回的 deviceId（hello 之前返回 UUID 兜底） */
 const char *mp_http_device_id(void);
+const char *mp_http_pairing_code(void);   /* hello 下发的配对码（未配对时非空） */
 
 /* 流式 GET：path 为完整路径（"/api/device/..."）或绝对 URL（OTA/BGM 下发时）。
  * 返回 HTTP 状态码（200/304…）；网络/传输错误返回 -1。

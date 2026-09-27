@@ -115,7 +115,11 @@ static bool resp_collect(void *ctx, const char *data, size_t len)
 static bool do_poll_once(void)
 {
     char path[POLL_PATH_LEN];
-    snprintf(path, sizeof(path), "/api/device/poll?since=%lu", (unsigned long)s_since);
+    /* poll 端点服务端必填 deviceId（DeviceEndpoints.cs HandlePoll 签名
+     * string deviceId）——真机实证：不带参 400，设备从此只有 hello 没有心跳
+     * （服务端日志只见「hello 心跳」、online 转 false、指令队列永不消费）。 */
+    snprintf(path, sizeof(path), "/api/device/poll?deviceId=%s&since=%lu",
+             mp_http_device_id(), (unsigned long)s_since);
 
     static char resp[POLL_RESP_CAP];
     resp_ctx_t ctx = { .buf = resp, .cap = sizeof(resp) };

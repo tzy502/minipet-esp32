@@ -9,7 +9,7 @@
  *   - 断网 = 静音降级（不做本地曲库缓存）
  *
  * 控制入口：audio_q（触摸控制条 / poll 指令），控制回传 POST /api/device/bgm/cmd。
- * PA_CTRL（GPIO46）：有声才开（codec_pa_enable）。
+ * PA_CTRL（GPIO46）：有声才开（pa_ctrl_enable）。
  * 音量：线性（feeder 出口统一缩放，立即生效）。
  */
 #ifndef MP_BGM_H

@@ -99,6 +99,8 @@ static struct { bool active; uint16_t *px; int32_t w, h, x, y; } g_bub;
 /* 未配网常驻横幅（问题4：POKER 态顶部深色底白字，compose 最顶层） */
 static bool g_banner_on;
 static char g_banner_text[48];
+static int64_t g_banner_expire_us;         /* 定时横幅到期时刻（us；0=常驻/无定时，
+                                            * render_banner_show_for 用，render_tick 到期自动隐藏） */
 
 static void mark_rect(int32_t x, int32_t y, int32_t w, int32_t h);   /* 前向声明（校准层先于定义使用） */
 
@@ -107,7 +109,7 @@ static volatile int32_t g_tilt_mdeg;
 static volatile int32_t g_drag_off_x;
 static bool     g_calib_on;                 /* 【校准模式】红线坐标系 + 触摸落点回显 */
 static int16_t  g_calib_touch_x = -1;       /* 最近一次触摸落点（-1=无） */
-static int16_t  g_calib_touch_y = -1;   /* 拖拽：人物屏幕 x 偏移（1:1 跟手，px） */
+static int16_t  g_calib_touch_y = -1;       /* 最近一次触摸落点 y（-1=无） */
 static volatile int32_t g_drag_off_y;   /* 拖拽：人物屏幕 y 偏移 */
 static int32_t s_last_ent_tilt;            /* 实体已按此 tilt 值摆放（问题7 跟随标脏） */
 
@@ -602,10 +604,15 @@ static void compose_region(int32_t x, int32_t y, int32_t w, int32_t h)
         return;
     }
 
-    /* 1) static_back（不动底；无地图 → 黑底） */
+    /* 1) static_back（不动底；无地图 → 黑底）
+     * 根因修复（拖动小人后旧位置图像永久残留，三轮未修的真凶）：脏区从第 x 列
+     * 开始，铺底必须同样从第 x 列起写——此前 drow/源均从第 0 列起，脏区
+     * [x, x+w) 的 framebuffer 内容从未被重铺，blit 发出的是上一帧陈旧像素
+     * （= 旧位置实体图像）→ 残留。背景接近纯色时错位拷贝肉眼看不出，
+     * 实体移动后才暴露。 */
     for (int32_t r = y; r < y + h; r++) {
-        uint16_t *drow = g_fb + (size_t)r * g_sw;
-        if (g_static) memcpy(drow, g_static + (size_t)r * g_sw, (size_t)w * 2u);
+        uint16_t *drow = g_fb + (size_t)r * g_sw + x;
+        if (g_static) memcpy(drow, g_static + (size_t)r * g_sw + x, (size_t)w * 2u);
         else memset(drow, 0, (size_t)w * 2u);
     }
 
@@ -613,7 +620,8 @@ static void compose_region(int32_t x, int32_t y, int32_t w, int32_t h)
     for (int i = 0; i < g_strip_n; i++)
         strip_blit(&g_strips[i], x, y, w, h);
 
-    /* 3) tile_layer（1bit alpha 叠加） */
+    /* 3) tile_layer（1bit alpha 叠加；列偏移与 static_back 同理必须 +x，
+     * 否则脏区 [x, x+w) 铺的是第 0 列起的陈旧内容） */
     if (g_tile) {
         for (int32_t r = y; r < y + h; r++) {
             const uint16_t *srow = g_tile + (size_t)r * g_sw;
@@ -621,12 +629,12 @@ static void compose_region(int32_t x, int32_t y, int32_t w, int32_t h)
                 g_tile_mask + (size_t)r * ((g_sw + 7) / 8) : NULL;
             uint16_t *drow = g_fb + (size_t)r * g_sw;
             if (!mrow) {
-                memcpy(drow, srow, (size_t)w * 2u);
+                memcpy(drow + x, srow + x, (size_t)w * 2u);
             } else {
-                const uint8_t *mseg = mrow + (x / 8);
+                const uint8_t *mseg = mrow + (x / 8);   /* mask 位索引已按绝对像素 x+c 起算 */
                 for (int32_t c = 0; c < w; c++) {
                     if (rc_mask_bit(mseg, (uint32_t)(x + c) - (x & ~7)))
-                        drow[c] = srow[c];
+                        drow[x + c] = srow[x + c];
                 }
             }
         }
@@ -635,15 +643,63 @@ static void compose_region(int32_t x, int32_t y, int32_t w, int32_t h)
     /* 4) 地图时钟（场景层，实体之下） */
     clock_digits_compose(g_fb, g_sw, RC_SCALE, x, y, w, h);
 
-    /* 【校准模式】红色底边线 y=440 + 竖直中线 x=240 + 中心十字 + 触摸落点白点 */
+    /* 【校准模式】方向/镜像标定层（实体之下、时钟之上；POKER/OFFLINE 触摸 down
+     * 沿由 render_calib_set 置位）。用户判读方法（对照顶部 M 序号横幅拍照回报）：
+     *   ① 顶部横幅文字正立、不左右镜像 → 该 mirror 组合方向正确；
+     *   ② 人物脚底踩在红线(y=440)上、红线与蓝线(y=478)间留出 40px 间隙 → 底边
+     *      正确（蓝线=面板真实底边；红蓝间隙 =「脚底距屏底 40px」规格可视化）；
+     *   ③ 红三角出现在画面【右下】角 → 左右未镜像；跑到【左下】角 → mirror
+     *      翻转，该组合不对。
+     * 文字正立 + 脚踩红线 + 三角在右下，三者同时成立的 M 序号即为定稿握持
+     * （USB 朝右、USB 对面竖边为底）的正确组合。 */
     if (g_calib_on) {
-        const uint16_t red = 0xF800;
+        const uint16_t red  = 0xF800;
+        const uint16_t blue = 0x001F;        /* 纯蓝：真实底边线专用，与红线区分 */
+
+        /* ① 脚底目标线：红横线 y=440（= 屏底-40px，人物脚底应踩在此线上） */
         if (440 >= y && 440 < y + h)
             for (int32_t c = x; c < x + w && c < g_sw; c++)
                 g_fb[(size_t)440 * g_sw + c] = red;
-        if (240 >= x && 240 < x + w)
-            for (int32_t r = y; r < y + h && r < g_sh; r++)
+
+        /* ② 真实底边：蓝横线 y=478（面板可见最底两行 478/479 的上一行）。
+         * 与红线间隔 40px：脚踩红线 = 规格满足；脚踩到蓝线 = 底边判定偏了 */
+        if (478 >= y && 478 < y + h)
+            for (int32_t c = x; c < x + w && c < g_sw; c++)
+                g_fb[(size_t)478 * g_sw + c] = blue;
+
+        /* 脚线标签：红线最左端 x=2..40 加粗 3px（y=439..441）成小红块，
+         * 远拍照片里快速定位脚底线的位置 */
+        for (int32_t r = 439; r <= 441; r++) {
+            if (r < y || r >= y + h) continue;
+            int32_t bx0 = 2 > x ? 2 : x;
+            int32_t bx1 = 41 < x + w ? 41 : x + w;   /* x=2..40 → [2,41) */
+            for (int32_t c = bx0; c < bx1 && c < g_sw; c++)
+                g_fb[(size_t)r * g_sw + c] = red;
+        }
+
+        /* ③ 镜像判读：右下角实心红三角（y=460..476、x=440..476；直角边贴右缘
+         * x=476 与下缘 y=476，斜边在左，逐行画 x=440+(476-r)..476，越往下越宽）。
+         * 未镜像 → 三角在右下；左右镜像 → 三角跑到左下，一眼可辨 */
+        for (int32_t r = 460; r <= 476; r++) {
+            if (r < y || r >= y + h) continue;
+            int32_t tx0 = 440 + (476 - r);
+            int32_t tx1 = 477;                       /* 含 x=476 → [..,477) */
+            if (tx0 < x) tx0 = x;
+            if (tx1 > x + w) tx1 = x + w;
+            for (int32_t c = tx0; c < tx1 && c < g_sw; c++)
+                g_fb[(size_t)r * g_sw + c] = red;
+        }
+
+        /* ④ 水平中线：红竖线 x=240，只画下段 y=200..476（顶部留给横幅文本，
+         * 不与之打架）；居中与左右镜像的横向基准 */
+        if (240 >= x && 240 < x + w) {
+            int32_t ry0 = 200 > y ? 200 : y;
+            int32_t ry1 = 477 < y + h ? 477 : y + h; /* y=200..476 → [200,477) */
+            for (int32_t r = ry0; r < ry1 && r < g_sh; r++)
                 g_fb[(size_t)r * g_sw + 240] = red;
+        }
+
+        /* ⑤ 触摸落点回显：8×8 白点（面板坐标系，逻辑保持不变） */
         if (g_calib_touch_x >= 0) {
             int32_t tx = g_calib_touch_x & ~1, ty = g_calib_touch_y & ~1;
             for (int dy2 = 0; dy2 < 8; dy2++)
@@ -734,10 +790,12 @@ static void compose_region(int32_t x, int32_t y, int32_t w, int32_t h)
 static void flush_dirty(void)
 {
     int32_t cx0 = -1, cy0 = -1, cx1 = -1, cy1 = -1;
+    int32_t cells = 0;
     for (int32_t cy = 0; cy < g_gh; cy++) {
         for (int32_t cx = 0; cx < g_gw; cx++) {
             if (!g_mark[cy * g_gw + cx]) continue;
             g_mark[cy * g_gw + cx] = 0;
+            cells++;
             if (cx0 < 0 || cx < cx0) cx0 = cx;
             if (cy0 < 0 || cy < cy0) cy0 = cy;
             if (cx > cx1) cx1 = cx;
@@ -760,6 +818,15 @@ static void flush_dirty(void)
         ESP_LOGD(TAG, "first dirty flush rect (%" PRId32 ",%" PRId32 ") %"
                  PRId32 "x%" PRId32, x, y, w, h);
     }
+    /* 真机诊断期探针：本帧标脏包围盒 + 标脏块数（500ms 限频，INFO 级；
+     * 验收后主线程降级） */
+    static int64_t s_flush_probe_us;
+    int64_t probe_now = esp_timer_get_time();
+    if (probe_now - s_flush_probe_us > 500000) {
+        s_flush_probe_us = probe_now;
+        ESP_LOGI("probe", "flush (%" PRId32 ",%" PRId32 ") %" PRId32
+                 "x%" PRId32 " cells=%" PRId32, x, y, w, h, cells);
+    }
     compose_region(x, y, w, h);
     blit_be(x, y, w, h, g_fb + (size_t)y * g_sw + x, g_sw);
 }
@@ -767,15 +834,31 @@ static void flush_dirty(void)
 /* ================= 上屏边界：LE framebuffer → 驱动大端 RGB565 =================
  * 全管线按小端 u16 处理（资产小端 + LVGL 小端一致）；
  * display_blit 要求大端字节序，故在此唯一边界做逐像素字节交换，
- * 分块经内部 RAM 暂存（8KB → 480 宽行 × 8 行），避免 PSRAM 二份帧缓冲。 */
-static uint8_t s_blit_stage[8192];
+ * 分块经内部 RAM 暂存，避免 PSRAM 二份帧缓冲。
+ * 暂存 24KB（480 宽 × 25 行/块）：480 宽全帧从 60 次 display_blit（= 60 次
+ * SPI 队列传输）降到 20 次，缓解拖动期高频 blit 的 ESP_ERR_NO_MEM 风暴；
+ * 24KB 静态内部 RAM 已评估（LVGL 大缓冲已走 PSRAM）。 */
+/* 对齐 64B（SPI 驱动硬性要求）：ESP-IDF spi_master setup_priv_desc 对
+ * 【非 DMA-capable 或地址/长度未对齐】的 TX 缓冲会在每次排队时临时
+ * malloc 一整块 MALLOC_CAP_DMA 暂存——内部堆被 WiFi/LVGL 挤压时分配
+ * 失败 → esp_lcd draw_bitmap 返回 ESP_ERR_NO_MEM（真机风暴根因：
+ * "send color data failed" 与 WiFi GOT_IP 强相关即此）。静态 64B 对齐
+ * = 驱动零分配，风暴根除。 */
+static uint8_t s_blit_stage[12288] __attribute__((aligned(64)));   /* 12KB：内部堆仅 ~143KB，24KB 曾把任务栈创建挤到随机失败（boot7），12KB=480宽12行/352宽16行 */
 
 static void blit_be(int32_t x, int32_t y, int32_t w, int32_t h,
                     const uint16_t *src, int32_t src_stride)
 {
     const int32_t chunk_px = (int32_t)sizeof s_blit_stage / 2;
     int32_t rows_per = (w > 0) ? chunk_px / w : 0;
-    if (rows_per < 1) rows_per = 1;
+    if (rows_per < 2) rows_per = 2;
+    if (rows_per & 1) rows_per--;
+    /* 行高恒偶（+h 本身恒偶：脏区 16px 网格）→ display_blit 内 even_round
+     * 不再外扩出行 → aw==w && ah==h 快速通道恒命中（大端缓冲直推 SPI，
+     * 零 PSRAM 暂存、零驱动侧 DMA 拷贝分配）。此前 rows_per=25（奇）使
+     * 每个 chunk 被外扩 +1 行踢进 PSRAM 暂存路径 → esp_lcd 对 PSRAM 缓冲
+     * 每次强制 malloc ~25KB 内部 DMA 拷贝 → 内部堆见底 → NO_MEM 风暴。
+     * （真机溯源 2026-09-26：blit len=25024=480行×26 与 24576 缓冲矛盾即此） */
 
     for (int32_t r0 = 0; r0 < h; r0 += rows_per) {
         int32_t hh = (r0 + rows_per < h) ? rows_per : (h - r0);
@@ -1079,25 +1162,51 @@ void render_tick(void)
      * 旧位置永不重绘 → 拖动轨迹残影，真机照片实证） */
     if (g_drag_off_x != s_last_drag_x || g_drag_off_y != s_last_drag_y) {
         int32_t ox = g_drag_off_x, oy = g_drag_off_y;
-        g_drag_off_x = s_last_drag_x; g_drag_off_y = s_last_drag_y;
+        int32_t poldx = s_last_drag_x, poldy = s_last_drag_y;  /* 探针：覆盖前先存真旧值 */
+        g_drag_off_x = poldx; g_drag_off_y = poldy;
         mark_ent();                          /* 旧位置 */
         g_drag_off_x = ox; g_drag_off_y = oy;
         mark_ent();                          /* 新位置 */
         s_last_drag_x = ox; s_last_drag_y = oy;
         any = true;
-        /* 【拖拽探针】旧/新偏移与标脏是否成对发生（真机残影定位） */
-        static int32_t plx, ply; static int64_t plt;
-        int64_t now = esp_timer_get_time();
-        if (now - plt > 300000) {
-            ESP_LOGW("probe", "drag old(%d,%d)->new(%d,%d) tilt=%d",
-                     s_last_drag_x - ox, s_last_drag_y - oy, ox, oy,
-                     (int)(g_tilt_mdeg / 1000));
-            plt = now;
+        /* 【拖拽探针】pold→new 真实偏移变化（此前在 s_last 已被更新成新值
+         * 之后才算 s_last-ox，恒为 0；根因已定位，降 INFO 级 + 1s 限频） */
+        static int64_t s_drag_probe_us;
+        if (now_us - s_drag_probe_us > 1000000) {
+            s_drag_probe_us = now_us;
+            ESP_LOGI("probe", "drag old(%" PRId32 ",%" PRId32 ")->new(%"
+                     PRId32 ",%" PRId32 ") tilt=%" PRId32,
+                     poldx, poldy, ox, oy, g_tilt_mdeg / 1000);
         }
-        (void)plx; (void)ply;
+    }
+
+    /* 5) 定时横幅到期自动隐藏（render_banner_show_for；expire_us=0 的常驻
+     * 横幅——配网横幅——不走此路径） */
+    if (g_banner_on && g_banner_expire_us != 0 && now_us >= g_banner_expire_us) {
+        g_banner_expire_us = 0;
+        g_banner_on = false;
+        mark_rect(0, 0, g_sw, RC_BANNER_H);   /* 横幅带整条标脏，下层重铺 */
+        any = true;
     }
 
     if (any) flush_dirty();
+
+    /* 【ENTPOS 探针】「人物不居中」真机读数（1s 限频，一行可 grep，前缀
+     * ENTPOS；诊断期 INFO 级，验收后主线程降级）：
+     * sx/sy=实体锚点 ent_screen_pos；cx0/cy0=联合画布原点（世界 1x）；
+     * base=世界附加偏移 render_set_entity_pos；drag=拖拽跟手偏移 */
+    static int64_t s_entpos_probe_us;
+    if (now_us - s_entpos_probe_us > 1000000) {
+        s_entpos_probe_us = now_us;
+        int32_t sx, sy;
+        ent_screen_pos(&sx, &sy);
+        ESP_LOGI("probe", "ENTPOS sx=%" PRId32 " sy=%" PRId32
+                 " cx0=%" PRId32 " cy0=%" PRId32
+                 " base=(%" PRId32 ",%" PRId32 ")"
+                 " drag=(%" PRId32 ",%" PRId32 ")",
+                 sx, sy, g_ent_cx0, g_ent_cy0,
+                 g_ent_base_wx, g_ent_base_wy, g_drag_off_x, g_drag_off_y);
+    }
 }
 
 int render_set_parts(const char *mpk_path)
@@ -1281,6 +1390,48 @@ lv_display_t *render_lvgl_display(void)
     return bridge_display();
 }
 
+/* 桥接字体缺失时的内置 5x7 兜底：配对码=纯数字，绝不能因服务端字体链
+ * 断供（E12）而让配对流程卡死。行距用 RC_BUBBLE_MAX_W（compose 读取步长）。 */
+static int bubble_render_fallback(const char *text, uint16_t *buf,
+                                  int32_t max_w, int32_t max_h,
+                                  int32_t *out_w, int32_t *out_h)
+{
+    const int32_t scale = 3, pad = 6, border = 2, gap = 3;
+    int32_t n = 0;
+    for (const char *p = text; *p; p++) n++;
+    if (n == 0) return RENDER_ERR_ARG;
+    int32_t inner_w = n * (MP_FONT_GLYPH_W * scale + gap) - gap;
+    int32_t inner_h = MP_FONT_GLYPH_H * scale;
+    int32_t bw = inner_w + 2 * (pad + border);
+    int32_t bh = inner_h + 2 * (pad + border);
+    if (bw > max_w || bh > max_h) return RENDER_ERR_ARG;
+
+    for (int32_t y = 0; y < bh; y++)
+        for (int32_t x = 0; x < bw; x++) {
+            bool bd = x < border || y < border || x >= bw - border || y >= bh - border;
+            buf[(size_t)y * RC_BUBBLE_MAX_W + x] = bd ? 0x303030 : 0xF7F7F2;
+        }
+    int32_t cx = pad + border;
+    for (const char *p = text; *p; p++) {
+        unsigned char u = (unsigned char)*p;
+        if (u >= 'a' && u <= 'z') u -= 32;
+        if (u < ' ' || u > 126) u = '?';
+        const uint8_t *cols = MP_FONT5X7[u];
+        for (int32_t col = 0; col < MP_FONT_GLYPH_W; col++)
+            for (int32_t row = 0; row < MP_FONT_GLYPH_H; row++) {
+                if (!(cols[col] & (1u << row))) continue;
+                for (int32_t dy = 0; dy < scale; dy++)
+                    for (int32_t dx = 0; dx < scale; dx++)
+                        buf[(size_t)(pad + border + row * scale + dy) * RC_BUBBLE_MAX_W +
+                            cx + col * scale + dx] = 0x101010;
+            }
+        cx += MP_FONT_GLYPH_W * scale + gap;
+    }
+    *out_w = bw;
+    *out_h = bh;
+    return RENDER_OK;
+}
+
 int render_bubble_show(const char *text, render_font_t font)
 {
     if (!g_inited) return RENDER_ERR_STATE;
@@ -1294,8 +1445,12 @@ int render_bubble_show(const char *text, render_font_t font)
     int rc = bridge_bubble_render(text, (int)font, buf, RC_BUBBLE_MAX_W,
                                   RC_BUBBLE_MAX_W, RC_BUBBLE_MAX_H, &bw, &bh);
     if (rc != RENDER_OK) {
-        heap_caps_free(buf);
-        return rc;
+        rc = bubble_render_fallback(text, buf, RC_BUBBLE_MAX_W, RC_BUBBLE_MAX_H, &bw, &bh);
+        if (rc != RENDER_OK) {
+            heap_caps_free(buf);
+            return rc;
+        }
+        ESP_LOGW(TAG, "气泡走内置 5x7 兜底（桥接字体缺失）");
     }
 
     if (g_bub.active) mark_rect(g_bub.x, g_bub.y, g_bub.w, g_bub.h);
@@ -1341,6 +1496,7 @@ int render_banner_show(const char *text)
     if (!g_inited) return RENDER_ERR_STATE;
     if (g_banner_on) mark_rect(0, 0, g_sw, RC_BANNER_H);
     g_banner_on = true;
+    g_banner_expire_us = 0;    /* 常驻：清定时横幅计时，防 show_for 残留到期误隐藏配网横幅 */
     g_banner_text[0] = 0;
     if (text) strlcpy(g_banner_text, text, sizeof(g_banner_text));
     mark_rect(0, 0, g_sw, RC_BANNER_H);
@@ -1351,7 +1507,19 @@ void render_banner_hide(void)
 {
     if (!g_inited || !g_banner_on) return;
     g_banner_on = false;
+    g_banner_expire_us = 0;
     mark_rect(0, 0, g_sw, RC_BANNER_H);
+}
+
+/* 定时横幅（输入层 VOL± 反馈）：显示 text 并在 duration_ms 后由 render_tick
+ * 自动隐藏；重复调用刷新文本与计时。签名勿动（输入层按此调用）。
+ * 常驻横幅（配网）仍走 render_banner_show（内部清到期时刻，不受定时影响）。 */
+int render_banner_show_for(const char *text, uint32_t duration_ms)
+{
+    int rc = render_banner_show(text);
+    if (rc != RENDER_OK) return rc;
+    g_banner_expire_us = esp_timer_get_time() + (int64_t)duration_ms * 1000;
+    return rc;
 }
 
 void render_input_tilt(float tilt_deg)

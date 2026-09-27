@@ -28,6 +28,12 @@ void watchdog_kick(void);
 /* 上电时查询：上次是否因熔断进入 FATAL（main 可直接停渲染） */
 bool watchdog_was_fatal_last_boot(void);
 
+/* 渲染闸门（E14「熔断后停止渲染」）：false = 本次开机处于熔断锁定态，
+ * 渲染任务在 watchdog_subscribe_render_task() 入口即被拦下（不订阅 TWDT、
+ * 一帧都不渲染，走纯文本 + 关屏待机）。main.c 也可在 xTaskCreate 前查询，
+ * 直接跳过创建渲染任务（等价钩子）。 */
+bool watchdog_render_allowed(void);
+
 /* 纯文本错误 + 关屏（状态机 FATAL 态复用；绝不进渲染路径）
  * line1/line2 为 ASCII 大写串（内嵌 5x7 字体只含 ASCII 可打印子集） */
 void watchdog_fatal_show(const char *line1, const char *line2);

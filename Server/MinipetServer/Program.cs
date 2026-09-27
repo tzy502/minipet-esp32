@@ -29,12 +29,15 @@ builder.Services.AddSingleton<QqMusicSource>();
 builder.Services.AddSingleton<IMusicSource>(sp => sp.GetRequiredService<WzMusicSource>());
 builder.Services.AddSingleton<IMusicSource>(sp => sp.GetRequiredService<QqMusicSource>());
 builder.Services.AddSingleton<BgmRouter>();              // 音源路由 + 同源降级（E8）
+builder.Services.AddSingleton<QqGatewayClient>();        // QQ node 网关 HTTP 客户端（契约见类头）
+builder.Services.AddSingleton<QqGatewayProcess>();       // QQ 网关子进程（拉起/健康检查/重启 1 次；IDisposable）
 builder.Services.AddSingleton<CacheManager>();           // WZ 位图/精灵 LRU（纸娃娃缩略图渲染共享）
 builder.Services.AddSingleton<WzService>();              // WZ 读取（catalog API / 纸娃娃真实缩略图共用）
 builder.Services.AddSingleton<MusicCatalogService>();    // WZ 曲库目录（BGM 曲目列表/决策共用）
 builder.Services.AddSingleton<ThumbService>();           // 64×64 缩略图 + 磁盘缓存（part/paperdoll 走真实渲染）
 builder.Services.AddSingleton<PresetStore>();            // 纸娃娃预设（data/presets/）
 builder.Services.AddSingleton<PaperdollPackService>();   // petConfig → 设备装扮资产包（换装下发链路）
+builder.Services.AddSingleton<FontPackService>();       // 16/24/32 三档 FONT 包（E12 字体链，hello 自动补）
 builder.Services.AddSingleton<DeviceAssetService>();     // 地图/NPC → 设备资产登记（E7 选择器/推送）
 
 builder.Services.ConfigureHttpJsonOptions(o =>
@@ -49,6 +52,8 @@ var app = builder.Build();
 var cfgSvc = app.Services.GetRequiredService<ConfigService>();
 var router = app.Services.GetRequiredService<BgmRouter>();
 _ = app.Services.GetRequiredService<DeviceManifestService>();
+// QQ 网关子进程：早绑定单例 → 启动即按配置开关巡检（未配置则空转），退出时 DI 调 Dispose 杀进程树
+_ = app.Services.GetRequiredService<QqGatewayProcess>();
 cfgSvc.Changed += e =>
     app.Logger.LogInformation("[Config] 已热重载（external={External}，WZ={Wz}）", e.External, e.New.Wz.DataPath);
 router.Failover += e =>

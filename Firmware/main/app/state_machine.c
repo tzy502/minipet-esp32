@@ -46,6 +46,28 @@ static int64_t    s_last_activity_ms;
 static SemaphoreHandle_t s_lock;
 
 /* ------------------------------------------------------------------ */
+/* E11 降级事件上报：离线态进出（Web 可见设备健康）                        */
+/* ------------------------------------------------------------------ */
+/* events.c 的 event_name() 只映射 touch/tap_light/tap_hard/shake/pickup/
+ * tilt_enter/tilt_exit/battery/asset_error/bgm_failover/boot/error —— 没有
+ * net_* 类型，且 events.c/app_core.h 本轮不归本改动动 → 不自造事件名（会落到
+ * event_name() 的 "unknown" 分支），复用【已映射】的 MP_EVT_ERROR，用 s 区分子类
+ * （服务端 DeviceEventRequest.data 原样存 JSON，Web 可按 data.s 区分）：
+ *   s="net_offline" a=1     → 降级进离线态（E11 无网络）
+ *   s="net_online"  a=0 b=1 → 回网恢复
+ * 断网瞬间的 POST 必然失败（events.c「失败即丢，不重放」），故离线事件记下发生
+ * 时刻；回网时按原始 ts 补报一次 —— 否则 Web 只能看到「回网」，看不到「掉线」。 */
+static bool    s_offline_evt_pending;
+static int64_t s_offline_evt_ts_ms;
+
+static void post_net_event(const char *sub, int32_t a, int32_t b, int64_t ts_ms)
+{
+    mp_event_t e = { .type = MP_EVT_ERROR, .a = a, .b = b, .ts_ms = ts_ms };
+    strlcpy(e.s, sub, sizeof(e.s));
+    mp_post_event(&e);
+}
+
+/* ------------------------------------------------------------------ */
 /* 工具                                                                 */
 /* ------------------------------------------------------------------ */
 static void cmd_simple(mp_cmd_type_t t, const char *s, int32_t a, int32_t b)
@@ -136,6 +158,11 @@ static void transition_locked(mp_state_t next)
         cmd_simple(MP_CMD_NET_STATE, NULL, 0, 0);
         cmd_simple(MP_CMD_BUBBLE, "离线模式：本地缓存运行", 0, 0);
         post_banner_if_needed();     /* 问题4：离线+未配网同样提示热点 */
+        /* E11 降级事件上报：进离线态（断网期 POST 多半丢 → 回网补报，见上方说明） */
+        s_offline_evt_ts_ms = mp_now_ms();
+        s_offline_evt_pending = true;
+        post_net_event("net_offline", 1, 0, s_offline_evt_ts_ms);
+        ESP_LOGW(TAG, "E11 降级：进 OFFLINE，上报 net_offline（type=error/a=1）");
         break;
 
     case MP_ST_OTA:
@@ -304,6 +331,14 @@ void state_machine_handle(mp_sm_event_t ev)
         case MP_ST_OFFLINE:      /* 离线也可开菜单：只显本地缓存项（E7/E11） */
             transition_locked(MP_ST_MENU);
             break;
+        case MP_ST_SELF_TEST:
+        case MP_ST_WIFI_PROVISION:
+            /* 【2026-09-27 真机】开机自检/配网期（WiFi 探测最长 20s + hello 数秒）
+             * 菜单键此前被 default 丢弃 → 用户"启动的时候菜单呼不出来"。
+             * 处理：允许在自检期开菜单——菜单只读本地缓存，不依赖自检结果；
+             * 退出仍走 MENU→POKER，自检后台继续跑（boot 完成后再落 POKER/配网态）。 */
+            transition_locked(MP_ST_MENU);
+            break;
         case MP_ST_MENU:
             transition_locked(MP_ST_POKER);
             break;
@@ -311,7 +346,7 @@ void state_machine_handle(mp_sm_event_t ev)
             transition_locked(MP_ST_POKER);
             break;
         default:
-            break;   /* OTA/FATAL/PROVISION 下菜单键无效 */
+            break;   /* OTA/FATAL 下菜单键无效 */
         }
         break;
 
@@ -336,6 +371,16 @@ void state_machine_handle(mp_sm_event_t ev)
         asset_dl_request_sync();          /* manifest 补拉（E11：回网自动同步） */
         mp_ota_confirm_valid();           /* OTA 新分区稳定验证（E11 回滚机制） */
         if (s_state == MP_ST_OFFLINE) {
+            /* E11 降级事件上报：回网恢复。此刻网络已通，POST 可达：
+             * 先按原始时刻补报离线事件（补上断网期丢掉的那笔），再报恢复 */
+            bool replayed = s_offline_evt_pending;
+            if (replayed) {
+                post_net_event("net_offline", 1, 0, s_offline_evt_ts_ms);
+                s_offline_evt_pending = false;
+            }
+            post_net_event("net_online", 0, 1, mp_now_ms());
+            ESP_LOGW(TAG, "E11 恢复：OFFLINE→POKER，上报 net_online（离线补报=%d）",
+                     (int)replayed);
             transition_locked(MP_ST_POKER);
         }
         break;
@@ -521,6 +566,16 @@ static void dispatch_manifest_synced(void)
         return;
     }
     dispatch_action(MP_ACTION_STAND);
+
+    /* 字体绑定完成后重显配对码（hello 早于字体加载，首显气泡会是空） */
+    {
+        const char *code = mp_http_pairing_code();
+        if (code && code[0]) {
+            mp_cmd_t c = { .type = MP_CMD_PAIRING_CODE };
+            strlcpy(c.s, code, sizeof(c.s));
+            mp_post_cmd(&c);
+        }
+    }
 
     /* 素材全量重绑后强制一次全屏重绘：清除面板自检色块/旧画面残留
      * （无 BGMAP → 全屏填黑；有 BGMAP → static_back+tile），此后每帧走脏区 */

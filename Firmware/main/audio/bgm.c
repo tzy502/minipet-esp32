@@ -9,7 +9,7 @@
  *   [feeder 任务 PRO 核]
  *     ring_read(1152 帧, 100ms 超时) → 线性音量缩放
  *     → codec_write（I2S DMA，48k/16bit 档随 MP3 帧采样率重配）
- *     → PA_CTRL 有声才开（codec_pa_enable）
+ *     → PA_CTRL 有声才开（pa_ctrl_enable）
  *
  * E8 短路状态机（同源内）：
  *   曲内失败重试 2 → 跳下一首（仍是同源）→ 连续 3 曲失败
@@ -29,6 +29,7 @@
 #include "freertos/semphr.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
+#include "esp_timer.h"
 #include "cJSON.h"
 
 #include "app_core.h"
@@ -265,7 +266,7 @@ typedef struct {
 
 static stream_ctx_t s_sc;
 
-static mp3dec_t *s_dec;   /* 解码器常驻复用（play_track 早于 bgm_task 引用） */
+static mp3dec_t *s_dec;   /* 解码器常驻（bgm 任务启始分配；play_track 每曲 mp3dec_init 复位） */
 
 /* 前向：流中控制队列排空（定义见「控制消息」节） */
 static void drain_audio_q_nonblock(void);
@@ -335,7 +336,11 @@ static bool stream_chunk(void *ctx, const char *data, size_t len)
     }
     size_t take = len;
     if (c->in_len + take > MP3_INBUF_LEN) {
-        take = MP3_INBUF_LEN - c->in_len;        /* 理论不可达：decode 后必空 */
+        /* 缓冲仍满且解不出帧（16KB 无同步头：坏流/超长垃圾前缀）。
+         * 上游 find_frame 已证明整缓冲无可解码帧 → 整段丢弃重同步，
+         * 保证流的前向推进（否则后续数据会被永久丢弃）。 */
+        c->in_len = 0;
+        take = len;
     }
     memcpy(c->in + c->in_len, data, take);
     c->in_len += take;
@@ -346,12 +351,17 @@ static bool stream_chunk(void *ctx, const char *data, size_t len)
 /* 播放一首：返回 true=自然播完（可续下一首），false=失败/中止 */
 static bool play_track(int track_id)
 {
-    char url[128];
-    snprintf(url, sizeof(url), "/api/device/bgm/stream?id=%d&source=%s",
-             track_id, source_str((mp_bgm_source_t)s_source));
+    char url[160];
+    /* bgm/stream 端点服务端必填 deviceId（DeviceEndpoints.cs HandleBgmStream
+     * 签名 string deviceId）——不带参实测 400，带参后实测 200 + audio/mpeg。 */
+    snprintf(url, sizeof(url), "/api/device/bgm/stream?deviceId=%s&id=%d&source=%s",
+             mp_http_device_id(), track_id, source_str((mp_bgm_source_t)s_source));
 
     memset(&s_sc, 0, sizeof(s_sc));
-    s_sc.dec = s_dec;                           /* 解码器常驻复用（不重 init） */
+    mp3dec_init(s_dec);                         /* 每曲复位解码器（清 bit reservoir/合成
+                                                 * 残态；上游 mp3dec_init 仅清头缓存，开销极小。
+                                                 * 流内逐帧调用间则必须保持状态，勿在此之外重置） */
+    s_sc.dec = s_dec;
     s_sc.in = heap_caps_malloc(MP3_INBUF_LEN, MALLOC_CAP_SPIRAM);
     if (!s_sc.in) return false;
 
@@ -411,7 +421,11 @@ static void bgm_play_session(int start_idx, int fb_id)
         int id;
         if (by_table) {
             id = tbl_id_at(idx);
-            if (id <= 0) return;                        /* 表中途重建/失效：结束会话 */
+            if (id <= 0) {
+                /* 表中途失效（重建为空/缩水）：走循环尾统一收尾
+                 * （s_state=PLAYING 时回 IDLE），不可裸 return 漏状态 */
+                break;
+            }
             s_tcur = idx;                               /* 真正起播前锚定 */
         } else {
             id = track;
@@ -479,8 +493,10 @@ static void bgm_play_session(int start_idx, int fb_id)
 /* ------------------------------------------------------------------ */
 
 /* 流播放期间（bgm 任务阻塞在 HTTP 读流）非阻塞排空控制队列：
- * 暂停/停止/切歌立即中止流；音量即时生效；下一首动作记账延后执行 */
+ * 暂停/停止/切歌立即中止流；音量即时生效；切歌/选曲动作记账延后执行 */
 static volatile int s_pending_op;      /* 0=无 1=next 2=prev */
+static volatile bool s_pending_play;   /* 流中收到选曲播放待执行 */
+static volatile int32_t s_pending_play_id;
 
 /* 音量统一落点（仅 bgm 任务上下文调用；s_vol 为 volatile u8 单写者）：
  * clamp 0..100 → 立即生效（feeder 出口读 s_vol）→ NVS 偏好 */
@@ -499,19 +515,23 @@ static void drain_audio_q_nonblock(void)
     while (xQueueReceive(mp_audio_q, &m, 0) == pdTRUE) {
         switch (m.type) {
         case MP_AUDIO_PAUSE:
+            s_pending_play = false;
             s_playing = false;
             if (s_state == MP_BGM_PLAYING) s_state = MP_BGM_PAUSED;
             break;
         case MP_AUDIO_STOP:
+            s_pending_play = false;
             s_playing = false;
             s_state = MP_BGM_IDLE;
             pcm_ring_flush(s_ring);
             break;
         case MP_AUDIO_NEXT:
+            s_pending_play = false;                  /* 后到控制覆盖先到选曲（到包序语义） */
             s_pending_op = 1;
             s_playing = false;
             break;
         case MP_AUDIO_PREV:
+            s_pending_play = false;
             s_pending_op = 2;
             s_playing = false;
             break;
@@ -521,7 +541,15 @@ static void drain_audio_q_nonblock(void)
         case MP_AUDIO_VOLUME:
             vol_apply((int)s_vol + m.a);   /* 流中增减：feeder 出口即时生效，不做 HTTP 回传 */
             break;
+        case MP_AUDIO_PLAY:
+            if (s_greyed[s_source]) break;           /* 置灰源禁播（E8） */
+            s_pending_play = true;                   /* 正播中到达：记账延后执行
+                                                        （丢弃会导致播中选曲永远无效） */
+            s_pending_play_id = m.a;
+            s_playing = false;                       /* 中止当前流/会话 */
+            break;
         case MP_AUDIO_SOURCE:
+            s_pending_play = false;
             if (m.a == 0 || m.a == 1) {
                 s_source = (mp_bgm_source_t)m.a;
                 s_greyed[s_source] = false;
@@ -532,7 +560,7 @@ static void drain_audio_q_nonblock(void)
             }
             break;
         default:
-            break;                  /* PLAY 期间到达：忽略（先停后放） */
+            break;                  /* RESUME 播放期间到达无意义；其余已列全 */
         }
     }
 }
@@ -547,6 +575,7 @@ static void handle_audio_msg(const mp_audio_msg_t *m)
             if (bgm_cmd("play", 0, &id) != 0 || id <= 0) return;
         }
         s_pending_op = 0;
+        s_pending_play = false;                     /* 本次 PLAY 直接落地，清延后记账 */
         s_state = MP_BGM_PLAYING;
         s_playing = true;
         mp_codec_start(s_rate ? s_rate : 44100);
@@ -574,7 +603,7 @@ static void handle_audio_msg(const mp_audio_msg_t *m)
             s_playing = true;
             pcm_ring_flush(s_ring);                      /* 丢暂停残留，防旧数据先出声 */
             mp_codec_start(s_rate ? s_rate : 44100);
-            bgm_cmd("resume", 0, NULL);                  /* 现场控制回传 */
+            bgm_cmd("play", 0, NULL);                  /* 现场控制回传 */
             bgm_play_session(idx, (int)s_cur_id);
         }
         break;
@@ -593,7 +622,7 @@ static void handle_audio_msg(const mp_audio_msg_t *m)
         s_state = MP_BGM_IDLE;
         s_playing = false;
         pcm_ring_flush(s_ring);
-        bgm_cmd("stop", 0, NULL);
+        bgm_cmd("pause", 0, NULL);
         break;
     case MP_AUDIO_NEXT:
     case MP_AUDIO_PREV: {
@@ -623,11 +652,11 @@ static void handle_audio_msg(const mp_audio_msg_t *m)
     }
     case MP_AUDIO_VOL:
         vol_apply(m->a);
-        bgm_cmd("vol", (int)s_vol, NULL);
+        bgm_cmd("volume", (int)s_vol, NULL);
         break;
     case MP_AUDIO_VOLUME:
         vol_apply((int)s_vol + m->a);
-        bgm_cmd("vol", (int)s_vol, NULL);              /* 现场控制回传 */
+        bgm_cmd("volume", (int)s_vol, NULL);              /* 现场控制回传 */
         break;
     case MP_AUDIO_SOURCE:
         /* E8：手动切类型才换源（并清该源灰显） */
@@ -652,7 +681,12 @@ static void handle_audio_msg(const mp_audio_msg_t *m)
 static void bgm_task(void *arg)
 {
     (void)arg;
-    s_dec = heap_caps_malloc(sizeof(mp3dec_t), MALLOC_CAP_8BIT);  /* 内部 RAM 优先 */
+    /* 解码器状态 ≈6.7KB（float 合成器），内部 RAM 优先；紧张时退 PSRAM
+     * （float 访存变慢但仍可解，好过无声） */
+    s_dec = heap_caps_malloc(sizeof(mp3dec_t), MALLOC_CAP_8BIT);
+    if (!s_dec) {
+        s_dec = heap_caps_malloc(sizeof(mp3dec_t), MALLOC_CAP_8BIT | MALLOC_CAP_SPIRAM);
+    }
     if (s_dec) {
         mp3dec_init(s_dec);
     }
@@ -674,11 +708,17 @@ static void bgm_task(void *arg)
             }
             handle_audio_msg(&m);
 
-            /* 流中收到的 next/prev 记账，此刻补执行 */
+            /* 流中收到的 next/prev/选曲记账，此刻补执行 */
             if (s_pending_op && !s_offline && s_dec) {
                 mp_audio_msg_t op = {
                     .type = (s_pending_op == 1) ? MP_AUDIO_NEXT : MP_AUDIO_PREV, .a = 0 };
                 s_pending_op = 0;
+                if (!s_greyed[s_source]) {
+                    handle_audio_msg(&op);
+                }
+            } else if (s_pending_play && !s_offline && s_dec) {
+                mp_audio_msg_t op = { .type = MP_AUDIO_PLAY, .a = s_pending_play_id };
+                s_pending_play = false;
                 if (!s_greyed[s_source]) {
                     handle_audio_msg(&op);
                 }
@@ -739,6 +779,24 @@ static void feeder_task(void *arg)
 /* ------------------------------------------------------------------ */
 /* 公开 API                                                             */
 /* ------------------------------------------------------------------ */
+static esp_timer_handle_t s_task_retry_timer;
+static volatile bool s_task_up;   /* bgm 任务是否已就绪（自愈重试判据） */
+
+/* 内部堆回稳后补建 bgm 任务（成功即停表自删） */
+static void bgm_task_retry_cb(void *arg)
+{
+    (void)arg;
+    if (s_task_up) return;
+    if (xTaskCreatePinnedToCore(bgm_task, "bgm", 24576, NULL, 3,
+                                NULL, 0 /* PRO */) == pdPASS) {
+        s_task_up = true;
+        ESP_LOGI(TAG, "bgm 任务延迟创建成功（内部堆已回稳）");
+        esp_timer_stop(s_task_retry_timer);
+        esp_timer_delete(s_task_retry_timer);
+        s_task_retry_timer = NULL;
+    }
+}
+
 void bgm_start(void)
 {
     s_tbl_lock = xSemaphoreCreateMutex();
@@ -752,7 +810,26 @@ void bgm_start(void)
         return;
     }
     mp_codec_init(44100);
-    xTaskCreatePinnedToCore(bgm_task, "bgm", 8192, NULL, 3, NULL, 0 /* PRO */);
+    /* bgm 栈 24576：mp3dec_decode_frame 的 mp3dec_scratch_t ≈16KB 在调用栈上
+     * （maindata 2815B + grbuf/syn 浮点缓冲 ≈13KB，见 minimp3.h 头注），且解码
+     * 经 mp_http_get→stream_chunk 嵌在 esp_http_client 调用链内（再 ~2KB）。
+     * 原 8192 必栈溢出（解码首帧即崩）。feeder 无解码，4096 够用。 */
+    /* 24K 栈是内部堆大客户（render 12K 已先行分配）：开机挤压窗口期可能
+     * 拿不到连续块（真机 3/3 boot 全败）。首试失败不阻塞开机，转 10s 周期
+     * 自愈定时器，内部堆回稳后自动补建（否则 BGM 静默不可用）。 */
+    if (xTaskCreatePinnedToCore(bgm_task, "bgm", 24576, NULL, 3,
+                                NULL, 0 /* PRO */) == pdPASS) {
+        s_task_up = true;
+    } else {
+        ESP_LOGW(TAG, "bgm 任务首建失败（内部堆挤压），转 10s 周期自愈重试");
+        const esp_timer_create_args_t timer_args = {
+            .callback = bgm_task_retry_cb,
+            .name = "bgm_task_retry",
+        };
+        if (esp_timer_create(&timer_args, &s_task_retry_timer) == ESP_OK) {
+            esp_timer_start_periodic(s_task_retry_timer, 10ULL * 1000000ULL);
+        }
+    }
     xTaskCreatePinnedToCore(feeder_task, "i2s_feed", 4096, NULL, 4, NULL, 0 /* PRO */);
 }
 

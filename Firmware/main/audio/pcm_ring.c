@@ -33,6 +33,11 @@ pcm_ring_t *pcm_ring_create(size_t size_bytes)
     r->cap = cap;
     r->rd = r->wr = 0;
     r->lock = xSemaphoreCreateMutex();
+    if (!r->lock) {
+        heap_caps_free(r->buf);
+        free(r);
+        return NULL;
+    }
     return r;
 }
 

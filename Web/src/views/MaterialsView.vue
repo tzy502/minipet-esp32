@@ -7,14 +7,19 @@
  * - 「加载更多」每次追加 100 条；缩略图 n-image 懒加载，失败回退 emoji
  * - 收藏星标（localStorage minipet.materials.favorites：map/mob/npc 桶 + 纸娃娃按类目 pd_{part}
  *   分桶；旧 paperdoll 桶为占位时代数据，弃用不迁移）；点击 id 复制
+ * - 「推送到设备」（T3/E4/E7）：⭐ 收藏只在本机浏览器，📤 推送才是真正上机动作 ——
+ *   选目标设备 → POST /admin/devices/{id}/push {kind,id,switch} → 202 后台打包，
+ *   完成后服务端 bump manifest rev + 自动下发切图指令（设备自动切换）。服务端 push 仅
+ *   支持 kind=map|npc（AdminEndpoints.cs:254-329），故 mob/纸娃娃 tab 只给禁用态说明。
  */
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import {
-  NButton, NCard, NCheckbox, NEmpty, NImage, NImageGroup, NInput, NResult, NSelect, NSpace,
-  NSpin, NTabPane, NTabs, NTag, useMessage,
+  NButton, NCard, NCheckbox, NEmpty, NImage, NImageGroup, NInput, NModal, NResult, NSelect, NSpace,
+  NSpin, NTabPane, NTabs, NTag, NTooltip, useMessage,
 } from 'naive-ui'
-import { getCatalog, getMaterials, thumbUrl } from '../api/client'
+import { errText, getCatalog, getMaterials, pushMaterial, thumbUrl } from '../api/client'
 import { CATEGORIES, numericId } from '../utils/appearance'
+import { useDevicesStore } from '../stores/devices'
 
 const TABS = [
   { key: 'map', label: '地图' },
@@ -169,6 +174,82 @@ function copyId(id) {
   )
 }
 
+// ── 推送到设备（T3：素材上机的真实动作，服务端 POST /admin/devices/{id}/push）────
+const devicesStore = useDevicesStore()
+const pushShow = ref(false)
+const pushTarget = ref(null) // { kind, id, name }
+const pushDeviceId = ref(null)
+const pushSwitch = ref(true) // 仅 kind=map 生效（服务端分支）；勾选=登记后自动切图
+const pushing = ref(false)
+const pushResult = ref(null) // { type: 'success'|'error', text }
+
+/** 当前 tab 是否可推送：服务端只接受 map|npc。 */
+const pushableKind = computed(() => (activeTab.value === 'map' || activeTab.value === 'npc' ? activeTab.value : null))
+const deviceOptions = computed(() =>
+  devicesStore.devices.map((d) => ({
+    label: `${d.name || '未命名设备'}（${d.deviceId}）${d.online ? ' · 在线' : ' · 离线'}`,
+    value: d.deviceId,
+  }))
+)
+
+function openPush(it) {
+  if (!pushableKind.value) {
+    message.warning('服务端推送端点仅支持地图 / NPC（kind=map|npc）')
+    return
+  }
+  pushTarget.value = { kind: activeTab.value, id: it.id, name: it.name }
+  pushResult.value = null
+  pushShow.value = true
+  if (!devicesStore.devices.length) {
+    devicesStore
+      .fetchAll({ silent: true })
+      .then(() => {
+        if (!pushDeviceId.value) pushDeviceId.value = devicesStore.devices[0]?.deviceId ?? null
+      })
+      .catch(() => {})
+  } else if (!pushDeviceId.value) {
+    pushDeviceId.value = devicesStore.devices[0]?.deviceId ?? null
+  }
+}
+
+/** 错误分支文案（400/404/503 是服务端 push 端点明确定义的三种拒绝）。 */
+function pushErrorHint(status) {
+  switch (status) {
+    case 400: return '请求参数被拒：kind 必须是 map|npc，id 不能为空'
+    case 404: return '设备不存在（可能已被移除，刷新设备列表后重选）'
+    case 503: return 'WZ 未加载：到「设置」页配置 WZ 路径后重试'
+    case 500: return '服务端处理异常（资产打包失败，详见服务端日志）'
+    default: return ''
+  }
+}
+
+async function doPush() {
+  if (!pushTarget.value) return
+  if (!pushDeviceId.value) {
+    message.warning('请先选择目标设备')
+    return
+  }
+  pushing.value = true
+  pushResult.value = null
+  try {
+    const r = await pushMaterial(pushDeviceId.value, pushTarget.value.kind, pushTarget.value.id, pushSwitch.value)
+    const text = `已受理（HTTP 202）：${r?.note || '后台打包中'}`
+    pushResult.value = {
+      type: 'success',
+      text: `${text}${pushSwitch.value && pushTarget.value.kind === 'map' ? '；资产登记完成后服务端自动下发切图指令' : ''}`,
+    }
+    message.success(text)
+  } catch (e) {
+    const status = e?.response?.status
+    const hint = pushErrorHint(status)
+    const text = `${errText(e)}${status ? `（HTTP ${status}）` : ''}${hint ? ` · ${hint}` : ''}`
+    pushResult.value = { type: 'error', text }
+    message.error(text)
+  } finally {
+    pushing.value = false
+  }
+}
+
 // ── 侦听：切 tab / 切类目重置并按缓存拉取；搜索防抖；过滤条件变化分页归位 ──
 watch(activeTab, () => {
   resetListState()
@@ -200,6 +281,7 @@ onBeforeUnmount(() => clearTimeout(searchTimer))
         <n-space align="center">
           <n-tag :bordered="false" type="info">服务端渲染缩略图</n-tag>
           <span class="hint">素材目录实时读自 WZ（Map/Mob/Npc/Character）</span>
+          <span class="hint">★ 收藏只存本机浏览器；📤 推送到设备才是上机动作（服务端 push 支持地图/NPC）</span>
         </n-space>
         <n-checkbox v-model:checked="onlyFav">只看收藏（{{ favCount }}）</n-checkbox>
       </n-space>
@@ -270,6 +352,19 @@ onBeforeUnmount(() => clearTimeout(searchTimer))
               >
                 {{ isFav(favBucket, it.id) ? '★' : '☆' }}
               </n-button>
+              <!-- 推送到设备：map/npc 可推；mob/纸娃娃服务端无对应 push 分支 → 禁用态说明 -->
+              <n-tooltip v-if="tab.key === 'map' || tab.key === 'npc'" trigger="hover">
+                <template #trigger>
+                  <n-button class="push" size="tiny" circle secondary type="primary" @click="openPush(it)">📤</n-button>
+                </template>
+                推送到设备（{{ tab.key === 'map' ? '地图' : 'NPC' }}资产登记 + 自动切换）
+              </n-tooltip>
+              <n-tooltip v-else trigger="hover">
+                <template #trigger>
+                  <n-button class="push" size="tiny" circle secondary disabled>📤</n-button>
+                </template>
+                服务端 push 端点只支持 kind=map|npc（{{ tab.key === 'mob' ? '怪物' : '纸娃娃部件' }}暂无可推送资产类型）
+              </n-tooltip>
             </div>
           </div>
         </n-image-group>
@@ -282,6 +377,65 @@ onBeforeUnmount(() => clearTimeout(searchTimer))
         </div>
       </n-tab-pane>
     </n-tabs>
+
+    <!-- 推送到设备（T3）：选设备 → POST /admin/devices/{id}/push → 202 后台打包 -->
+    <n-modal
+      v-model:show="pushShow"
+      preset="card"
+      title="推送到设备"
+      style="width: 460px"
+      :mask-closable="!pushing"
+    >
+      <n-space vertical :size="12">
+        <n-space align="center" :size="8">
+          <n-tag :bordered="false" type="info">{{ pushTarget?.kind === 'map' ? '地图' : 'NPC' }}</n-tag>
+          <b>{{ pushTarget?.name || '—' }}</b>
+          <span class="hint">{{ pushTarget?.id }}</span>
+        </n-space>
+
+        <div>
+          <div class="hint">目标设备</div>
+          <n-select
+            v-model:value="pushDeviceId"
+            :options="deviceOptions"
+            :disabled="pushing || !deviceOptions.length"
+            placeholder="选择设备"
+          />
+          <div v-if="!deviceOptions.length" class="hint err">
+            暂无设备：先到「设备总览」配对（POST /admin/pair）
+          </div>
+        </div>
+
+        <n-checkbox v-model:checked="pushSwitch" :disabled="pushing">
+          登记后立即切换（仅地图生效；NPC 只登记资产）
+        </n-checkbox>
+
+        <div class="hint">
+          推送 = 服务端把该素材打包进此设备 manifest（数秒，HTTP 202 受理）→ 设备轮询到 rev
+          变化后自动拉包 → 完成后自动切换。收藏（★）仍只在本机浏览器。
+        </div>
+
+        <n-result
+          v-if="pushResult"
+          size="small"
+          :status="pushResult.type === 'success' ? 'success' : 'error'"
+          :title="pushResult.type === 'success' ? '已受理' : '推送失败'"
+          :description="pushResult.text"
+        />
+
+        <n-space justify="end">
+          <n-button :disabled="pushing" @click="pushShow = false">关闭</n-button>
+          <n-button
+            type="primary"
+            :loading="pushing"
+            :disabled="!pushDeviceId"
+            @click="doPush"
+          >
+            推送到该设备
+          </n-button>
+        </n-space>
+      </n-space>
+    </n-modal>
   </div>
 </template>
 
@@ -326,4 +480,6 @@ onBeforeUnmount(() => clearTimeout(searchTimer))
   white-space: nowrap;
 }
 .star { position: absolute; top: 2px; right: 2px; }
+.push { position: absolute; top: 2px; left: 2px; }
+.err { color: #d03050; }
 </style>

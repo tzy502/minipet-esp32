@@ -68,18 +68,26 @@ static struct {
 
 typedef enum {
     MENU_PAGE_ROOT = 0,
-    MENU_PAGE_MAPS,
-    MENU_PAGE_PAPERDOLL,
+    MENU_PAGE_MAPS,          /* BGMAP 本地清单（asset_dl_bgmap_list） */
+    MENU_PAGE_PAPERDOLL,     /* 换装 PARTS 清单（asset_dl_parts_list） */
+    MENU_PAGE_ACTIONS,       /* 动作演示（MP_ACTION_*，真实指令通道） */
+    MENU_PAGE_NPC,           /* Monsters：NPC 素材清单（asset_dl_npc_list，T2） */
     MENU_PAGE_BGM,
 } menu_page_t;
 
 #define MENU_ROWS_MAX   8       /* 单页可选行上限（含 Back/Exit 行） */
-#define MENU_MAPS_MAX   3       /* Maps 页真实条目位（当前 + 2 示例） */
+#define MENU_LIST_MAX   6       /* 列表页真实条目上限（+Back(+空态行) ≤ 8） */
+#define MENU_COLLECT_MAX (MENU_LIST_MAX + 1)  /* 多收 1 条用于探测「还有更多」 */
+#define MENU_DL_TIMEOUT_MS 30000  /* T4：单包下载轮询超时（tick 100ms 轮询落盘） */
 
+/* 列表条目（四类列表页共用；数据全部来自 asset_dl 本地清单，无写死演示项） */
 typedef struct {
-    char label[32];             /* 列表显示串（ASCII，Montserrat 可渲染） */
-    char hash[24];              /* MP_CMD_SET_MAP 的 s（16 hex / 示例名） */
-} map_item_t;
+    char label[32];             /* 显示串（asset_dl 已保证 ASCII；动作页为动作名） */
+    char hash[20];              /* 资产 hash（BGMAP / PARTS / NPC 的 PARTS 包） */
+    char entity[40];            /* NPC：entity（"npc:<id>"；含 LAYOUT 双包实体标识） */
+    char action[16];            /* Actions 页：MP_ACTION_* */
+    bool cached;                /* TF 上是否已有 <kind_dir>/<hash>.mpk */
+} menu_item_t;
 
 typedef struct {
     menu_page_t page;
@@ -87,11 +95,26 @@ typedef struct {
     int      sel;               /* 选中行（input 任务单字写，渲染任务读） */
     int      sel_applied;       /* 已贴高亮的行号（变化才重贴，防 10Hz 失效） */
     lv_obj_t *rows[MENU_ROWS_MAX];
+    bool     row_enabled[MENU_ROWS_MAX];   /* T3：置灰行（离线未缓存）不派发 */
 
-    map_item_t maps[MENU_MAPS_MAX];
-    int        map_cnt;
+    menu_item_t items[MENU_LIST_MAX];
+    int        item_cnt;        /* 列表页真实条目数（不含 Back/空态行） */
+    int        back_idx;        /* Back 行号（列表页；-1 = 无） */
 
     lv_obj_t *status_label;     /* BGM 页状态行（tick 500ms 刷新） */
+    lv_obj_t *hint_label;       /* 页脚提示行（构建时静态文本；T4 运行期改写） */
+
+    /* T4：选中未缓存条目 → 请求单包下载 → tick 轮询落盘 → 成功再 post 指令 */
+    bool          dl_active;
+    char          dl_hash[20];
+    mp_cmd_type_t dl_cmd;       /* 落盘后要发的指令（MP_CMD_NONE = 只下载） */
+    int64_t       dl_deadline_ms;
+    char          hint_once[40];/* 一次性提示（下载完成 → 重建后显示一格） */
+
+    bool     offline;           /* 本页构建时的网络态（T3 置灰判据） */
+    bool     offline_shown;     /* 本次构建时的网络态（置灰依据；tick 比对重建） */
+    bool     truncated;         /* 清单条目超 MENU_LIST_MAX（页脚提示 " MORE"） */
+    uint32_t rev_shown;         /* 本次构建时的 asset_dl 本地 rev（清单变化重建） */
 
     const lv_font_t *f_title, *f_item, *f_small;
 
@@ -99,6 +122,8 @@ typedef struct {
     volatile bool req_ok;
     volatile bool req_exit;
     volatile bool req_rebuild;          /* 仅渲染任务写：点击/tick 换页统一延后 */
+    volatile bool req_act;              /* 触摸点击（indev 回调）→ 由 tick 排空派发 */
+    volatile int  req_act_row;
     menu_page_t   pend_page;
     int           pend_sel;
 
@@ -253,6 +278,8 @@ int bridge_mode_poker(void)
     s_menu.req_ok = false;
     s_menu.req_exit = false;
     s_menu.req_rebuild = false;
+    s_menu.req_act = false;
+    s_menu.dl_active = false;         /* 出菜单不再轮询下载（文件仍会落盘，仅不派发） */
     if (s_menu.indev) lv_indev_reset(s_menu.indev, NULL);
     lv_display_set_buffers(s_br.disp, s_br.poker_buf[0], s_br.poker_buf[1],
                            s_br.poker_buf_sz, LV_DISPLAY_RENDER_MODE_PARTIAL);
@@ -263,14 +290,24 @@ int bridge_mode_poker(void)
 
 /* ---------------- MENU 真实选择器（E7 菜单真实化） ----------------
  * 旧实现只有黑底占位文字。现为真实选择器：
- *   主菜单：Maps / Paperdoll / BGM / Exit 四行（触摸点选 + 侧键矩阵）
- *   Maps     子页：当前缓存地图（asset_dl_map_path(NULL)）+ 2 个示例条目
- *            点选 → MP_CMD_SET_MAP（hash 通道，state_machine.dispatch_map 查
- *            路径+条带并切图）→ 回主菜单
- *   Paperdoll 子页：现有通道只有动作切换（MP_CMD_SET_ACTION）→ 列出五个真实
- *            动作；「列出 PARTS 条目 + 换装指令」缺失见汇报
+ *   主菜单：Maps / Paperdoll / Actions / Monsters / BGM / Exit 六行
+ *           （触摸点选 + 侧键矩阵；Monsters = NPC 素材页，T2）
+ *   Maps     子页：asset_dl_bgmap_list() 真实 BGMAP 条目（hash + ASCII label）
+ *            [v]=已缓存 [ ]=未缓存（点选→按 hash 拉包→落盘后 MP_CMD_SET_MAP）
+ *            [x]=未缓存且离线 → 置灰不可点（T3）
+ *   Paperdoll 子页：asset_dl_parts_list() 真实 PARTS 装扮条目 → MP_CMD_SET_PARTS
+ *            （hash 通道，state_machine.dispatch_set_parts_by_hash → render_set_parts）
+ *   Actions  子页：五个真实动作（MP_CMD_SET_ACTION），[v] 由
+ *            asset_dl_layout_cached() 标注该动作布局是否已在 TF
+ *   Monsters 子页：asset_dl_npc_list() 真实 NPC 条目（selector=="npc"）。
+ *            固件渲染层只有单实体（纸娃娃）通道，无 NPC 实体渲染接口 →
+ *            本页只列清单/下载（不 post 渲染指令，避免拿 NPC PARTS 去套
+ *            纸娃娃布局渲染出乱码）。空清单显示明确空态。
  *   BGM      子页：状态行（曲目数/bgm_get_state/get_source）+ 播放暂停/
  *            上一首/下一首三按钮（bgm_toggle_pause/prev/next，audio_q 异步）
+ *
+ * 网络态：state_machine_offline_mode() 每 500ms 轮询（state_machine.c 明示
+ * 「查询型状态由渲染层轮询」）；离线且未缓存的行 LV_STATE_DISABLED 置灰。
  *
  * 输入接线（跨任务）：
  *   触摸：input 任务菜单态调 lv_bridge_touch_feed(x,y,pressed)（读 I2C 帧后
@@ -278,9 +315,9 @@ int bridge_mode_poker(void)
  *   侧键矩阵（短按）：顶键=确认 → render_menu_ok()；中键=上移/底键=下移 →
  *         render_menu_nav(0/1)。跨任务安全：nav 只写单字 sel（渲染任务 100ms
  *         tick 贴高亮），ok 置 req_ok 旗标由同一 tick 排空——绝不在 indev/
- *         外任务上下文直接动控件树；触摸点击虽在渲染任务 indev 上下文，
- *         换页/重建也统一经 req_rebuild 延到 tick 排空（防 indev 压着对象时
- *         lv_obj_clean 自删）。长按顶键（转时钟）归 input_dispatch，不在此处理。
+ *         外任务上下文直接动控件树；触摸点击（row_click_cb）也只落
+ *         req_act/req_act_row 旗标，动作统一由 tick 排空（防 indev 压着对象时
+ *         lv_obj_clean 自删）。
  * 须与 render_tick 同任务构建（render_enter_menu → bridge_mode_menu）。 */
 
 /* 字体：内置 Montserrat（sdkconfig.defaults 三行 + 主线程 regen 后生效）；
@@ -339,9 +376,15 @@ void lv_bridge_touch_feed(int x, int y, bool pressed)
  * 列表高亮，越界回绕。只写单字 sel，高亮由菜单 tick 统一贴（跨任务安全） */
 void render_menu_nav(int dir)
 {
-    if (!s_br.menu_mode || s_menu.row_cnt <= 0) return;
+    if (!s_br.menu_mode || s_menu.row_cnt <= 0) {
+        ESP_LOGW("menu", "nav 丢弃：menu_mode=%d row_cnt=%d（state≠MENU 或菜单未建）",
+                 (int)s_br.menu_mode, s_menu.row_cnt);
+        return;
+    }
+    int old = s_menu.sel;
     if (dir) s_menu.sel = (s_menu.sel + 1) % s_menu.row_cnt;
     else     s_menu.sel = (s_menu.sel + s_menu.row_cnt - 1) % s_menu.row_cnt;
+    ESP_LOGI("menu", "nav(%d) sel %d→%d/%d（100ms 内贴高亮）", dir, old, s_menu.sel, s_menu.row_cnt);
 }
 
 /* 顶键短按=确认/进入：置请求旗标，菜单 tick 在渲染任务排空
@@ -363,48 +406,91 @@ static void menu_request_exit(void)
     state_machine_handle(MP_SM_EV_MENU_KEY);
 }
 
-/* ---------------- 数据收集（Maps 数据面） ---------------- */
+/* ---------------- 数据收集（真实数据面：asset_dl 本地清单） ----------------
+ * 全部条目来自 asset_dl_*_list()（manifest 登记 + TF access 缓存标记），
+ * 无写死演示项；asset_dl 侧已在 s_lock 内取快照（可从渲染任务调用）。 */
 
-/* /sdcard/minipet/bg/<hash>.mpk → <hash>（MP_CMD_SET_MAP 通道按 hash 派发） */
-static void menu_hash_from_path(const char *path, char *out, size_t cap)
+/* 已缓存条目排前（组内保持清单顺序）——离线时可用项置顶，减少误点置灰行 */
+static void menu_items_cached_first(void)
 {
-    const char *base = strrchr(path, '/');
-    base = base ? base + 1 : path;
-    const char *dot = strrchr(base, '.');
-    size_t n = dot ? (size_t)(dot - base) : strlen(base);
-    if (n >= cap) n = cap - 1;
-    memcpy(out, base, n);
-    out[n] = '\0';
+    menu_item_t tmp[MENU_LIST_MAX];
+    int n = 0;
+    for (int i = 0; i < s_menu.item_cnt; i++)
+        if (s_menu.items[i].cached) tmp[n++] = s_menu.items[i];
+    for (int i = 0; i < s_menu.item_cnt; i++)
+        if (!s_menu.items[i].cached) tmp[n++] = s_menu.items[i];
+    memcpy(s_menu.items, tmp, sizeof(menu_item_t) * (size_t)n);
 }
 
-/* 本地缓存地图清单。数据面现状：asset_dl 只有「当前地图」单条查询
- * （asset_dl_map_path(NULL)），无「列出全部 BGMAP 条目」接口 →
- * 当前地图 1 条真实条目 + 2 个写死示例条目兜底演示（示例 hash 未缓存时
- * dispatch_map 内 asset_dl_map_path 查不到自动短路，无副作用）。 */
+/* Maps 页：本地清单里的 BGMAP 条目（hash + ASCII label + 缓存标记） */
 static void menu_maps_collect(void)
 {
-    char path[MP_MPK_PATH_MAX];
-    s_menu.map_cnt = 0;
-
-    if (asset_dl_map_path(NULL, path, sizeof(path))) {
-        map_item_t *it = &s_menu.maps[s_menu.map_cnt++];
-        menu_hash_from_path(path, it->hash, sizeof(it->hash));
-        char nowlbl[16];
-        snprintf(nowlbl, sizeof(nowlbl), "Now %.8s", it->hash);
-        strlcpy(it->label, nowlbl, sizeof(it->label));   /* 经临时缓冲避 -Wrestrict 误报 */
+    char hashes[MENU_COLLECT_MAX][20] = { { 0 } };
+    char labels[MENU_COLLECT_MAX][32] = { { 0 } };
+    bool cached[MENU_COLLECT_MAX] = { false };
+    int n = asset_dl_bgmap_list(hashes, labels, cached, MENU_COLLECT_MAX);
+    if (n < 0) n = 0;
+    s_menu.truncated = (n > MENU_LIST_MAX);
+    if (n > MENU_LIST_MAX) n = MENU_LIST_MAX;
+    s_menu.item_cnt = n;
+    for (int i = 0; i < n; i++) {
+        strlcpy(s_menu.items[i].hash, hashes[i], sizeof(s_menu.items[i].hash));
+        strlcpy(s_menu.items[i].label, labels[i], sizeof(s_menu.items[i].label));
+        s_menu.items[i].entity[0] = 0;
+        s_menu.items[i].action[0] = 0;
+        s_menu.items[i].cached = cached[i];
     }
-    static const char * const demo[2] = { "Demo map A", "Demo map B" };
-    for (int i = 0; i < 2 && s_menu.map_cnt < MENU_MAPS_MAX; i++) {
-        map_item_t *it = &s_menu.maps[s_menu.map_cnt++];
-        strlcpy(it->label, demo[i], sizeof(it->label));
-        snprintf(it->hash, sizeof(it->hash), "demo_map_%c", (char)('a' + i));
-    }
+    menu_items_cached_first();
 }
 
-/* ---------------- Paperdoll / BGM 动作表 ---------------- */
+/* Paperdoll 页：本地清单里的 PARTS 装扮条目 → MP_CMD_SET_PARTS（换装） */
+static void menu_parts_collect(void)
+{
+    char hashes[MENU_COLLECT_MAX][20] = { { 0 } };
+    char labels[MENU_COLLECT_MAX][32] = { { 0 } };
+    bool cached[MENU_COLLECT_MAX] = { false };
+    int n = asset_dl_parts_list(hashes, labels, cached, MENU_COLLECT_MAX);
+    if (n < 0) n = 0;
+    s_menu.truncated = (n > MENU_LIST_MAX);
+    if (n > MENU_LIST_MAX) n = MENU_LIST_MAX;
+    s_menu.item_cnt = n;
+    for (int i = 0; i < n; i++) {
+        strlcpy(s_menu.items[i].hash, hashes[i], sizeof(s_menu.items[i].hash));
+        strlcpy(s_menu.items[i].label, labels[i], sizeof(s_menu.items[i].label));
+        s_menu.items[i].entity[0] = 0;
+        s_menu.items[i].action[0] = 0;
+        s_menu.items[i].cached = cached[i];
+    }
+    menu_items_cached_first();
+}
 
-/* 现有通道只有 MP_CMD_SET_ACTION（s=动作名 → render_set_layout）；
- * 真换装（PARTS 列表 + MP_CMD_SET_PARTS）缺失见汇报 */
+/* Monsters(NPC) 页：selector=="npc" 的实体（entity 去重；服务端 1 PARTS + N LAYOUT）。
+ * 固件无 NPC 实体渲染通道 → 本页只列/只下（见页头注释）。 */
+static void menu_npc_collect(void)
+{
+    char entities[MENU_COLLECT_MAX][40] = { { 0 } };
+    char hashes[MENU_COLLECT_MAX][20] = { { 0 } };
+    char labels[MENU_COLLECT_MAX][32] = { { 0 } };
+    bool cached[MENU_COLLECT_MAX] = { false };
+    int n = asset_dl_npc_list(entities, hashes, labels, cached, MENU_COLLECT_MAX);
+    if (n < 0) n = 0;
+    s_menu.truncated = (n > MENU_LIST_MAX);
+    if (n > MENU_LIST_MAX) n = MENU_LIST_MAX;
+    s_menu.item_cnt = n;
+    for (int i = 0; i < n; i++) {
+        strlcpy(s_menu.items[i].hash, hashes[i], sizeof(s_menu.items[i].hash));
+        strlcpy(s_menu.items[i].label, labels[i], sizeof(s_menu.items[i].label));
+        strlcpy(s_menu.items[i].entity, entities[i], sizeof(s_menu.items[i].entity));
+        s_menu.items[i].action[0] = 0;
+        s_menu.items[i].cached = cached[i];
+    }
+    menu_items_cached_first();
+}
+
+/* ---------------- Actions 页动作表（真实指令通道） ---------------- */
+
+/* MP_CMD_SET_ACTION（s=动作名 → render_set_layout）；[v] 由
+ * asset_dl_layout_cached() 判定该动作的 LAYOUT 包是否已在 TF */
 static const struct { const char *label, *action; } PD_ITEMS[] = {
     { "Stand", MP_ACTION_STAND },
     { "Walk",  MP_ACTION_WALK  },
@@ -413,6 +499,20 @@ static const struct { const char *label, *action; } PD_ITEMS[] = {
     { "Hit",   MP_ACTION_HIT   },
 };
 #define PD_CNT ((int)(sizeof(PD_ITEMS) / sizeof(PD_ITEMS[0])))
+
+static void menu_actions_collect(void)
+{
+    int n = (PD_CNT > MENU_LIST_MAX) ? MENU_LIST_MAX : PD_CNT;
+    s_menu.item_cnt = n;
+    for (int i = 0; i < n; i++) {
+        strlcpy(s_menu.items[i].label, PD_ITEMS[i].label, sizeof(s_menu.items[i].label));
+        strlcpy(s_menu.items[i].action, PD_ITEMS[i].action, sizeof(s_menu.items[i].action));
+        s_menu.items[i].hash[0] = 0;
+        s_menu.items[i].entity[0] = 0;
+        s_menu.items[i].cached = asset_dl_layout_cached(PD_ITEMS[i].action);
+    }
+    /* 动作顺序是语义顺序（Stand→Walk→…），不按缓存重排 */
+}
 
 static void menu_bgm_post(mp_audio_msg_type_t type, int32_t a)
 {
@@ -455,6 +555,17 @@ static void menu_bgm_status_refresh(void)
 
 /* ---------------- 行为分发 ---------------- */
 
+/* 根页行表（显式 idx→page 映射，不再用枚举算术耦合顺序） */
+static const struct { const char *label; int page; } ROOT_ROWS[] = {
+    { "Maps",      MENU_PAGE_MAPS      },
+    { "Paperdoll", MENU_PAGE_PAPERDOLL },
+    { "Actions",   MENU_PAGE_ACTIONS   },
+    { "Monsters",  MENU_PAGE_NPC       },
+    { "BGM",       MENU_PAGE_BGM       },
+    { "Exit",      -1                  },   /* -1 = 收菜单（状态机 MENU_KEY 通道） */
+};
+#define ROOT_CNT ((int)(sizeof(ROOT_ROWS) / sizeof(ROOT_ROWS[0])))
+
 static void menu_goto(menu_page_t page)
 {
     s_menu.pend_page  = page;
@@ -462,34 +573,102 @@ static void menu_goto(menu_page_t page)
     s_menu.req_rebuild = true;      /* tick 排空重建（防 indev 上下文自删） */
 }
 
+/* 页脚提示改写（仅渲染任务调用：构建期与菜单 tick） */
+static void menu_hint_set(const char *text)
+{
+    if (s_menu.hint_label) lv_label_set_text(s_menu.hint_label, text);
+}
+
+/* T4：列表页条目激活。
+ *   已缓存 → 直接 post 既有指令（state_machine 查路径/条带后落地）；
+ *   未缓存 → asset_dl_request_one(hash) 入队 → 提示「下载中」→ 菜单 tick
+ *            轮询 asset_dl_file_cached() 落盘 → 成功再 post 同一指令。
+ * cmd == MP_CMD_NONE = 只下载不派发（NPC 页：固件无 NPC 渲染通道）。 */
+static void menu_activate_item(int idx, mp_cmd_type_t cmd)
+{
+    const menu_item_t *it = &s_menu.items[idx];
+
+    if (it->cached) {
+        if (cmd != MP_CMD_NONE) {
+            mp_cmd_t c = { .type = cmd };
+            strlcpy(c.s, it->hash, sizeof(c.s));
+            mp_post_cmd(&c);
+            ESP_LOGI(TAG, "menu: 已缓存直接派发 cmd=%d hash=%.16s", (int)cmd, it->hash);
+        } else {
+            ESP_LOGI(TAG, "menu: 已缓存（NPC 页无渲染通道，不派发）%.16s", it->hash);
+        }
+        menu_goto(MENU_PAGE_ROOT);
+        return;
+    }
+
+    /* 未缓存：离线已被置灰（双保险再挡一次）；在线则拉包 */
+    if (state_machine_offline_mode()) {
+        menu_hint_set("OFFLINE: NOT CACHED");
+        ESP_LOGW(TAG, "menu: 离线且未缓存，拒绝下载 %.16s", it->hash);
+        return;
+    }
+    if (s_menu.dl_active) {                    /* 同屏只挂一个下载：避免请求互相覆盖 */
+        menu_hint_set("BUSY: DOWNLOAD IN PROGRESS");
+        ESP_LOGW(TAG, "menu: 已有下载在途，忽略 %.16s", it->hash);
+        return;
+    }
+    if (!asset_dl_request_one(it->hash)) {
+        menu_hint_set("REQ FAILED (NOT IN MANIFEST)");
+        ESP_LOGW(TAG, "menu: request_one 被拒 %.16s", it->hash);
+        return;
+    }
+    s_menu.dl_active     = true;
+    s_menu.dl_cmd        = cmd;
+    strlcpy(s_menu.dl_hash, it->hash, sizeof(s_menu.dl_hash));
+    s_menu.dl_deadline_ms = mp_now_ms() + MENU_DL_TIMEOUT_MS;
+    if (s_menu.hint_label) {
+        lv_label_set_text_fmt(s_menu.hint_label, "DOWNLOADING %.8s ... WAIT",
+                              s_menu.dl_hash);
+    }
+    ESP_LOGI(TAG, "menu: 下载中 %.16s → cmd=%d", s_menu.dl_hash, (int)cmd);
+}
+
 static void menu_activate(int idx)
 {
     if (idx < 0 || idx >= s_menu.row_cnt) return;
+    if (!s_menu.row_enabled[idx]) {          /* T3：置灰行侧键确认也不派发 */
+        ESP_LOGI("menu", "row %d 置灰（离线未缓存），忽略确认", idx);
+        return;
+    }
+
+    /* 列表页 Back 行（各页共用） */
+    if (s_menu.back_idx >= 0 && idx == s_menu.back_idx) {
+        menu_goto(MENU_PAGE_ROOT);
+        return;
+    }
 
     switch (s_menu.page) {
     case MENU_PAGE_ROOT:
-        if (idx == 3) { menu_request_exit(); break; }   /* Exit 行 */
-        menu_goto((menu_page_t)(MENU_PAGE_MAPS + idx));
+        if (idx >= ROOT_CNT) break;
+        if (ROOT_ROWS[idx].page < 0) { menu_request_exit(); break; }   /* Exit 行 */
+        menu_goto((menu_page_t)ROOT_ROWS[idx].page);
         break;
 
     case MENU_PAGE_MAPS:
-        /* 点选 → SET_MAP（hash）→ 回主菜单；示例条目 hash 未缓存时
-         * dispatch_map 短路，界面仍回根页（演示路径可见） */
-        if (idx < s_menu.map_cnt) {
-            mp_cmd_t c = { .type = MP_CMD_SET_MAP };
-            strlcpy(c.s, s_menu.maps[idx].hash, sizeof(c.s));
-            mp_post_cmd(&c);
-        }
-        menu_goto(MENU_PAGE_ROOT);
+        if (idx < s_menu.item_cnt) menu_activate_item(idx, MP_CMD_SET_MAP);
         break;
 
     case MENU_PAGE_PAPERDOLL:
-        if (idx < PD_CNT) {
+        if (idx < s_menu.item_cnt) menu_activate_item(idx, MP_CMD_SET_PARTS);
+        break;
+
+    case MENU_PAGE_NPC:
+        /* 只下载：NPC 渲染通道缺失（渲染层单实体纸娃娃）→ 不 post 渲染指令 */
+        if (idx < s_menu.item_cnt) menu_activate_item(idx, MP_CMD_NONE);
+        break;
+
+    case MENU_PAGE_ACTIONS:
+        if (idx < s_menu.item_cnt) {
             mp_cmd_t c = { .type = MP_CMD_SET_ACTION };
-            strlcpy(c.s, PD_ITEMS[idx].action, sizeof(c.s));
+            strlcpy(c.s, s_menu.items[idx].action, sizeof(c.s));
             mp_post_cmd(&c);
+            menu_goto(MENU_PAGE_ROOT);
         }
-        menu_goto(MENU_PAGE_ROOT);
         break;
 
     case MENU_PAGE_BGM:
@@ -501,9 +680,47 @@ static void menu_activate(int idx)
     }
 }
 
+/* 触摸点击：只落旗标，动作由菜单 tick（渲染任务、非 indev 上下文）排空
+ * ——indev 事件回调内不动控件树（防 lv_obj_clean 自删） */
 static void row_click_cb(lv_event_t *e)
 {
-    menu_activate((int)(intptr_t)lv_event_get_user_data(e));
+    s_menu.req_act_row = (int)(intptr_t)lv_event_get_user_data(e);
+    s_menu.req_act = true;
+}
+
+/* T4：轮询下载落盘（菜单 tick 100ms）。
+ * 落盘 → post 既定指令 + 原地重建（cached 标记刷新 + 一次性提示）；
+ * 超时 → 提示并清态（下载失败/服务端不可达）。 */
+static void menu_dl_poll(void)
+{
+    if (!s_menu.dl_active) return;
+
+    if (asset_dl_file_cached(s_menu.dl_hash)) {
+        if (s_menu.dl_cmd != MP_CMD_NONE) {
+            mp_cmd_t c = { .type = s_menu.dl_cmd };
+            strlcpy(c.s, s_menu.dl_hash, sizeof(c.s));
+            mp_post_cmd(&c);
+        }
+        if (s_menu.dl_cmd != MP_CMD_NONE) {
+            snprintf(s_menu.hint_once, sizeof(s_menu.hint_once),
+                     "DL OK %.8s -> APPLIED", s_menu.dl_hash);
+        } else {
+            snprintf(s_menu.hint_once, sizeof(s_menu.hint_once),
+                     "DL OK %.8s -> CACHED", s_menu.dl_hash);
+        }
+        ESP_LOGI(TAG, "menu: 下载完成 %.16s → cmd=%d", s_menu.dl_hash, (int)s_menu.dl_cmd);
+        s_menu.dl_active = false;
+        s_menu.pend_page = s_menu.page;      /* 原地重建：cached 标记刷新 */
+        s_menu.pend_sel  = s_menu.sel;
+        s_menu.req_rebuild = true;
+        return;
+    }
+
+    if (mp_now_ms() > s_menu.dl_deadline_ms) {
+        ESP_LOGW(TAG, "menu: 下载超时 %.16s", s_menu.dl_hash);
+        s_menu.dl_active = false;
+        menu_hint_set("DL TIMEOUT (SERVER?)");
+    }
 }
 
 /* ---------------- 控件构建 ---------------- */
@@ -514,8 +731,18 @@ static void menu_style_row(lv_obj_t *btn, bool selected)
     lv_obj_set_style_border_color(btn, lv_color_hex(selected ? 0x4DA3FF : 0x34343C), 0);
 }
 
+/* 置灰行（T3）配色：DISABLED 选择器覆盖默认态；选中态只提亮边框，
+ * 侧键把光标移到置灰行时仍可见（文本保持暗色） */
+static void menu_style_row_disabled(lv_obj_t *btn, bool selected)
+{
+    lv_obj_set_style_bg_color(btn, lv_color_hex(0x18181C), LV_STATE_DISABLED);
+    lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, LV_STATE_DISABLED);
+    lv_obj_set_style_border_color(btn, lv_color_hex(selected ? 0x3C5A78 : 0x2A2A30),
+                                  LV_STATE_DISABLED);
+}
+
 static lv_obj_t *menu_add_row(lv_obj_t *parent, int idx, const char *text,
-                              int32_t y, int32_t h)
+                              int32_t y, int32_t h, bool enabled)
 {
     lv_obj_t *btn = lv_button_create(parent);
     lv_obj_set_pos(btn, 48, y);
@@ -524,17 +751,35 @@ static lv_obj_t *menu_add_row(lv_obj_t *parent, int idx, const char *text,
     lv_obj_set_style_border_width(btn, 2, 0);
     lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, 0);
     lv_obj_set_style_shadow_width(btn, 0, 0);
-    menu_style_row(btn, idx == s_menu.sel);
+    menu_style_row(btn, idx == s_menu.sel && enabled);
+    if (!enabled) {
+        /* T3：离线且未缓存 → 置灰。DISABLED 选择器覆盖默认态配色；
+         * LVGL 的 DISABLED 态同时拦住 indev 点击（侧键路径由 row_enabled 挡） */
+        menu_style_row_disabled(btn, idx == s_menu.sel);
+        lv_obj_add_state(btn, LV_STATE_DISABLED);
+    }
 
     lv_obj_t *lb = lv_label_create(btn);
-    lv_obj_set_style_text_color(lb, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_text_color(lb, lv_color_hex(enabled ? 0xFFFFFF : 0x6A6A74), 0);
     if (s_menu.f_item) lv_obj_set_style_text_font(lb, s_menu.f_item, 0);
-    lv_label_set_text(lb, text);
+    lv_label_set_text(lb, text);   /* ASCII：Montserrat 内置字体只含拉丁字形 */
     lv_obj_center(lb);
 
     lv_obj_add_event_cb(btn, row_click_cb, LV_EVENT_CLICKED, (void *)(intptr_t)idx);
-    if (idx < MENU_ROWS_MAX) s_menu.rows[idx] = btn;
+    if (idx >= 0 && idx < MENU_ROWS_MAX) {
+        s_menu.rows[idx] = btn;
+        s_menu.row_enabled[idx] = enabled;
+    }
     return btn;
+}
+
+/* 列表行显示串：[v]=已缓存 [ ]=未缓存可下载 [x]=未缓存且离线（置灰） */
+static void menu_row_text(char *out, size_t cap, bool cached, bool enabled,
+                          const char *label)
+{
+    snprintf(out, cap, "[%s] %s",
+             cached ? "v" : (enabled ? " " : "x"),
+             (label && label[0]) ? label : "(no name)");
 }
 
 static lv_obj_t *menu_add_title(lv_obj_t *parent, const char *text)
@@ -554,6 +799,39 @@ static void menu_add_hint(lv_obj_t *parent, const char *text)
     if (s_menu.f_small) lv_obj_set_style_text_font(lb, s_menu.f_small, 0);
     lv_label_set_text(lb, text);   /* ASCII：Montserrat 内置字体只含拉丁字形 */
     lv_obj_align(lb, LV_ALIGN_BOTTOM_MID, 0, -16);
+    s_menu.hint_label = lb;
+}
+
+/* 列表页构建（Maps / Paperdoll / Monsters / Actions 共用布局）：
+ *   行 0..item_cnt-1 = 真实条目；空清单插一行置灰空态；末行 Back。
+ *   行高 45、间距 50：y = 92 + i*50（i≤6 → 底 437 < 页脚提示 ~448）。 */
+static void menu_build_list(lv_obj_t *scr, const char *title, const char *empty_text,
+                            const char *hint)
+{
+    menu_add_title(scr, title);
+    int row = 0;
+    if (s_menu.item_cnt <= 0) {
+        menu_add_row(scr, row++, empty_text, 92, 45, false);   /* 明确空态，非假数据 */
+    } else {
+        for (int i = 0; i < s_menu.item_cnt && row < MENU_ROWS_MAX; i++) {
+            bool en = s_menu.items[i].cached || !s_menu.offline;   /* T3 置灰判据 */
+            char text[48];
+            menu_row_text(text, sizeof(text), s_menu.items[i].cached, en,
+                          s_menu.items[i].label);
+            menu_add_row(scr, row++, text, 92 + i * 50, 45, en);
+        }
+    }
+    menu_add_row(scr, row, "< Back", 92 + row * 50, 45, true);
+    s_menu.back_idx = row;
+    s_menu.row_cnt  = row + 1;
+    if (s_menu.truncated) {
+        /* 截断必须可见：清单条目多于单页行数（不静默吞数据） */
+        char more[80];
+        snprintf(more, sizeof(more), "%s (+MORE)", hint);
+        menu_add_hint(scr, more);
+    } else {
+        menu_add_hint(scr, hint);
+    }
 }
 
 /* 重建当前页控件树（只在渲染任务菜单 tick / bridge_mode_menu 里调用）。
@@ -567,9 +845,20 @@ static void menu_rebuild(void)
     }
     if (lv_obj_get_child_count(scr)) lv_obj_clean(scr);
     memset(s_menu.rows, 0, sizeof s_menu.rows);
+    memset(s_menu.row_enabled, 0, sizeof s_menu.row_enabled);
     s_menu.status_label = NULL;
+    s_menu.hint_label   = NULL;
     s_menu.row_cnt = 0;
+    s_menu.item_cnt = 0;
+    s_menu.back_idx = -1;
+    s_menu.truncated = false;
     s_menu.sel_applied = -1;
+    /* 选中行先夹到有效范围再建控件（构建期贴高亮用它） */
+    if (s_menu.sel < 0 || s_menu.sel >= MENU_ROWS_MAX) s_menu.sel = 0;
+    /* 快照网络态与清单 rev：本页所有 cached/置灰判据基于同一时刻（tick 比对重建） */
+    s_menu.offline = state_machine_offline_mode();
+    s_menu.offline_shown = s_menu.offline;
+    s_menu.rev_shown = asset_dl_local_rev();
 
     lv_obj_set_style_bg_color(scr, lv_color_hex(0x000000), 0);
     lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
@@ -577,33 +866,33 @@ static void menu_rebuild(void)
 
     switch (s_menu.page) {
     case MENU_PAGE_ROOT: {
-        static const char *const rows[4] = { "Maps", "Paperdoll", "BGM", "Exit" };
         menu_add_title(scr, "MiniPet");
-        for (int i = 0; i < 4; i++)
-            menu_add_row(scr, i, rows[i], 118 + i * 70, 56);
-        s_menu.row_cnt = 4;
+        for (int i = 0; i < ROOT_CNT && i < MENU_ROWS_MAX; i++)
+            menu_add_row(scr, i, ROOT_ROWS[i].label, 100 + i * 56, 50, true);
+        s_menu.row_cnt = (ROOT_CNT < MENU_ROWS_MAX) ? ROOT_CNT : MENU_ROWS_MAX;
         menu_add_hint(scr, "UP:MID DOWN:BOT LONG:CLOCK");
         break;
     }
-    case MENU_PAGE_MAPS: {
-        menu_add_title(scr, "Maps");
+    case MENU_PAGE_MAPS:
         menu_maps_collect();
-        for (int i = 0; i < s_menu.map_cnt; i++)
-            menu_add_row(scr, i, s_menu.maps[i].label, 118 + i * 70, 56);
-        menu_add_row(scr, s_menu.map_cnt, "< Back", 118 + s_menu.map_cnt * 70, 56);
-        s_menu.row_cnt = s_menu.map_cnt + 1;
-        menu_add_hint(scr, "TAP: PICK   TOP:OK");
+        menu_build_list(scr, "Maps", "NO MAP IN LOCAL MANIFEST",
+                        "TAP: SWITCH/DL   [v] CACHED");
         break;
-    }
-    case MENU_PAGE_PAPERDOLL: {
-        menu_add_title(scr, "Paperdoll");
-        for (int i = 0; i < PD_CNT; i++)
-            menu_add_row(scr, i, PD_ITEMS[i].label, 104 + i * 56, 48);
-        menu_add_row(scr, PD_CNT, "< Back", 104 + PD_CNT * 56, 48);
-        s_menu.row_cnt = PD_CNT + 1;
-        menu_add_hint(scr, "ACTION DEMO - OUTFIT LISTS NEED SYNC");
+    case MENU_PAGE_PAPERDOLL:
+        menu_parts_collect();
+        menu_build_list(scr, "Paperdoll", "NO OUTFIT PACK (SYNC NEEDED)",
+                        "TAP: WEAR PARTS  [v] CACHED");
         break;
-    }
+    case MENU_PAGE_ACTIONS:
+        menu_actions_collect();
+        menu_build_list(scr, "Actions", "NO ACTION PACK (SYNC NEEDED)",
+                        "TAP: PLAY  [v] CACHED  [ ] NO PACK");
+        break;
+    case MENU_PAGE_NPC:
+        menu_npc_collect();
+        menu_build_list(scr, "Monsters", "NO NPC ASSET (SERVER PUSH)",
+                        "NPC PACKS: TAP TO CACHE (NO RENDER)");
+        break;
     case MENU_PAGE_BGM: {
         menu_add_title(scr, "BGM");
         s_menu.status_label = lv_label_create(scr);
@@ -613,34 +902,50 @@ static void menu_rebuild(void)
         lv_obj_align(s_menu.status_label, LV_ALIGN_TOP_MID, 0, 96);
         menu_bgm_status_refresh();
 
-        menu_add_row(scr, 0, "Play / Pause", 170, 54);
-        menu_add_row(scr, 1, "Prev",          238, 54);
-        menu_add_row(scr, 2, "Next",          306, 54);
-        menu_add_row(scr, 3, "< Back",        374, 54);
+        menu_add_row(scr, 0, "Play / Pause", 170, 54, true);
+        menu_add_row(scr, 1, "Prev",          238, 54, true);
+        menu_add_row(scr, 2, "Next",          306, 54, true);
+        menu_add_row(scr, 3, "< Back",        374, 54, true);
         s_menu.row_cnt = 4;
         menu_add_hint(scr, "TOUCH OR TOP KEY");
         break;
     }
     }
 
-    s_menu.sel_applied = s_menu.sel;   /* 构建时已按 sel 贴高亮 */
-    ESP_LOGI(TAG, "menu_rebuild: page=%d rows=%d widgets=%u",
-             (int)s_menu.page, s_menu.row_cnt,
+    if (s_menu.sel >= s_menu.row_cnt) s_menu.sel = 0;   /* 页内行数变化（截断/空态） */
+    s_menu.sel_applied = -1;   /* 交下一 tick 统一重贴高亮（与夹取后的 sel 严格一致） */
+
+    /* T4 一次性提示（下载完成）：本次重建消费后清空 */
+    if (s_menu.hint_once[0]) {
+        menu_hint_set(s_menu.hint_once);
+        s_menu.hint_once[0] = 0;
+    }
+
+    ESP_LOGI(TAG, "menu_rebuild: page=%d rows=%d items=%d offline=%d widgets=%u",
+             (int)s_menu.page, s_menu.row_cnt, s_menu.item_cnt, (int)s_menu.offline,
              (unsigned)lv_obj_get_child_count(scr));
     lv_obj_invalidate(scr);            /* DIRECT 模式强制整屏重绘入 menu_buf */
 }
 
-/* 高亮跟随 sel（菜单 tick；sel 变化才重贴，避免无谓失效区） */
+/* 高亮跟随 sel（菜单 tick；sel 变化才重贴，避免无谓失效区）。
+ * 置灰行不贴高亮底（保持 DISABLED 配色；选中框仍可见） */
 static void menu_apply_selection(void)
 {
     if (s_menu.sel_applied == s_menu.sel) return;
-    for (int i = 0; i < s_menu.row_cnt && i < MENU_ROWS_MAX; i++)
-        if (s_menu.rows[i]) menu_style_row(s_menu.rows[i], i == s_menu.sel);
+    for (int i = 0; i < s_menu.row_cnt && i < MENU_ROWS_MAX; i++) {
+        if (!s_menu.rows[i]) continue;
+        if (!s_menu.row_enabled[i]) {
+            menu_style_row_disabled(s_menu.rows[i], i == s_menu.sel);  /* 光标可见 */
+            continue;
+        }
+        menu_style_row(s_menu.rows[i], i == s_menu.sel);
+    }
     s_menu.sel_applied = s_menu.sel;
 }
 
-/* 菜单态 100ms 节拍（渲染任务）：排空侧键/换页请求 → 贴高亮 → 500ms 刷 BGM 状态。
- * 所有会动控件树的操作都收敛到本回调（渲染任务、非 indev 上下文）执行 */
+/* 菜单态 100ms 节拍（渲染任务）：排空侧键/触摸/换页请求 → 贴高亮 → 轮询下载
+ * → 500ms 刷 BGM 状态/网络态。所有会动控件树的操作都收敛到本回调
+ * （渲染任务、非 indev 上下文）执行 */
 static void menu_tick_cb(lv_timer_t *t)
 {
     (void)t;
@@ -658,15 +963,29 @@ static void menu_tick_cb(lv_timer_t *t)
         menu_rebuild();
         return;
     }
+    if (s_menu.req_act) {                   /* 触摸点击（indev 回调只落旗标） */
+        s_menu.req_act = false;
+        menu_activate(s_menu.req_act_row);
+        return;
+    }
     if (s_menu.req_ok) {
         s_menu.req_ok = false;
         menu_activate(s_menu.sel);
         return;
     }
+    menu_dl_poll();                         /* T4：下载落盘轮询 → post 切换指令 */
     menu_apply_selection();
     if (++s_menu.bgm_refr_div >= 5) {   /* 100ms×5 = 500ms */
         s_menu.bgm_refr_div = 0;
         menu_bgm_status_refresh();
+        /* 网络态翻转（离线置灰跟随）或清单 rev 变化（列表/缓存标记跟随）→ 重建 */
+        bool off = state_machine_offline_mode();
+        uint32_t rev = asset_dl_local_rev();
+        if (off != s_menu.offline_shown || rev != s_menu.rev_shown) {
+            s_menu.pend_page = s_menu.page;
+            s_menu.pend_sel  = s_menu.sel;
+            s_menu.req_rebuild = true;
+        }
     }
 }
 
@@ -706,6 +1025,13 @@ int bridge_mode_menu(void)
     s_menu.req_ok = false;
     s_menu.req_exit = false;
     s_menu.req_rebuild = false;
+    s_menu.req_act = false;
+    s_menu.req_act_row = -1;
+    s_menu.dl_active = false;         /* T4：上一轮残留的下载轮询不带进新菜单 */
+    s_menu.dl_hash[0] = 0;
+    s_menu.dl_cmd = MP_CMD_NONE;
+    s_menu.hint_once[0] = 0;
+    s_menu.back_idx = -1;
     menu_rebuild();           /* E7：进入菜单即构建真实选择器（防白屏/黑屏） */
     if (!s_menu.tick) {
         s_menu.tick = lv_timer_create(menu_tick_cb, 100, NULL);  /* 高亮/请求/BGM 状态节拍 */

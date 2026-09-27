@@ -7,9 +7,12 @@
  * 的 RX 通道本驱动不创建——audio 模块要录音时需把通道重建为全双工
  * （i2s_new_channel 同时给 tx/rx handle），本文件只保留 TX。
  *
- * BRING-UP 注意 [核对]：I2C 上电序列按 espressif esp_codec_dev / esp-adf
- * 的 es8311 参考序列抄录（DAC 播放链路、MCLK=256fs、I2S slave），
- * 未经实测。若无声按官方参考驱动逐条核对 0x01/0x02/0x12/0x13/0x14/0x32。
+ * BRING-UP 注意：I2C 上电序列已按本仓库 managed_components/espressif__esp_codec_dev
+ * /device/es8311/es8311.c 的 es8311_open + es8311_start（DAC 工作模式、I2S slave、
+ * use_mclk、模拟 MIC、无 DMIC）+ es8311_set_fs（16bit/I2S 格式/256fs 系数表）
+ * 逐条核对合并——原表 REG02=0x10（倍频档错，参考为 0x00）、缺 REG09 16bit 字长
+ * （默认 24bit，与 I2S TX 位宽不符必失真）、缺 REG03/04/05 时钟系数等已修。
+ * 序列仍未真机验证（无声时开 es8311_dump 对照参考驱动排查）。
  */
 #include "codec_es8311.h"
 
@@ -27,24 +30,49 @@ static const char *TAG = "es8311";
 
 /* ES8311 寄存器（仅列本文件用到的） */
 #define ES8311_REG_RESET   0x00    /* 0x80 软复位 */
-#define ES8311_REG_VOLUME  0x32    /* DAC 数字音量 0-0xBF */
-#define ES8311_VOLUME_MAX  0xBF
+#define ES8311_REG_VOLUME  0x32    /* DAC 数字音量：0x00=-95.5dB … 0xBF≈0dB … 0xFF=+32dB */
+#define ES8311_VOLUME_MAX  0xBF    /* set_volume 100% 对应值 ≈0dB（再往上进增益区不用） */
 
 /* PA 使能极性：GPIO46 高电平开功放（低电平/复位默认为关，见 strapping 注释） */
 #define PA_ACTIVE_LEVEL    1
 
-/** {寄存器, 值} 初始化表（DAC 播放链路；逐条语义见行尾，全部 [核对]） */
+/** {寄存器, 值} 初始化表（DAC 播放链路）。逐条对应 esp_codec_dev es8311 参考驱动
+ * 的 es8311_open → es8311_start → es8311_set_fs(16bit/I2S/256fs) 合并结果；
+ * 参考里的读-改-写步已按复位默认值折算为绝对值。MCLK=256fs 下 44.1k/48k 的
+ * 系数表取值完全相同（pre_div=1/倍频 x1/OSR=16/单速档），故只在 init 写一次，
+ * 运行中换采样率只重配 S3 侧 I2S 时钟（codec_es8311_set_sample_rate）。 */
 static const struct { uint8_t reg; uint8_t val; } s_es8311_init[] = {
-    { 0x00, 0x80 }, /* 软复位 */
-    { 0x00, 0x00 }, /* 释放复位 */
-    { 0x01, 0x3F }, /* CLK1：MCLK 源选择 = MCLK 引脚输入（外部 256fs）[核对] */
-    { 0x02, 0x10 }, /* CLK2：内部时钟分频 [核对] */
-    { 0x12, 0x00 }, /* 系统电源管理：DAC 链路上电 [核对] */
-    { 0x0D, 0x01 }, /* 模拟参考（VREF）上电 [核对] */
-    { 0x0E, 0x02 }, /* ADC/DAC 模拟供电 [核对] */
-    { 0x13, 0x10 }, /* 耳机/DAC 输出驱动 [核对] */
-    { 0x14, 0x10 }, /* 输出驱动级 [核对] */
-    { 0x32, 0xBF }, /* DAC 音量默认最大（应用层用 set_volume 调小） */
+    { 0x00, 0x80 }, /* RESET：软复位全寄存器（bit6=0 = I2S slave） */
+    { 0x2C, 0x08 }, /* GPIO44：I2C 抗干扰（es8311 首笔写易失败，参考驱动写两次） */
+    { 0x2C, 0x08 }, /* 同上第二笔 */
+    { 0x0D, 0xFA }, /* 系统：配置期模拟链路安全态（es8311_open 口径） */
+    { 0x01, 0x30 }, /* CLK1：codec 内部时钟先使能（open 中间值） */
+    { 0x02, 0x00 }, /* CLK2：pre_div=1、倍频 x1（MCLK=256fs 标准档；原表 0x10=x4 错） */
+    { 0x03, 0x10 }, /* CLK3：ADC OSR=16、单速档（44.1/48k 同值） */
+    { 0x04, 0x10 }, /* CLK4：DAC OSR=16 */
+    { 0x05, 0x00 }, /* CLK5：ADC/DAC 时钟分频 =1 */
+    { 0x0B, 0x00 }, /* 系统（open 口径） */
+    { 0x0C, 0x00 }, /* 系统（open 口径） */
+    { 0x10, 0x1F }, /* 系统（open 口径） */
+    { 0x11, 0x7F }, /* 系统（open 口径） */
+    { 0x00, 0x80 }, /* RESET 释放：保持 slave（bit6=0，open→start 口径） */
+    { 0x01, 0x3F }, /* CLK1：MCLK 取自 MCLK 引脚（bit7=0）、不反相、时钟全开 */
+    { 0x06, 0x03 }, /* CLK6：SCLK 不反相（bit5=0）+ BCLK 分频码 3（slave 模式 BCLK 直入，仅对齐参考） */
+    { 0x07, 0x00 }, /* CLK7：LRCK 分频高位（slave 模式 LRCK 直入） */
+    { 0x08, 0xFF }, /* CLK8：LRCK 分频低位（256 = LRCK 每帧 256 BCLK） */
+    { 0x09, 0x0C }, /* SDP IN（DAC 串行口）：I2S 标准格式(bit1:0=00) + 16bit 字长(bit3:2=11)
+                       —— 原表缺失：复位默认 24bit，与 I2S TX 16bit 位宽不符必失真 */
+    { 0x0A, 0x0C }, /* SDP OUT（ADC 串行口）：格式对齐（录音链路未启用） */
+    { 0x13, 0x10 }, /* 系统（open 口径） */
+    { 0x2C, 0x58 }, /* GPIO44：内部基准 = ADCL+DACR（参考默认 no_dac_ref=false） */
+    { 0x0E, 0x02 }, /* 系统：模拟供电上电（start 口径） */
+    { 0x12, 0x00 }, /* 系统：使能 DAC（start DAC 模式口径） */
+    { 0x14, 0x1A }, /* 系统：输出驱动级、模拟 PGA 档、DMIC 关（start 口径 0x1A；原表 0x10 缺 bit3/bit1） */
+    { 0x0D, 0x01 }, /* 系统：VREF 上电（start 口径） */
+    { 0x37, 0x08 }, /* DAC：ramp 率（start 口径，防爆音） */
+    { 0x45, 0x00 }, /* GPIO45：GP 控制关（start 口径） */
+    { 0x32, 0xBF }, /* DAC 数字音量 ≈0dB（vol_range：0x00=-95.5dB … 0xFF=+32dB，
+                       0xBF≈0dB；运行中细调走 feeder 线性缩放，set_volume 粗调备用） */
 };
 
 static i2s_chan_handle_t     s_tx;

@@ -63,6 +63,10 @@ bool key_gpio0_tick(void)
     if ((now - raw_change_ms) >= KEY0_DEBOUNCE_MS && pressed != stable_pressed) {
         stable_pressed = pressed;
         if (stable_pressed) {
+            /* 无条件诊断日志：只依赖驱动+tick 在跑，不看任何 app 状态——
+             * 「按下连这条都没有」即可断定 GPIO0 电平从未变低（引脚不对/
+             * 接线不复位假设），把软件嫌疑排除在诊断链最前端 */
+            ESP_LOGI(TAG, "key0 raw press (level=%d)", gpio_get_level(KEY_GPIO0_PIN));
             release_pending = false;     /* 弹回按下：静止确认作废，闩继续关 */
             if (!latched) {
                 latched = true;          /* 只在确认按下沿触发一次 */

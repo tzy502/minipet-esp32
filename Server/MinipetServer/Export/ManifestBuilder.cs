@@ -29,8 +29,10 @@ public static class ManifestBuilder
     {
         var o = new JsonObject
         {
-            // 固件 asset_dl kind_dir 是 strcmp 大写白名单——PascalCase（"Parts"）会导致设备不下载
-            ["kind"] = a.Kind.ToString().ToUpperInvariant(),
+            // 固件 asset_dl kind_dir 白名单匹配——"Parts"（PascalCase）或 "AUDIOMETA"
+            // （枚举名直接大写）都会导致设备只登记元数据、永不下载；统一走
+            // MpakKindNames.DirName（AudioMeta → "AUDIO_META" 特判，E12）
+            ["kind"] = a.Kind.DirName(),
             ["bytes"] = a.ByteCount,
             ["url"] = $"/api/device/asset/{a.Hash:x16}",
             ["label"] = a.Label,

@@ -83,6 +83,32 @@ public sealed class PaperdollPackService
         }
     }
 
+    /// <summary>
+    /// 该设备索引里是否已有装扮包（kind=PARTS + selector=paperdoll）。只读索引、不打包
+    /// ——hello 首启 provisioning 的幂等前置判定（EnsurePacked 会先跑数秒导出再判幂等，
+    /// 每次 hello 都调它的代价不可接受）。
+    /// </summary>
+    public bool HasPackedAppearance(string deviceId)
+    {
+        try
+        {
+            var indexPath = Path.Combine(_paths.ExportRoot, deviceId, ManifestBuilder.AssetsManifestFileName);
+            var root = ReadIndex(indexPath);
+            if (root["assets"] is not JsonObject ao) return false;
+            foreach (var kv in ao)
+            {
+                if (kv.Value is not JsonObject e) continue;
+                if (!string.Equals(e["kind"]?.GetValue<string>(), MpakKind.Parts.DirName(), StringComparison.Ordinal)) continue;
+                if (string.Equals(e["selector"]?.GetValue<string>(), "paperdoll", StringComparison.Ordinal)) return true;
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[PaperdollPack] 读设备 {deviceId} 索引失败: {ex.Message}");
+        }
+        return false;
+    }
+
     private static JsonObject ReadIndex(string path)
     {
         try
@@ -118,9 +144,9 @@ public sealed class PaperdollPackService
     {
         var o = new JsonObject
         {
-            // 固件 asset_dl kind_dir 是 strcmp 大写白名单（PARTS/LAYOUT/BGMAP/FONT/AUDIO_META），
-            // 小写会被设备登记元数据但永不下载（2026-09-26 接缝审查修正）
-            ["kind"] = a.Kind.ToString().ToUpperInvariant(),
+            // 固件 asset_dl kind_dir 白名单匹配（见 MpakKindNames；AUDIO_META 特判在内），
+            // 小写/枚举名直大写会被设备拒收不下载（2026-09-26 接缝审查修正）
+            ["kind"] = a.Kind.DirName(),
             ["bytes"] = a.ByteCount,
             ["file"] = a.FileName,
             ["url"] = $"/api/device/asset/{a.Hash:x16}",

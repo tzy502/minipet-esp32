@@ -1,0 +1,203 @@
+# MiniPet ESP32 技术总档（唯一权威技术文档）
+
+> 2026-09-27 汇总。本文档 = 硬件事实 + 环境操作 + 架构 + 全部根因台账 + 契约 + 标定状态 + 遗留清单。
+> 新会话/新人接手：先读本文档，再读 `hardware-bringup-issues.md`（联调动态）。
+> 规则：每次修复必须有真机证据（日志/照片）；禁止"代码写完即报完成"。
+
+---
+
+## 一、板卡硬件事实
+
+| 项 | 值 |
+|---|---|
+| 板型 | 微雪 ESP32-S3 Touch AMOLED 2.16"（480×480 QSPI 圆屏方屏） |
+| 芯片 | ESP32-S3，Octal PSRAM 8MB（占用 35-37 脚），16MB Flash |
+| 面板 | CO5300（QSPI，BSP=waveshare__esp32_s3_touch_amoled_2_16） |
+| 触摸 | CST9220（I2C，INT=11 RST=40；帧格式见 §六） |
+| IMU | QMI8658（I2C，INT1=17，DRDY 中断+20ms 轮询兜底） |
+| RTC | PCF85063（I2C，寄存器存 UTC；OS 标志=首次上电判据） |
+| PMU | AXP2101（PWRON 短按=底键，IRQ 脚未接线→寄存器轮询） |
+| Codec | ES8311（I2S，44100Hz；**PA 使能=GPIO46 高有效**，纯 GPIO 直控） |
+| SD | SDMMC（1/2/3/41）；内部 Flash assets 分区 0x620000/6M 为兜底 |
+| 按键 | 顶键=菜单 GPIO18；中键=GPIO0（BOOT，strapping 只准输入+上拉）；底键=AXP2101 PWRON |
+| USB | 19/20 = 原生 USB（烧录/日志口，绝不可挪用）；串口设备名 `/dev/cu.usbmodem21201` |
+| **内部 RAM** | **动态堆仅 ~143KB（90+21+32KiB），启动挤压窗口期可低至空闲 6KB/最大块 3KB** —— 本板一切"随机任务创建失败/分配失败"的总根源 |
+| 出厂复位 | NVS 擦除 = `0x9000-0xF000` erase_region（不影响 assets FAT） |
+
+### 引脚占用总表（扫描探针排除依据）
+SD 1/2/3/41 · LCD 4/5/6/7/12/38/39 · 音频 8/9/10/42/45/46 · 触摸 11/40 · RTC 13 · I2C 14/15 · IMU 17/21 · 菜单键 18 · PA 46 · 系统 26-32(Flash)/35-37(PSRAM)/43-44(UART0)/19-20(USB)；空闲候选=GPIO0/16/47/48。
+
+---
+
+## 二、环境与操作手册
+
+### 2.1 环境（每次新 shell 必做）
+```bash
+source /Users/<USER>/esp/esp-idf/export.sh        # IDF v5.5
+cd /Users/<USER>/IdeaProjects/minipet-esp32/Firmware   # ⚠️ 必须 cd 进这层，仓库根目录没有 CMakeLists
+```
+- IDF 自带 python（含 pyserial）：`/Users/<USER>/.espressif/python_env/idf5.5_py3.9_env/bin/python`——系统 python3 **没有** serial 模块，抓日志必须用这个。
+
+### 2.2 标准烧录流程（build → flash → 复位 → 抓日志）
+```bash
+idf.py build                                      # 验收线：0 error 0 warning
+idf.py -p /dev/cu.usbmodem21201 flash             # 烧录，末尾自动硬复位启动新固件
+```
+烧录完成后**新固件已在跑**，抓日志三种姿势：
+
+**(a) 烧完立刻抓（推荐）**：flash 完成后 1 秒内打开串口读：
+```bash
+PY=/Users/<USER>/.espressif/python_env/idf5.5_py3.9_env/bin/python
+$PY - <<'EOF'
+import serial, time
+s = serial.Serial('/dev/cu.usbmodem21201', 115200, timeout=1)
+f = open('/tmp/boot.log', 'wb'); t = time.time()
+while time.time() - t < 20:            # 时长按需：开机诊断 15-25s，含 keyscan 期 75s+
+    d = s.read(4096)
+    if d: f.write(d); f.flush()
+f.close(); s.close()
+EOF
+```
+**(b) 干净复位重抓（要完整 boot 日志时）**：先借 esptool 复位，立刻开读（同上读取脚本）：
+```bash
+$PY -m esptool --chip esp32s3 -p /dev/cu.usbmodem21201 \
+    --before default_reset --after hard_reset chip_id >/dev/null 2>&1
+```
+**(c) 运行态软复位**（板子正常跑着触发重启）：pyserial 打开后拨 DTR/RTS：
+```python
+s.setDTR(False); s.setRTS(True); time.sleep(0.1); s.setRTS(False)   # RTS 脉冲复位
+```
+
+### 2.3 日志判读要点（踩过的坑）
+- **脏日志识别**：时间戳乱序（如 1322ms 行后出现 6970ms 再回 1323ms）= USJ CDC 缓冲把上一 boot 残留混进来了，**整份作废重抓**，不要基于它下结论。
+- **抓不到开机头**：复位到开读之间会丢 bootloader 段日志；关键 app 日志（1.4s 之后）一般来得及。
+- **关键日志锚点**（grep tag）：`key0`（中键计数/按下时状态）、`tmap`（触摸映射）、`orient`（方向）、`probe`（flush/ENTPOS 渲染探针）、`rc`（渲染层，含气泡兜底）、`http`（hello/tx_fail/RAW 探针）、`co5300`（显示驱动/NO_MEM）、`menu`（导航诊断）、`bgm`、`keyscan`（GPIO 扫描）。
+- **TWDT panic**：`CONFIG_ESP_TASK_WDT_PANIC=y`（当前开着）卡死即 panic 打回溯；定位完关掉。
+- 中键取证：NVS `calib/key0`=累计次数、`calib/k0st`=最后一次按下时的状态机状态（开机日志自动回读，4=MENU）。
+
+### 2.4 常见故障
+| 症状 | 处置 |
+|---|---|
+| `idf.py` 报 CMakeLists not found | 当前目录不对，cd 进 Firmware |
+| 端口打不开/烧录失败 | 残留 monitor 占口：`lsof | grep usbmodem` 找 PID kill，或 pkill -f idf_monitor |
+| ModuleNotFoundError: serial | 用 IDF 环境的 python（见 2.1） |
+| 恢复出厂（重配网） | esptool `erase_region 0x9000 0xF000`（只擦 NVS 不动 assets）；配网页 WiFi 密码 12 位 <WIFI_PASS> |
+| 烧录后行为诡异 | 先确认 flash 真的成功（完整输出见 "Done"）；再排除脏日志误判 |
+| **黑屏 + 串口刷 `boot: No bootable app partitions`（复位循环）** | 烧录中途被取消 → app 分区残缺镜像（`invalid segment length 0xffffffff`），ota_1 又为空 → 处置=重烧完整镜像即愈，与代码无关。**烧录一旦开始不要中断** |
+
+### 2.5 服务端/网络环境
+- 本地服务端（Mac）：`dotnet run`=5059；用户常驻实例抢 5000 勿动；测试显式 `ASPNETCORE_URLS=5059`。dotnet/WZ 数据在 `/Volumes/SSD`（见记忆 dev-env-ssd）。
+- 生产服务端：NAS `http://<NAS_IP>:38090`（**禁改后端**；Mac IP=<DEV_PC_IP>，板子 DHCP≈<PET_IP>）。
+- 家 WiFi：<WIFI_SSID> / <WIFI_PASS>（12 位，别输成 13 位）。SoftAP 配网：`<AP_SSID>` → portal 192.168.4.1。
+- 服务端健康自检：`curl -m 5 http://<NAS_IP>:38090/api/device/hello`（GET 应 200）。
+
+---
+
+## 三、固件架构速览
+
+```
+app_main（main.c）
+├─ NVS → 事件循环 → 三队列(cmd/event/audio) → watchdog → 驱动 init
+├─ render_init（内含 display_init）→ 【render/input 任务必须先于 bgm(24K栈) 创建！】
+├─ poller/events/asset_dl/ota/bgm_start
+├─ state_machine_boot（阻塞：WiFi/服务端探测；OFFLINE 态=服务端不可达也正常跑）
+└─ render_task(33ms/30fps): 排空 cmd_q → render_tick → watchdog_kick
+   input_task(20ms): IMU→touch_tick→key_tick(菜单键18)→key0_tick(中键GPIO0)→pwron_tick(底键PMU)
+```
+
+### 渲染管线（compositor.c，非 LVGL；LVGL 仅菜单态）
+1. 脏区 16×16 块网格 → flush_dirty 合并包围盒
+2. compose_region 逐层重算：clock_doze → **static_back(须 +x 偏移)** → strip → tile(**须 +x**) → clock → calib线 → 实体(1bit覆盖掩码) → 气泡 → 横幅
+3. blit_be：小端 FB → 大端字节交换（12KB 64B 对齐 stage，**行高恒偶**）→ display_blit
+4. display_co5300.c：esp_lcd QSPI（队列深度 3）+ **槽位信号量背压**（在飞≤3，完成回调归还，2s 泄漏探针）
+5. 面板方向：**swap=false + 无镜像（组合 0，原生方向）**——菜单照片终审：组合1(mirror_x)文字左右镜像、组合2(mirror_y)垂直颠倒，原生即正立
+
+### 音频管线（bgm.c）
+触发(audio_q) → 曲目表(SD `minipet/audio/*.mpk` AUDIO_META) → mp_http 流式 GET → minimp3(vendored 真解码) → pcm_ring → feeder 任务 → ES8311 I2S；PA=GPIO46 有数据才开。任务栈 24576（mp3dec scratch ~16KB 在栈上）。
+
+---
+
+## 四、根因台账（全部真机实证，新异常先查此单）
+
+### 启动/系统
+| 症状 | 根因 | 修法/铁律 |
+|---|---|---|
+| NO_MEM 风暴 7404条/80s + 卡死 | **三层链**：blit 行高奇数→even_round 外扩+1 行→快速通道失效走 PSRAM 暂存→esp_lcd `setup_priv_desc` 对非 DMA-capable/未对齐缓冲**每次排队强制 malloc 整块内部 DMA 拷贝**→内部堆见底 | 行高恒偶+stage 64B 对齐+12KB+槽位背压。**铁律：SPI 推送缓冲必须 DMA-capable 且地址+长度对齐** |
+| 任务创建随机失败（假"在跑"） | 内部堆 143KB，启动窗口期最大块<所需栈；SELFTEST 曾从未跑成 | 关键任务先建（render 12K 先于 bgm 24K）+失败重试/自愈定时器+日志带堆水位 |
+| 菜单呼出重启 | flush 未调 flush_ready 死循环 | 入口无条件 flush_ready |
+| 配网后无限重启 | WIFI_STORAGE_FLASH 自动重连撞 set_config | RAM 存储+容错化 |
+| 断网冷启动时间=1970 | 无人用 RTC 种子系统时钟 | seed_time_from_rtc_once（wifi_init_once 末尾）；⚠️ SNTP 仅配网流程跑（常态化待定夺） |
+| TWDT already initialized 噪音 | 系统已自动 init，watchdog 再 init | 已 reconfigure 兜底；panic 跟随 CONFIG_ESP_TASK_WDT_PANIC（诊断期=y） |
+
+### 渲染/显示
+| 症状 | 根因 | 修法 |
+|---|---|---|
+| 拖动路径永久残留 | **compose_region 步骤1/3 漏加 x 列偏移**——脏区 framebuffer 从未重铺，blit 发陈旧像素；背景近纯色肉眼不可见 | 两层补 +x；待照片终验 |
+| 显示颠倒/镜像（方向三改） | 组合2=垂直颠倒、组合1=水平镜像（菜单文字照片实证） | **组合 0 = swap=false + 无镜像**（原生即正立；教训：判读必须用有手性的标记，白点/位置分不清镜像与颠倒） |
+| 触摸/拖动方向不对 | 方向固化后触摸映射未跟转 | **8 候选自校准**（NVS calib/tmap，点屏切换，白点落指尖=正确）；定稿后 MP_TOUCH_CALIB=0 |
+| 气泡不显示 | `font 1 not loaded`（服务端字体链断 E12）→ LVGL 渲染静默失败 | **内置 5x7 兜底** bubble_render_fallback（配对码=纯数字不依赖字体链） |
+| 黑屏（历史） | 手写 QSPI 时序不可靠 | 换官方 waveshare BSP |
+| 右缘 480 残影 | mark/compose/blit 三路矩形分歧 | ent_screen_rect_at 权威矩形（先 clamp 再取偶） |
+
+### 输入
+| 症状 | 根因 | 结论/修法 |
+|---|---|---|
+| 中键"没反应" | **按键是好的**（NVS 计数实证 7 次）；反馈横幅画在颠倒画面里看不见+没放歌音量变化无声 | 方向修正后横幅可见；menu 态中键=选择器上移；⚠️ VOL 横幅在 MENU 态被 LVGL 整屏覆盖（设计如此） |
+| 触摸乱跳/坐标垃圾 | CST9220 帧缺有效性门 | ACK=0xAB 且 d[0]&0xF==0x06 才有效 |
+| 倾斜互切风暴 | 竖握 roll≈±80° 永超阈值 | 45° 内才算倾斜；SET_ACTION 同名跳过 |
+
+### 网络
+| 症状 | 根因 | 状态 |
+|---|---|---|
+| 板子 TCP 被服务端 RST（errno=104） | **服务端与请求内容均无责**（Mac 同网段逐字复刻全 200+连发 200；板子 TCP 握手能过、open 阶段被掐） | 已自然恢复（hello ok 多轮）；裸 socket 探针 `raw_tcp_probe_once` 常驻失败路径，复发时自动裁决"NAS 按源拦截 vs 客户端层" |
+| WiFi 每 2-5s 被掐 | poller 循环无条件 connect_sta 掐断活连接 | s_sta_connected 门 + s_conn_busy 闩（set_config 失败须清闩） |
+| URL 双坑 | 手输无 scheme / 浏览器自动 https | NVS 读入时 scheme 归一化（https 强制降 http） |
+
+---
+
+## 五、跨端契约（C# 导出 ↔ C 解析，全部真机炸过后定稿）
+- MPAK：信封头 **40B**（magic 16B 含 8B 零填充）；PARTS 索引 **20B**（尾 2B pad）；LAYOUT 帧头 **12B** 无 pad、piece **12B**（尾 1B pad）；FONT 头 **8B**、glyph **12B**；AUDIO 轨 **108B**；**offset=位图区相对**。
+- LAYOUT x/y 已含帧位移（导出契约），move 字段勿重复叠加；piece 顺序=权威绘制序。
+- 协议：poll 回 `{commands:[{seq,type,payload}],lastSeq,mrev}`；hello 返回 `pairingCode`/`deviceId`/`manifestRev`；manifest kind 全大写（固件已 strcasecmp 兼容）。
+- 通用规律：**两端各自实现时必须拿真实响应样本对表**；格式文档字段和≠标注步长时以固件读法为准。
+
+---
+
+## 六、CST9220 触摸帧格式（消费侧 input_dispatch 直读）
+- 8 字节帧 @reg 0x00：d[0]低半字节==0x06 且 d[6]==0xAB 才有效；触点数=d[5]&0x7F
+- 12 位重组：`rx=(d[1]<<4)|(d[3]>>4)`；`ry=(d[2]<<4)|(d[3]&0x0F)`
+- 映射：8 候选自校准（`tmap_apply`，NVS calib/tmap，当前=用户点屏选定）；抬起帧回填最后有效坐标。
+
+---
+
+## 七、标定与取证状态（NVS namespace="calib"）
+| key | 含义 | 当前值 |
+|---|---|---|
+| k | 方向组合（已弃用：固化进 display_init） | 2（无效） |
+| tmap | 触摸映射候选 0-7 | 用户点屏选定中（默认 6=旧口径） |
+| key0 | 中键累计按下次数 | **7（GPIO0 通路实证良好）** |
+
+### 临时件清理清单（验收后一次性处理）
+- [ ] `MP_TOUCH_CALIB`→0（input_dispatch.c）
+- [ ] 探针降级：flush(500ms INFO)/ENTPOS(1s INFO)/keyscan(常驻，`MP_KEY_SCAN_PROBE`→0)/drag 探针
+- [ ] `CONFIG_ESP_TASK_WDT_PANIC`→n（sdkconfig+defaults）
+- [ ] calib 红蓝线/白点加关闭路径（现首触常驻；无 render_calib_set(false) 调用者）
+- [ ] 气泡/横幅在 MENU 态不可见（LVGL 整屏覆盖，设计如此，待产品定夺）
+- [ ] touch_cst9220.c 文件头与 input_dispatch 两处映射注释矛盾未清
+
+---
+
+## 八、遗留问题（服务端/导出端，固件侧无责）
+- **E12 字体链断**：FontSizes{16}、seed/fonts 孤儿、无 CJK charset → 气泡中文/字号不可用（配对码已用内置字体绕过）
+- E7 NPC 导出器、E8 QQ 音源、设备日志/mDNS、Web 表情入口、entities[] 未上线
+- minimp3 VBR gapless 未处理（首尾 ~529 样本过渡，影响极小）
+- 常态 SNTP 重校准未做（现仅配网流程校时，长期不断电会漂移）
+
+---
+
+## 九、工作纪律（血泪教训）
+1. **无真机实证不得宣称修复**（多次"修好了"被照片证伪——必须 build 0 告警 → 烧录 → 抓日志/拍照）
+2. 旋转/镜像类改动**一轮一变量**，必须照片确认；白点测映射分不清 180° 颠倒（点无手性）——判读要用文字/三角等有手性的标记
+3. 多 agent 纪律：前台 ≤5/波 + 文件边界 + 派前探针定契约 + 波后主线程接缝对读；agent 汇报不算自测
+4. 用户红线：不留占位/假功能；改 defaults 必须合法符号名并 grep sdkconfig.h 验证；python 批量 patch 必须断言
+5. 每次验收流程：build → 烧录 → monitor 30s → 拍照给用户确认 → 才许 git commit（当前全部改动未 commit）

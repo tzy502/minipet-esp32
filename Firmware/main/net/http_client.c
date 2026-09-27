@@ -19,6 +19,8 @@
 #include "esp_mac.h"
 #include "esp_log.h"
 #include "cJSON.h"
+#include "lwip/sockets.h"
+#include <errno.h>
 
 #include "app_core.h"
 #include "hal_contract.h"
@@ -31,6 +33,7 @@ static const char *TAG = "http";
 static char s_server_url[128];      /* 无结尾斜杠 */
 static char s_uuid[13];             /* 12 hex + NUL */
 static char s_device_id[40];        /* hello 返回；未注册时 = s_uuid */
+static char s_pairing_code[8];      /* hello 下发的 6 位配对码（暂存，字体绑定后重显） */
 
 /* ------------------------------------------------------------------ */
 /* 初始化                                                               */
@@ -69,11 +72,96 @@ void mp_http_init(void)
 const char *mp_http_server_url(void) { return s_server_url[0] ? s_server_url : NULL; }
 const char *mp_http_uuid(void)       { return s_uuid; }
 const char *mp_http_device_id(void)  { return s_device_id; }
+const char *mp_http_pairing_code(void)    { return s_pairing_code; }
+
+/* ------------------------------------------------------------------ */
+/* 传输失败限频诊断（问题8 卡点）                                         */
+/* ------------------------------------------------------------------ */
+/* 一次失败一行读全：esp_err + errno + 完整 URL + 失败阶段。errno 用
+ * IDF 5.5 公开 API esp_http_client_get_errno（转发 esp_transport_get_errno，
+ * 传输失败时存有 lwip errno，可区分 ECONNRESET/ETIMEDOUT/EHOSTUNREACH；
+ * 须在 close 拆传输前取，errno=0 说明对端无错关闭/无上下文）。
+ * 限频：同 key（phase+ret+errno 组合）5s 一条——hello/poll 长轮询失败
+ * 风暴期间不刷屏。 */
+static void raw_tcp_probe_once(const char *url);
+
+static void tx_fail_log(const char *url, const char *path,
+                        const char *phase, esp_err_t ret, int eno)
+{
+    static uint32_t last_ms;                 /* 同 key 上次输出时刻（开机 ms） */
+    static int      last_key;
+    static bool     key_valid;
+    int key = (int)((uint32_t)ret ^ ((uint32_t)eno << 8) ^ ((uint32_t)phase[0] << 16));
+    uint32_t now = esp_log_timestamp();
+    if (key_valid && key == last_key && (uint32_t)(now - last_ms) < 5000) return;
+    last_key  = key;
+    last_ms   = now;
+    key_valid = true;
+    ESP_LOGW(TAG, "mp_http_tx_fail ret=0x%x (%s) errno=%d (%s) url=%s path=%s phase=%s",
+             (unsigned)ret, esp_err_to_name(ret), eno, strerror(eno), url, path, phase);
+    if (phase[0] == 'o' && strcmp(phase, "open") == 0) raw_tcp_probe_once(url);
+}
+
+/* 【网络取证】绕过 esp_http_client 的裸 socket 三步探针（每次开机至多一次，
+ * 首次 open 失败触发）：区分「网络层按源掐连接」（raw 同样失败）vs
+ * 「esp_http_client 层问题」（raw 成功）。Mac curl 实测同请求 200——
+ * 服务端健康，差异必在板子到服务端的路径上。 */
+static void raw_tcp_probe_once(const char *url)
+{
+    static bool done;
+    if (done) return;
+    done = true;
+
+    const char *p = strstr(url, "//");
+    if (!p) return;
+    p += 2;
+    const char *slash = strchr(p, '/');
+    const char *colon = strchr(p, ':');
+    char host[64] = { 0 };
+    int port = 80;
+    size_t hl = (colon && (!slash || colon < slash)) ? (size_t)(colon - p)
+              : (slash ? (size_t)(slash - p) : strlen(p));
+    if (hl == 0 || hl >= sizeof host) return;
+    memcpy(host, p, hl);
+    if (colon && (!slash || colon < slash)) port = atoi(colon + 1);
+
+    struct sockaddr_in sa = { 0 };
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons((uint16_t)port);
+    if (inet_aton(host, &sa.sin_addr) != 1) {
+        ESP_LOGW("probe", "RAW 主机非点分 IP（%s），跳过", host);
+        return;
+    }
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) { ESP_LOGW("probe", "RAW socket 失败 errno=%d", errno); return; }
+    if (connect(sock, (struct sockaddr *)&sa, sizeof sa) != 0) {
+        ESP_LOGW("probe", "RAW connect %s:%d 失败 errno=%d (%s) → 网络层按源拦截",
+                 host, port, errno, strerror(errno));
+        close(sock);
+        return;
+    }
+    ESP_LOGW("probe", "RAW connect %s:%d 成功（TCP 握手通）", host, port);
+    char req[128];
+    int n = snprintf(req, sizeof req, "GET / HTTP/1.0\r\nHost: %s:%d\r\n\r\n", host, port);
+    int w = send(sock, req, n, 0);
+    ESP_LOGW("probe", "RAW send=%d errno=%d", w, w < 0 ? errno : 0);
+    char buf[96];
+    int r = recv(sock, buf, sizeof buf - 1, 0);
+    if (r > 0) {
+        buf[r] = 0;
+        for (int i = 0; i < r; i++) if (buf[i] == '\r' || buf[i] == '\n') { buf[i] = 0; break; }
+        ESP_LOGW("probe", "RAW recv=%d 首行: %s → 服务端正常回包，问题在 esp_http_client 层", r, buf);
+    } else {
+        ESP_LOGW("probe", "RAW recv=%d errno=%d (%s) → 握手后被按源 RST，查 NAS 防火墙",
+                 r, errno, strerror(errno));
+    }
+    close(sock);
+}
 
 /* ------------------------------------------------------------------ */
 /* 通用事务：GET / POST，流式回调                                        */
 /* ------------------------------------------------------------------ */
-static int http_txn(const char *url, bool is_post, const char *body,
+static int http_txn(const char *url, const char *path, bool is_post, const char *body,
                     mp_http_chunk_cb cb, void *ctx,
                     char *resp_buf, size_t resp_cap, uint32_t timeout_ms)
 {
@@ -87,7 +175,10 @@ static int http_txn(const char *url, bool is_post, const char *body,
         .disable_auto_redirect = false,
     };
     esp_http_client_handle_t h = esp_http_client_init(&cfg);
-    if (!h) return -1;
+    if (!h) {
+        tx_fail_log(url, path, "init", ESP_FAIL, 0);   /* 无传输上下文，errno 记 0 */
+        return -1;
+    }
 
     int status = -1;
     char *chunk = malloc(READ_CHUNK);
@@ -99,20 +190,35 @@ static int http_txn(const char *url, bool is_post, const char *body,
     }
 
     int body_len = (body ? (int)strlen(body) : 0);
-    if (esp_http_client_open(h, body_len) != ESP_OK) goto out;
+    esp_err_t open_err = esp_http_client_open(h, body_len);
+    if (open_err != ESP_OK) {
+        /* open = 建连 + 发请求头阶段：ECONNRESET/EHOSTUNREACH 等在这里现形 */
+        tx_fail_log(url, path, "open", open_err, esp_http_client_get_errno(h));
+        goto out;
+    }
     if (body_len > 0) {
         int w = esp_http_client_write(h, body, body_len);
-        if (w < 0) goto out_close;
+        if (w < 0) {
+            tx_fail_log(url, path, "write", ESP_FAIL, esp_http_client_get_errno(h));
+            goto out_close;
+        }
     }
 
-    if (esp_http_client_fetch_headers(h) < 0) goto out_close;
+    if (esp_http_client_fetch_headers(h) < 0) {
+        tx_fail_log(url, path, "fetch_headers", ESP_FAIL, esp_http_client_get_errno(h));
+        goto out_close;
+    }
     status = esp_http_client_get_status_code(h);
 
     /* 流式读：优先给回调；小响应用兜底缓冲（hello/poll 的 JSON） */
     size_t resp_len = 0;
     for (;;) {
         int r = esp_http_client_read(h, chunk, READ_CHUNK);
-        if (r <= 0) break;                    /* 0=EOF，-1=超时/结束 */
+        if (r < 0) {
+            /* -1=读超时/对端中途掐断（0=正常 EOF，不算失败） */
+            tx_fail_log(url, path, "read", ESP_FAIL, esp_http_client_get_errno(h));
+        }
+        if (r <= 0) break;
         bool keep = true;
         if (cb) keep = cb(ctx, chunk, (size_t)r);
         if (resp_buf && resp_cap > 1 && resp_len < resp_cap - 1) {
@@ -153,7 +259,7 @@ int mp_http_get(const char *path_or_url, uint32_t timeout_ms,
 {
     char url[URL_BUF_LEN];
     if (build_url(url, sizeof(url), path_or_url) != 0) return -1;
-    return http_txn(url, false, NULL, cb, ctx, NULL, 0, timeout_ms);
+    return http_txn(url, path_or_url, false, NULL, cb, ctx, NULL, 0, timeout_ms);
 }
 
 int mp_http_post_json(const char *path, const char *json_body,
@@ -161,7 +267,7 @@ int mp_http_post_json(const char *path, const char *json_body,
 {
     char url[URL_BUF_LEN];
     if (build_url(url, sizeof(url), path) != 0) return -1;
-    return http_txn(url, true, json_body, NULL, NULL, resp_buf, resp_cap, timeout_ms);
+    return http_txn(url, path, true, json_body, NULL, NULL, resp_buf, resp_cap, timeout_ms);
 }
 
 /* ------------------------------------------------------------------ */
@@ -242,6 +348,7 @@ int mp_http_hello(void)
     if (!pair || !pair[0])
         pair = cJSON_GetStringValue(cJSON_GetObjectItem(r, "pair"));
     if (pair && pair[0]) {
+        strlcpy(s_pairing_code, pair, sizeof(s_pairing_code));   /* 暂存：dispatch_manifest_synced 字体就绪后重显 */
         mp_cmd_t c = { .type = MP_CMD_PAIRING_CODE };
         strlcpy(c.s, pair, sizeof(c.s));
         mp_post_cmd(&c);

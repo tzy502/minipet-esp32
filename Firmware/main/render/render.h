@@ -102,6 +102,9 @@ void render_bubble_hide(void);
  * text 为 ASCII 大写串（内嵌 5x7 字体）；CLOCK_DOZE 态自动让位不画 */
 int  render_banner_show(const char *text);
 void render_banner_hide(void);
+/* 定时横幅（输入层 VOL± 反馈）：显示 text 并在 duration_ms 后由 render_tick
+ * 自动隐藏；重复调用刷新文本与计时。常驻横幅（配网）仍走 render_banner_show */
+int  render_banner_show_for(const char *text, uint32_t duration_ms);
 
 /* ---------------- IMU 视差（input 任务可异步调用；int32 对齐写原子） --- */
 void render_input_tilt(float tilt_deg);

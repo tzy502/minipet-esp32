@@ -25,11 +25,12 @@
 #include "freertos/semphr.h"
 
 #include "esp_log.h"
+#include "esp_heap_caps.h"
+#include "nvs.h"
 
 #include "app_core.h"
 #include "hal_contract.h"
 #include "state_machine.h"
-#include "bgm.h"              /* bgm_get_state（BGM 态回读，切播放/暂停用） */
 
 static const char *TAG = "input";
 
@@ -101,8 +102,11 @@ static int64_t  s_last_interaction_ms;
 
 /* 渲染层线规约（render.h）：渲染 API 只许 render 任务调 →
  * 一律走 cmd_q（动作/表情），视差例外走 render_input_tilt（异步安全） */
+static char s_cur_action[24] = MP_EXPR_DEFAULT;    /* 幂等：同动作不重复重绑布局 */
 static void post_action(const char *action)
 {
+    if (strcmp(s_cur_action, action) == 0) return;   /* 同动作跳过（防风暴） */
+    strlcpy(s_cur_action, action, sizeof(s_cur_action));
     mp_cmd_t c = { .type = MP_CMD_SET_ACTION };
     strlcpy(c.s, action, sizeof(c.s));
     mp_post_cmd(&c);
@@ -212,9 +216,16 @@ static void accel_to_angles(const imu_accel_t *a, float *roll, float *pitch)
 static uint8_t tilt_bits_from_angles(float roll, float pitch, float deadzone)
 {
     uint8_t bits = 0;
-    if (roll < -deadzone)  bits |= MP_TILT_LEFT;   /* 左倾 → 视差反向平移 */
-    if (roll >  deadzone)  bits |= MP_TILT_RIGHT;
-    if (pitch >  deadzone) bits |= MP_TILT_UP;     /* 上倾 → fly（E6） */
+    /* 竖握保护（真机定稿 2026-09-26）：|角度|>45° 是"手持姿态"而非"倾斜"——
+     * 竖握时 roll≈±80° 曾导致 walk/stand 每 300ms 互切（布局重绑风暴→卡死）。
+     * 只有 8°..45° 的温和倾斜才算倾斜交互 */
+    if (fabsf(roll) <= 45.0f) {
+        if (roll < -deadzone)  bits |= MP_TILT_LEFT;   /* 左倾 → 视差反向平移 */
+        if (roll >  deadzone)  bits |= MP_TILT_RIGHT;
+    }
+    if (fabsf(pitch) <= 45.0f) {
+        if (pitch >  deadzone) bits |= MP_TILT_UP;     /* 上倾 → fly（E6） */
+    }
     return bits;
 }
 
@@ -385,6 +396,89 @@ typedef struct {
     uint8_t d[TOUCH_FRAME_LEN];
 } touch_frame_t;
 
+/* 触摸映射（raw→屏幕）。
+ * 【2026-09-27 定稿依据】显示已固化为面板原生方向（display_init：swap=false +
+ * 无镜像，见 technical-reference §三.5）。触摸 IC 与面板同体安装，其上报的
+ * raw 坐标即面板原生坐标 → 正确映射 = 【恒等映射（候选 0）】，与显示严格同向。
+ * 此前默认候选 4/6 = (ry,rx) 交换 X/Y 轴（转置），与原生方向差 90°——这就是
+ * "触摸方向与显示不同向"、菜单按钮点不中的直接原因。
+ *
+ * 旧"点屏轮播自校准"（MP_TOUCH_CALIB）已废弃：它在 POKER 态把【每一次点击】
+ * 都当成切候选，导致映射每次触摸都自我漂移、永远无法稳定（菜单按钮因此彻底
+ * 不可用）。现改为固定恒等映射 + 手动覆盖：若日后换面板/换安装方向，只改
+ * s_tmap_k 初值或写 NVS calib/tmap 即可，不再自动漂移。 */
+#define MP_TOUCH_CALIB 0   /* 0=映射固定（默认）；1=恢复点屏轮播（仅产线标定用） */
+
+/* 8 种轴变换候选（raw→屏幕）。0=恒等（与原生方向显示同向，当前定稿） */
+static uint8_t s_tmap_k = 0;   /* 恒等映射：raw 即屏幕坐标 */
+
+static void tmap_apply(int rx, int ry, int *sx, int *sy)
+{
+    int x, y;
+    switch (s_tmap_k & 7) {
+    case 0: x = rx;                  y = ry;                  break;
+    case 1: x = TOUCH_RANGE_PX - rx; y = ry;                  break;
+    case 2: x = rx;                  y = TOUCH_RANGE_PX - ry; break;
+    case 3: x = TOUCH_RANGE_PX - rx; y = TOUCH_RANGE_PX - ry; break;
+    case 4: x = ry;                  y = rx;                  break;
+    case 5: x = TOUCH_RANGE_PX - ry; y = rx;                  break;
+    default: x = ry;                 y = TOUCH_RANGE_PX - rx; break;   /* 6=旧映射 */
+    case 7: x = TOUCH_RANGE_PX - ry; y = TOUCH_RANGE_PX - rx; break;
+    }
+    if (x < 0) x = 0;
+    if (x > TOUCH_RANGE_PX - 1) x = TOUCH_RANGE_PX - 1;
+    if (y < 0) y = 0;
+    if (y > TOUCH_RANGE_PX - 1) y = TOUCH_RANGE_PX - 1;
+    *sx = x;
+    *sy = y;
+}
+
+static void tmap_init(void)
+{
+    nvs_handle_t h;
+    if (nvs_open("calib", NVS_READWRITE, &h) == ESP_OK) {
+        uint8_t ver = 0;
+        nvs_get_u8(h, "tmapv", &ver);
+        if (ver < 3) {
+            /* 迁移 v3（2026-09-27 定稿）：显示已固化面板原生方向 → 触摸必须
+             * 恒等映射（候选 0）。旧版 v1/v2 存的候选（5/6 或用户点屏残留的
+             * 4）都是交换 X/Y 的转置映射，会让触摸与显示差 90°、菜单按钮点不中
+             * → 一律强制迁移到 0，并置 tmapv=3 防再次被旧值覆盖。 */
+            s_tmap_k = 0;
+            nvs_set_u8(h, "tmap", s_tmap_k);
+            nvs_set_u8(h, "tmapv", 3);
+            nvs_commit(h);
+        } else {
+            uint8_t k;
+            if (nvs_get_u8(h, "tmap", &k) == ESP_OK) s_tmap_k = k & 7;
+        }
+        nvs_close(h);
+    }
+    ESP_LOGW("tmap", "触摸映射组合 %d/7（0=恒等，与显示同向）", s_tmap_k & 7);
+}
+
+/* 触摸 down 沿调用：切下一候选并把当前帧按新候选重映射（白点即新落点） */
+static void tmap_tap_advance(touch_frame_t *f)
+{
+#if MP_TOUCH_CALIB
+    s_tmap_k = (s_tmap_k + 1) & 7;
+    nvs_handle_t h;
+    if (nvs_open("calib", NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_u8(h, "tmap", s_tmap_k);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+    int sx, sy;
+    tmap_apply(f->raw_x, f->raw_y, &sx, &sy);
+    f->x = (int16_t)sx;
+    f->y = (int16_t)sy;
+    ESP_LOGW("tmap", "组合 %d/7 raw=(%d,%d) → 屏幕(%d,%d)", s_tmap_k & 7,
+             f->raw_x, f->raw_y, f->x, f->y);
+#else
+    (void)f;
+#endif
+}
+
 static bool touch_read_frame(touch_frame_t *f)
 {
     static i2c_master_dev_handle_t s_dev;   /* 懒解析（touch init 在 main 里先行） */
@@ -418,10 +512,9 @@ static bool touch_read_frame(touch_frame_t *f)
 
     int rx = ((int)f->d[1] << 4) | (f->d[3] >> 4);      /* 12 位 X */
     int ry = ((int)f->d[2] << 4) | (f->d[3] & 0x0F);    /* 12 位 Y */
-    /* 映射定稿（BSP 板级 swap_xy=1 + mirror_y=1，2026-09-26 真机校准）：
-     * 屏幕 X = raw Y；屏幕 Y = 480 - raw X */
-    int sx = ry;
-    int sy = TOUCH_RANGE_PX - rx;
+    /* 映射走 8 候选表（自校准，见 tmap_apply）；默认 6=旧 BSP 口径 */
+    int sx, sy;
+    tmap_apply(rx, ry, &sx, &sy);
     if (sx < 0) sx = 0;
     if (sx > TOUCH_RANGE_PX - 1) sx = TOUCH_RANGE_PX - 1;
     if (sy < 0) sy = 0;
@@ -451,7 +544,6 @@ static void touch_tick(void)
     static int64_t down_ms;
     static bool longpress_fired;
     static bool drag_active;              /* 问题6：本次按住已进入水平拖动 */
-    static int16_t s_drag_last_x, s_drag_last_y;  /* 拖拽跟手：上一帧手指 x/y */
 
     /* 菜单/时钟/配网态：触摸全归 LVGL，宠物交互（抚摸/拖拽/长按）不穿透
      * （真机：菜单里的长按再发 MENU_KEY → 菜单"关了又出现"） */
@@ -465,7 +557,6 @@ static void touch_tick(void)
     static int fail_cnt;                  /* 触摸 I2C 连续读失败计数 */
     static int64_t fail_last_log_ms;
     static bool frame_fmt_logged;         /* 首帧字节转储（只打一次，防 count 位置翻车无据可查） */
-    static int64_t s_frame_stream_until;  /* 【帧流诊断】窗口 */
 
     if (state_machine_menu_open()) {
         /* E6 胶水定稿：菜单是独立全屏窗口，触摸归菜单不穿透——
@@ -511,16 +602,11 @@ static void touch_tick(void)
 
     if (!frame_fmt_logged) {
         frame_fmt_logged = true;
-        s_frame_stream_until = mp_now_ms() + 8000;   /* 【帧流诊断】按下后 8s 逐帧记录 */
         ESP_LOGI(TAG, "触摸首帧 [%02X %02X %02X %02X %02X %02X %02X %02X] n=%d",
                  f.d[0], f.d[1], f.d[2], f.d[3],
                  f.d[4], f.d[5], f.d[6], f.d[7], f.count);
     }
-    if (mp_now_ms() < s_frame_stream_until) {
-        ESP_LOGI(TAG, "帧流 [%02X %02X %02X %02X %02X %02X %02X %02X] n=%d repack=(%d,%d)",
-                 f.d[0], f.d[1], f.d[2], f.d[3],
-                 f.d[4], f.d[5], f.d[6], f.d[7], f.count, f.raw_x, f.raw_y);
-    }
+    /* 帧流诊断已完成（格式定稿：status=d[0]&0xF==0x06 有效） */
 
     if (f.touched && !down) {
         down = true;
@@ -528,7 +614,18 @@ static void touch_tick(void)
         down_ms = mp_now_ms();
         longpress_fired = false;
         drag_active = false;
-        s_drag_last_x = f.x; s_drag_last_y = f.y;
+        /* 【四角标定】raw 与映射后成对输出（500ms 限频防连点刷屏）：真机依次
+         * 按四角+中心，对照白点回显位置读本日志，据实测改 touch_read_frame
+         * 里的两行映射（现口径 sx=raw_y, sy=480−raw_x，见上方分析） */
+        {
+            static int64_t calib_log_ms;
+            int64_t t_now = mp_now_ms();
+            if (t_now - calib_log_ms >= 500) {
+                calib_log_ms = t_now;
+                ESP_LOGI("touch", "down raw=(%d,%d) map=(%d,%d)",
+                         f.raw_x, f.raw_y, f.x, f.y);
+            }
+        }
         /* 校准日志（每次按下沿一条）：原始帧 + 重组 raw + 映射值。
          * 核对目标：屏幕中心 → (240,240)、四角 → 对应角；不符时按
          * touch_read_frame 上方注释改两行映射即可 */
@@ -545,7 +642,10 @@ static void touch_tick(void)
          * 现口径：sx=raw_y, sy=480−raw_x（BSP swap_xy=1+mirror_y=1）。 */
         ESP_LOGI(TAG, "四向判定: 按角→落点象限【%s】 屏幕(%d,%d)",
                  touch_quadrant_name(f.x, f.y), f.x, f.y);
-        render_calib_set(true, f.x, f.y);    /* 【校准】落点回显到屏 */
+        extern void mp_orient_calib_tap(void);   /* main.c（MP_ORIENT_CALIB 期切换方向组合） */
+        mp_orient_calib_tap();
+        tmap_tap_advance(&f);                /* 【拖动方向自校准】点屏切换映射候选 */
+        render_calib_set(true, f.x, f.y);    /* 【校准】落点回显到屏（白点=当前候选落点） */
     } else if (f.touched && down) {
         int dx = (int)f.x - (int)down_x;
         /* 问题6：按住并水平拖动（≥TAP_MOVE_PX）→ 倾斜视差同款效果：
@@ -555,12 +655,16 @@ static void touch_tick(void)
             drag_active = true;
         }
         if (drag_active) {
-            /* 拖拽跟手：手指增量 1:1 移动人物（X/Y 双向，clamp 内不出屏） */
-            render_set_drag_off(render_get_drag_off() + ((int)f.x - s_drag_last_x));
-            render_set_drag_off_y(render_get_drag_off_y() + ((int)f.y - s_drag_last_y));
-            s_drag_last_x = f.x;
-            s_drag_last_y = f.y;
-            note_interaction();
+            /* 拖拽跟手（绝对定位，免累计漂移）：人物偏移 = 手指位置 - 屏心
+             * 66ms 节流降压（拖动期丢帧真机根因之一） */
+            static int64_t last_apply;
+            int64_t now = mp_now_ms();
+            if (now - last_apply >= 66) {
+                last_apply = now;
+                render_set_drag_off((int)f.x - 240);
+                render_set_drag_off_y((int)f.y - 240);
+                note_interaction();
+            }
             return;
         }
         if (!longpress_fired && !drag_active &&
@@ -693,46 +797,24 @@ static void key_tick(void)
     }
 }
 
-/* ================================================================== */
-/* 中键（GPIO0：BGM 播放/暂停切换）                                      */
-/* ================================================================== */
-/* 接线口径 [核对]：据微雪 wiki，三键的【中键】大概率接 GPIO0（CHIP_PU 附近）。
- * GPIO0 是 strapping 脚，运行期只准「输入 + 内部上拉」，绝不可配成输出/
- * 挂中断（复位时序相关）——key_gpio0 驱动为纯轮询（30ms 消抖 + 释放门闩，
- * 与菜单键同口径），~20ms 主循环节拍采样。
- *
- * 功能绑定：BGM 播放/暂停切换。全部走既有通道，未新增命令枚举：
- *   - 态回读 bgm_get_state()（main/audio/bgm.h 对外接口）；
- *   - 切换经 audio_q（app_core.h 的 MP_AUDIO_PAUSE/RESUME/PLAY），
- *     由 bgm 任务消费；app_core 无 MP_CMD_BGM* 播控枚举（只有回显用
- *     MP_CMD_BGM_STATE），故不占用 cmd_q。 */
-static void key0_fire_bgm_toggle(void)
-{
-    mp_audio_msg_t m = { .type = MP_AUDIO_NONE, .a = 0 };
-    switch (bgm_get_state()) {
-    case MP_BGM_PLAYING:
-        m.type = MP_AUDIO_PAUSE;         /* 播放中 → 暂停 */
-        break;
-    case MP_BGM_PAUSED:
-        m.type = MP_AUDIO_RESUME;        /* 暂停中 → 继续 */
-        break;
-    case MP_BGM_IDLE:
-        m.type = MP_AUDIO_PLAY;          /* 无曲 → 起播（a=0 服务端决定曲目） */
-        break;
-    case MP_BGM_FAILED:
-    default:
-        ESP_LOGW(TAG, "中键：BGM 源置灰（failover），忽略切换");
-        return;
-    }
-    if (!mp_post_audio(&m)) {
-        ESP_LOGW(TAG, "中键：audio_q 满，本次 BGM 切换丢失");
-    }
-}
-
 static void key0_tick(void)
 {
     if (!key_gpio0_tick()) return;       /* 消抖后的按下沿事件（一次/按压） */
     ESP_LOGI(TAG, "中键（GPIO0）按下沿");
+    {
+        /* 【中键取证】NVS 累计计数 + 按下时状态机状态：计数证明通路，
+         * 状态字节裁决"菜单里没反应"是按键没到还是分支走错 */
+        mp_state_t st_now = state_machine_current();
+        nvs_handle_t h;
+        if (nvs_open("calib", NVS_READWRITE, &h) == ESP_OK) {
+            uint32_t n = 0;
+            nvs_get_u32(h, "key0", &n);
+            nvs_set_u32(h, "key0", n + 1);
+            nvs_set_u8(h, "k0st", (uint8_t)st_now);
+            nvs_commit(h);
+            nvs_close(h);
+        }
+    }
     note_interaction();
     mp_state_t st = state_machine_current();
     if (st == MP_ST_MENU) {
@@ -747,7 +829,109 @@ static void key0_tick(void)
     /* POKER/OFFLINE：音量减（用户定稿：桌宠页中/底键=音量加减） */
     mp_audio_msg_t m = { .type = MP_AUDIO_VOLUME, .a = -10 };
     if (!mp_post_audio(&m)) ESP_LOGW(TAG, "audio_q 满，音量-丢失");
+    render_banner_show_for("VOL -", 1500);   /* 定时横幅：1.5s 后渲染侧自动隐藏 */
 }
+
+/* ================================================================== */
+/* 【临时探针】中键引脚 GPIO 电平扫描（MP_KEY_SCAN_PROBE，定稿后整段删）  */
+/* ================================================================== */
+/* 中键疑似在 GPIO0（wiki：Key2 同接 GPIO0/CHIP_PU），但真机按下零日志 →
+ * 引脚归属未定。本探针 boot 后扫 60s 自动自删：20ms 轮询候选脚（输入+内部
+ * 上拉，与 key_gpio0 同款），任一脚电平跳变即 ESP_LOGI（每脚 1s 限频防刷屏）。常驻不退出。
+ *
+ * 候选集 = ESP32-S3 全脚（0-21,26-48）排除后剩下的空闲脚：
+ *   - 板上外设已占（profile_amoled216 + wiki GPIO 表）：SD 1/2/3/41、
+ *     LCD 4/5/6/7/12/38/39、音频 8/9/10/42/45/46、触摸 11/40、RTC 13、
+ *     I2C 14/15、IMU 17/21、菜单键 18；
+ *   - 系统用途不可碰：26-32（Flash）、35-37（S3R8 Octal PSRAM）、
+ *     19/20（原生 USB=烧录/日志口）、43/44（UART0 控制台）；
+ *   → 剩余：GPIO0（Key2/BOOT，strapping 只能输入正合适）、GPIO16（板上
+ *     SYS_OUT，wiki 列为板上网络、用途存疑）、GPIO47/48（S3 空脚，wiki 表
+ *     未列出，防板上另有走线；未连时上拉读 1 恒定，无害）。
+ */
+#define MP_KEY_SCAN_PROBE 1
+
+#if MP_KEY_SCAN_PROBE
+#include "driver/gpio.h"
+
+static const int s_keyscan_pins[] = { 0, 16, 47, 48 };
+#define KEYSCAN_PIN_N       (sizeof(s_keyscan_pins) / sizeof(s_keyscan_pins[0]))
+#define KEYSCAN_POLL_MS     20       /* 轮询节拍（与键 tick 同） */
+#define KEYSCAN_LOG_GAP_MS  1000     /* 同一脚跳变日志限频 */
+
+static void keyscan_task(void *arg)
+{
+    (void)arg;
+    int     last_lvl[KEYSCAN_PIN_N];
+    int64_t last_log[KEYSCAN_PIN_N] = {0};
+    bool    cfg_ok[KEYSCAN_PIN_N]   = {false};
+
+    for (int i = 0; i < (int)KEYSCAN_PIN_N; i++) {
+        gpio_config_t io = {
+            .pin_bit_mask = 1ULL << s_keyscan_pins[i],
+            .mode         = GPIO_MODE_INPUT,
+            .pull_up_en   = GPIO_PULLUP_ENABLE,   /* 按下接地口径（key_gpio0 同款） */
+            .pull_down_en = GPIO_PULLDOWN_DISABLE,
+            .intr_type    = GPIO_INTR_DISABLE,    /* 只读不扰，一律不挂中断 */
+        };
+        cfg_ok[i] = (gpio_config(&io) == ESP_OK);
+        if (!cfg_ok[i]) {
+            ESP_LOGW("keyscan", "GPIO%d 配置失败，跳过", s_keyscan_pins[i]);
+            last_lvl[i] = -1;
+            continue;
+        }
+        last_lvl[i] = gpio_get_level(s_keyscan_pins[i]);
+        ESP_LOGI("keyscan", "GPIO%d 初值 level=%d", s_keyscan_pins[i], last_lvl[i]);
+    }
+    ESP_LOGI("keyscan", "探针启动：候选 0/16/47/48，常驻（MP_KEY_SCAN_PROBE 关闭才退出）");
+
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(KEYSCAN_POLL_MS));
+        int64_t now = mp_now_ms();
+        for (int i = 0; i < (int)KEYSCAN_PIN_N; i++) {
+            if (!cfg_ok[i]) continue;
+            int lvl = gpio_get_level(s_keyscan_pins[i]);
+            if (lvl == last_lvl[i]) continue;
+            last_lvl[i] = lvl;                   /* 限频窗口内的跳变只刷新电平 */
+            if (now - last_log[i] >= KEYSCAN_LOG_GAP_MS) {
+                last_log[i] = now;
+                ESP_LOGI("keyscan", "GPIO%d -> %d", s_keyscan_pins[i], lvl);
+            }
+        }
+    }
+    vTaskDelay(pdMS_TO_TICKS(1000));   /* 常驻：任何时刻按键都会被记录 */
+}
+
+static int     s_keyscan_tries;
+static int64_t s_keyscan_next_try_ms;
+
+/* 首次创建 + 主循环低频重试（非阻塞：每 2s 一次，至多 15 次）。
+ * 扫描窗从任务真正跑起来起算，重试不损诊断价值 */
+static void keyscan_probe_try(bool first)
+{
+    if (xTaskCreatePinnedToCore(keyscan_task, "keyscan", 3072, NULL,
+                                tskIDLE_PRIORITY + 1, NULL, 0) == pdPASS) {
+        s_keyscan_tries = 99;            /* 成功：关闭重试 */
+        return;
+    }
+    s_keyscan_tries++;
+    if (first || s_keyscan_tries == 15)
+        ESP_LOGW(TAG, "keyscan 探针任务创建失败(第%d次) 内部空闲=%u 最大块=%u",
+                 s_keyscan_tries,
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+    s_keyscan_next_try_ms = mp_now_ms() + 2000;
+}
+
+static void keyscan_probe_retry(void)
+{
+    if (s_keyscan_tries >= 15 || s_keyscan_tries == 0) return;   /* 未失败/已放弃/已成功 */
+    if (mp_now_ms() < s_keyscan_next_try_ms) return;
+    keyscan_probe_try(false);
+}
+#else
+static inline void keyscan_probe_retry(void) {}   /* 探针关闭：主循环调用点免 #if */
+#endif /* MP_KEY_SCAN_PROBE */
 
 /* ================================================================== */
 /* 底键（AXP2101 PWRON 短按：手动进/出待机时钟）                         */
@@ -786,6 +970,7 @@ static void pwron_tick(void)
     /* POKER/OFFLINE：音量加 */
     mp_audio_msg_t m = { .type = MP_AUDIO_VOLUME, .a = +10 };
     if (!mp_post_audio(&m)) ESP_LOGW(TAG, "audio_q 满，音量+丢失");
+    render_banner_show_for("VOL +", 1500);   /* 定时横幅：1.5s 后渲染侧自动隐藏 */
 }
 
 /* ================================================================== */
@@ -885,6 +1070,14 @@ void input_dispatch_task(void *arg)
     (void)arg;
     key_gpio18_init();
     key_gpio0_init();             /* 中键 GPIO0（输入+上拉+轮询消抖，绝不输出） */
+    tmap_init();                  /* 触摸映射自校准：恢复上次选中候选 */
+#if MP_KEY_SCAN_PROBE
+    /* 【临时探针】中键引脚扫描：低优先级 core0，60s 自删（定稿后随
+     * MP_KEY_SCAN_PROBE 一起移除） */
+    /* 真机实证（2026-09-26）：启动挤压窗口期内部堆可低至空闲 6KB/最大块 3KB
+     * （<3072 任务栈）——首次失败由主循环 keyscan_probe_retry 低频重试 */
+    keyscan_probe_try(true);
+#endif
     srand((unsigned)mp_now_ms());
     s_last_ax = 0;
     imu_link_selfcheck();
@@ -929,9 +1122,10 @@ void input_dispatch_task(void *arg)
             }
         }
 
+        keyscan_probe_retry();
         touch_tick();
         key_tick();
-        key0_tick();              /* 中键 GPIO0：BGM 播放/暂停切换 */
+        key0_tick();              /* 中键 GPIO0：音量减（用户定稿，BGM 切换已废弃） */
         expr_fsm_tick();
 
         int64_t idle_ms = (s_last_interaction_ms == 0)

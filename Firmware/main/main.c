@@ -28,6 +28,8 @@
 #include "freertos/task.h"
 #include "freertos/queue.h"
 #include "nvs_flash.h"
+#include "nvs.h"
+#include "esp_timer.h"
 #include "esp_event.h"
 #include "esp_netif.h"
 #include "esp_log.h"
@@ -90,6 +92,58 @@ static void input_task(void *arg)
 }
 
 /* ------------------------------------------------------------------ */
+/* 方向轮播标定（一次性标定工具：定稿后置 0 整体消失）                     */
+/* ------------------------------------------------------------------ */
+#define MP_ORIENT_CALIB 0   /* 方向已定稿：组合2（swap=0,mx=0,my=1）固化进 display_init，标定逻辑保留可复开 */
+
+#if MP_ORIENT_CALIB
+/* 屏幕方向标定 v2（点屏切换制）：用户握持向（USB 朝右）需要内容相对 v1 默认
+ * 转 90°——那在 swap=false 半区；v1 只轮 swap=true 的 4 个镜像组合是几何错误
+ * （用户实测"只会上下颠倒"且横幅被面板旋转 90° 读不了）。现改为：8 种组合
+ * （swap 两模式 × mirror 四种）由【点屏幕】逐个切换（POKER/OFFLINE 触摸
+ * down 沿，input_dispatch 调 mp_orient_calib_tap），选中态写 NVS，开机自动
+ * 应用并打日志——用户点到位后报编号或重启，主线程从日志回读固化。 */
+typedef struct { bool swap, mx, my; } orient_combo_t;
+static const orient_combo_t s_orient_combos[8] = {
+    { false, false, false }, { false, true,  false },
+    { false, false, true  }, { false, true,  true  },
+    { true,  false, false }, { true,  true,  false },
+    { true,  false, true  }, { true,  true,  true  },
+};
+static uint8_t s_orient_k;
+
+static void orient_apply(uint8_t k)
+{
+    const orient_combo_t *c = &s_orient_combos[k & 7];
+    display_set_orientation(c->swap, c->mx, c->my);
+    render_force_redraw();
+    ESP_LOGW("orient", "组合 %d/7 swap=%d mx=%d my=%d", k & 7,
+             (int)c->swap, (int)c->mx, (int)c->my);
+}
+
+#endif  /* MP_ORIENT_CALIB 组合表/应用逻辑 */
+
+/* input_dispatch 触摸 down 沿调用（仅 MP_ORIENT_CALIB=1 期有行为） */
+void mp_orient_calib_tap(void)
+{
+#if MP_ORIENT_CALIB
+    static int64_t last_tap;
+    int64_t now = esp_timer_get_time();
+    if (now - last_tap < 400000) return;    /* 防连点跳两个组合 */
+    last_tap = now;
+    s_orient_k = (s_orient_k + 1) & 7;
+    nvs_handle_t h;
+    if (nvs_open("calib", NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_u8(h, "k", s_orient_k);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+    orient_apply(s_orient_k);
+    render_banner_show_for("ABCDEFG", 3000);   /* 镜像判读：字母反写=镜像 */
+#endif
+}
+
+/* ------------------------------------------------------------------ */
 /* app_main                                                              */
 /* ------------------------------------------------------------------ */
 void app_main(void)
@@ -134,25 +188,64 @@ void app_main(void)
     state_machine_init();
     render_init(&MINIPET_PROFILE_AMOLED216);   /* FATFS 挂载后、首 tick 前（render.h） */
 
+    /* 中键历史计数回显（永远生效：GPIO0 通路取证，与标定开关无关） */
+    {
+        nvs_handle_t h;
+        if (nvs_open("calib", NVS_READONLY, &h) == ESP_OK) {
+            uint32_t n = 0;
+            if (nvs_get_u32(h, "key0", &n) == ESP_OK && n > 0) {
+                uint8_t stb = 255;
+                nvs_get_u8(h, "k0st", &stb);
+                /* 状态枚举：0BOOT 1SELF_TEST 2WIFI_PROVISION 3POKER 4MENU
+                 * 5CLOCK_DOZE 6OFFLINE 7OTA 8FATAL */
+                ESP_LOGW("key0", "中键累计 %lu 次，最后一次按下时状态=%u（4=MENU）",
+                         (unsigned long)n, stb);
+            }
+            nvs_close(h);
+        }
+    }
+#if MP_ORIENT_CALIB
+    {
+        /* 应用上次标定选中的方向组合（NVS 记忆） */
+        nvs_handle_t h;
+        if (nvs_open("calib", NVS_READONLY, &h) == ESP_OK) {
+            uint8_t k = 0;
+            if (nvs_get_u8(h, "k", &k) == ESP_OK) {
+                s_orient_k = k & 7;
+                orient_apply(s_orient_k);
+            }
+            nvs_close(h);
+        }
+    }
+#endif
+
+    /* 任务：APP(1) 渲染+交互 —— 必须先于 bgm(24K 栈)/ota 等创建：
+     * 本板内部动态堆仅 ~143KB 且碎片化，真机实证 bgm 24K 先分配后
+     * render 12K 连续块即失败（internal=9115 最大块=3060，整屏黑）。
+     * render 再配有界重试兜底（碎片随时序漂移，boot 间随机）。 */
+    bool render_ok = false;
+    for (int t = 0; t < 10 && !render_ok; t++) {
+        if (xTaskCreatePinnedToCore(render_task, "render", 12288, NULL, 5, NULL, 1) == pdPASS) {
+            render_ok = true;
+            break;
+        }
+        ESP_LOGE(TAG, "render 任务创建失败(第%d次) internal=%u 最大块=%u", t + 1,
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
+    BaseType_t rc = xTaskCreatePinnedToCore(input_task, "input", 4096, NULL, 4, NULL, 1);
+    if (rc != pdPASS) {
+        ESP_LOGE(TAG, "input 任务创建失败 rc=%d internal=%u", rc,
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+    }
+
     /* 任务：PRO(0) 网络/后台 —— 4.1 */
     poller_start();        /* 长轮询+退避（内含 WiFi 回网重连） */
     events_start();        /* POST event */
     asset_dl_start();      /* manifest diff/下载/LRU（优先级低于 poller） */
     ota_start();           /* 双分区升级 */
     bgm_start();           /* BGM 解码+feeder+环形缓冲（codec_init 在内） */
-
-    /* 任务：APP(1) 渲染+交互 —— 4.1（提前到大内存消耗者之前创建：
-     * 内部 RAM 碎片化下 32K 栈分配失败过，16K/4K 实测可起） */
-    BaseType_t rc = xTaskCreatePinnedToCore(render_task, "render", 12288, NULL, 5, NULL, 1);
-    if (rc != pdPASS) {
-        ESP_LOGE(TAG, "render 任务创建失败 rc=%d internal=%u", rc,
-                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
-    }
-    rc = xTaskCreatePinnedToCore(input_task, "input", 4096, NULL, 4, NULL, 1);
-    if (rc != pdPASS) {
-        ESP_LOGE(TAG, "input 任务创建失败 rc=%d internal=%u", rc,
-                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
-    }
 
     /* 自检 + 初始迁移（BOOT→SELF_TEST→…；阻塞含 WiFi/服务端探测） */
     bool psram_ok = (heap_caps_get_total_size(MALLOC_CAP_SPIRAM) > 0);

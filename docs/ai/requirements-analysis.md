@@ -141,10 +141,20 @@ Vue 3 + Naive UI 管理界面（构建产物打进 api 镜像，单容器同源�
 
 - **触发型**：播完自动回 default；触发映射按 E6（触摸/力度/系统事件）
 - **blink**：设备本地随机 3~8s 循环（E5 已含）
-- **系统事件映射**：BGM 播放=hum / 低电=despair / 配对成功=cheers / 素材故障=dam / 过温=hot
+- **系统事件映射**：BGM 播放=hum / 低电=**troubled**（E11 分级口径，2026-09-27 定稿；原文写 despair）/ 配对成功=cheers / 素材故障=dam / BGM 双源整体不可用=despair（E8）/ 过温=hot
 - **随机轮播**：静置时低频播稀有表情（wink/chu/qBlue）
 - 表情切换 = 只重合成 face 类部件（E5 已含，快）
 - **来源约束**：25 表情之外不做任何自创表情；某表情素材缺失 → 回退 default（导出器保证）
+
+> **低电表情口径定稿（2026-09-27，消解 E10 ↔ E11 冲突）**
+> 冲突原文：E10「系统事件映射：低电=despair」 vs E11「低电分级：<20% 打哈欠（troubled）→ <10% 强制睡眠」。
+> 定稿：**低电 = troubled（唯一口径）**。依据：① E11 是分级语义（<20% 预警可恢复 / <10% 强制睡眠），
+> troubled（烦躁）对应预警，despair（绝望）语义过重且无分级空间；② 设备端实现即 troubled ——
+> `Firmware/main/app/input_dispatch.c:996-1000`（`pct<=20 → MP_EXPR_TROUBLED`），而 <10% 走
+> `MP_SM_EV_BATTERY_CRIT` → CLOCK_DOZE（`state_machine.c` 进态即发 `MP_EXPR_DEFAULT`），
+> 低电路径上 despair 没有任何可见窗口；③ despair 已有归属：BGM 双源整体不可用（E8，见本文件 E8 条
+> 与 `docs/ai/README.md`），无需低电再占用。
+> 结论：E10/E11/代码三方统一为 **低电 → troubled**；despair 不再表示低电。表情集合仍为 25 个，无新增/删除。
 
 ### E11 — 降级与容错（P0）✅ 已确认（2026-09-25，OTA 修订：直接 WiFi 升级）
 
@@ -152,9 +162,13 @@ Vue 3 + Naive UI 管理界面（构建产物打进 api 镜像，单容器同源�
 - **服务端重启/升级**：设备端长轮询指数退避重连（1s→2s→…→60s 封顶），期间本地模式
 - **素材包损坏**：hash 校验失败 → 弃用重拉；宠物播 dam 表情提示
 - **TF 卡满**：按淘汰策略清（保最近 N + 收藏）
-- **低电分级**：<20% 宠物打哈欠（troubled）→ <10% 强制睡眠保电（纯时钟态）
+- **低电分级**：<20% 宠物打哈欠（troubled）→ <10% 强制睡眠保电（纯时钟态）（低电表情口径见 E10 下方定稿）
 - **OTA（胶水修订）**：**设备直接走 WiFi OTA**——服务端下发升级指令（poll 指令含固件版本与下载地址），设备从服务端 HTTP 拉固件包自更新；双分区 + 失败自动回滚旧分区；**不需要插线烧录**
-- 所有降级事件上报服务端（Web 可见设备健康状态）
+- 所有降级事件上报服务端（Web 可见设备健康状态）。落地：离线态进出（OFFLINE↔POKER）迁移由
+  `Firmware/main/app/state_machine.c` 的 `MP_SM_EV_NET_OFFLINE/NET_ONLINE` 分支上报
+  （暂复用已映射的 `MP_EVT_ERROR` + `s="net_offline"/"net_online"`，断网时首发可能被 events.c
+  的「失败即丢」策略丢弃，故离线事件在回网时按原始时刻补报一次；待 events.c 增加专用
+  `net_offline`/`net_online` 事件名后切换）
 
 ### E12 — 字体与文本（P0）✅ 已确认（2026-09-25，字体修订：宋体）
 

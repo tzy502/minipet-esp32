@@ -1,22 +1,30 @@
 <script setup>
 /**
- * 单设备详情（E4/E13）：信息卡 + 换宠换装（AppearancePicker 复用）+ 阈值覆盖 + OTA 触发。
+ * 单设备详情（E4/E13）：信息卡 + 换宠换装（AppearancePicker 复用）+ 阈值覆盖 + OTA 触发
+ * + 素材推送（T3/E7）+ 动作/表情/气泡调试（T2/E4，25 表情手动指定）。
  * 换装 = PUT devices/{id} 显式传 petConfig（按设备隔离，manifest rev+1）；
  * 阈值覆盖 = 传 thresholds 对象；显式传 petConfig:null = 清空回默认宠物。
+ * T2 指令端点服务端尚未提供（见 Web/docs/interfaces-needed-from-server.md）：开卡先探测，
+ * 缺失 → 25 个表情按钮全部禁用 + 卡片内给出接口需求；端点上线后无需改前端（探测转 ok）。
  */
 import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import {
   NCard, NSpace, NButton, NTag, NDescriptions, NDescriptionsItem, NInput,
   NInputNumber, NCheckbox, NForm, NFormItem, NResult, NSpin, NPopconfirm,
-  NImage, NDivider, useMessage,
+  NImage, NDivider, NSelect, NAlert, NTooltip, useMessage,
 } from 'naive-ui'
-import { getDevice, updateDevice, triggerOta, getCatalog, paperdollThumbUrl } from '../api/client'
+import {
+  getDevice, updateDevice, triggerOta, getCatalog, getMaterials, paperdollThumbUrl,
+  pushMaterial, errText, sendDeviceCommand, probeDeviceCommand, deviceCommandPath,
+  DEVICE_COMMAND_TYPE,
+} from '../api/client'
 import { useDevicesStore } from '../stores/devices'
 import AppearancePicker from '../components/AppearancePicker.vue'
 import {
   CATEGORIES, GENDERS, newDraft, appearanceToDraft, draftToAppearance, buildPaperdollId,
 } from '../utils/appearance'
+import { EXPRESSIONS, BUBBLE_MAX_BYTES, bubbleByteLength } from '../utils/expressions'
 import { fmtTime, fmtAgo } from '../utils/format'
 
 const props = defineProps({ id: { type: String, required: true } })
@@ -44,6 +52,9 @@ async function load() {
       thresholdForm.light = th.tapLightG ?? 2
       thresholdForm.hard = th.tapHardG ?? 4
       thresholdForm.idle = th.idleToClockMin ?? 5
+      // T4：服务端 DeviceThresholdsConfig 目前无 ImuSensitivity 字段（ConfigService.cs:38-47）
+      // → 未探测到就禁用输入且不随 PUT 下发（不硬塞发不出去的字段）
+      thresholdForm.sensitivity = th.imuSensitivity ?? 1
       overrideThresholds.value = device.value.thresholdsSource === 'device'
       nameText.value = device.value.name || ''
     }
@@ -134,6 +145,8 @@ async function applyPet(clear = false) {
     previewUrl.value = ''
     await load()
     devicesStore.fetchAll({ silent: true }).catch(() => {})
+    // 首页卡片缩略图用的 petConfig 缓存置失效重取（T1：换装后卡片立刻反映新装扮）
+    devicesStore.ensurePetConfig(props.id, { force: true }).catch(() => {})
   } catch (e) {
     message.error(e?.serverError || '装扮下发失败')
   } finally {
@@ -143,23 +156,24 @@ async function applyPet(clear = false) {
 
 // ── 阈值覆盖 ────────────────────────────────────────────────────────────
 const overrideThresholds = ref(false)
-const thresholdForm = reactive({ deadzone: 8, light: 2, hard: 4, idle: 5 })
+const thresholdForm = reactive({ deadzone: 8, light: 2, hard: 4, idle: 5, sensitivity: 1 })
 const savingTh = ref(false)
 const thresholdsSource = computed(() => device.value?.thresholdsSource || 'global')
+/** T4：服务端阈值模型是否已含灵敏度字段（运行时探测；有则启用并下发，无则禁用+说明）。 */
+const imuSensitivitySupported = computed(() => device.value?.thresholds?.imuSensitivity != null)
 
 async function saveThresholds() {
   savingTh.value = true
   try {
-    await updateDevice(props.id, {
-      thresholds: overrideThresholds.value
-        ? {
-            imuDeadzoneDeg: Number(thresholdForm.deadzone),
-            tapLightG: Number(thresholdForm.light),
-            tapHardG: Number(thresholdForm.hard),
-            idleToClockMin: Number(thresholdForm.idle),
-          }
-        : null,
-    })
+    const thresholds = {
+      imuDeadzoneDeg: Number(thresholdForm.deadzone),
+      tapLightG: Number(thresholdForm.light),
+      tapHardG: Number(thresholdForm.hard),
+      idleToClockMin: Number(thresholdForm.idle),
+    }
+    // 仅在服务端确有该字段时才带上（否则会被 ConfigService 反序列化静默丢弃，属"发不出去"）
+    if (imuSensitivitySupported.value) thresholds.imuSensitivity = Number(thresholdForm.sensitivity)
+    await updateDevice(props.id, { thresholds: overrideThresholds.value ? thresholds : null })
     message.success(overrideThresholds.value ? '已按设备覆盖阈值' : '已保存（未勾选覆盖，不改变阈值）')
     load()
   } catch (e) {
@@ -188,6 +202,147 @@ async function doOta() {
   } finally {
     otaBusy.value = false
   }
+}
+
+// ── 素材推送到设备（T3/E7：地图/NPC 资产登记进该设备 manifest）─────────────
+const pushKind = ref('map')
+const pushId = ref('')
+const pushSwitch = ref(true)
+const pushBusy = ref(false)
+const pushResult = ref(null) // { type, text }
+const matOptions = ref([])
+const matLoading = ref(false)
+const matLoaded = reactive({}) // kind → 已加载过
+
+async function loadMatOptions() {
+  const k = pushKind.value
+  if (matLoaded[k] || matLoading.value) return
+  matLoading.value = true
+  try {
+    const data = await getMaterials(k)
+    matOptions.value = (data?.items ?? []).map((it) => ({
+      label: `${it.name || '—'} [${it.id}]`,
+      value: String(it.id),
+    }))
+    matLoaded[k] = true
+  } catch (e) {
+    matOptions.value = []
+    pushResult.value = { type: 'error', text: `素材目录加载失败：${errText(e)}（仍可直接输入编号）` }
+  } finally {
+    matLoading.value = false
+  }
+}
+watch(pushKind, () => {
+  pushId.value = ''
+  matOptions.value = []
+  loadMatOptions()
+})
+
+function pushErrorHint(status) {
+  switch (status) {
+    case 400: return '请求参数被拒：kind 必须是 map|npc，id 不能为空'
+    case 404: return '设备不存在（该设备可能已被移除）'
+    case 503: return 'WZ 未加载：到「设置」页配置 WZ 路径后重试'
+    case 500: return '服务端资产打包异常（详见服务端日志）'
+    default: return ''
+  }
+}
+
+async function doPushMaterial() {
+  const id = pushId.value.trim()
+  if (!id) {
+    message.warning('请选择或输入素材编号（如地图 200000100）')
+    return
+  }
+  pushBusy.value = true
+  pushResult.value = null
+  try {
+    const r = await pushMaterial(props.id, pushKind.value, id, pushSwitch.value)
+    const text = `已受理（HTTP 202）：${r?.note || '后台打包中'}`
+    pushResult.value = { type: 'success', text }
+    message.success(text)
+  } catch (e) {
+    const status = e?.response?.status
+    const hint = pushErrorHint(status)
+    const text = `${errText(e)}${status ? `（HTTP ${status}）` : ''}${hint ? ` · ${hint}` : ''}`
+    pushResult.value = { type: 'error', text }
+    message.error(text)
+  } finally {
+    pushBusy.value = false
+  }
+}
+
+// ── 动作 / 表情 / 气泡调试（T2/E4：25 表情手动指定）────────────────────────
+// 服务端缺 admin 入队端点（AdminEndpoints.cs 只有 manifest/ota/map/push）→ 开卡先探测：
+// supported=false(404/405) → 按钮全禁用 + 卡片内贴出接口需求；端点上线后探测自动转 ok。
+const cmdPath = computed(() => deviceCommandPath(props.id))
+const cmdSupport = ref('unknown') // unknown | ok | missing | mismatch
+const cmdProbeNote = ref('')
+const cmdProbeBusy = ref(false)
+const cmdBusy = ref('') // 正在下发的表情 key / 'bubble'
+const bubbleText = ref('')
+
+const bubbleBytes = computed(() => bubbleByteLength(bubbleText.value))
+const bubbleTooLong = computed(() => bubbleBytes.value > BUBBLE_MAX_BYTES)
+const cmdDisabled = computed(() => cmdSupport.value === 'missing')
+
+async function probeCmd() {
+  cmdProbeBusy.value = true
+  cmdSupport.value = 'unknown'
+  cmdProbeNote.value = ''
+  try {
+    const r = await probeDeviceCommand(props.id)
+    if (r.supported === false) {
+      cmdSupport.value = 'missing'
+      cmdProbeNote.value = `HTTP ${r.status}`
+    } else if (r.supported === true && r.status >= 400) {
+      cmdSupport.value = 'mismatch'
+      cmdProbeNote.value = `HTTP ${r.status}：${r.error || ''}`
+    } else if (r.supported === true) {
+      cmdSupport.value = 'ok'
+    } else {
+      cmdSupport.value = 'unknown'
+      cmdProbeNote.value = r.error || '无法判定（网络不可达？）'
+    }
+  } finally {
+    cmdProbeBusy.value = false
+  }
+}
+onMounted(probeCmd)
+
+/** 发一条指令；404/405 → 判定端点缺失并禁用按钮（服务端还没上线的真实态）。 */
+async function sendCmd(type, value, busyKey) {
+  cmdBusy.value = busyKey
+  try {
+    const r = await sendDeviceCommand(props.id, type, value)
+    cmdSupport.value = 'ok'
+    message.success(`指令已入队（${type}=${value}${r?.seq != null ? `，seq ${r.seq}` : ''}）`)
+    return true
+  } catch (e) {
+    const status = e?.response?.status
+    if (status === 404 || status === 405 || status === 501) {
+      cmdSupport.value = 'missing'
+      cmdProbeNote.value = `HTTP ${status}`
+      message.error(`服务端未提供 ${cmdPath.value}（HTTP ${status}）—— 见卡片内接口需求`)
+    } else {
+      message.error(errText(e))
+    }
+    return false
+  } finally {
+    cmdBusy.value = ''
+  }
+}
+function playExpression(ex) {
+  sendCmd(DEVICE_COMMAND_TYPE.EXPRESSION, ex, ex)
+}
+async function sendBubble() {
+  const t = bubbleText.value.trim()
+  if (!t) return
+  if (bubbleTooLong.value) {
+    message.warning(`气泡文本 ${bubbleBytes.value} 字节，超出固件上限 ${BUBBLE_MAX_BYTES} 字节（≈31 汉字）`)
+    return
+  }
+  if (await sendCmd(DEVICE_COMMAND_TYPE.BUBBLE, t, 'bubble')) bubbleText.value = ''
 }
 </script>
 
@@ -335,8 +490,36 @@ async function doOta() {
             <n-form-item label="待机转时钟（分钟）">
               <n-input-number v-model:value="thresholdForm.idle" :min="1" :max="240" :disabled="!overrideThresholds || savingTh" style="width: 100%" />
             </n-form-item>
+            <!-- T4：E4 要求「IMU 灵敏度」，服务端 DeviceThresholdsConfig 暂无该字段 →
+                 运行时探测；未探测到即禁用，且保存时不带该字段（不硬塞发不出去的字段） -->
+            <n-form-item>
+              <template #label>
+                <n-tooltip trigger="hover" :disabled="imuSensitivitySupported">
+                  <template #trigger>
+                    <span>IMU 灵敏度（倍率，越大越灵敏）</span>
+                  </template>
+                  服务端阈值模型（DeviceThresholdsConfig）还没有 ImuSensitivity 字段，暂不可下发 ——
+                  接口需求见 Web/docs/interfaces-needed-from-server.md
+                </n-tooltip>
+              </template>
+              <n-input-number
+                v-model:value="thresholdForm.sensitivity"
+                :min="0.2"
+                :max="3"
+                :step="0.1"
+                :disabled="!overrideThresholds || savingTh || !imuSensitivitySupported"
+                style="width: 100%"
+              />
+            </n-form-item>
           </div>
         </n-form>
+        <n-alert v-if="!imuSensitivitySupported" type="info" :show-icon="false" size="small" class="mt8">
+          「IMU 灵敏度」当前为占位（禁用态）：服务端 <code>DeviceThresholdsConfig</code> 只有
+          ImuDeadzoneDeg / TapLightG / TapHardG / IdleToClockMin 四个字段，没有灵敏度字段 ——
+          前端不硬塞发不出去的字段。需服务端补 <code>device.imuSensitivity</code>（hello
+          <code>config.imuSensitivity</code> + 设备表阈值覆盖），详见
+          <code>Web/docs/interfaces-needed-from-server.md</code> §T4。
+        </n-alert>
         <template #action>
           <n-space justify="end">
             <n-button type="primary" size="small" :loading="savingTh" @click="saveThresholds">保存阈值</n-button>
@@ -356,6 +539,126 @@ async function doOta() {
           <span class="hint">bin 需先放到服务端 data/firmware/&lt;ver&gt;.bin</span>
         </n-space>
       </n-card>
+
+      <!-- 素材推送（T3/E7）：收藏只在本机，这里是真正让素材上机的动作 -->
+      <n-card title="素材推送（地图 / NPC 上机，E7）" size="small">
+        <n-space vertical :size="10">
+          <n-space align="center" :size="8" style="width: 100%">
+            <n-select v-model:value="pushKind" :options="[{ label: '地图 map', value: 'map' }, { label: 'NPC npc', value: 'npc' }]" size="small" style="width: 130px" :disabled="pushBusy" />
+            <n-select
+              v-model:value="pushId"
+              filterable
+              tag
+              clearable
+              size="small"
+              style="min-width: 320px; flex: 1"
+              :options="matOptions"
+              :loading="matLoading"
+              :disabled="pushBusy"
+              placeholder="搜索目录或直接输入素材编号（如 200000100）"
+              @update:show="(v) => v && loadMatOptions()"
+            />
+            <n-checkbox v-model:checked="pushSwitch" :disabled="pushBusy">登记后立即切换（仅地图）</n-checkbox>
+            <n-popconfirm @positive-click="doPushMaterial">
+              <template #trigger>
+                <n-button type="primary" size="small" :loading="pushBusy" :disabled="!pushId">推送到本设备</n-button>
+              </template>
+              把 {{ pushKind === 'map' ? '地图' : 'NPC' }} {{ pushId }} 推送到 {{ device.name || device.deviceId }} ？
+              服务端后台打包（HTTP 202 受理）→ 设备拉到新 manifest → 完成后自动切换。
+            </n-popconfirm>
+          </n-space>
+          <n-alert
+            v-if="pushResult"
+            :type="pushResult.type === 'success' ? 'success' : 'error'"
+            :show-icon="false"
+            size="small"
+          >
+            {{ pushResult.text }}
+          </n-alert>
+          <div class="hint">
+            端点：<code>POST /api/admin/devices/{{ device.deviceId }}/push</code> body
+            <code>{ kind: "map"|"npc", id, switch }</code> → 202 受理（后台打包，数秒）；
+            失败分支：400 参数非法 / 404 设备不存在 / 503 WZ 未加载 / 500 打包异常。
+          </div>
+        </n-space>
+      </n-card>
+
+      <!-- 动作 / 表情 / 气泡调试（T2/E4）：25 表情手动指定 -->
+      <n-card title="表情 / 气泡调试（E4 25 表情手动指定）" size="small">
+        <template #header-extra>
+          <n-space align="center">
+            <n-tag size="small" :bordered="false" :type="cmdSupport === 'ok' ? 'success' : cmdSupport === 'missing' ? 'error' : 'default'">
+              {{ cmdSupport === 'ok' ? '端点在位' : cmdSupport === 'missing' ? '端点缺失' : cmdSupport === 'mismatch' ? '端点入参不符' : '未探测到' }}
+            </n-tag>
+            <n-button size="tiny" secondary :loading="cmdProbeBusy" @click="probeCmd">重新检测</n-button>
+          </n-space>
+        </template>
+
+        <n-space vertical :size="10">
+          <n-alert v-if="cmdDisabled" type="warning" :show-icon="false" size="small">
+            <b>服务端尚未提供设备指令端点，25 个表情按钮已禁用。</b>
+            （探测结果：{{ cmdProbeNote || 'HTTP 404/405' }}）需要服务端新增：
+            <div class="req">
+              <div><code>POST {{ cmdPath }}</code></div>
+              <div>body <code>{ "type": "expression" | "action" | "bubble", "value": "&lt;表情名/动作名/气泡文本&gt;", "durationMs"?: number }</code></div>
+              <div>期望 <code>202 { "ok": true, "seq": &lt;n&gt;, "type": "...", "value": "..." }</code>；表达式名限清单内 25 个，气泡 ≤ 95 字节（UTF-8）</div>
+              <div>
+                实现要点：<code>CommandQueue.Enqueue(id, type, value)</code> —— payload 必须是
+                <b>裸 JSON 字符串</b>或 <code>{ "id": "..." }</code>；固件
+                （<code>Firmware/main/net/poller.c:141-210</code>）读 <code>commands[].type</code> +
+                <code>payload</code>，形如 <code>{"value":"..."}</code> 会被静默忽略。
+              </div>
+              <div>完整清单：<code>Web/docs/interfaces-needed-from-server.md</code> §T2</div>
+            </div>
+          </n-alert>
+          <n-alert v-else-if="cmdSupport === 'mismatch'" type="warning" :show-icon="false" size="small">
+            端点存在但拒绝了约定入参（{{ cmdProbeNote }}）—— 请对照 <code>Web/docs/interfaces-needed-from-server.md</code> §T2 核对请求体字段名。
+          </n-alert>
+          <n-alert v-else-if="cmdSupport === 'unknown'" type="info" :show-icon="false" size="small">
+            未能判定端点是否可用（{{ cmdProbeNote || '网络不可达' }}）：按钮未禁用，点击后按真实响应提示。
+          </n-alert>
+
+          <div class="expr-grid">
+            <n-button
+              v-for="ex in EXPRESSIONS"
+              :key="ex.key"
+              size="small"
+              secondary
+              :type="ex.friendly ? 'primary' : 'default'"
+              :disabled="cmdDisabled"
+              :loading="cmdBusy === ex.key"
+              :title="`${ex.cn}（${ex.key}）${ex.friendly ? ' · 随机池' : ''}`"
+              @click="playExpression(ex.key)"
+            >
+              {{ ex.cn }}<span class="expr-key">{{ ex.key }}</span>
+            </n-button>
+          </div>
+          <div class="hint">
+            25 个表情名逐字取自 <code>PaperdollService.KnownExpressions</code>（服务端 WZ 实测清单）/ <code>docs/ai/README.md:93</code>；
+            蓝色为主角「随机表情」池（Friendly），其余为手动触发；<code>blink</code> 由渲染层本地插播，仅调试用。
+          </div>
+
+          <n-divider style="margin: 4px 0" />
+
+          <n-space align="center" :size="8" style="width: 100%">
+            <n-input
+              v-model:value="bubbleText"
+              size="small"
+              style="flex: 1; min-width: 260px"
+              :status="bubbleTooLong ? 'error' : undefined"
+              placeholder="气泡文本（同端点下发；固件上限 95 字节 ≈ 31 汉字）"
+              :disabled="cmdDisabled"
+              @keyup.enter="sendBubble"
+            />
+            <n-tag size="small" :bordered="false" :type="bubbleTooLong ? 'error' : 'default'">
+              {{ bubbleBytes }} / {{ BUBBLE_MAX_BYTES }} 字节
+            </n-tag>
+            <n-button size="small" secondary :disabled="cmdDisabled || !bubbleText.trim() || bubbleTooLong" :loading="cmdBusy === 'bubble'" @click="sendBubble">
+              发气泡
+            </n-button>
+          </n-space>
+        </n-space>
+      </n-card>
     </n-space>
   </div>
 </template>
@@ -367,6 +670,11 @@ async function doOta() {
   gap: 0 16px;
 }
 .hint { font-size: 12px; opacity: 0.6; }
+.mt8 { margin-top: 8px; }
+.expr-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(112px, 1fr)); gap: 8px; }
+.expr-key { font-size: 10px; opacity: 0.55; margin-left: 4px; }
+.req { margin-top: 6px; line-height: 1.8; }
+.req code { background: rgba(128, 128, 140, 0.15); padding: 0 3px; border-radius: 3px; }
 .gender-row { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
 .slot-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 4px 16px; }
 .slot-row { display: flex; align-items: center; gap: 6px; min-height: 30px; }

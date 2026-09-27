@@ -76,10 +76,42 @@ void asset_dl_set_active_map(const char *hash);
 /* ---------------- 收藏 / LRU / rev ------------------------------------ */
 void asset_dl_set_favorite(const char *hash, bool fav);   /* E7 收藏保护 */
 
-/* E7 选择器列表（真机定稿）：kind 过滤 + manifest label 透传。
- * 返回条数；labels 供选择器显示（缺失时回退 hash 前 8 位） */
-int asset_dl_bgmap_list(char hashes[][20], char labels[][32], int max);
-int asset_dl_parts_list(char hashes[][20], char labels[][32], int max);
+/* ---------------- E7 选择器列表（菜单数据面；渲染任务可调用）--------------
+ * 跨任务安全：三个 list 函数内部都取 s_lock（旧实现直接读 s_files[] 无锁，
+ * 与 asset_dl 任务的 upsert/淘汰并发时会看到半更新行）→ 允许从 LVGL
+ * 渲染任务（菜单重建）直接调用。单次持锁含 access(F_OK) 少量 IO。
+ *
+ * label 口径（菜单字体是内置 Montserrat，仅拉丁字形 → CJK 渲染成空白）：
+ *   manifest label 只在「纯可打印 ASCII」时透传；否则回退
+ *   ① map/entity 字段（ASCII，如 "001010000" / "npc:2100000"）
+ *   ② hash 前 8 位。
+ * cached[i]（可 NULL）= <kind_dir>/<hash>.mpk 是否已在 TF（access F_OK）。
+ * 注意：s_files[] 里含「已登记元数据但未下载成功」的条目，故 list 结果
+ * 是「清单全集 + 缓存标记」，不是「仅已缓存」（菜单需据此提供下载入口）。
+ * 返回条数（≤ max）；hashes 为 manifest 原文（小写 16 hex），可直接回填
+ * MP_CMD_SET_MAP / MP_CMD_SET_PARTS 的 s 通道。 */
+int asset_dl_bgmap_list(char hashes[][20], char labels[][32], bool *cached, int max);
+/* PARTS 装扮类：selector=="paperdoll" 或 entity "paperdoll*"；排除 fontTime
+ * （selector=="clock"）与地图条带小包（条带 PARTS 无 selector——旧实现会把
+ * 条带混进换装列表） */
+int asset_dl_parts_list(char hashes[][20], char labels[][32], bool *cached, int max);
+/* NPC 实体列表（T2）：selector=="npc" 或 entity "npc:*"，按 entity 去重
+ * （服务端一个 NPC = 1 个 PARTS + N 个 LAYOUT）。hashes[i] = 该 NPC 的 PARTS
+ * 包 hash；entities[i] = "npc:<id>"。无 NPC 条目 → 返回 0（菜单显示空态）。 */
+int asset_dl_npc_list(char entities[][40], char hashes[][20], char labels[][32],
+                      bool *cached, int max);
+/* LAYOUT：该动作是否已有本地文件（元数据 + access(F_OK)）。不能用
+ * asset_dl_layout_path 代替——它只查元数据，文件被 LRU 淘汰后仍返回 true。 */
+bool asset_dl_layout_cached(const char *action);
+/* 该 hash 的 .mpk 是否已在 TF（strcmp 精确匹配，口径同 manifest 键大小写） */
+bool asset_dl_file_cached(const char *hash);
+/* T4：按单个 hash 请求下载（复用 asset_dl_task 唤醒 + download_one 落盘，
+ * 不新造队列/任务）。hash 须已在本地清单登记且 kind 有目录（THUMB 等无目录
+ * kind 一律 false）。返回 true = 已受理（本地已有文件也返回 true，视为完成）；
+ * false = 参数非法 / 未登记 / 同步任务未启动。
+ * 完成判定：调用方轮询 asset_dl_file_cached(hash)（菜单 100ms tick）。 */
+bool asset_dl_request_one(const char *hash);
+
 void asset_dl_touch(const char *hash);                    /* 最近使用 */
 uint32_t asset_dl_local_rev(void);
 

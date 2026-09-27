@@ -16,6 +16,28 @@ public enum MpakKind : ulong
 }
 
 /// <summary>
+/// kind → manifest 的 "kind" 字段名（唯一事实源）。
+/// 固件 asset_dl.c 的 kind_dir() 按名字匹配白名单（strcasecmp：大小写无所谓，
+/// 但下划线是内容的一部分）：PARTS / LAYOUT / BGMAP / FONT / AUDIO_META；
+/// 不认识的 kind 设备端只登记元数据、不下载（THUMB 即属此类）。
+/// 陷阱：AudioMeta 枚举名全大写是 "AUDIOMETA"，与固件白名单 "AUDIO_META" 差一个下划线
+/// —— 直接 ToString().ToUpperInvariant() 会让曲库元数据包永远匹配不上（E12 实测根因）。
+/// </summary>
+public static class MpakKindNames
+{
+    public static string DirName(this MpakKind kind) => kind switch
+    {
+        MpakKind.Parts => "PARTS",
+        MpakKind.Layout => "LAYOUT",
+        MpakKind.Bgmap => "BGMAP",
+        MpakKind.Font => "FONT",
+        MpakKind.AudioMeta => "AUDIO_META",
+        MpakKind.Thumb => "THUMB",
+        _ => kind.ToString().ToUpperInvariant(),
+    };
+}
+
+/// <summary>
 /// MPAK 通用信封（算法规格 §二）读写。
 ///
 /// 布局（全部小端、4B 对齐原则）：

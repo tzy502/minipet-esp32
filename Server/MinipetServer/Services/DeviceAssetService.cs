@@ -155,7 +155,7 @@ public sealed class DeviceAssetService
     {
         var o = new JsonObject
         {
-            ["kind"] = a.Kind.ToString().ToUpperInvariant(),
+            ["kind"] = a.Kind.DirName(),
             ["bytes"] = a.ByteCount,
             ["file"] = a.FileName,
             ["url"] = $"/api/device/asset/{a.Hash:x16}",

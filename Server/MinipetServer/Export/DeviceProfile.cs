@@ -54,9 +54,27 @@ public sealed class DeviceProfile
         for (int i = 0; i < 8 && dir != null; i++, dir = dir.Parent!)
         {
             string candidate = Path.Combine(dir.FullName, "Server", "seed");
-            if (Directory.Exists(candidate)) return candidate;
+            if (LooksLikeSeedRoot(candidate)) return candidate;
+        }
+        // publish / 容器布局（E12）：dotnet publish 把 Server/seed 拷到输出根（ContentRoot=/app）
+        // → 向上找 seed/ 而不只是 Server/seed，否则镜像里字体/默认装扮种子全都找不到
+        dir = new DirectoryInfo(startDir ?? Environment.CurrentDirectory);
+        for (int i = 0; i < 8 && dir != null; i++, dir = dir.Parent!)
+        {
+            string candidate = Path.Combine(dir.FullName, "seed");
+            if (LooksLikeSeedRoot(candidate)) return candidate;
         }
         // 开发期回退：构建输出目录向上通常两级即到仓库根；找不到时给相对路径让调用方报错
         return "Server/seed";
     }
+
+    /// <summary>
+    /// 目录像不像 Server/seed：含任一种子标志文件/子目录才算（防把同名普通目录当种子根；
+    /// publish 布局由 csproj 的 Content Link 把整套种子拷到输出根 seed/）。
+    /// </summary>
+    private static bool LooksLikeSeedRoot(string dir)
+        => Directory.Exists(dir)
+           && (File.Exists(Path.Combine(dir, "default-appearance.json"))
+               || Directory.Exists(Path.Combine(dir, "fonts"))
+               || Directory.Exists(Path.Combine(dir, "profiles")));
 }

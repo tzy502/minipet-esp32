@@ -6,6 +6,7 @@ using MinipetServer.Device;
 using MinipetServer.Health;
 using MinipetServer.Manifest;
 using MinipetServer.Music;
+using MinipetServer.Services;
 
 namespace MinipetServer.Api;
 
@@ -74,7 +75,8 @@ public static class DeviceEndpoints
 
     /// <summary>设备注册：profile+UUID+固件版本 → deviceId 与配置。匿名可用（配对只解锁 Web 管理，E13）。</summary>
     private static IResult HandleHello(
-        HelloRequest body, DeviceRegistry reg, ConfigService cfg, DeviceManifestService mfst, DeviceEventLog eventLog)
+        HelloRequest body, DeviceRegistry reg, ConfigService cfg, DeviceManifestService mfst, DeviceEventLog eventLog,
+        PaperdollPackService packs, FontPackService fonts, HealthReport health)
     {
         if (string.IsNullOrWhiteSpace(body?.Uuid))
             return Results.Json(new { error = "uuid 必填" }, statusCode: 400);
@@ -108,6 +110,9 @@ public static class DeviceEndpoints
         {
             code = reg.ActivePairingCode(dev.DeviceId) ?? reg.IssuePairingCode(dev.DeviceId);
         }
+
+        // E13/E12 首启 provisioning（后台补齐默认素材 + 字体包；失败只记事件，不阻断 hello）
+        ScheduleFirstBootProvisioning(dev, packs, fonts, mfst, eventLog, health);
 
         var th = dev.Thresholds ?? cfg.Current.Device;
         return Results.Json(new
@@ -279,4 +284,97 @@ public static class DeviceEndpoints
 
     private static IResult NotFoundDevice(string deviceId)
         => Results.Json(new { error = $"未注册设备：{deviceId}（先 POST /api/device/hello）" }, statusCode: 404);
+
+    // ── 首启 provisioning（E13 默认素材 + E12 字体链，2026-09-27 补链）────────────
+
+    /// <summary>
+    /// 设备首次 hello 时 data/cache/export/{deviceId}/ 是空的 → manifest 无 assets：
+    /// 设备既没有宠物可显示（无 PARTS/LAYOUT，新建 uuid 首启屏幕空白）也没有字
+    /// （无 FONT，固件报 "font 1 not loaded"，菜单/气泡全无字）。本方法在后台补齐：
+    ///   · 外观：PetConfig 为空 → seed/default-appearance.json（出厂宠物）；
+    ///     PetConfig 有值但包丢了（data 被清 / 换机）→ 用设备自己的配置重打。
+    ///   · 字体：16/24/32 三档 FONT 包（FontPackService，种子 JSON 打包，与 WZ 无关）。
+    /// 幂等：索引里已有 PARTS(selector=paperdoll) 与任一 FONT 条目时整体跳过（只读索引，
+    /// 不触发打包）；两段各自失败只记日志 + 设备事件，绝不抛给 hello。
+    /// 铁律：hello 不等打包（装扮导出数秒、字体 ~1s），打包完成即 BumpRev 唤醒设备长轮询。
+    /// </summary>
+    private static void ScheduleFirstBootProvisioning(DeviceRecord dev, PaperdollPackService packs,
+        FontPackService fonts, DeviceManifestService mfst, DeviceEventLog eventLog, HealthReport health)
+    {
+        bool hasAppearance, hasFonts;
+        try
+        {
+            hasAppearance = packs.HasPackedAppearance(dev.DeviceId);
+            hasFonts = fonts.PackedSizes(dev.DeviceId).Count > 0;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[Provision] 设备 {dev.DeviceId} 索引检查失败: {ex.Message}");
+            return;
+        }
+        if (hasAppearance && hasFonts) return;
+
+        bool hasPet = dev.PetConfig is { ValueKind: JsonValueKind.Object };
+        _ = Task.Run(() =>
+        {
+            try
+            {
+                if (!hasAppearance)
+                {
+                    var appearance = hasPet ? dev.PetConfig!.Value : TryLoadSeedAppearance();
+                    if (appearance.ValueKind != JsonValueKind.Object)
+                    {
+                        Console.Error.WriteLine($"[Provision] 设备 {dev.DeviceId} 无可用外观（PetConfig 空且 seed 缺失），跳过装扮 provisioning");
+                        eventLog.Append(dev.DeviceId, "首启 provisioning：无可用外观（PetConfig 空 + seed 缺失）");
+                    }
+                    else
+                    {
+                        bool packed = packs.EnsurePacked(dev.DeviceId, appearance);
+                        mfst.BumpRev(dev.DeviceId, packed ? "首启默认素材已生成" : "首启素材未变化（同外观已打包）");
+                        eventLog.Append(dev.DeviceId, packed
+                            ? (hasPet ? "首启 provisioning：按设备 petConfig 重打 PARTS+LAYOUT" : "首启 provisioning：默认外观 PARTS+LAYOUT 已下发")
+                            : "首启 provisioning：装扮包已存在，跳过");
+                        Console.WriteLine($"[Provision] 设备 {dev.DeviceId} 装扮 provisioning {(packed ? "完成" : "跳过（已存在）")}");
+                    }
+                }
+
+                if (!hasFonts)
+                {
+                    int n = fonts.EnsureFonts(dev.DeviceId);
+                    if (n > 0)
+                    {
+                        mfst.BumpRev(dev.DeviceId, $"字体包已生成（{n} 档 FONT）");
+                        eventLog.Append(dev.DeviceId, $"首启 provisioning：{n} 档 FONT 字体包已下发（E12）");
+                        Console.WriteLine($"[Provision] 设备 {dev.DeviceId} 字体 provisioning 完成（{n} 档）");
+                    }
+                    else
+                    {
+                        eventLog.Append(dev.DeviceId, "首启 provisioning：字体包已存在，跳过");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"[Provision] 设备 {dev.DeviceId} 首启 provisioning 失败: {ex.Message}");
+                health.RecordEvent(dev.DeviceId, "provision_error", JsonSerializer.SerializeToElement(new { error = ex.Message }));
+                eventLog.Append(dev.DeviceId, $"首启 provisioning 失败：{ex.Message}（设备稍后重连会重试）");
+            }
+        });
+    }
+
+    /// <summary>seed/default-appearance.json → JsonElement（出厂宠物外观）；缺失/损坏返回 default（ValueKind=Undefined）。</summary>
+    private static JsonElement TryLoadSeedAppearance()
+    {
+        try
+        {
+            var file = Path.Combine(MiniPet.Export.DeviceProfile.FindSeedRoot(), "default-appearance.json");
+            if (!File.Exists(file)) return default;
+            return JsonDocument.Parse(File.ReadAllText(file)).RootElement.Clone();
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[Provision] seed 默认装扮读取失败: {ex.Message}");
+            return default;
+        }
+    }
 }

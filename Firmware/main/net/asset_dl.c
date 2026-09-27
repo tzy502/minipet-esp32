@@ -69,6 +69,12 @@ static int s_clock_cnt;
 static SemaphoreHandle_t s_lock;
 static SemaphoreHandle_t s_sync_req;
 
+/* T4 单包下载请求（菜单点选未缓存条目）：s_one_hash 非空 = 待下单个包（s_lock
+ * 保护），s_sync_req 兼作唤醒信号。s_sync_again = 唤醒批次里还欠一次全量同步
+ * （单包优先处理时不能把同批的全量请求吞掉——跨任务读写，volatile 单字）。 */
+static char          s_one_hash[20];
+static volatile bool s_sync_again;
+
 /* ------------------------------------------------------------------ */
 /* crc32c（Castagnoli，表运行期生成）                                    */
 /* ------------------------------------------------------------------ */
@@ -121,31 +127,105 @@ static const char *kind_dir(const char *kind)
     return NULL;
 }
 
-static int kind_list(const char *kind, char hashes[][20], char labels[][32], int max)
+/* 本地 .mpk 是否在位（<kind_dir>/<hash>.mpk）。调用方须持 s_lock（或无并发写） */
+static bool file_cached_row(const local_file_t *lf)
+{
+    const char *dir = kind_dir(lf->kind);
+    if (!dir) return false;
+    char path[MP_MPK_PATH_MAX];
+    /* hash 字段定长 20B（16 hex + NUL），拼接后必然远小于 MP_MPK_PATH_MAX；
+     * GCC 看不到 local_file_t.hash 的定长约束 → 局部关掉 format-truncation。 */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-truncation"
+    snprintf(path, sizeof(path), "%s/%s.mpk", dir, lf->hash);
+#pragma GCC diagnostic pop
+    return (access(path, F_OK) == 0);
+}
+
+/* 纯可打印 ASCII？（菜单字体 Montserrat 无 CJK 字形，中文串渲染成空白） */
+static bool ascii_printable(const char *s)
+{
+    if (!s || !s[0]) return false;
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        if (*p < 0x20 || *p > 0x7E) return false;
+    }
+    return true;
+}
+
+/* 菜单显示串：① label(ASCII) → ② map_id/entity(ASCII) → ③ hash 前 8 位 */
+static void pick_ascii_label(const local_file_t *lf, char *out, size_t cap)
+{
+    if (ascii_printable(lf->label))        strlcpy(out, lf->label, cap);
+    else if (ascii_printable(lf->map_id))  strlcpy(out, lf->map_id, cap);
+    else if (ascii_printable(lf->entity))  strlcpy(out, lf->entity, cap);
+    else                                   snprintf(out, cap, "%.8s", lf->hash);
+}
+
+/* kind 过滤 + cached 标记。调用方须持 s_lock */
+static int kind_list_locked(const char *kind, char hashes[][20], char labels[][32],
+                            bool *cached, int max)
 {
     int n = 0;
     for (int i = 0; i < s_file_cnt && n < max; i++) {
         if (strcasecmp(s_files[i].kind, kind) != 0) continue;
-        if (strcmp(kind, "PARTS") == 0 &&
-            strcmp(s_files[i].selector, "clock") == 0) continue;   /* fontTime 非装扮 */
-        if (hashes) strlcpy(hashes[n], s_files[i].hash, 20);
-        if (labels) {
-            strlcpy(labels[n], s_files[i].label[0] ? s_files[i].label
-                                                   : s_files[i].hash, 32);
+        if (strcasecmp(kind, "PARTS") == 0) {
+            /* fontTime 非装扮；地图条带小包（无 selector）也不进换装列表 */
+            if (strcmp(s_files[i].selector, "clock") == 0) continue;
+            if (!(strcmp(s_files[i].selector, "paperdoll") == 0 ||
+                  strncmp(s_files[i].entity, "paperdoll", 9) == 0)) continue;
         }
+        if (hashes) strlcpy(hashes[n], s_files[i].hash, 20);
+        if (labels) pick_ascii_label(&s_files[i], labels[n], 32);
+        if (cached) cached[n] = file_cached_row(&s_files[i]);
         n++;
     }
     return n;
 }
 
-int asset_dl_bgmap_list(char hashes[][20], char labels[][32], int max)
+int asset_dl_bgmap_list(char hashes[][20], char labels[][32], bool *cached, int max)
 {
-    return kind_list("BGMAP", hashes, labels, max);
+    if (max <= 0) return 0;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    int n = kind_list_locked("BGMAP", hashes, labels, cached, max);
+    xSemaphoreGive(s_lock);
+    return n;
 }
 
-int asset_dl_parts_list(char hashes[][20], char labels[][32], int max)
+int asset_dl_parts_list(char hashes[][20], char labels[][32], bool *cached, int max)
 {
-    return kind_list("PARTS", hashes, labels, max);
+    if (max <= 0) return 0;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    int n = kind_list_locked("PARTS", hashes, labels, cached, max);
+    xSemaphoreGive(s_lock);
+    return n;
+}
+
+int asset_dl_npc_list(char entities[][40], char hashes[][20], char labels[][32],
+                      bool *cached, int max)
+{
+    if (max <= 0) return 0;
+    int n = 0;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    for (int i = 0; i < s_file_cnt && n < max; i++) {
+        if (strcasecmp(s_files[i].kind, "PARTS") != 0) continue;
+        if (!(strcmp(s_files[i].selector, "npc") == 0 ||
+              strncmp(s_files[i].entity, "npc:", 4) == 0)) continue;
+        if (!s_files[i].entity[0]) continue;
+
+        bool dup = false;                       /* entity 去重（1 PARTS + N LAYOUT） */
+        for (int k = 0; k < n; k++) {
+            if (strcmp(entities[k], s_files[i].entity) == 0) { dup = true; break; }
+        }
+        if (dup) continue;
+
+        strlcpy(entities[n], s_files[i].entity, 40);
+        if (hashes) strlcpy(hashes[n], s_files[i].hash, 20);
+        if (labels) pick_ascii_label(&s_files[i], labels[n], 32);
+        if (cached) cached[n] = file_cached_row(&s_files[i]);
+        n++;
+    }
+    xSemaphoreGive(s_lock);
+    return n;
 }
 
 static void ensure_dirs(void)
@@ -455,6 +535,25 @@ static bool download_one(const char *hash, const char *kind)
     return false;
 }
 
+/* 下载成功后登记（不下载）：最近使用时间 + FONT 包内字号。
+ * 调用方须持 s_lock（与 sync_once 的登记块同口径，抽出供单包下载复用） */
+static void note_download_locked(const char *hash, const char *kind)
+{
+    for (int i = 0; i < s_file_cnt; i++) {
+        if (strcmp(s_files[i].hash, hash) != 0) continue;
+        s_files[i].last_used_ms = mp_now_ms();
+        if (strcasecmp(kind, "FONT") == 0) {
+            char p[MP_MPK_PATH_MAX];
+            const char *d = kind_dir("FONT");
+            if (d) {
+                snprintf(p, sizeof(p), "%s/%s.mpk", d, hash);
+                s_files[i].font_px = read_font_px(p);   /* 16/24/32 */
+            }
+        }
+        break;
+    }
+}
+
 /* ------------------------------------------------------------------ */
 /* TF 水位 + LRU 淘汰                                                    */
 /* ------------------------------------------------------------------ */
@@ -548,7 +647,13 @@ static void sync_once(void)
     }
     manifest_ctx_t ctx = { .buf = resp, .cap = MANIFEST_RESP_CAP };
 
-    int status = mp_http_get("/api/device/manifest", 10000, manifest_collect, &ctx);
+    /* manifest 端点服务端必填 deviceId（DeviceEndpoints.cs HandleManifest 签名
+     * string deviceId；缺失即 400）——真机实证：不带参永久 400 → 素材包一个
+     * 都下不到、rev 永不跟随。deviceId 由 hello 返回并缓存在 http_client。 */
+    char mpath[128];
+    snprintf(mpath, sizeof(mpath), "/api/device/manifest?deviceId=%s",
+             mp_http_device_id());
+    int status = mp_http_get(mpath, 10000, manifest_collect, &ctx);
     if (status != 200) return;
 
     cJSON *root = cJSON_Parse(resp);
@@ -617,20 +722,7 @@ static void sync_once(void)
             evict_if_needed();                      /* 下载前查水位 */
             if (!download_one(hash, kind)) continue;
             xSemaphoreTake(s_lock, portMAX_DELAY);
-            for (int i = 0; i < s_file_cnt; i++) {
-                if (strcmp(s_files[i].hash, hash) == 0) {
-                    s_files[i].last_used_ms = mp_now_ms();
-                    if (strcmp(kind, "FONT") == 0) {
-                        char p[MP_MPK_PATH_MAX];
-                        const char *d = kind_dir("FONT");
-                        if (d) {
-                            snprintf(p, sizeof(p), "%s/%s.mpk", d, hash);
-                            s_files[i].font_px = read_font_px(p);   /* 16/24/32 */
-                        }
-                    }
-                    break;
-                }
-            }
+            note_download_locked(hash, kind);
             xSemaphoreGive(s_lock);
         }
         xSemaphoreTake(s_lock, portMAX_DELAY);
@@ -647,12 +739,89 @@ static void sync_once(void)
     mp_post_cmd(&c);
 }
 
+/* ---------------- T4 单包下载（菜单点选未缓存条目 → 下载 → 上层切换）-------
+ * 复用既有资产任务与 download_one（不新造任务/队列）：请求写 s_one_hash 后
+ * give(s_sync_req) 唤醒任务；任务侧单包优先于全量 sync。 */
+
+/* 取出待下单个包（取出即置空）；调用方给缓冲 ≥20 字节 */
+static bool take_one_request(char *out, size_t cap)
+{
+    bool got = false;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    if (s_one_hash[0]) {
+        strlcpy(out, s_one_hash, cap);
+        s_one_hash[0] = 0;
+        got = true;
+    }
+    xSemaphoreGive(s_lock);
+    return got;
+}
+
+bool asset_dl_request_one(const char *hash)
+{
+    if (!hash || strlen(hash) < 8) return false;
+    if (!s_sync_req || !s_lock) return false;      /* 任务未启动（asset_dl_start 之前） */
+
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    int idx = -1;
+    for (int i = 0; i < s_file_cnt; i++) {
+        if (strcmp(s_files[i].hash, hash) == 0) { idx = i; break; }
+    }
+    if (idx < 0 || !kind_dir(s_files[idx].kind)) {
+        xSemaphoreGive(s_lock);
+        return false;                              /* 未登记 / THUMB 等无目录 kind */
+    }
+    if (file_cached_row(&s_files[idx])) {          /* 本地已有：视为已完成 */
+        xSemaphoreGive(s_lock);
+        return true;
+    }
+    strlcpy(s_one_hash, s_files[idx].hash, sizeof(s_one_hash));
+    xSemaphoreGive(s_lock);
+
+    ESP_LOGI(TAG, "request_one %s 入队", hash);
+    xSemaphoreGive(s_sync_req);
+    return true;
+}
+
+/* 单包下载执行体（资产任务上下文）：查 kind → 水位检查 → download_one → 登记 */
+static void one_request_run(const char *hash)
+{
+    char kind[12] = { 0 };
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    for (int i = 0; i < s_file_cnt; i++) {
+        if (strcmp(s_files[i].hash, hash) == 0) {
+            strlcpy(kind, s_files[i].kind, sizeof(kind));
+            break;
+        }
+    }
+    xSemaphoreGive(s_lock);
+    if (!kind[0]) return;                          /* 清单变更/已淘汰：静默放弃 */
+
+    evict_if_needed();
+    if (!download_one(hash, kind)) {
+        ESP_LOGW(TAG, "request_one %s 下载失败（菜单侧将轮询超时）", hash);
+        return;
+    }
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    note_download_locked(hash, kind);
+    save_local_manifest_locked();
+    xSemaphoreGive(s_lock);
+    ESP_LOGI(TAG, "request_one %s 落盘完成", hash);
+}
+
 static void asset_dl_task(void *arg)
 {
     (void)arg;
+    char one[20];
     for (;;) {
         if (xSemaphoreTake(s_sync_req, pdMS_TO_TICKS(60000)) == pdTRUE) {
             while (xSemaphoreTake(s_sync_req, 0) == pdTRUE) {}   /* 合并重复请求 */
+            s_sync_again = false;                                /* 本次唤醒消费掉同步需求 */
+            if (take_one_request(one, sizeof(one))) {
+                one_request_run(one);        /* T4：菜单点选的单包优先（不吃掉同批 sync） */
+                if (s_sync_again) sync_once();
+                continue;
+            }
             sync_once();
         } else {
             sync_once();      /* 周期兜底：60s 无触发也对表一次服务端 rev */
@@ -679,6 +848,7 @@ void asset_dl_start(void)
 void asset_dl_request_sync(void)
 {
     if (!s_sync_req) return;
+    s_sync_again = true;      /* 单包请求与全量同步同批到达时不丢全量（见 asset_dl_task） */
     xSemaphoreGive(s_sync_req);
 }
 
@@ -705,6 +875,40 @@ size_t asset_dl_collect_hashes(char *buf, size_t cap)
 
     buf[off] = 0;
     return off;
+}
+
+bool asset_dl_file_cached(const char *hash)
+{
+    if (!hash || !hash[0]) return false;
+    bool ok = false;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    for (int i = 0; i < s_file_cnt; i++) {
+        if (strcmp(s_files[i].hash, hash) == 0) {
+            ok = file_cached_row(&s_files[i]);
+            break;
+        }
+    }
+    xSemaphoreGive(s_lock);
+    return ok;
+}
+
+bool asset_dl_layout_cached(const char *action)
+{
+    if (!action || !action[0]) return false;
+    bool ok = false;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    /* 选取口径与 asset_dl_layout_path 一致：paperdoll 实体优先，否则任一 */
+    int pd = -1, fb = -1;
+    for (int i = 0; i < s_file_cnt; i++) {
+        if (strcasecmp(s_files[i].kind, "LAYOUT") != 0) continue;
+        if (strcmp(s_files[i].action, action) != 0) continue;
+        if (strncmp(s_files[i].entity, "paperdoll", 9) == 0) { pd = i; break; }
+        if (fb < 0) fb = i;
+    }
+    int pick = (pd >= 0) ? pd : fb;
+    if (pick >= 0) ok = file_cached_row(&s_files[pick]);
+    xSemaphoreGive(s_lock);
+    return ok;
 }
 
 bool asset_dl_layout_path(const char *action, char *path, size_t cap)

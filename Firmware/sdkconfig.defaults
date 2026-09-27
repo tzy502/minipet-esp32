@@ -44,3 +44,11 @@ CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096
 CONFIG_LV_FONT_MONTSERRAT_16=y
 CONFIG_LV_FONT_MONTSERRAT_20=y
 CONFIG_LV_FONT_MONTSERRAT_28=y
+
+# ---- 任务看门狗（E14 定稿）：不 panic ----
+# TWDT 超时只回调/报警，重启与熔断的决策权在 app/watchdog.c（三振：重启自愈 →
+# 熔断待机）。若置 y：IDF panic 处理器会在渲染栈已损坏（正是卡死场景）时接管，
+# 绕过 watchdog.c 的 NVS 计数与熔断路径 —— 与设计相反，且表现为不可控重启循环。
+# 诊断期若确需 panic 回溯，临时改 y 并同步 watchdog.c（trigger_panic 跟随本项），
+# 用完必须回 n：docs/ai/technical-reference.md「临时件清理清单」同源。
+CONFIG_ESP_TASK_WDT_PANIC=n

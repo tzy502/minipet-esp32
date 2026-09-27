@@ -93,7 +93,19 @@ int sd_mount(void)
         err = esp_vfs_fat_spiflash_mount_rw_wl(SD_MOUNT_POINT, "assets",
                                                &flash_cfg, &s_flash_wl);
         if (err != ESP_OK) {
-            ESP_LOGE(TAG, "Flash assets 分区挂载也失败: %s", esp_err_to_name(err));
+            /* 【真机崩溃根因，2026-09-27】SD 卡不在时走本回退，而 assets 分区
+             * 首次挂载/坏 WL 状态会触发 WL 初始化 + FAT 格式化/擦除，在内部堆
+             * 仅 ~143KB 且已被 WiFi/LVGL 挤压的情况下分配失败 →
+             * `wl_read failed (0x101)` → 驱动内部 ESP_ERROR_CHECK 直接 abort →
+             * 设备无限重启（实测 12s 内 4 次重启，日志见 boot_new.log）。
+             * 回退是【可选路径】：失败绝不能拖垮整机——降级为"无本地素材"
+             * （素材仍可由服务端 manifest 下发到内存/其他存储），返回错误即可。 */
+            ESP_LOGE(TAG, "Flash assets 分区挂载失败: %s（内部空闲=%u 最大块=%u）"
+                          "→ 降级为无本地素材，不阻断启动",
+                     esp_err_to_name(err),
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                     (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+            s_flash_wl = (wl_handle_t)0;
             return ENODEV;
         }
         s_on_flash = true;

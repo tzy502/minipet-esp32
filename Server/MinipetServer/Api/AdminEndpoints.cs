@@ -141,15 +141,27 @@ public static class AdminEndpoints
             return Results.Json(new { source = src.Name, count = tracks.Count, tracks });
         });
 
-        g.MapGet("/music/sources", (BgmRouter router) => Results.Json(new
+        // 音源健康（E8/E4）：qq 附带 cookie 导入时间与过期标记 —— Web 曲库页健康标签 +
+        // 「cookie 待过期」提示用；cookieStale=true 表示超过 QqMusicSource.CookieStaleThreshold（7 天）
+        g.MapGet("/music/sources", (BgmRouter router, ConfigService cfg, QqGatewayProcess gateway) =>
         {
-            sources = router.Sources.Select(s => new
+            var qq = cfg.Current.QqMusic;
+            var (stale, ageDays) = QqMusicSource.CookieFreshness(qq);
+            return Results.Json(new
             {
-                name = s.Name,
-                enabled = s.IsEnabled,
-                health = s.Health(),
-            }).ToList(),
-        }));
+                sources = router.Sources.Select(s => new
+                {
+                    name = s.Name,
+                    enabled = s.IsEnabled,
+                    health = s.Health(),
+                    // QQ 专属字段（其它源为 null → JSON 序列化按 WhenWritingNull 省略）
+                    cookieSavedAtUtc = s.Name == "qq" ? qq.CookieSavedAtUtc : null,
+                    cookieStale = s.Name == "qq" && stale,
+                    cookieAgeDays = s.Name == "qq" ? ageDays : null,
+                    gateway = s.Name == "qq" ? gateway.Status : null,
+                }).ToList(),
+            });
+        });
 
         g.MapGet("/music/sources/{name}/health", (string name, BgmRouter router) =>
             router.Resolve(name) is { } src
@@ -170,17 +182,38 @@ public static class AdminEndpoints
             return Results.Json(new { name = src.Name, enabled = body.Enabled.Value, health = src.Health() });
         });
 
-        // cookie 导入（QQ）：只落配置 + 保存时间；有效期告警在 M10 网关接入后补
-        g.MapPost("/music/sources/qq/cookie", (CookieRequest body, ConfigService cfg, QqMusicSource qq) =>
+        // cookie 导入（QQ）：落配置 + 导入时间（CookieSavedAtUtc，E4 过期告警的依据）；
+        // 导入后立刻推给网关（若已就绪）并触发一次巡检（网关可能刚被拉起/重启）。
+        g.MapPost("/music/sources/qq/cookie", (CookieRequest body, ConfigService cfg, QqMusicSource qq,
+            QqGatewayProcess gateway) =>
         {
-            var (applied, errors) = cfg.Update(c => c.QqMusic.Cookie = body?.Cookie?.Trim() ?? "");
+            var cookie = body?.Cookie?.Trim() ?? "";
+            var (applied, errors) = cfg.Update(c =>
+            {
+                c.QqMusic.Cookie = cookie;
+                c.QqMusic.CookieSavedAtUtc = string.IsNullOrEmpty(cookie) ? null : DateTime.UtcNow;
+            });
             if (applied == null) return Results.Json(new { errors }, statusCode: 400);
+
+            // 推 cookie 给网关 + 立刻巡检（配置变更本身也会触发 QqGatewayProcess 的 Changed 巡检，
+            // 这里同步补一次是为了让响应里的 health 立即反映新 cookie）
+            if (!string.IsNullOrEmpty(cookie))
+            {
+                try { gateway.EnsureHealthyNow(); }
+                catch (Exception ex) { Console.Error.WriteLine($"[QqGateway] cookie 导入后巡检失败: {ex.Message}"); }
+            }
+            var (stale, ageDays) = QqMusicSource.CookieFreshness(cfg.Current.QqMusic);
             return Results.Json(new
             {
                 ok = true,
-                imported = !string.IsNullOrEmpty(body?.Cookie),
+                imported = !string.IsNullOrEmpty(cookie),
+                cookieSavedAtUtc = cfg.Current.QqMusic.CookieSavedAtUtc,
+                cookieStale = stale,
+                cookieAgeDays = ageDays,
                 health = qq.Health(),
-                note = "cookie 已保存；曲库/取链待 M10 node 网关接入（cookie 导入与启停已可用）",
+                note = string.IsNullOrEmpty(cookie)
+                    ? "cookie 已清空"
+                    : "cookie 已保存并推送网关；取链/转发由 /api/device/bgm/stream 实时完成（直链不下发设备）",
             });
         });
 
@@ -198,6 +231,57 @@ public static class AdminEndpoints
         {
             var (ok, message) = cfg.ValidateWzPath(body?.Path);
             return Results.Json(new { ok, message });
+        });
+
+        // ── 设备实时指令下发（E4 25 表情手动指定 / E12 台词气泡 / 亮度 / 重启）──
+        // Web 侧已就绪（Web/src/api/client.js sendDeviceCommand），此前无端点（405）→ 前端禁用态。
+        // payload 形状必须与固件 poller.c:182-197 对齐：
+        //   expression / action / bubble → 【裸 JSON 字符串】（固件找 payload 本身或 payload.id）
+        //   brightness                   → 数值放 n（固件走 pn 通道）
+        //   ⚠ 写成 {"value":"…"} 会被固件静默忽略（既不报错也不生效）——勿改。
+        g.MapPost("/devices/{id}/command", (string id, DeviceCommandRequest body,
+            DeviceRegistry reg, CommandQueue queue, DeviceEventLog eventLog) =>
+        {
+            var dev = reg.Get(id);
+            if (dev == null) return NotFoundDevice(id);
+            var type = body?.Type?.Trim().ToLowerInvariant();
+            if (string.IsNullOrEmpty(type))
+                return Results.Json(new { error = "type 必填" }, statusCode: 400);
+
+            string[] stringTypes = { "expression", "action", "bubble" };
+            if (stringTypes.Contains(type))
+            {
+                var value = body?.Value?.Trim();
+                if (string.IsNullOrEmpty(value))
+                    return Results.Json(new { error = $"{type} 需要 value" }, statusCode: 400);
+                if (type == "bubble" && System.Text.Encoding.UTF8.GetByteCount(value) > 95)
+                    return Results.Json(new { error = "bubble 文本超 95 字节（固件 mp_cmd_t.s=char[96]）" },
+                        statusCode: 400);
+                var cmd = queue.Enqueue(id, type, value);
+                eventLog.Append(id, $"指令下发：{type}={value}");
+                return Results.Json(new { ok = true, seq = cmd.Seq, type, value }, statusCode: 202);
+            }
+
+            if (type == "brightness")
+            {
+                if (body?.N is not (>= 0 and <= 100))
+                    return Results.Json(new { error = "brightness 需要 n∈[0,100]" }, statusCode: 400);
+                var cmd = queue.Enqueue(id, "brightness", new { n = body.N });
+                eventLog.Append(id, $"指令下发：brightness={body.N}");
+                return Results.Json(new { ok = true, seq = cmd.Seq, type, n = body.N }, statusCode: 202);
+            }
+
+            if (type == "reboot")
+            {
+                var cmd = queue.Enqueue(id, "reboot", new { });
+                eventLog.Append(id, "指令下发：reboot");
+                return Results.Json(new { ok = true, seq = cmd.Seq, type }, statusCode: 202);
+            }
+
+            return Results.Json(new
+            {
+                error = $"type 非法：{body?.Type}（可用：expression/action/bubble/brightness/reboot）"
+            }, statusCode: 400);
         });
 
         g.MapPut("/settings", (MinipetConfig body, ConfigService cfg) =>
@@ -341,6 +425,38 @@ public static class AdminEndpoints
                 health = health.GetSummary(id),
             });
         });
+
+        // ── 字体包补链（E12）：手动触发某设备的 16/24/32 三档 FONT 打包 ──
+        // 新设备 hello 已自动补（DeviceEndpoints.ScheduleFirstBootProvisioning），这里是修复入口：
+        // 字体种子换代 / 设备 font 目录被清 / 想单档重推时用。同步执行（种子 JSON 打包 ~1s，
+        // 不占 WZ 锁）；body 可省，{"sizes":[16,24,32]} 指定档位。
+        g.MapPost("/devices/{id}/fonts", (string id, FontSizesRequest? body, DeviceRegistry reg,
+            FontPackService fonts, DeviceManifestService mfst, DeviceEventLog eventLog) =>
+        {
+            var dev = reg.Get(id);
+            if (dev == null) return NotFoundDevice(id);
+            try
+            {
+                int generated = fonts.EnsureFonts(id, body?.Sizes);
+                if (generated > 0) mfst.BumpRev(id, $"字体包已生成（{generated} 档 FONT）");
+                eventLog.Append(id, generated > 0
+                    ? $"字体包手动补齐：新生成 {generated} 档 FONT"
+                    : "字体包手动补齐：已是最新（幂等跳过）");
+                return Results.Json(new
+                {
+                    ok = true,
+                    deviceId = id,
+                    generated,
+                    packedSizes = fonts.PackedSizes(id),
+                    manifestRev = mfst.GetCurrentRev(id),
+                });
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"[FontPack] 设备 {id} 字体打包失败: {ex.Message}");
+                return Results.Json(new { error = ex.Message }, statusCode: 500);
+            }
+        });
     }
 
     // ── DTO ───────────────────────────────────────────────────────────────
@@ -375,6 +491,12 @@ public static class AdminEndpoints
     public sealed class CookieRequest
     {
         public string? Cookie { get; set; }
+    }
+
+    /// <summary>字体补链请求体（POST /devices/{id}/fonts）；sizes 省略 = 16/24/32。</summary>
+    public sealed class FontSizesRequest
+    {
+        public List<int>? Sizes { get; set; }
     }
 
     /// <summary>WZ 路径独立校验请求体（POST /settings/validate-path，不落盘）。</summary>
@@ -421,6 +543,18 @@ public static class AdminEndpoints
         public string? Kind { get; set; }
         public string? Id { get; set; }
         public bool? Switch { get; set; }
+    }
+
+    /// <summary>
+    /// 设备实时指令（POST /devices/{id}/command）：
+    /// type = expression | action | bubble（用 Value）| brightness（用 N）| reboot。
+    /// 与固件 poller.c:182-197 的 payload 约定一一对应，勿改字段语义。
+    /// </summary>
+    public sealed class DeviceCommandRequest
+    {
+        public string? Type { get; set; }
+        public string? Value { get; set; }
+        public int? N { get; set; }
     }
 
     public sealed class PresetUpsertRequest

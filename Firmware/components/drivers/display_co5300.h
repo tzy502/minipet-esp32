@@ -33,6 +33,19 @@ extern "C" {
 esp_err_t display_init(void);
 
 /**
+ * @brief 运行时切换面板方向（方向标定轮播专用）
+ *
+ * @param swap_xy  宽高轴交换（本板握持定稿恒为 true：面板原生竖屏坐标系）
+ * @param mirror_x/mirror_y  逐轴镜像
+ *
+ * 用途：开机方向轮播标定模式——依次展示 4 种 mirror 组合供用户肉眼定稿；
+ * 定稿后由 display_init() 固化对应常量（当前默认 swap_xy=true +
+ * mirror(false,false)），本 API 即可删除。须在 display_init() 成功后调用，
+ * 未初始化时忽略并告警。
+ */
+void display_set_orientation(bool swap_xy, bool mirror_x, bool mirror_y);
+
+/**
  * @brief 矩形区域上传（SET_WINDOW + 行流）
  *
  * @param x,y,w,h 矩形区域；自动 clamp 到屏幕范围

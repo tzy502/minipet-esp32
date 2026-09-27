@@ -66,6 +66,67 @@ export function triggerOta(deviceId, ver) {
   return http.post(`/admin/ota/${encodeURIComponent(deviceId)}`, { ver: String(ver).trim() }).then((r) => r.data)
 }
 
+// ── 素材推送到设备（E7/E13：地图 / NPC 资产登记进该设备 manifest）──────────
+// POST /admin/devices/{id}/push  body { kind: "map"|"npc", id: "<素材编号>", switch: bool }
+//   → 202 { ok: true, note: "后台打包中，完成后自动下发" }（打包在后台 Task.Run，数秒）
+//   → 400 kind/id 非法；404 设备不存在；503 WZ 未加载；500 同步段异常
+// switch=true 且 kind=map 时：服务端登记资产 → bump rev → 自动下发切图指令（设备自动切换）
+// switch 对 npc 无效（服务端只在 kind=map 分支切图）；素材编号保留原始字符串（如 "200000100"）
+export function pushMaterial(deviceId, kind, id, switchAfter = true) {
+  return http
+    .post(`/admin/devices/${encodeURIComponent(deviceId)}/push`, {
+      kind: String(kind),
+      id: String(id).trim(),
+      switch: !!switchAfter,
+    })
+    .then((r) => r.data)
+}
+
+// ── 设备指令（动作 / 表情 / 气泡，E4/E12）────────────────────────────────
+// ⚠ 服务端端点【尚未提供】：AdminEndpoints.cs 目前只有 manifest/ota/map/push 四类入队，
+//   没有任何 admin 端点能调 CommandQueue.Enqueue 下发 action/expression/bubble。
+//   需求清单（方法/路径/请求体/期望响应/固件侧实证）见 Web/docs/interfaces-needed-from-server.md。
+//   本函数按需求清单的约定形态预留：一旦服务端上线，UI 无需改动即可生效。
+//   期望：POST /api/admin/devices/{id}/command
+//         body { type: "expression"|"action"|"bubble", value: "<名字/文本>", durationMs?: number }
+//         → 202 { ok: true, seq: <n>, type, value }
+//   固件侧已支持（Firmware/main/net/poller.c:141-210 摊平 commands[].type + payload：
+//   payload 须是裸字符串或 {"id":"..."}，形如 {"value":"..."} 会被固件静默忽略）。
+export const DEVICE_COMMAND_TYPE = Object.freeze({ EXPRESSION: 'expression', ACTION: 'action', BUBBLE: 'bubble' })
+
+/** 设备指令端点的完整路径（UI 展示「需要服务端提供什么」时用同一份字符串）。 */
+export function deviceCommandPath(deviceId) {
+  return `/api/admin/devices/${encodeURIComponent(deviceId)}/command`
+}
+
+/** 下发设备指令（动作/表情/气泡）。服务端未上线该端点时 reject（404/405）。 */
+export function sendDeviceCommand(deviceId, type, value, opts = {}) {
+  const body = { type: String(type), value: String(value) }
+  if (opts.durationMs != null) body.durationMs = Number(opts.durationMs)
+  return http.post(`/admin/devices/${encodeURIComponent(deviceId)}/command`, body).then((r) => r.data)
+}
+
+/**
+ * 探测指令端点是否可用（表情调试卡片开卡/「重新检测」用）。
+ * 语义：POST {"type":"expression","value":"default"}——default 是视觉无变化的空操作表情，
+ * 端点已上线时这一发不会改变设备观感（仅消耗一个队列 seq）。
+ * 返回 { supported: true | false | null, status?, error? }
+ *   true  = 路由存在（2xx；或 400/422/503 等业务错误 → 说明路由在，只是入参/依赖问题）
+ *   false = 404/405/501 路由不存在 → UI 禁用按钮并给出接口需求
+ *   null  = 网络不可达等无法判定
+ */
+export async function probeDeviceCommand(deviceId) {
+  try {
+    const res = await sendDeviceCommand(deviceId, DEVICE_COMMAND_TYPE.EXPRESSION, 'default')
+    return { supported: true, status: res?.seq != null ? 202 : 200, data: res }
+  } catch (e) {
+    const status = e?.response?.status
+    if (status === 404 || status === 405 || status === 501) return { supported: false, status }
+    if (status) return { supported: true, status, error: errText(e) }
+    return { supported: null, error: errText(e) }
+  }
+}
+
 // ── 纸娃娃预设（E4 编辑器 → E7 设备选择器「纸娃娃 tab」）──────────────────
 export function listPresets() {
   return http.get('/admin/presets').then((r) => r.data)

@@ -20,11 +20,31 @@ public sealed class WzConfig
 public sealed class QqMusicConfig
 {
     [JsonPropertyName("_comment")]
-    public string Comment { get; set; } = "QQ 音乐音源：Enabled=总开关（停用则该源对设备置灰）；Cookie=网页版 cookie（Web 导入）；GatewayPort=容器内 node 网关端口";
+    public string Comment { get; set; } = "QQ 音乐音源：Enabled=总开关（停用则该源对设备置灰）；Cookie=网页版 cookie（Web 导入，CookieSavedAtUtc 记导入时间，超 7 天告警）；GatewayPort=容器内 node 网关端口；GatewayScript=网关入口脚本绝对路径（空=自动探测，见 QqGatewayProcess）";
 
     public bool Enabled { get; set; } = false;
     public string Cookie { get; set; } = "";
     public int GatewayPort { get; set; } = 3300;
+
+    /// <summary>
+    /// QQ 曲库列表用的搜索关键词（QQ 无"全库"概念：/music/tracks?source=qq 走网关 /search）。
+    /// 空 = 曲库列表为空（不臆造默认歌单）；设备端 next/prev 依赖该列表。
+    /// </summary>
+    public string SearchKeyword { get; set; } = "";
+
+    /// <summary>
+    /// cookie 导入时间（UTC）——POST /api/admin/music/sources/qq/cookie 写入；清空 cookie 时置 null。
+    /// /api/admin/music/sources 据此算 cookieStale（超过 7 天 = QQ 网页 cookie 大概率已失效，E4 告警）。
+    /// </summary>
+    public DateTime? CookieSavedAtUtc { get; set; }
+
+    /// <summary>
+    /// node 网关入口脚本绝对路径（如 /app/qq-gateway/index.js）。空 = 自动探测：
+    /// MINIPET_QQ_GATEWAY 环境变量 → data/qq-gateway/index.js → 应用目录 qq-gateway/index.js。
+    /// 网关本体（Rain120/qq-music-api + 适配层，见 Music/QqGatewayClient.cs 顶部契约注释）
+    /// 不在本仓库、镜像也未内置 → 探测不到时 qq 源恒 Degraded 并给出明确原因（不造假实现）。
+    /// </summary>
+    public string GatewayScript { get; set; } = "";
 }
 
 public sealed class BgmConfig
@@ -197,7 +217,12 @@ public sealed class ConfigService : IDisposable
         => Update(c =>
         {
             c.Wz = incoming.Wz;
-            c.QqMusic = incoming.QqMusic;
+            // cookie 导入时间不是 Web 表单字段：Web 回传整份配置时不带 CookieSavedAtUtc，
+            // 直接整体替换会把导入时间清成 null → cookieStale 告警永远不触发。cookie 未变则保留。
+            var sameCookie = string.Equals(c.QqMusic.Cookie ?? "", incoming.QqMusic?.Cookie ?? "", StringComparison.Ordinal);
+            var savedAt = c.QqMusic.CookieSavedAtUtc;
+            c.QqMusic = incoming.QqMusic ?? new QqMusicConfig();
+            if (sameCookie) c.QqMusic.CookieSavedAtUtc = savedAt;
             c.Bgm = incoming.Bgm;
             c.Device = incoming.Device;
             c.Clock = incoming.Clock;
@@ -267,6 +292,8 @@ public sealed class ConfigService : IDisposable
         c.Clock.MapOffsets = new Dictionary<string, int[]>(c.Clock.MapOffsets ?? new Dictionary<string, int[]>(), StringComparer.Ordinal);
         c.Wz.DataPath ??= "";
         c.QqMusic.Cookie ??= "";
+        c.QqMusic.GatewayScript ??= "";
+        c.QqMusic.SearchKeyword ??= "";
         var src = (c.Bgm.DefaultSource ?? "").Trim().ToLowerInvariant();
         c.Bgm.DefaultSource = src.Length == 0 ? "wz" : src;
     }

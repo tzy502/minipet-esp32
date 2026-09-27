@@ -54,6 +54,8 @@ static httpd_handle_t s_httpd;
 static TaskHandle_t   s_dns_task;
 static TaskHandle_t   s_portal_task;
 static EventGroupHandle_t s_wifi_events;   /* IDF5：句柄类型是 EventGroupHandle_t */
+static volatile bool s_conn_busy;   /* connect_sta 并发门闩：poller 与 state_machine 会同时调用 */
+static bool s_sta_connected;        /* STA 已拿到 IP：GOT_IP 置位 / DISCONNECTED 清位（防循环重连掐断活连接） */
 #define WIFI_GOT_IP_BIT   BIT0
 #define WIFI_FAIL_BIT     BIT1
 
@@ -500,16 +502,66 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
             wifi_event_sta_disconnected_t *d = (wifi_event_sta_disconnected_t *)data;
             reason = d->reason;
         }
+        s_sta_connected = false;
         ESP_LOGW(TAG, "WiFi 断开 reason=%d（205=握手失败 201=无AP 8=离开 15=4路超时 202=认证失败）", reason);
         xEventGroupSetBits(s_wifi_events, WIFI_FAIL_BIT);
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *e = (ip_event_got_ip_t *)data;
         ESP_LOGI(TAG, "WiFi GOT_IP: " IPSTR, IP2STR(&e->ip_info.ip));
+        s_sta_connected = true;
         xEventGroupSetBits(s_wifi_events, WIFI_GOT_IP_BIT);
     }
 }
 
-static volatile bool s_conn_busy;   /* connect_sta 并发门闩：poller 与 state_machine 会同时调用 */
+/* ================================================================== */
+/* 冷启动时间种子（问题7）：S3 内部时钟断电即 1970，断网冷启动无人校时。  */
+/* 开机首次 WiFi 初始化处（portal 与正常联网两条路径的公共必经点，且      */
+/* app_main 已先行 rtc_pcf85063_init）读 PCF85063——有效则 settimeofday   */
+/* 种子系统时钟；RTC 未校准（首次上电 OS 标志/字段非法）则跳过等 SNTP。   */
+/* ================================================================== */
+static bool s_rtc_seeded;          /* 每次开机只种一次 */
+
+/* UTC 日历 → Unix epoch（Hinnant days_from_civil，同 clock_digits.c：
+ * 工具链 picolibc 无 timegm，且不依赖 TZ 环境变量） */
+static int64_t utc_to_epoch(const struct tm *t)
+{
+    int64_t y = t->tm_year + 1900;
+    unsigned m = (unsigned)t->tm_mon + 1;
+    unsigned d = (unsigned)t->tm_mday;
+    y -= (m <= 2);
+    int64_t era  = (y >= 0 ? y : y - 399) / 400;
+    unsigned yoe = (unsigned)(y - era * 400);                       /* [0,399] */
+    unsigned doy = (153u * (m + (m > 2 ? -3u : 9u)) + 2u) / 5u + d - 1u;
+    unsigned doe = yoe * 365u + yoe / 4u - yoe / 100u + doy;
+    int64_t days = era * 146097 + (int64_t)doe - 719468;
+    return days * 86400 + t->tm_hour * 3600 + t->tm_min * 60 + t->tm_sec;
+}
+
+static void seed_time_from_rtc_once(void)
+{
+    if (s_rtc_seeded) return;
+    s_rtc_seeded = true;
+
+    struct tm tm_rtc = { 0 };
+    /* 有效判据同 clock_digits：年份 >= 2020 且各字段合法（首次上电/坏数据
+     * 一律视为未校准）。驱动口径 = UTC 日历（rtc_pcf85063.h）。 */
+    if (mp_rtc_get_time(&tm_rtc) &&
+        tm_rtc.tm_year >= 120 &&
+        tm_rtc.tm_mon  >= 0 && tm_rtc.tm_mon  <= 11 &&
+        tm_rtc.tm_mday >= 1 && tm_rtc.tm_mday <= 31 &&
+        tm_rtc.tm_hour >= 0 && tm_rtc.tm_hour <= 23 &&
+        tm_rtc.tm_min  >= 0 && tm_rtc.tm_min  <= 59 &&
+        tm_rtc.tm_sec  >= 0 && tm_rtc.tm_sec  <= 60) {
+        int64_t epoch = utc_to_epoch(&tm_rtc);
+        struct timeval tv = { .tv_sec = (time_t)epoch, .tv_usec = 0 };
+        settimeofday(&tv, NULL);
+        ESP_LOGI(TAG, "RTC 种子系统时钟: epoch=%lld (%04d-%02d-%02d %02d:%02d:%02d UTC)",
+                 (long long)epoch, tm_rtc.tm_year + 1900, tm_rtc.tm_mon + 1,
+                 tm_rtc.tm_mday, tm_rtc.tm_hour, tm_rtc.tm_min, tm_rtc.tm_sec);
+    } else {
+        ESP_LOGW(TAG, "RTC 未校准（首次上电或读数无效），系统时钟暂为 1970，等 SNTP 校准");
+    }
+}
 
 static void wifi_init_once(void)
 {
@@ -531,6 +583,7 @@ static void wifi_init_once(void)
 
     s_wifi_events = xEventGroupCreate();
     s_wifi_inited = true;
+    seed_time_from_rtc_once();   /* 问题7：断网冷启动用 RTC 种子系统时钟（一次性） */
 }
 
 static void wifi_start_ap(const char *ssid)
@@ -580,9 +633,14 @@ static bool sntp_and_set_rtc(void)
 
     setenv("TZ", "CST-8", 1);                     /* 东八区 */
     tzset();
-    ESP_LOGI(TAG, "SNTP synced: %04d-%02d-%02d %02d:%02d:%02d",
-             tm_now.tm_year + 1900, tm_now.tm_mon + 1, tm_now.tm_mday,
-             tm_now.tm_hour, tm_now.tm_min, tm_now.tm_sec);
+    /* 同步成功一次性日志：epoch + ctime（ctime_r 在 tzset 后取，为东八区
+     * 本地时间，与屏显口径一致；epoch 恒为 UTC 不受影响。本函数每次开机
+     * 至多执行一次，不存在刷屏问题） */
+    char tbuf[32];
+    ctime_r(&now, tbuf);
+    size_t tlen = strlen(tbuf);
+    if (tlen > 0 && tbuf[tlen - 1] == '\n') tbuf[tlen - 1] = 0;
+    ESP_LOGI(TAG, "SNTP synced: epoch=%lld (%s)", (long long)now, tbuf);
     if (!mp_rtc_set_time(&tm_now)) {              /* PCF85063（hal_contract 适配） */
         ESP_LOGW(TAG, "RTC write failed");
         return false;
@@ -689,6 +747,7 @@ esp_err_t provision_wifi_connect_sta(uint32_t timeout_ms)
     }
     mp_nvs_get_str("wifi_pass", pass, sizeof(pass));
 
+    if (s_sta_connected) return ESP_OK;   /* 已连接：绝不可断开重连（会掐断活连接→闪烁/轮询失败循环） */
     wifi_init_once();
     bool owner = false;
     if (!s_conn_busy) { s_conn_busy = true; owner = true; }
@@ -723,6 +782,7 @@ esp_err_t provision_wifi_connect_sta(uint32_t timeout_ms)
     e = esp_wifi_set_config(WIFI_IF_STA, &sta);
     if (e != ESP_OK) {
         ESP_LOGE(TAG, "set_config 失败: %s", esp_err_to_name(e));
+        s_conn_busy = false;   /* 门闩复位：否则本函数永远走「共享等待」死路（再无人推进连接） */
         return e;
     }
 

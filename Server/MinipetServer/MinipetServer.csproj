@@ -23,4 +23,15 @@
     </Reference>
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- E12/E13 出厂种子随 publish 进镜像（Dockerfile 只拷 /app/publish，不拷仓库 Server/ 源目录）：
+         容器 ContentRoot=/app 下没有 Server/seed → Link 到输出根的 seed/，
+         DeviceProfile.FindSeedRoot 的第二候选布局即此。字体三档 JSON ~4.2MB 是主要体积；
+         默认装扮（新设备 provisioning）+ profile（导出视口）同源。 -->
+    <Content Include="../seed/**/*"
+             Link="seed/%(RecursiveDir)%(Filename)%(Extension)"
+             CopyToOutputDirectory="PreserveNewest"
+             CopyToPublishDirectory="PreserveNewest" />
+  </ItemGroup>
+
 </Project>

@@ -3,10 +3,10 @@ import { onMounted, onBeforeUnmount, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import {
   NGrid, NGridItem, NCard, NButton, NBadge, NEmpty, NResult, NSpin, NAlert,
-  NModal, NForm, NFormItem, NInput, NTag, NSpace, NAvatar, useMessage,
+  NModal, NForm, NFormItem, NInput, NTag, NSpace, useMessage,
 } from 'naive-ui'
 import { useDevicesStore } from '../stores/devices'
-import { thumbUrl } from '../api/client'
+import DevicePetThumb from '../components/DevicePetThumb.vue'
 import { fmtAgo } from '../utils/format'
 
 const router = useRouter()
@@ -116,8 +116,10 @@ function goDetail(id) {
             </n-tag>
           </template>
           <div class="card-body">
+            <!-- 缩略图 = 该设备真实装扮（petConfig → buildPaperdollId → /admin/thumb?type=paperdoll）；
+                 无自定义装扮时回落 seed 神子外观（语义即「默认宠物」） -->
             <n-badge value="宠" :offset="[-4, 4]" color="#c2c2c2">
-              <n-avatar :size="64" :src="thumbUrl('paperdoll', d.deviceId)" object-fit="cover" round />
+              <DevicePetThumb :device="d" :size="64" />
             </n-badge>
             <div class="meta">
               <div>{{ d.deviceId }}</div>
