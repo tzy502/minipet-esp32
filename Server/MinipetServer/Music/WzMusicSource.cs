@@ -24,6 +24,34 @@ public sealed class WzMusicSource : IMusicSource
         _catalog = catalog;
     }
 
+    /* 【E8 出声主路径修复 2026-09-27】设备端曲目 id 是 AUDIO_META 里的 u32
+     * （XxHash32(trackKey)，见 Export/AudioMetaWriter.cs:36-38），而本类只认
+     * 字符串 key（"Bgm00.img/SleepyWood"）。此前数字 id 直接进 WZ 提取分支 →
+     * rel.Split('/').Length==1 → FileNotFoundException「曲目不存在：<数字>」→
+     * 设备点播必然 503（与网络无关的代码级断点）。
+     * 现建 u32 → trackKey 反查表（懒建，曲库变化时按数量失配自动重建）。 */
+    private Dictionary<uint, string>? _idToKey;
+
+    private Dictionary<uint, string>? IdToKey(CancellationToken ct)
+    {
+        if (_idToKey != null) return _idToKey;
+        try
+        {
+            var list = ListTracksAsync(ct).GetAwaiter().GetResult();
+            var map = new Dictionary<uint, string>(list.Count);
+            foreach (var t in list)
+            {
+                if (!string.IsNullOrEmpty(t.Id)) map[MiniPet.Export.AudioMetaWriter.TrackIdForKey(t.Id)] = t.Id;
+            }
+            _idToKey = map;
+            return map;
+        }
+        catch
+        {
+            return null;   /* 曲库不可用：退回原行为（字符串 key 仍可直取） */
+        }
+    }
+
     public string Name => "wz";
     public bool IsEnabled => true;
 
@@ -65,6 +93,16 @@ public sealed class WzMusicSource : IMusicSource
         if (string.IsNullOrWhiteSpace(trackId)) throw new ArgumentException("trackId 为空", nameof(trackId));
         var rel = trackId.Trim().Replace('\\', '/');
         if (rel.Contains("..")) throw new FileNotFoundException($"非法曲目 id：{trackId}");
+
+        // 0) 纯数字 = 设备侧 AUDIO_META 的 u32 id → 反查 trackKey（E8 出声主路径）
+        if (rel.Length > 0 && rel.All(char.IsAsciiDigit))
+        {
+            var map = IdToKey(ct);
+            if (map != null && uint.TryParse(rel, out var num) && map.TryGetValue(num, out var key))
+                rel = key;
+            else
+                throw new FileNotFoundException($"曲目 id 无法反查（AUDIO_META 未导出或曲库变更）：{trackId}");
+        }
 
         // 1) 磁盘优先（历史目录形态 / 已提取缓存）
         var full = Path.GetFullPath(Path.Combine(_root, rel + ".mp3"));

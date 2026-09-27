@@ -303,6 +303,9 @@ static void poller_task(void *arg)
             continue;
         }
 
+        /* E9 常态化校时：借本任务执行（不新建 rtcsync 任务，绕开内部堆碎片） */
+        provision_rtc_resync_step();
+
         bool ok = do_poll_once();
 
         if (ok) {

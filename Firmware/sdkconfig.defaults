@@ -52,3 +52,7 @@ CONFIG_LV_FONT_MONTSERRAT_28=y
 # 诊断期若确需 panic 回溯，临时改 y 并同步 watchdog.c（trigger_panic 跟随本项），
 # 用完必须回 n：docs/ai/technical-reference.md「临时件清理清单」同源。
 CONFIG_ESP_TASK_WDT_PANIC=n
+
+# E11 OTA 真回滚（2026-09-27）：新固件能启动但坏了时由 bootloader 回滚旧分区。
+# 已在 ota.c:164-168 / state_machine.c:372 调 esp_ota_mark_app_valid_cancel_rollback()。
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y

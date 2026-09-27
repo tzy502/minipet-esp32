@@ -156,7 +156,7 @@ void mp_orient_calib_tap(void)
  * 表现为设备每 ~2.7s 一轮重启循环（网络 GOT_IP 那一刻崩）。
  * 修法：app_main 只做"起一个带大栈的 app_main_task"，全部启动逻辑搬进去。
  * 大栈分配失败时回退到原行为（原栈上直接跑），至少不改变既有可用性。 */
-#define MP_MAIN_STACK  16384
+#define MP_MAIN_STACK  12288
 
 static void app_main_task(void *arg);
 

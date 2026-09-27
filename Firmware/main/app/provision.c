@@ -720,6 +720,36 @@ void provision_wifi_preinit(void)
 static volatile bool s_rtc_started;
 bool provision_rtc_task_running(void) { return s_rtc_started; }
 
+/* 【绕开内部堆碎片 2026-09-27】不新建任务，改由 poller 任务周期调用本函数：
+ * 实测内部堆 112KB 但最大连续块仅 38KB 且 WiFi 初始化后碎片化，导致 3KB 任务
+ * 栈都分配失败（rtcsync/bgm 反复首建失败 → 时钟恒 --:--、BGM 无声）。
+ * 复用已在跑的 poller 任务，零新增内部 RAM。 */
+void provision_rtc_resync_step(void)
+{
+    static int64_t s_last_try_ms;
+    static bool    s_have_time;
+    int64_t now_ms = esp_timer_get_time() / 1000;
+
+    time_t now_s = time(NULL);
+    struct tm tmv = { 0 };
+    gmtime_r(&now_s, &tmv);
+    if (tmv.tm_year >= RTC_VALID_YEAR_MIN) {
+        if (!s_have_time) {
+            s_have_time = true;
+            ESP_LOGI(TAG, "系统时间有效（epoch=%lld）→ 校时停止重试", (long long)now_s);
+        }
+        return;                                  /* 已有效：不再尝试 */
+    }
+    if (now_ms - s_last_try_ms < 15000) return;  /* 15s 一次，别拖慢心跳 */
+    s_last_try_ms = now_ms;
+    if (!s_sta_connected) return;
+    ESP_LOGW(TAG, "系统时间未同步（RTC 未校准）→ 借 poller 任务触发 SNTP 校时");
+    if (sntp_and_set_rtc()) {
+        s_have_time = true;
+        ESP_LOGI(TAG, "常态化校时成功，待机时钟可用");
+    }
+}
+
 void provision_rtc_resync_start(void)
 {
     static bool started;
@@ -734,6 +764,16 @@ void provision_rtc_resync_start(void)
         s_rtc_started = true;
     } else {
         ESP_LOGW(TAG, "rtcsync 任务创建失败（内部堆挤压）→ 稍后重试");
+        /* 【碎片取证 2026-09-27】打印内部堆布局：定位"38KB 最大块却建不了
+         * 3KB 任务"的真实原因（区域碎片 vs 分配标志不匹配）。每 30s 限频。 */
+        {
+            static int64_t s_last_dump;
+            int64_t now_ms = esp_timer_get_time() / 1000;
+            if (now_ms - s_last_dump >= 30000) {
+                s_last_dump = now_ms;
+                dump_internal_heap();
+            }
+        }
     }
 }
 

@@ -35,6 +35,10 @@ public sealed class DeviceRecord
     public DeviceBgmPrefs Bgm { get; set; } = new();
     /// <summary>按设备阈值覆盖；null = 跟随全局配置（ConfigService.Device）。</summary>
     public DeviceThresholdsConfig? Thresholds { get; set; }
+    /// <summary>按设备台词气泡覆盖（E12）；null = 跟随全局配置（ConfigService.Speech）。
+    /// 供多设备差异化台词用（E13 每设备独立配置）；Web 侧暂未编辑此字段，手改 devices.json 即生效
+    ///（SpeechScheduler 每拍读设备表快照，无需重启）。</summary>
+    public SpeechConfig? Speech { get; set; }
     public string Firmware { get; set; } = "";
     public DateTime? LastSeenUtc { get; set; }
     public DateTime CreatedAtUtc { get; set; } = DateTime.UtcNow;

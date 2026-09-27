@@ -24,7 +24,7 @@ static const char *TAG = "sd_tf";
 #define SD_SPI_HOST     SPI3_HOST    /* 显示在 SPI2_HOST，互不干扰 */
 #define SD_SPI_HZ       20000000     /* 20MHz：GPIO 矩阵 + 卡兼容性稳妥档 */
 #define SD_MOUNT_POINT  "/sdcard"
-#define SD_MAX_FILES    8            /* manifest + 多个素材包并发流式读 */
+#define SD_MAX_FILES    4            /* 内部堆紧张：4 足够 manifest+1 包并发 */
 
 /* TF 挂载失败时的兜底：内部 Flash 的 "assets" FAT 分区挂到同一 /sdcard
  * （出厂预置默认素材，无 TF 也能起播——design-review 3.11 出厂保底） */

@@ -24,6 +24,13 @@ README.md
 **/.vite
 **/coverage
 
+# 源码树里的旧 Web 产物（.gitignore 的本地构建残留，只有 .gitkeep 入库）：
+# 它会被 `COPY Server/ ./Server/`（Dockerfile:55）带进构建上下文 → Microsoft.NET.Sdk.Web
+# 的 publish 把 wwwroot 当内容一起发布（本机实证：publish 输出 wwwroot/index.html 引
+# assets/index-B3Oa4XgL.js）→ 在 final stage 覆盖 webbuild 刚构建的新 UI
+# （线上容器跑旧 Web UI 的根因之一，2026-09-27 修）。镜像里的 /app/wwwroot 只许来自 webbuild。
+Server/MinipetServer/wwwroot
+
 # 运行时数据与本地环境文件（绝不能进镜像）
 data
 .env

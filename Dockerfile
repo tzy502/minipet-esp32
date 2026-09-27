@@ -40,6 +40,11 @@ RUN set -eux; \
         printf '<!doctype html><meta charset="utf-8"><title>MiniPet</title><p>Web UI build produced no dist/.' > dist/index.html; \
       }; \
     fi
+# 本次前端产物的指纹（final stage 断言 /app/wwwroot 就是这一份用；只传指纹文件，不重复拷 dist）
+RUN set -eux; \
+    cd dist; \
+    for f in $(find . -type f | sort); do sha256sum "$f"; done > /tmp/dist.sha256; \
+    wc -l < /tmp/dist.sha256
 
 # ---------- Stage 2: Server 发布 ----------
 FROM mcr.microsoft.com/dotnet/sdk:9.0 AS serverbuild
@@ -61,6 +66,17 @@ RUN dotnet publish Server/MinipetServer/MinipetServer.csproj \
 RUN set -eux; \
     ls /app/publish/runtimes/linux-x64/native/libSkiaSharp.so; \
     ls /app/publish/runtimes/linux-arm64/native/libSkiaSharp.so
+# 问题1 同类防复发（2026-09-27 层序修复）：publish 会把源码树里的 wwwroot
+# （Server/MinipetServer/wwwroot，.gitignore 的本地构建残留，被上面 COPY Server/ 带进
+# 构建上下文）当内容一起发布出去。本机实证（同版本源码）：
+#   dotnet publish Server/MinipetServer/MinipetServer.csproj -c Debug -o /tmp/mp-publish-check
+#   → /tmp/mp-publish-check/wwwroot/index.html 引 assets/index-B3Oa4XgL.js（旧代）
+# 原 Dockerfile 顺序「先 COPY dist 到 ./wwwroot，再 COPY publish ./」时，这一坨旧 UI 会
+# 目录合并覆盖掉本次前端构建产物 → 线上容器跑旧 Web UI。这里从源头剔除，
+# 保证 publish 产物永远不含 wwwroot（final stage 的断言是第二道防线）。
+RUN set -eux; \
+    rm -rf /app/publish/wwwroot; \
+    test ! -e /app/publish/wwwroot
 
 # ---------- Stage 3: 运行时 ----------
 FROM mcr.microsoft.com/dotnet/aspnet:9.0 AS final
@@ -82,11 +98,32 @@ RUN apt-get update \
 # 这里统一放置到 /usr/bin/node 供 QqGatewayProcess 拉起。
 COPY --from=node:22-bookworm-slim /usr/local/bin/node /usr/bin/node
 
+# .NET 发布产物（上面 serverbuild 已剔除 wwwroot —— 防止旧 UI 目录合并覆盖新产物）
+COPY --from=serverbuild /app/publish ./
+
 # Vue 构建产物 → wwwroot（api 直接托管，同源无 CORS/nginx）
 COPY --from=webbuild /src/dist ./wwwroot
+# 本次前端产物指纹（webbuild 产出；只传指纹文件，不重复拷 dist 膨胀镜像）
+COPY --from=webbuild /tmp/dist.sha256 /tmp/dist.sha256
 
-# .NET 发布产物
-COPY --from=serverbuild /app/publish ./
+# ── 构建期断言 [assert-wwwroot]（防复发；风格同 serverbuild 的 SkiaSharp 断言）──────
+# ① wwwroot/index.html 引用的 JS 必须在本次前端构建产物（/tmp/dist.sha256 指纹表）里真实存在：
+#    旧 UI 被目录合并回来时，index.html 指向的 assets/index-<旧hash>.js 在新产物里不存在 → 构建失败；
+# ② wwwroot 的文件集 + 每个文件的 sha256 必须与本次 dist 指纹表逐字节一致（多一个旧代文件即失败）；
+# ③ 占位首页路径（Web/ 无 package.json / 构建未产出 dist）显式打印警告，不做 JS 断言但 ② 仍生效。
+RUN set -eux; \
+    ref="$(grep -oE 'assets/[A-Za-z0-9._-]+\.js' ./wwwroot/index.html | head -n1 || true)"; \
+    if [ -n "$ref" ]; then \
+      ls -l "./wwwroot/$ref"; \
+      grep -F "$ref" /tmp/dist.sha256; \
+    else \
+      echo '警告：wwwroot/index.html 未引用 assets/*.js —— 占位首页路径（本次前端构建无产物）'; \
+    fi; \
+    (cd ./wwwroot && for f in $(find . -type f | sort); do sha256sum "$f"; done) > /tmp/wwwroot.sha256; \
+    echo "本次前端产物文件数：$(wc -l < /tmp/dist.sha256)"; \
+    test "$(cat /tmp/dist.sha256)" = "$(cat /tmp/wwwroot.sha256)"; \
+    echo 'wwwroot 断言通过：镜像内 UI = 本次前端构建产物'; \
+    rm -f /tmp/wwwroot.sha256
 
 ENV TZ=Asia/Shanghai
 

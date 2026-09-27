@@ -31,6 +31,7 @@ builder.Services.AddSingleton<IMusicSource>(sp => sp.GetRequiredService<QqMusicS
 builder.Services.AddSingleton<BgmRouter>();              // 音源路由 + 同源降级（E8）
 builder.Services.AddSingleton<QqGatewayClient>();        // QQ node 网关 HTTP 客户端（契约见类头）
 builder.Services.AddSingleton<QqGatewayProcess>();       // QQ 网关子进程（拉起/健康检查/重启 1 次；IDisposable）
+builder.Services.AddSingleton<SpeechScheduler>();        // 随机台词气泡（E12：静置调度 → bubble 指令；IDisposable）
 builder.Services.AddSingleton<CacheManager>();           // WZ 位图/精灵 LRU（纸娃娃缩略图渲染共享）
 builder.Services.AddSingleton<WzService>();              // WZ 读取（catalog API / 纸娃娃真实缩略图共用）
 builder.Services.AddSingleton<MusicCatalogService>();    // WZ 曲库目录（BGM 曲目列表/决策共用）
@@ -54,6 +55,8 @@ var router = app.Services.GetRequiredService<BgmRouter>();
 _ = app.Services.GetRequiredService<DeviceManifestService>();
 // QQ 网关子进程：早绑定单例 → 启动即按配置开关巡检（未配置则空转），退出时 DI 调 Dispose 杀进程树
 _ = app.Services.GetRequiredService<QqGatewayProcess>();
+// E12 随机台词气泡调度：早绑定单例 → 构造即起定时器（同上；配置/设备表都按拍读快照，无热重载耦合）
+_ = app.Services.GetRequiredService<SpeechScheduler>();
 cfgSvc.Changed += e =>
     app.Logger.LogInformation("[Config] 已热重载（external={External}，WZ={Wz}）", e.External, e.New.Wz.DataPath);
 router.Failover += e =>

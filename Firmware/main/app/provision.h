@@ -58,6 +58,9 @@ void provision_wifi_preinit(void);
 /* 校时任务是否已成功创建（供失败重试判定）。 */
 bool provision_rtc_task_running(void);
 
+/* 校时单步（由已存在的任务周期调用，避免新建任务栈）。 */
+void provision_rtc_resync_step(void);
+
 #ifdef __cplusplus
 }
 #endif
