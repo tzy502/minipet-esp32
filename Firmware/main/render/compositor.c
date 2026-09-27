@@ -480,10 +480,23 @@ static void ent_screen_pos_at(int32_t tilt_mdeg, int32_t *sx, int32_t *sy)
     int32_t drag_x = g_ent_cbox_ok ? g_drag_off_x : 0;
     int32_t drag_y = g_ent_cbox_ok ? g_drag_off_y : 0;
 
-    *sx = g_sw / 2 + g_ent_cx0 * RC_SCALE + RC_ENT_CENTER_OFF_X
+    /* 【落点修复 2026-09-27 · 用户报"渲染位置不对，应与屏幕正中心重叠"】
+     * 实体缓冲是 480×440，而填充进缓冲的可见内容只有画布 2x 那么大
+     * （如 107×84 → 214×168），**缓冲里未覆盖的部分是透明的**。原公式把缓冲
+     * 左上角当作可见内容左上角来摆，于是：
+     *   sy = 480 - 40 = 440 → 可见区（168 高）被顶到屏底，只剩底部 40px 露出来
+     * ——真机表现就是"右下角一小块白块"。
+     * 正确做法：把"可见内容在缓冲内的偏移"补偿掉——内容在缓冲内水平居中
+     * （canvas 超限时 cx0=-max_w/2）与纵向留白都要减去，使**可见内容**居中/贴底。 */
+    /* 水平方向：实体缓冲只有 480 宽，而内容宽 2*cw 可能小于它，**偶数宽度下
+     * 左右各留白相同**，所以左内边距是 (RC_ENT_W - 2*cw)/2（不是整份差值）。 */
+    int32_t pad_x = (RC_ENT_W - g_ent_cw * RC_SCALE) / 2;   /* 可见内容在缓冲内的左内边距 */
+    int32_t pad_y = RC_ENT_H - g_ent_ch * RC_SCALE;          /* 可见内容在缓冲内的下内边距 */
+
+    *sx = g_sw / 2 + g_ent_cx0 * RC_SCALE - pad_x + RC_ENT_CENTER_OFF_X
           + (g_ent_base_wx << RC_SCALE_SHIFT) + ent_tilt_off_px(tilt_mdeg)
           + drag_x;
-    *sy = g_sh - RC_ENT_MARGIN_B + g_ent_cy0 * RC_SCALE + RC_ENT_CENTER_OFF_Y
+    *sy = g_sh - RC_ENT_MARGIN_B + g_ent_cy0 * RC_SCALE - pad_y + RC_ENT_CENTER_OFF_Y
           + (g_ent_base_wy << RC_SCALE_SHIFT) + drag_y;
 }
 
@@ -812,12 +825,15 @@ static void recompose_entity(void)
         int64_t now_ms = esp_timer_get_time() / 1000;
         if (now_ms - s_rp_ms > 3000) {
             s_rp_ms = now_ms;
-            ESP_LOGW(TAG, "实体渲染：action=%s 帧 %u/%u pieces=%u 画布 cbox=(%d,%d %dx%d) "
-                          "原点=(%d,%d) tilt=%d",
+            int32_t pbx, pby, pex, pey, pdw, pdh;
+            ent_screen_rect_at(g_tilt_mdeg, &pbx, &pby, &pex, &pey, &pdw, &pdh);
+            ESP_LOGW(TAG, "实体渲染：action=%s 帧 %u/%u pieces=%u 画布=(%d,%d %dx%d) "
+                          "落点=(%d,%d %dx%d) tilt=%d drag=(%d,%d)",
                      lt->action, (unsigned)g_anim.frame_idx, (unsigned)lt->frame_count,
                      (unsigned)fr->piece_count,
                      (int)g_ent_cx0, (int)g_ent_cy0, (int)g_ent_cw, (int)g_ent_ch,
-                     (int)g_ent_base_wx, (int)g_ent_base_wy, (int)g_tilt_mdeg);
+                     (int)pex, (int)pey, (int)pdw, (int)pdh, (int)g_tilt_mdeg,
+                     (int)g_drag_off_x, (int)g_drag_off_y);
         }
     }
     /* 帧内 piece 列表顺序 = 权威绘制序（导出端按桌面 RenderFrame 底→顶排列：

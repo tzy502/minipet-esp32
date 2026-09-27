@@ -73,29 +73,6 @@ mp_app_config_t g_mp_cfg = {
 /* ------------------------------------------------------------------ */
 /* APP 核任务                                                            */
 /* ------------------------------------------------------------------ */
-/* 日志 vprintf：直写 ROM UART，FIFO 满即丢 —— 绝不阻塞调用任务（见 app_main_task 注释）。 */
-static int mp_log_vprintf_nonblocking(const char *fmt, va_list ap)
-{
-    char buf[256];
-    int n = vsnprintf(buf, sizeof(buf), fmt, ap);
-    if (n <= 0) return n;
-    size_t len = (size_t)n < sizeof(buf) - 1 ? (size_t)n : sizeof(buf) - 1;
-    /* 【真·非阻塞 · 且写对通道 2026-09-27】两处纠正：
-     * ① 板子控制台是 **USB-Serial-JTAG**（CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y），
-     *    不是 UART0 —— 之前往 0x3FF40000 写等于写进没人用的外设，日志全丢；
-     * ② 日志写入必须**不阻塞**：没人读串口时（设备挂墙上、无监视器）USB-JTAG 的
-     *    IN FIFO 填满后，默认写路径会把调用任务挂死 → 渲染任务 >5s 不喂狗 →
-     *    看门狗三振 `esp_restart()`，表现为设备每 ~2.5 分钟自我复位
-     *    （服务端事件日志里 `boot` 与 `pickup` 成对出现的真因）。
-     * 这里直接写 USB-Serial-JTAG 的 EP1 数据寄存器，并在 CONF 里置 WR_DONE；
-     * FIFO 满则由硬件丢弃，**绝不阻塞**。 */
-    for (size_t i = 0; i < len; i++) {
-        REG_WRITE(USB_SERIAL_JTAG_EP1_REG, (uint32_t)(uint8_t)buf[i]);
-        REG_WRITE(USB_SERIAL_JTAG_EP1_CONF_REG, USB_SERIAL_JTAG_WR_DONE);
-    }
-    return n;
-}
-
 /* 渲染任务：30fps 帧循环；每帧先排空 cmd_q（net→render 指令落地），
  * 再 render_tick 一帧，最后喂看门狗（E14 渲染心跳）。 */
 static void render_task(void *arg)
@@ -221,7 +198,6 @@ static void app_main_task(void *arg)
      * 这里把日志接到 ROM 的 UART 直写：FIFO 满就丢弃本行，**绝不阻塞**；
      * 不碰 newlib 锁（此前用 uart_vfs_dev_use_driver 在 main_task 上下文里
      * 触发 newlib 锁空指针崩溃 —— 已由 addr2line 定位并移除）。 */
-    esp_log_set_vprintf(mp_log_vprintf_nonblocking);
 
     /* NVS（配网凭据/服务器地址/看门狗计数/BGM 偏好都住这里） */
     esp_err_t err = nvs_flash_init();
