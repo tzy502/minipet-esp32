@@ -220,6 +220,12 @@ static int tbl_step_locked(int dir)
 /* bgm/cmd 回传（E8：设备端现场控制）                                    */
 /* ------------------------------------------------------------------ */
 static const char *source_str(mp_bgm_source_t s) { return s ? "qq" : "wz"; }
+
+/* 菜单标签用：当前源显示名（大写便于 5x7/拉丁字体判读） */
+const char *bgm_source_name(void)
+{
+    return (s_source == MP_BGM_SRC_QQ) ? "QQ" : "WZ";
+}
 /* 发控制命令并取回应答 id（next/prev/play 用）；纯回传可忽略应答 */
 static int bgm_cmd(const char *cmd, int n, int *out_id)
 {

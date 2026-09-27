@@ -702,7 +702,23 @@ static void menu_activate(int idx)
         if      (idx == 0) menu_bgm_toggle();
         else if (idx == 1) bgm_prev();                  /* 本地曲目表循环，表空回退服务端 */
         else if (idx == 2) bgm_next();
-        else if (idx == 3) menu_goto(MENU_PAGE_ROOT);   /* Back 行 */
+        else if (idx == 3) bgm_volume_add(-10);         /* E6：控制条音量 - */
+        else if (idx == 4) bgm_volume_add(+10);         /* E6：控制条音量 + */
+        else if (idx == 5) {                            /* E8：设备端先选类型（切源） */
+            mp_bgm_source_t cur = bgm_get_source();
+            mp_bgm_source_t nxt = (cur == MP_BGM_SRC_WZ) ? MP_BGM_SRC_QQ : MP_BGM_SRC_WZ;
+            if (bgm_source_greyed(nxt)) {
+                menu_hint_set("SOURCE UNAVAILABLE");
+            } else {
+                mp_audio_msg_t m = { .type = MP_AUDIO_SOURCE, .a = (int32_t)nxt };
+                if (mp_post_audio(&m)) menu_hint_set("SOURCE SWITCHED");
+                else ESP_LOGW(TAG, "audio_q 满，切源丢失");
+            }
+            s_menu.pend_page = s_menu.page;   /* 原地重建以刷新标签/置灰 */
+            s_menu.pend_sel  = s_menu.sel;
+            s_menu.req_rebuild = true;
+        }
+        else if (idx == 6) menu_goto(MENU_PAGE_ROOT);   /* Back 行 */
         break;
     }
 }
@@ -936,11 +952,27 @@ static void menu_rebuild(void)
         lv_obj_align(s_menu.status_label, LV_ALIGN_TOP_MID, 0, 96);
         menu_bgm_status_refresh();
 
-        menu_add_row(scr, 0, "Play / Pause", 170, 54, true);
-        menu_add_row(scr, 1, "Prev",          238, 54, true);
-        menu_add_row(scr, 2, "Next",          306, 54, true);
-        menu_add_row(scr, 3, "< Back",        374, 54, true);
-        s_menu.row_cnt = 4;
+        /* 【E6/E8 补齐 2026-09-27】需求：控制条含【音量】；「设备上先选类型」
+         * （WZ/QQ 曲库切换）；「某源整体不可用 → 设备该源入口置灰」。
+         * 此前 BGM 页只有 Play/Pause/Prev/Next，音量只挂物理键、无切源入口、
+         * bgm_source_greyed() 零调用者（置灰从未生效）。 */
+        menu_add_row(scr, 0, "Play / Pause", 150, 48, true);
+        menu_add_row(scr, 1, "Prev",          202, 48, true);
+        menu_add_row(scr, 2, "Next",          254, 48, true);
+        menu_add_row(scr, 3, "Vol -",         306, 48, true);
+        menu_add_row(scr, 4, "Vol +",         358, 48, true);
+        /* 切源行：置灰跟随 bgm_source_greyed()（该源整体不可用 → 不可点） */
+        {
+            bool wz_grey = bgm_source_greyed(MP_BGM_SRC_WZ);
+            bool qq_grey = bgm_source_greyed(MP_BGM_SRC_QQ);
+            char src_label[48];
+            snprintf(src_label, sizeof(src_label), "Source: %s%s",
+                     bgm_source_name(), (wz_grey && qq_grey) ? " (BOTH DOWN)" : "");
+            /* 两个源都不可用才整体置灰；否则可点切换 */
+            menu_add_row(scr, 5, src_label, 410, 48, !(wz_grey && qq_grey));
+        }
+        menu_add_row(scr, 6, "< Back",        462, 48, true);
+        s_menu.row_cnt = 7;
         menu_add_hint(scr, "TOUCH OR TOP KEY");
         break;
     }

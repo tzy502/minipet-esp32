@@ -24,6 +24,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_system.h"
+#include "esp_random.h"
 #include "esp_log.h"
 
 static const char *TAG = "sm";
@@ -33,6 +34,7 @@ static const char *TAG = "sm";
 #include "hal_contract.h"
 #include "watchdog.h"
 #include "provision.h"
+#include "input_dispatch.h"   /* E7：切换后随机表情 */
 #include "clock_digits.h"    /* CLOCK_ANCHOR_AUTO（问题3 默认居中锚点） */
 #include "http_client.h"
 #include "asset_dl.h"
@@ -468,6 +470,20 @@ static void dispatch_action(const char *action)
 }
 
 /* 按 hash 换装扮（E13）：hash → parts 路径 → render_set_parts */
+/* E7：切换（地图/装扮）完成后的随机表情反馈。
+ * 从 25 个实证表情里随机挑一个"有表现力但不突兀"的（排除 default/blink 这类
+ * 常态表情），持续 1.5s 后由既有表情 FSM 自动回 default。 */
+static void switch_random_expression(void)
+{
+    static const char *pool[] = {
+        MP_EXPR_SMILE, MP_EXPR_LOVE, MP_EXPR_CHEERS, MP_EXPR_SHINE,
+        MP_EXPR_WINK,  MP_EXPR_CHU,   MP_EXPR_GLITTER, MP_EXPR_HUM,
+    };
+    uint32_t k = esp_random() % (sizeof(pool) / sizeof(pool[0]));
+    ESP_LOGI(TAG, "E7 切换完成 → 随机表情 %s", pool[k]);
+    input_trigger_expression(pool[k], 1500);
+}
+
 static void dispatch_set_parts_by_hash(const char *hash)
 {
     char path[MP_MPK_PATH_MAX];
@@ -605,9 +621,13 @@ void app_cmd_dispatch(const mp_cmd_t *cmd)
         break;
     case MP_CMD_SET_MAP:
         dispatch_map(cmd->s);
+        /* 【E7 补齐 2026-09-27】需求：「切换完成后宠物反应 = 随机表情」。
+         * 此前切换路径无任何 render_set_expression 调用（核对报告列为缺口）。 */
+        switch_random_expression();
         break;
     case MP_CMD_SET_PARTS:
         dispatch_set_parts_by_hash(cmd->s);
+        switch_random_expression();   /* E7：换装完成同样给随机表情反馈 */
         break;
     case MP_CMD_BRIGHTNESS:
         display_brightness((uint8_t)cmd->a);

@@ -43,6 +43,9 @@ mp_bgm_source_t bgm_get_source(void);
 uint8_t bgm_get_volume(void);
 bool bgm_source_greyed(mp_bgm_source_t src);
 
+/* 源显示名（菜单标签用）："wz"/"qq"。 */
+const char *bgm_source_name(void);
+
 /* ---------------- 曲目表与播放控制（任意任务上下文，经 audio_q 异步生效）--- */
 
 /* 选曲播放：id 取自 AUDIO_META 曲目表（bgm_list 同源）。
