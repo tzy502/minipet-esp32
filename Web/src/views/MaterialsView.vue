@@ -320,7 +320,7 @@ onBeforeUnmount(() => clearTimeout(searchTimer))
               <div>收藏以本机 localStorage（<code>minipet.materials.favorites</code>）为真源 —— 离线/端点缺失时能力不减。</div>
               <div v-if="syncState === 'ok'">服务端端点 <code>GET/PUT /api/admin/materials/favorites</code> 在位：进入本页自动拉取合并（并集，本地不丢）。{{ lastSyncText }}</div>
               <div v-else-if="syncState === 'missing'">
-                服务端暂无收藏端点（探测 HTTP {{ syncNote || '404' }}）→ 同步未启用，收藏只在本机浏览器。
+                服务端暂无收藏端点（探测：{{ syncNote || '路由未注册' }}）→ 同步未启用，收藏只在本机浏览器。
                 接口需求已写入 <code>Web/docs/interfaces-needed-from-server.md</code> §T7。
               </div>
               <div v-else>探测未完成或不可达{{ syncNote ? `（${syncNote}）` : '' }}。</div>

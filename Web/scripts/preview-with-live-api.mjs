@@ -21,6 +21,13 @@
  *          3) GET  /api/admin/devices/{id} → 真实响应 + thresholds.imuSensitivity
  *             （服务端真加了字段时，详情页与设置页都会带出来）
  *          4) PUT  /api/admin/settings → 200 回显（不落盘，绝不动真实服务端配置）
+ *          5) GET/PUT /api/admin/materials/favorites → 200（T7 收藏端点在位；内存态，
+ *             预置 map:['200000100'] / npc:['9200000'] 用于验证「进页拉取合并（并集）+ 回推」。
+ *             真实服务端该路由 404 → 前端应判「端点缺失，收藏仅本机」）
+ *          6) GET /api/admin/music/sources → 真实响应 + 注入 qq「cookieStale=true /
+ *             cookieAgeDays=9 / gateway.scriptFound=false」形态，用于验证 T1 的
+ *             cookie 过期黄色告警与网关降级原因渲染（真实实例当前 cookie 为空，
+ *             字段被 WhenWritingNull 省略，浏览器里无法自然构造该分支）
  *   MOCK_PUSH_FAIL=400|404|503
  *       —— 故障注入：POST /api/admin/devices/{id}/push 直接回该状态码 + 服务端同款
  *          { "error": ... } 响应体，用于在真实浏览器里验证前端推送的错误分支
@@ -37,6 +44,8 @@ const PORT = Number(process.env.PORT || 5199)
 const API_TARGET = process.env.API_TARGET || 'http://<NAS_IP>:38090'
 const MOCK = process.env.MINIPET_MOCK === '1'
 const MOCK_PUSH_FAIL = Number(process.env.MOCK_PUSH_FAIL || 0)
+/** T7 收藏端点的内存态（mock 预置 2 条服务端收藏，验证「拉取合并」分支）。 */
+let MOCK_FAVORITES = { map: ['200000100'], npc: ['9200000'] }
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -155,6 +164,43 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, JSON.stringify({ ok: true, config: body, wzPathExists: true, mocked: true }), {
         'content-type': 'application/json',
       })
+    }
+    // 5) 素材收藏（T7/E4）：模拟「服务端已按 §T7 提供收藏存储」——
+    //    前端探针应判 supported=true（真实服务端 404 → missing），
+    //    进素材页自动拉取合并（并集）并回推。内存态，重启即清。
+    if (url.pathname === '/api/admin/materials/favorites') {
+      if (req.method === 'GET') {
+        return send(res, 200, JSON.stringify({ favorites: MOCK_FAVORITES, mocked: true }), { 'content-type': 'application/json' })
+      }
+      if (req.method === 'PUT') {
+        const body = JSON.parse((await readBody(req)).toString() || '{}')
+        if (!body.favorites || typeof body.favorites !== 'object' || Array.isArray(body.favorites)) {
+          return send(res, 400, JSON.stringify({ error: 'favorites 必须是对象', mocked: true }), { 'content-type': 'application/json' })
+        }
+        MOCK_FAVORITES = body.favorites
+        return send(res, 200, JSON.stringify({ ok: true, favorites: MOCK_FAVORITES, mocked: true }), { 'content-type': 'application/json' })
+      }
+    }
+    // 6) 音源健康（T1/E4）：真实响应 + 注入「cookie 已过期 + 网关降级」形态，
+    //    用于在真实浏览器里验证 cookie 告警（黄色 NAlert）与网关降级原因渲染
+    //    （真实实例当前 cookie 为空、cookieAgeDays 字段被省略，无法自然构造该分支）。
+    if (url.pathname === '/api/admin/music/sources' && req.method === 'GET') {
+      const r = await fetch(API_TARGET + url.pathname)
+      const data = await r.json()
+      const qq = (data.sources || []).find((s) => s.name === 'qq')
+      if (qq) {
+        qq.cookieStale = true
+        qq.cookieAgeDays = 9
+        qq.cookieSavedAtUtc = new Date(Date.now() - 9 * 86400e3).toISOString()
+        qq.gateway = {
+          enabled: true, scriptFound: false, running: false, healthy: false, cookieLoaded: false,
+          pid: 0, restarts: 0, lastProbeUtc: new Date().toISOString(),
+          lastError: '未找到网关脚本（MOCK 注入）',
+        }
+        qq.health = { ...(qq.health || {}), state: 1, detail: 'cookie 已保存 9 天（>7 天阈值）可能已失效，请重新导入；需外部 node 网关：未找到网关脚本（MOCK 注入）' }
+        data.mocked = true
+      }
+      return send(res, 200, JSON.stringify(data), { 'content-type': 'application/json' })
     }
   }
 

@@ -2,8 +2,15 @@
 /**
  * 曲库管理（E4/E8）：WZ 曲库浏览 + QQ 音源卡片 + 设备播放控制卡片。
  * - NDataTable：source 切换 wz/qq（GET /admin/music/tracks?source=），搜索 + 前端分页；
- * - QQ 卡：cookie 导入（POST .../sources/qq/cookie）、健康 NTag、启停 NSwitch
- *   （PUT .../sources/{name}；wz 为默认源不可停）。
+ * - QQ 卡（E4 告警 + E4 关键词入口）：
+ *     · cookie 导入（POST .../sources/qq/cookie）、健康 NTag、启停 NSwitch
+ *       （PUT .../sources/{name}；wz 为默认源不可停）；
+ *     · cookie 有效期告警：消费服务端已算好的 `cookieStale` / `cookieAgeDays` / `cookieSavedAtUtc`
+ *       （>7 天 → 黄色 NAlert「已保存 N 天…可能已失效」；未过期 → 「已保存 N 天」）；
+ *     · 网关降级原因：`gateway` 对象（QqGatewayStatus）+ `health.detail`（服务端聚合原因）——
+ *       网关本体不在仓库/镜像内，未配好时如实标注「需服务端配好网关」；
+ *     · 搜索关键词 qqMusic.searchKeyword（QQ 无全库概念，空 = 曲库恒空）：读写走**既有**
+ *       settings 通道（stores/settings.js load/save → PUT /admin/settings 全量同构回传）。
  * - 设备播放控制卡（本页顶部）：E8 定稿「控制入口在设备触摸屏，Web 只管曲库/歌单/cookie」，
  *   本卡是用户实测反馈「服务器页面也没有播放 bgm 的按钮」后的**超出需求的附加能力**，
  *   因此按「只读展示 + 探测到才启用的可选远程下发」做：
@@ -19,13 +26,15 @@ import {
   NButton, NSpin, NResult, NAlert, NTooltip, NSelect, NSlider, NDivider, useMessage,
 } from 'naive-ui'
 import {
-  musicTracks, listMusicSources, setMusicSourceEnabled, setQqCookie, getSettings,
+  musicTracks, listMusicSources, setMusicSourceEnabled, setQqCookie,
   listDevices, getDevice, getDeviceLogs, sendBgmCommand, probeBgmCommand, setDeviceBgmPrefs,
-  BGM_COMMAND, errText,
+  BGM_COMMAND, errText, musicStateKey, qqCookieInfo, qqGatewayInfo,
 } from '../api/client'
+import { useSettingsStore } from '../stores/settings'
 import { fmtBytes } from '../utils/format'
 
 const message = useMessage()
+const settingsStore = useSettingsStore()
 
 // ── 曲库 ────────────────────────────────────────────────────────────────
 const source = ref('wz')
@@ -86,8 +95,14 @@ const STATE_TAG = {
   down: { type: 'error', label: '不可用' },
   disabled: { type: 'default', label: '已停用' },
 }
+/**
+ * 健康标签。⚠ 服务端按**数字**序列化 MusicSourceState（实测 wz=0 / qq 停用=3）——
+ * 旧实现直接 `s.toLowerCase()` 会对 number 抛 TypeError（整页渲染失败）；这里先过
+ * client.js 的 musicStateKey() 归一（数字与字符串枚举两种形态都兼容）。
+ */
 function stateTag(s) {
-  return STATE_TAG[s?.toLowerCase()] ?? { type: 'default', label: s || '未知' }
+  const key = musicStateKey(s)
+  return STATE_TAG[key] ?? { type: 'default', label: s == null ? '未知' : String(s) }
 }
 
 async function loadSources() {
@@ -119,9 +134,13 @@ async function saveCookie() {
   try {
     const r = await setQqCookie(cookieText.value.trim())
     message.success(r?.imported ? 'cookie 已保存' : 'cookie 已清空')
-    cookieHint.value = r?.note || r?.health?.detail || ''
+    // 服务端导入响应里就带新鲜度（cookieStale/cookieAgeDays）——直接用于即时提示
+    cookieHint.value = r?.imported
+      ? `cookieSavedAtUtc=${r?.cookieSavedAtUtc ?? '—'} · ${r?.cookieStale ? '已过期（>7 天）' : `已保存 ${r?.cookieAgeDays ?? 0} 天`}`
+      : (r?.note || 'cookie 已清空')
     cookieText.value = ''
     loadSources()
+    loadQqConfig() // cookie 状态变了，「已导入 N 天」提示同步刷新
   } catch (e) {
     message.error(e?.serverError || 'cookie 保存失败')
   } finally {
@@ -129,14 +148,70 @@ async function saveCookie() {
   }
 }
 
-// 设置页之外顺带取一次 cookie 是否已配置（只在本地提示「已导入」，不回显明文）
+// 设置页之外顺带取一次 QQ 相关配置（cookie 是否已配置 + 曲库搜索关键词），不回显 cookie 明文
 const cookieConfigured = ref(false)
-async function probeCookie() {
+const keyword = ref('') // 表单值（qqMusic.searchKeyword）
+const savedKeyword = ref('') // 服务端当前值（用于「未保存」提示）
+const keywordSaving = ref(false)
+const configNote = ref('')
+
+/** 复用既有 settings 通道（stores/settings.js → GET /admin/settings），不新造读取方式。 */
+async function loadQqConfig() {
   try {
-    const s = await getSettings()
-    cookieConfigured.value = !!(s?.config?.qqMusic?.cookie)
-  } catch { /* 忽略：仅提示用 */ }
+    await settingsStore.load()
+    const c = settingsStore.config
+    cookieConfigured.value = !!c?.qqMusic?.cookie
+    savedKeyword.value = c?.qqMusic?.searchKeyword ?? ''
+    keyword.value = savedKeyword.value
+    configNote.value = ''
+  } catch (e) {
+    configNote.value = errText(e, 'QQ 配置读取失败')
+  }
 }
+
+/**
+ * 保存搜索关键词 → 复用既有 settings 写通道（PUT /admin/settings 全量同构回传）。
+ * 必须**先取最新全量配置**再改一个字段：服务端 `ConfigService.Replace` 是整段替换
+ * （wz/qqMusic/bgm/device/clock/speech 全部覆盖），只发 {qqMusic:{...}} 会把 WZ 路径等清空 → 400。
+ */
+async function saveKeyword() {
+  const next = keyword.value.trim()
+  keywordSaving.value = true
+  try {
+    await settingsStore.load() // 取最新快照，避免覆盖其它会话/页面的改动
+    const cfg = JSON.parse(JSON.stringify(settingsStore.config ?? {}))
+    cfg.qqMusic = { ...(cfg.qqMusic ?? {}), searchKeyword: next }
+    const r = await settingsStore.save(cfg)
+    savedKeyword.value = r?.config?.qqMusic?.searchKeyword ?? next
+    keyword.value = savedKeyword.value
+    configNote.value = ''
+    message.success(
+      savedKeyword.value
+        ? `搜索关键词已保存：${savedKeyword.value}`
+        : '搜索关键词已清空（QQ 曲库将为空）'
+    )
+    if (source.value === 'qq') loadTracks() // 关键词变了，曲库立即可见地重拉
+  } catch (e) {
+    const errs = e?.response?.data?.errors
+    const text = errs?.length ? errs.join('；') : errText(e, '保存失败')
+    configNote.value = text
+    message.error(text)
+  } finally {
+    keywordSaving.value = false
+  }
+}
+const keywordDirty = computed(() => keyword.value.trim() !== savedKeyword.value)
+
+// ── T1：cookie 有效期 + 网关降级原因（服务端已算好，前端只消费）─────────────
+/** cookie 新鲜度：cookieStale / cookieAgeDays / cookieSavedAtUtc（null 字段被服务端省略）。 */
+const cookieInfo = computed(() => qqCookieInfo(qq.value))
+/** 网关状态：gateway 是对象（QqGatewayStatus），非 "Ok/Degraded" 字符串。 */
+const gatewayInfo = computed(() => qqGatewayInfo(qq.value))
+/** 服务端聚合原因（health.detail）：cookie 过期 / 网关未就绪 / 未启用 都会在这里给全文。 */
+const healthDetail = computed(() => qq.value?.health?.detail || '')
+/** 整体非 Ok（state 0=Ok）：用于决定是否亮降级说明。 */
+const stateKey = computed(() => musicStateKey(qq.value?.health?.state))
+const degraded = computed(() => !!qq.value && qq.value.health?.state != null && stateKey.value !== 'ok')
 
 // ── 设备播放控制（E8 附加：只读展示 + 探测到才启用的远程下发）─────────────
 const DEVICE_KEY = 'minipet.music.deviceId'
@@ -315,7 +390,7 @@ watch(deviceId, () => {
 let refreshTimer = null
 onMounted(async () => {
   loadSources()
-  probeCookie()
+  loadQqConfig()
   loadTracks()
   // deviceId 由 loadDevices 选定 → watch(deviceId) 负责首次 loadDeviceInfo + probeBgm
   await loadDevices()
@@ -426,7 +501,7 @@ onBeforeUnmount(() => clearInterval(refreshTimer))
       </n-space>
     </n-card>
 
-    <n-card size="small" class="mb12" title="QQ 音源">
+    <n-card size="small" class="mb12" title="QQ 音源（E4：cookie 有效期告警 + 曲库关键词 + 网关状态）">
       <template #header-extra>
         <n-space align="center">
           <n-tooltip trigger="hover">
@@ -437,6 +512,9 @@ onBeforeUnmount(() => clearInterval(refreshTimer))
             </template>
             {{ qq?.health?.detail || '健康详情未知（源未注册）' }}
           </n-tooltip>
+          <n-tag v-if="gatewayInfo.present" size="small" :bordered="false" :type="gatewayInfo.level === 'ok' ? 'success' : gatewayInfo.level === 'off' ? 'default' : 'warning'">
+            网关：{{ gatewayInfo.label }}
+          </n-tag>
           <n-switch
             :value="!!qq?.enabled"
             :loading="toggling"
@@ -449,6 +527,38 @@ onBeforeUnmount(() => clearInterval(refreshTimer))
         </n-space>
       </template>
       <n-space vertical size="small">
+        <!-- T1：cookie 有效期（服务端已算好 cookieStale / cookieAgeDays / cookieSavedAtUtc） -->
+        <n-alert v-if="cookieInfo.stale" type="warning" :show-icon="false" size="small">
+          <b v-if="!cookieInfo.unknownAge">cookie 已保存 {{ cookieInfo.ageDays }} 天（&gt;7 天）可能已失效，请重新导入</b>
+          <b v-else>cookie 无导入时间（旧配置）——有效期未知，可能已失效，请重新导入</b>
+          <div class="hint" style="margin-top: 4px">
+            服务端判定：<code>cookieStale=true</code><template v-if="cookieInfo.ageDays != null"> · <code>cookieAgeDays={{ cookieInfo.ageDays }}</code></template>
+            <template v-if="cookieInfo.savedAtUtc"> · 导入于 {{ cookieInfo.savedAtUtc }}</template>
+            （阈值 7 天，<code>QqMusicSource.CookieFreshness</code>）
+          </div>
+        </n-alert>
+        <n-alert v-else-if="cookieInfo.ageDays != null" type="default" :show-icon="false" size="small">
+          cookie 已保存 {{ cookieInfo.ageDays }} 天（未超 7 天阈值）
+          <template v-if="cookieInfo.savedAtUtc"> · 导入于 {{ cookieInfo.savedAtUtc }}</template>
+        </n-alert>
+
+        <!-- T1：整体非 Ok（含网关未就绪）→ 展示服务端聚合的降级原因 -->
+        <n-alert v-if="degraded" :type="stateKey === 'disabled' ? 'default' : 'warning'" :show-icon="false" size="small">
+          <b>QQ 音源当前{{ stateTag(qq?.health?.state).label }}。</b>{{ healthDetail }}
+          <div v-if="gatewayInfo.present" class="hint" style="margin-top: 4px">
+            网关细节：<code>enabled={{ qq?.gateway?.enabled }}</code> · <code>scriptFound={{ qq?.gateway?.scriptFound }}</code>
+            · <code>running={{ qq?.gateway?.running }}</code> · <code>healthy={{ qq?.gateway?.healthy }}</code>
+            · <code>cookieLoaded={{ qq?.gateway?.cookieLoaded }}</code>
+            <template v-if="qq?.gateway?.scriptPath"> · <code>scriptPath={{ qq?.gateway?.scriptPath }}</code></template>
+            <template v-if="gatewayInfo.reason"> · {{ gatewayInfo.reason }}</template>
+          </div>
+          <div v-if="gatewayInfo.present && gatewayInfo.level !== 'ok'" class="hint" style="margin-top: 4px">
+            ⚠ QQ 网关本体（Rain120/qq-music-api + 适配层）<b>不在本仓库、镜像也未内置</b>：
+            需服务端自行部署后放到 <code>data/qq-gateway/index.js</code>，或配 <code>QqMusic.GatewayScript</code> /
+            环境变量 <code>MINIPET_QQ_GATEWAY</code>；未配好前该源恒为降级（不造假实现）。
+          </div>
+        </n-alert>
+
         <n-input
           v-model:value="cookieText"
           type="textarea"
@@ -463,6 +573,37 @@ onBeforeUnmount(() => clearInterval(refreshTimer))
           </span>
           <n-button size="small" type="primary" :loading="cookieSaving" @click="saveCookie">保存 cookie</n-button>
         </n-space>
+
+        <n-divider style="margin: 2px 0" />
+
+        <!-- T2：QQ 曲库关键词（QQ 无全库概念；空 = /music/tracks?source=qq 恒空） -->
+        <n-space align="center" :size="8" wrap style="width: 100%">
+          <span style="font-size: 13px">曲库搜索关键词</span>
+          <n-input
+            v-model:value="keyword"
+            size="small"
+            clearable
+            style="width: 260px"
+            placeholder="如：久石让 / 天空之城（空 = 曲库为空）"
+            :disabled="keywordSaving"
+            @keyup.enter="saveKeyword"
+          />
+          <n-button size="small" type="primary" secondary :loading="keywordSaving" :disabled="!keywordDirty" @click="saveKeyword">
+            保存关键词
+          </n-button>
+          <n-tag v-if="keywordDirty" size="small" :bordered="false" type="warning">未保存</n-tag>
+          <span class="hint">
+            写入 <code>qqMusic.searchKeyword</code>（走既有 <code>PUT /api/admin/settings</code> 全量同构回传，
+            复用设置页同一通道）；当前服务端值：<b>{{ savedKeyword || '（空）' }}</b>
+          </span>
+        </n-space>
+        <n-alert v-if="configNote" type="warning" :show-icon="false" size="small">{{ configNote }}</n-alert>
+        <div class="hint">
+          QQ 无「全库」概念：服务端 <code>QqMusicSource.ListTracksAsync</code> 用该关键词调网关
+          <code>/search</code>（取前 30 首）；<b>关键词为空或网关未就绪 → QQ 曲库列表为空</b>（服务端不臆造默认歌单）。
+          QQ 网关本体不在本仓库，需服务端按 <code>GET /api/admin/music/sources</code> 的
+          <code>gateway</code> / <code>health.detail</code> 提示配好后本页才有曲目。
+        </div>
       </n-space>
     </n-card>
 
@@ -487,6 +628,13 @@ onBeforeUnmount(() => clearInterval(refreshTimer))
           style="width: 220px"
         />
       </template>
+
+      <n-alert v-if="source === 'qq' && !tracksLoading && !tracksError && !filteredTracks.length" type="info" :show-icon="false" size="small" style="margin-bottom: 8px">
+        <b>QQ 曲库为空。</b>
+        QQ 无「全库」概念，服务端用 <code>qqMusic.searchKeyword</code> 调网关搜索取曲：
+        <template v-if="!savedKeyword">当前关键词为<b>空</b> → 请在上方「QQ 音源」卡填写关键词并保存。</template>
+        <template v-else>当前关键词「<b>{{ savedKeyword }}</b>」，仍无结果 → 多为网关未就绪（{{ gatewayInfo.present ? gatewayInfo.label : '网关状态未返回' }}<template v-if="healthDetail">；{{ healthDetail }}</template>）。</template>
+      </n-alert>
 
       <n-spin v-if="tracksLoading" class="block-center" />
       <n-result

@@ -1,8 +1,9 @@
-# Web 侧待服务端支持的接口清单（T2 / T4 / T5 / T6）
+# Web 侧待服务端支持的接口清单（T2 / T4 / T5 / T6 / T7）
 
 > 生成时间：2026-09-27 · 提出方：Web（`Web/`，本轮只改 Web，未动 `Server/`）
 > 现状核对基线：`Server/MinipetServer` 工作区当前代码（`AdminEndpoints.cs` / `ConfigService.cs` /
-> `DeviceEndpoints.cs` / `Services/PaperdollService.cs`）+ 线上实例 `http://<NAS_IP>:38090` 实测。
+> `DeviceEndpoints.cs` / `Services/PaperdollService.cs` / `Services/SpeechScheduler.cs`）+
+> 线上实例 `http://<NAS_IP>:38090` 实测。
 > 前端已按本文约定**预留调用与 UI**，并在运行时探测服务端是否已支持：
 > 字段/端点一旦上线，前端**无需改动**即自动启用（见每节的「前端现状与探测行为」）。
 >
@@ -18,7 +19,42 @@
 > ```
 > 影响：`Web/scripts/ui-smoke.mjs` 中「真实服务端尚无 T2/T4/T5」的 4 条断言因此转 FAIL
 > （它们断言的是「服务端缺」，不是「前端错」）——**本轮未改这 4 条断言**，留待服务端任务收口时同步。
+> ⤷ **后续（2026-09-27 深夜 Web T1–T4 收口轮）已改**：这 4 条断言按实测改为「端点在位 / 字段在位」
+> 形态，并新增 T1（cookie 告警 + 网关降级）、T2 关键词入口、T3/T7 收藏探测与设备选择器分组断言；
+> 当前 `ui-smoke.mjs` 在「真实 + mock」双实例下 **30/30 PASS**。
 > **T6（bgm）仍未实现**（同一端点，但 type 白名单不含 bgm，见下）。
+>
+> **状态复核（2026-09-27 深夜，Web T1–T4 收口轮实测，本轮 Web 侧改动）**：
+> ```
+> $ curl -s -o /dev/null -w '%{http_code}\n' http://<NAS_IP>:38090/api/health
+> 200
+> $ curl -s http://<NAS_IP>:38090/api/admin/music/sources        # ↓ qq 条目（原样截取）
+> "cookieStale": false, "gateway": {"enabled":false,"scriptFound":false,"running":false,
+>   "healthy":false,"cookieLoaded":false,"pid":0,"restarts":0,"lastProbeUtc":"…"}
+> #  ⚠ cookieSavedAtUtc / cookieAgeDays 为 null 时被 JSON 序列化**省略**；gateway 是**对象**不是枚举字符串
+> $ curl -s http://<NAS_IP>:38090/api/admin/settings | jq '.config.speech'
+> {"_comment":"随机台词气泡（E12）…","enabled":false,"idleSec":300,"lines":[]}   # T5 段在位
+> $ curl -s http://<NAS_IP>:38090/api/admin/settings | jq '.config.qqMusic.searchKeyword'
+> ""                                                             # T2 关键词字段在位（Web 本轮补了入口）
+> $ curl -s -X POST -H 'Content-Type: application/json' -d '{"type":"bgm","value":"__probe__"}' \
+>     http://<NAS_IP>:38090/api/admin/devices/dev-693ea4/command
+> {"error":"type 非法：bgm（可用：expression/action/bubble/brightness/reboot）"}   # T6：部署实例仍未放行 bgm
+> $ curl -s -i http://<NAS_IP>:38090/api/admin/materials/favorites | head -8
+> HTTP/1.1 200 OK
+> Content-Length: 404
+> Content-Type: text/html
+> …
+> <!DOCTYPE html>          # T7：收藏端点缺失 —— ⚠ 未注册的 GET /api/** 走 SPA fallback 回 200+HTML，不是 404
+> $ curl -s -o /dev/null -w '%{http_code}\n' -X PUT -H 'Content-Type: application/json' \
+>     -d '{"favorites":{}}' http://<NAS_IP>:38090/api/admin/materials/favorites
+> 405                      # 对照：SPA fallback 只接 GET；写路由缺失是 405
+> ```
+> 结论：**T2 / T4 / T5 三项服务端确已上线**（部署实例实测），Web 侧本轮把消费端补齐；
+> **T6 在部署实例上仍未放行 bgm**（工作区代码已实现，待部署）；**T7 为新增缺口**（收藏无服务端存储）。
+>
+> ⚠ **给所有 GET 探针的教训**：服务端对未注册的 `GET /api/**` 回 **200 + text/html（SPA fallback）**，
+> 不能只看状态码判「端点在位」——必须同时校验响应形状（`favorites` 对象）或识别 HTML。
+> `Web/src/api/client.js:probeMaterialFavorites` 已按此实现（`spaFallback` 标记）。
 
 ---
 
@@ -78,9 +114,9 @@
     400/422/503 → 标「端点入参不符」（说明路由在、入参或依赖有问题）。
   - 25 表情清单逐字取自 `PaperdollService.KnownExpressions`，落在
     `Web/src/utils/expressions.js`（`key`/`cn`/`friendly` 三列）。
-- **实测**：真实服务端（无端点）→ 25/25 按钮 disabled + 提示（`Web/scripts/ui-smoke.mjs` 断言）；
-  用 `Web/scripts/preview-with-live-api.mjs` 的 `MINIPET_MOCK=1` 模拟端点上线 → 状态转「端点在位」、
-  按钮全可点、点击「微笑」toast `指令已入队（expression=smile，seq 42）`。
+- **实测**（2026-09-27 深夜复测，服务端**端点在位**）：真实实例 → 25/25 按钮**全可点**、状态标「端点在位」
+  （`ui-smoke.mjs` 断言已同步更新，旧「端点缺失 → 全禁用」断言是服务端上线前的形态）；
+  `MINIPET_MOCK=1` → 状态同样「端点在位」、点击「微笑」toast `指令已入队（expression=smile，seq 42）`。
 
 ---
 
@@ -116,8 +152,11 @@ $ curl -s http://<NAS_IP>:38090/api/admin/settings | jq '.config.device | keys'
     **PUT /admin/settings、PUT /admin/devices/{id} 都不会带 `imuSensitivity` 字段**
     （不硬塞发不出去的字段）。
   - 探测到：自动启用，随 PUT 一并下发。
-- **实测**：真实服务端 → 打开「覆盖全局阈值」后 5 个阈值输入中 4 个可编辑、灵敏度仍 disabled + 说明；
-  `MINIPET_MOCK=1`（模拟字段上线）→ 5/5 可编辑、占位说明消失。
+- **实测**（2026-09-27 深夜复测）：真实服务端已返回 `device.imuSensitivity=1` →
+  详情页打开「覆盖全局阈值」后 **5/5** 输入可编辑、占位说明消失；设置页灵敏度输入同样启用
+  （`ui-smoke.mjs` 断言已按此更新）。`MINIPET_MOCK=1` → 同样 5/5 可编辑。
+  ⚠ 固件侧是否消费 `config.imuSensitivity` 仍**未验证**（`http_client.c` 目前可能仍未解析该键，
+  服务端字段对设备无影响；Web 侧配置能力不受影响）。
 
 ---
 
@@ -164,8 +203,12 @@ $ curl -s http://<NAS_IP>:38090/api/admin/settings | jq '.config.device | keys'
 - 运行时探测 `config.speech != null`：
   - **未探测到（当前真实态）**：整卡 disabled + 醒目说明（含上述①②③的需求摘要）；
   - 探测到：表单启用，随 PUT /admin/settings 全量同构回传（`speech` 段参与往返）。
-- **实测**：真实服务端 → 卡片 tag「待服务端支持」+ 需求说明可见、输入禁用；
-  `MINIPET_MOCK=1`（模拟 speech 段）→ tag「配置段在位」、开关/秒数/台词 textarea 启用且回填两条台词。
+- **实测**（2026-09-27 深夜复测，服务端**段已在位**）：真实实例 → tag「配置段在位（真实读写）」、
+  开关/静置秒数（回填服务端值 300）/台词库全部启用、旧「当前服务端没有台词配置段」文案已从代码中删除；
+  `ui-smoke.mjs` 实测台词逐行字节校验（两行 → 「共 2 条」）+ mock 实例下真实走一次
+  `PUT /admin/settings`（保存台词 → toast「设置已保存」）。
+  另：本页对真实实例**只读断言、不点保存**，避免测试脚本改动线上配置；真实写往返由
+  `GET → PUT(searchKeyword 探针) → GET → PUT(还原)` 的 curl/node 用例覆盖（实测还原后配置逐字节一致）。
 
 ---
 
@@ -251,6 +294,72 @@ $ curl -s http://<NAS_IP>:38090/api/admin/settings | jq '.config.device | keys'
 
 ---
 
+## T7：素材收藏的服务端存储（E4「地图选择含收藏（喂给设备选择器的「最近+收藏」）」）
+
+> 提出轮次：Web T3 收口（2026-09-27 深夜）。**服务端目前完全没有这一块**——既无存储也无端点。
+
+### 缺什么（实测证据）
+
+```
+$ curl -s -i http://<NAS_IP>:38090/api/admin/materials/favorites | head -8
+HTTP/1.1 200 OK
+Content-Length: 404
+Content-Type: text/html          ← ⚠ 不是 404：未注册的 GET /api/** 被 SPA fallback 接走，回 index.html
+$ curl -s -o /dev/null -w '%{http_code}\n' -X PUT -H 'Content-Type: application/json' \
+    -d '{"favorites":{}}' http://<NAS_IP>:38090/api/admin/materials/favorites
+405                              ← 写路由缺失是 405（SPA fallback 只接 GET）
+$ grep -rn "favorite\|Favorite" Server/MinipetServer/Api/AdminEndpoints.cs
+（无输出：AdminEndpoints.cs 只有 pair/devices/manifest/ota/push/logs/presets/catalog/
+  materials/music/settings/thumb 等路由，没有收藏相关路由）
+```
+- 现状：收藏（★）只存在浏览器 `localStorage`（键 `minipet.materials.favorites`，桶 `map`/`mob`/`npc`/`pd_{part}`），
+  换浏览器/换设备即丢；设备选择器只能靠本机这一份数据。
+- Web 侧已按「探测到才启用」实现（见下），**端点缺失时功能不退化**（localStorage 仍是真源）。
+
+### 需要新增
+
+| 项 | 值 |
+| --- | --- |
+| 方法/路径（读） | `GET /api/admin/materials/favorites` |
+| 响应 | `200 { "favorites": { "map": ["200000100", …], "npc": ["…"], "mob": ["…"] } }`（桶名与 Web 一致；未知桶原样保留） |
+| 方法/路径（写） | `PUT /api/admin/materials/favorites` |
+| 请求体 | `{ "favorites": { "map": ["…"], … } }`（整体覆盖；Web 侧提交的是「本地 ∪ 服务端」的并集） |
+| 成功响应 | `200 { "ok": true, "favorites": { … } }` |
+| 失败响应 | `400 { "error": "favorites 必须是对象" }`（顶层非对象/数组）；`503`（如需 WZ 校验而 WZ 未加载） |
+| 落盘建议 | `data/config/favorites.json`（单文件、原子写，照抄 `ConfigService.Save` 的 `StorageUtil.AtomicWriteAllText`）；**不要塞进 `MinipetConfig`**——它是 per-浏览器偏好而非设备配置，塞进去会让 `PUT /admin/settings` 的全量回传把它清掉 |
+| 语义建议 | 纯字符串 id 集合，服务端**不必校验 id 是否真实存在**（目录随 WZ 版本变化；UI 侧未命中的 id 会以 `[id]` 形式照常可选可下发） |
+
+**可选（E4「喂给设备选择器」的服务端侧增强，不阻塞）**
+
+- 若希望「最近使用」也跨浏览器：加桶 `recent`：`{ "recent": { "map": ["…（最新在前）"], … } }`。
+  Web 侧当前只在成功 `POST /admin/devices/{id}/push` 后写本机 `minipet.materials.recent`（上限 12 条/桶）。
+- 若希望收藏能直接变成设备侧的「收藏列表」（设备触摸屏选图），需要额外设计 manifest 字段；
+  E4 原文只要求「地图选择含收藏」，Web 侧已用本机收藏喂满选择器，故不阻塞。
+
+### 前端现状与探测行为
+
+- `Web/src/api/client.js`：`FAVORITES_PATH` / `FAVORITE_BUCKETS` / `getMaterialFavorites()` /
+  `putMaterialFavorites()` / `probeMaterialFavorites()`。
+  探针判定：**路由在位且响应含 `favorites` 对象**才算命中；`404/405/501`、
+  或 `HTTP 200 但回 text/html（SPA fallback）/JSON 缺 favorites` 都判「端点缺失」。
+- `Web/src/utils/favorites.js`：收藏与「最近」的**唯一真源**
+  （localStorage 键与旧版完全兼容；模块级响应式单例，素材页与设备详情页共享）。
+  - 探测命中 → 进页自动 `pullAndMerge()`（**并集**：local ∪ remote，任何一侧都不丢）→ 再 `PUT` 回推；
+  - 端点缺失 → `syncState='missing'`，**完全退回本机模式**，UI 标注
+    「收藏仅本机（端点缺失）」并把本节需求链在 tooltip 里（探针原文一并展示；
+    真实实例的原文是「HTTP 200 但回的是 SPA index.html（GET 路由未注册，SPA fallback）」）；
+  - 网络不可达 / 响应形态不符 → `'error'`（同样退回本机），不阻塞页面。
+- `Web/src/views/MaterialsView.vue`：顶部同步态 `NTag`（成功态额外给「同步到服务端」按钮）；
+  星标读写全部走上面那个单例。
+- `Web/src/views/DeviceDetailView.vue`：素材（地图/NPC）选择器按 **★ 收藏 / 🕘 最近使用 / 全部目录**
+  分组（同 id 只出现一次；不在目录里的收藏 id 也保留为可下发编号）——这就是 E4「喂给设备选择器」。
+- **实测（2026-09-27）**：真实实例 → 探测判 `missing`、tag「收藏仅本机（端点缺失）」、
+  页头提示 + §T7 需求可见、星标与选择器分组照常工作；
+  `MINIPET_MOCK=1`（mock 实例按本节形态提供端点）→ 判 `ok`、显示「同步到服务端」按钮、
+  进页自动把服务端已有收藏合并进本机（并集）并回推。
+
+---
+
 ## 附：可选的性能优化请求（不阻塞任何验收）
 
 **设备列表带 `petConfig`（T1 的 N+1 优化）**
@@ -275,11 +384,22 @@ $ curl -s http://<NAS_IP>:38090/api/admin/settings | jq '.config.device | keys'
 cd Web
 npm run build                                             # 产物 dist/
 node scripts/preview-with-live-api.mjs                    # 真实服务端 API → http://127.0.0.1:5199
-PORT=5198 MINIPET_MOCK=1 node scripts/preview-with-live-api.mjs          # 模拟 T2/T4/T5 已补齐
+PORT=5198 MINIPET_MOCK=1 node scripts/preview-with-live-api.mjs          # 模拟 T2/T4/T5/T6/T7 已补齐
 PORT=5197 MINIPET_MOCK=1 MOCK_PUSH_FAIL=503 node scripts/preview-with-live-api.mjs  # 推送错误分支注入
 node scripts/ui-smoke.mjs --base http://127.0.0.1:5199 \
      --mock-base http://127.0.0.1:5198 --push-fail-base http://127.0.0.1:5197 --push
 ```
+
+> mock 实例（`MINIPET_MOCK=1`）除 T2/T4/T5/T6 外，本轮新增两处注入（见
+> `scripts/preview-with-live-api.mjs` 顶部注释）：
+> - **T7 收藏端点**：`GET/PUT /api/admin/materials/favorites`（内存态，预置
+>   `map:['200000100'] / npc:['9200000']`）→ 前端应判「端点在位」并自动拉取合并；
+> - **T1 音源健康**：`GET /api/admin/music/sources` 真实响应 + 注入 qq
+>   `cookieStale=true / cookieAgeDays=9 / gateway.scriptFound=false / health.state=1`
+>   → 前端应渲染黄色 cookie 告警与网关降级原因。
+>
+> **双实例实测（2026-09-27 深夜，本轮收口）**：`ui-smoke.mjs --base 5199 --mock-base 5198`
+> → **30/30 PASS**（真实实例 18 条 + mock 12 条；`--push` 未开，避免改动真实设备资产）。
 
 > T6（bgm 播放控制）自测点已并入 `ui-smoke.mjs`：真实实例 3 条（端点不支持 → 7 键禁用 + 需求文案 /
 > 「存为设备偏好」可用 / 真实 PUT 200）、mock 实例 3 条（端点在位 + 7 键启用 / 播放 202 / 音量 202）。

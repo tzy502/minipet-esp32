@@ -251,17 +251,35 @@ export function putMaterialFavorites(favorites) {
 
 /**
  * 探测服务端收藏端点是否在位（T3）。
- * 返回 { supported: true|false|null, status?, shapeOk?, data?, error? }
- *   true  = 路由在位且响应含 favorites 对象（shapeOk=true）；路由在位但形态不符 → shapeOk=false
- *   false = 404/405/501 路由不存在 → UI 退回「收藏仅本机 localStorage」
+ * 返回 { supported: true|false|null, status?, shapeOk?, spaFallback?, data?, error? }
+ *   true  = 路由在位**且**响应含 favorites 对象（shapeOk=true）
+ *   false = 路由不存在；或回的不是该端点（含 SPA fallback）→ UI 退回「收藏仅本机 localStorage」
  *   null  = 网络不可达等无法判定
+ *
+ * ⚠ 实测坑（2026-09-27 真实实例）：未注册的 **GET** `/api/**` 不返回 404，而是被 SPA fallback
+ *   接走 → `HTTP 200 + Content-Type: text/html`（index.html）。只按状态码判定会把「端点缺失」
+ *   误判成「在位」→ 这里对 200 也校验响应形状与 HTML 兜底。
+ *   （对照：同一路径 POST/PUT → 405，所以 POST 型探针不受影响。）
  */
 export async function probeMaterialFavorites() {
   try {
-    const data = await getMaterialFavorites()
+    const res = await http.get('/admin/materials/favorites')
+    const data = res?.data
     const favs = data?.favorites
     const shapeOk = !!favs && typeof favs === 'object' && !Array.isArray(favs)
-    return { supported: true, shapeOk, status: 200, data }
+    if (!shapeOk) {
+      const spaFallback = typeof data === 'string' && /^\s*(<!DOCTYPE html|<html)/i.test(data)
+      return {
+        supported: false,
+        shapeOk: false,
+        spaFallback,
+        status: res?.status ?? 200,
+        error: spaFallback
+          ? 'HTTP 200 但回的是 SPA index.html（GET 路由未注册，SPA fallback）'
+          : 'HTTP 200 但响应缺 favorites 对象',
+      }
+    }
+    return { supported: true, shapeOk: true, status: 200, data }
   } catch (e) {
     const status = e?.response?.status
     if (status === 404 || status === 405 || status === 501) return { supported: false, status }

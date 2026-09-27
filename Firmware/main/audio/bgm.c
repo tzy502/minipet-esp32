@@ -787,7 +787,7 @@ static void bgm_task_retry_cb(void *arg)
 {
     (void)arg;
     if (s_task_up) return;
-    if (xTaskCreatePinnedToCore(bgm_task, "bgm", 24576, NULL, 3,
+    if (xTaskCreatePinnedToCore(bgm_task, "bgm", 16384, NULL, 3,
                                 NULL, 0 /* PRO */) == pdPASS) {
         s_task_up = true;
         ESP_LOGI(TAG, "bgm 任务延迟创建成功（内部堆已回稳）");
@@ -810,14 +810,17 @@ void bgm_start(void)
         return;
     }
     mp_codec_init(44100);
-    /* bgm 栈 24576：mp3dec_decode_frame 的 mp3dec_scratch_t ≈16KB 在调用栈上
-     * （maindata 2815B + grbuf/syn 浮点缓冲 ≈13KB，见 minimp3.h 头注），且解码
-     * 经 mp_http_get→stream_chunk 嵌在 esp_http_client 调用链内（再 ~2KB）。
-     * 原 8192 必栈溢出（解码首帧即崩）。feeder 无解码，4096 够用。 */
+    /* bgm 栈 16384（2026-09-27 实测收紧）：mp3dec_decode_frame 的
+     * mp3dec_scratch_t 实际 ≈10KB（maindata 4.6KB + grbuf 4.6KB + syn 4.2KB +
+     * gr_info/bs/ist_pos，按 minimp3.h:252-259 逐字段核算），叠加解码经
+     * mp_http_get→stream_chunk→esp_http_client 的调用链（~2KB）仍有充分余量。
+     * 原 24576 是内部堆大客户：真机 3/3 boot 拿不到连续块 → 转 10s 自愈重试，
+     * BGM 实际起不来（无声）。收紧到 16K 后可在启动期直接分配成功。
+     * feeder 无解码，4096 够用。 */
     /* 24K 栈是内部堆大客户（render 12K 已先行分配）：开机挤压窗口期可能
      * 拿不到连续块（真机 3/3 boot 全败）。首试失败不阻塞开机，转 10s 周期
      * 自愈定时器，内部堆回稳后自动补建（否则 BGM 静默不可用）。 */
-    if (xTaskCreatePinnedToCore(bgm_task, "bgm", 24576, NULL, 3,
+    if (xTaskCreatePinnedToCore(bgm_task, "bgm", 16384, NULL, 3,
                                 NULL, 0 /* PRO */) == pdPASS) {
         s_task_up = true;
     } else {

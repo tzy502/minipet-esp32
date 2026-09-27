@@ -121,20 +121,21 @@ export const syncNote = ref('')
 /** 最近一次同步动作的可读结果（UI 提示用）。 */
 export const lastSyncText = ref('')
 
-/** 探测服务端收藏端点（404/405/501 → missing）。 */
+/** 探测服务端收藏端点（404/405/501 或 SPA fallback → missing）。 */
 export async function probeSync() {
   syncState.value = 'syncing'
   try {
     const r = await probeMaterialFavorites()
     if (r.supported === false) {
       syncState.value = 'missing'
-      syncNote.value = `HTTP ${r.status}`
-    } else if (r.supported === true) {
+      syncNote.value = r.error || `HTTP ${r.status}`
+    } else if (r.supported === true && r.shapeOk === true) {
       syncState.value = 'ok'
-      syncNote.value = r.shapeOk === false ? `HTTP ${r.status}：响应缺 favorites 对象` : ''
+      syncNote.value = ''
     } else {
+      // 路由存在但响应形态不符 / 服务端报错 / 网络不可达 → 一律退回本机并如实标注原因
       syncState.value = 'error'
-      syncNote.value = r.error || '网络不可达'
+      syncNote.value = r.error || `HTTP ${r.status ?? '—'}：响应形态不符`
     }
     return r
   } catch (e) {

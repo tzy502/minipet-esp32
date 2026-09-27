@@ -162,7 +162,7 @@ const overrideThresholds = ref(false)
 const thresholdForm = reactive({ deadzone: 8, light: 2, hard: 4, idle: 5, sensitivity: 1 })
 const savingTh = ref(false)
 const thresholdsSource = computed(() => device.value?.thresholdsSource || 'global')
-/** T4：服务端阈值模型是否已含灵敏度字段（运行时探测；有则启用并下发，无则禁用+说明）。 */
+/** E4：设备表阈值是否已含灵敏度字段（运行时探测；有则启用并下发，无则禁用+说明）。 */
 const imuSensitivitySupported = computed(() => device.value?.thresholds?.imuSensitivity != null)
 
 async function saveThresholds() {
@@ -346,7 +346,7 @@ async function probeCmd() {
 }
 onMounted(probeCmd)
 
-/** 发一条指令；404/405 → 判定端点缺失并禁用按钮（服务端还没上线的真实态）。 */
+/** 发一条指令；404/405 → 判定端点缺失并禁用按钮（该端点服务端已上线，此分支只对老部署实例生效）。 */
 async function sendCmd(type, value, busyKey) {
   cmdBusy.value = busyKey
   try {
@@ -526,16 +526,16 @@ async function sendBubble() {
             <n-form-item label="待机转时钟（分钟）">
               <n-input-number v-model:value="thresholdForm.idle" :min="1" :max="240" :disabled="!overrideThresholds || savingTh" style="width: 100%" />
             </n-form-item>
-            <!-- T4：E4 要求「IMU 灵敏度」，服务端 DeviceThresholdsConfig 暂无该字段 →
-                 运行时探测；未探测到即禁用，且保存时不带该字段（不硬塞发不出去的字段） -->
+            <!-- E4「IMU 灵敏度」：服务端 DeviceThresholdsConfig.ImuSensitivity 已在上位（随 thresholds 覆盖下发）；
+                 探测只为兼容老部署实例（探测不到 → 禁用且保存时不带该字段，不硬塞发不出去的字段） -->
             <n-form-item>
               <template #label>
                 <n-tooltip trigger="hover" :disabled="imuSensitivitySupported">
                   <template #trigger>
                     <span>IMU 灵敏度（倍率，越大越灵敏）</span>
                   </template>
-                  服务端阈值模型（DeviceThresholdsConfig）还没有 ImuSensitivity 字段，暂不可下发 ——
-                  接口需求见 Web/docs/interfaces-needed-from-server.md
+                  当前服务端未返回 thresholds.imuSensitivity（老部署实例？），暂不可下发 ——
+                  接口需求见 Web/docs/interfaces-needed-from-server.md §T4
                 </n-tooltip>
               </template>
               <n-input-number
@@ -550,11 +550,10 @@ async function sendBubble() {
           </div>
         </n-form>
         <n-alert v-if="!imuSensitivitySupported" type="info" :show-icon="false" size="small" class="mt8">
-          「IMU 灵敏度」当前为占位（禁用态）：服务端 <code>DeviceThresholdsConfig</code> 只有
-          ImuDeadzoneDeg / TapLightG / TapHardG / IdleToClockMin 四个字段，没有灵敏度字段 ——
-          前端不硬塞发不出去的字段。需服务端补 <code>device.imuSensitivity</code>（hello
-          <code>config.imuSensitivity</code> + 设备表阈值覆盖），详见
-          <code>Web/docs/interfaces-needed-from-server.md</code> §T4。
+          「IMU 灵敏度」当前为占位（禁用态）：本次设备响应的 <code>thresholds</code> 里没有
+          <code>imuSensitivity</code>，因此不下发该字段。该字段已由服务端实现在位
+          （<code>DeviceThresholdsConfig.ImuSensitivity</code>，默认 1.0），此处出现即说明连的是旧部署实例。
+          规格见 <code>Web/docs/interfaces-needed-from-server.md</code> §T4。
         </n-alert>
         <template #action>
           <n-space justify="end">
@@ -635,8 +634,10 @@ async function sendBubble() {
 
         <n-space vertical :size="10">
           <n-alert v-if="cmdDisabled" type="warning" :show-icon="false" size="small">
-            <b>服务端尚未提供设备指令端点，25 个表情按钮已禁用。</b>
-            （探测结果：{{ cmdProbeNote || 'HTTP 404/405' }}）需要服务端新增：
+            <b>本次探测判定设备指令端点不可用，25 个表情按钮已禁用。</b>
+            （探测结果：{{ cmdProbeNote || 'HTTP 404/405' }}）该端点服务端<b>已上线</b>（实测
+            <code>202 {"ok":true,"seq":47,…}</code>）；出现此提示说明连的是旧部署实例，
+            或探测请求被网络/依赖问题挡下。端点规格：
             <div class="req">
               <div><code>POST {{ cmdPath }}</code></div>
               <div>body <code>{ "type": "expression" | "action" | "bubble", "value": "&lt;表情名/动作名/气泡文本&gt;", "durationMs"?: number }</code></div>

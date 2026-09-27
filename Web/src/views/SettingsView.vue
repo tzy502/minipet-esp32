@@ -4,10 +4,15 @@
  * 随机台词气泡（E12）/ 地图时钟坐标表（高级，JSON 编辑）→ PUT /admin/settings 全量同构回传。
  * 端口只读展示（部署层 .env 的 MINIPET_PORT 管理，R2 定稿）。
  *
- * T4「IMU 灵敏度」/ T5「随机台词气泡」服务端模型当前都没有对应字段（ConfigService.cs:38-68），
- * 故两处均为「运行时探测 + 禁用态占位」：探测到字段才启用并参与 PUT，否则只展示说明，
- * 绝不硬塞发不出去（PUT 后被 Replace 静默丢弃）的字段。接口需求见
- * Web/docs/interfaces-needed-from-server.md。
+ * 字段在位实况（2026-09-27 真实实例 `GET /api/admin/settings` 实测）：
+ *   · `config.device.imuSensitivity = 1` **在位**（ConfigService.cs:58-73 DeviceThresholdsConfig）；
+ *   · `config.speech = {enabled:false, idleSec:300, lines:[]}` **在位**，且
+ *     `ConfigService.Replace` 显式搬运 `c.Speech = incoming.Speech ?? new SpeechConfig()`；
+ *   · 设备指令端点 `POST /api/admin/devices/{id}/command` **已上线**（实测 202 {"ok":true,"seq":47,…}），
+ *     E12 的 bubble 入队通道与 `Services/SpeechScheduler.cs`（静置调度）服务端均已具备。
+ * 两处仍保留**运行时探测**（`config.device.imuSensitivity != null` / `config.speech != null`）：
+ * 探测不到只可能是老部署实例 → 退回禁用占位并贴出需求，绝不硬塞发不出去的字段。
+ * 接口需求历史记录见 Web/docs/interfaces-needed-from-server.md（§T4/§T5 已标记服务端已实现）。
  */
 import { computed, onMounted, reactive, ref } from 'vue'
 import {
@@ -33,9 +38,11 @@ const mapOffsetsError = ref('')
 const saving = ref(false)
 
 // ── T4/T5 字段存在性探测（服务端模型有没有这些字段，决定启用还是占位）─────────
+// 实测两份服务端都已带这些字段（见文件头注释）；探测只为兼容老部署实例。
 const imuSensitivitySupported = computed(() => store.config?.device?.imuSensitivity != null)
 const speechSupported = computed(() => store.config?.speech != null)
-const speech = reactive({ enabled: true, idleSec: 60 })
+// 默认值与服务端 SpeechConfig 对齐（enabled=false / idleSec=300）——探测失败时不会被误保存
+const speech = reactive({ enabled: false, idleSec: 300 })
 const speechLinesText = ref('')
 const speechLinesError = ref('')
 
@@ -86,10 +93,10 @@ async function initialLoad() {
       form.idleToClockMin = c.device?.idleToClockMin ?? 5
       // T4：探测到才回填（否则保持占位默认值 1.0，不参与下发）
       form.imuSensitivity = c.device?.imuSensitivity ?? 1
-      // T5：台词段存在才回填
+      // T5：台词段存在才回填（服务端实测在位）
       if (c.speech) {
-        speech.enabled = c.speech.enabled ?? true
-        speech.idleSec = c.speech.idleSec ?? 60
+        speech.enabled = c.speech.enabled ?? false
+        speech.idleSec = c.speech.idleSec ?? 300
         speechLinesText.value = Array.isArray(c.speech.lines) ? c.speech.lines.join('\n') : ''
       }
       speechLinesError.value = ''
@@ -159,7 +166,7 @@ async function onSave() {
   }
   // T4：服务端模型无 ImuSensitivity 字段时不带该 key（带了也会被 Replace 静默丢弃）
   if (imuSensitivitySupported.value) next.device.imuSensitivity = Number(form.imuSensitivity)
-  // T5：服务端无 speech 段时不带该 key（同上）
+  // 探测不到 speech 段（老部署实例）时不带该 key：同 ImuSensitivity，不硬塞发不出去的字段
   if (speechSupported.value) {
     next.speech = { ...next.speech, enabled: speech.enabled, idleSec: Number(speech.idleSec), lines: sl.value }
   }
@@ -237,15 +244,15 @@ async function onSave() {
               <n-form-item label="待机转时钟（分钟，无交互后睡）">
                 <n-input-number v-model:value="form.idleToClockMin" :min="1" :max="240" :step="1" :disabled="saving" style="width: 100%" />
               </n-form-item>
-              <!-- T4：E4 要求设置页有「IMU 灵敏度」；服务端 DeviceThresholdsConfig 暂无该字段
-                   → 运行时探测：有则启用并下发，无则禁用占位（不允许硬塞发不出去的字段） -->
+              <!-- IMU 灵敏度（E4）：服务端 DeviceThresholdsConfig.ImuSensitivity 已在上位并随 PUT 下发；
+                   探测只为兼容老部署实例（探测不到 → 禁用占位，不硬塞发不出去的字段） -->
               <n-form-item>
                 <template #label>
                   <n-tooltip trigger="hover" :disabled="imuSensitivitySupported">
                     <template #trigger>
                       <span>IMU 灵敏度（倍率，越大越灵敏）</span>
                     </template>
-                    服务端设备阈值模型还没有 ImuSensitivity 字段，此项暂不可下发 ——
+                    当前服务端未返回 device.imuSensitivity（老部署实例？）——此项暂不可下发，
                     接口需求见 Web/docs/interfaces-needed-from-server.md §T4
                   </n-tooltip>
                 </template>
@@ -262,34 +269,31 @@ async function onSave() {
           </n-form>
           <n-alert v-if="!imuSensitivitySupported" type="info" :show-icon="false" size="small" class="mt8">
             <b>「IMU 灵敏度」为占位（禁用态）。</b>
-            服务端 <code>DeviceThresholdsConfig</code>（<code>ConfigService.cs:38-47</code>）当前只有
-            ImuDeadzoneDeg / TapLightG / TapHardG / IdleToClockMin 四个字段，没有灵敏度字段，
-            hello 下发给设备的 <code>config</code> 也只有这四个 + BGM 两项。
-            需要服务端补：<code>device.imuSensitivity</code>（double，默认 1.0）→ hello
-            <code>config.imuSensitivity</code> → 固件侧生效；完整规格见
-            <code>Web/docs/interfaces-needed-from-server.md</code> §T4。
-            本项已做运行时探测：服务端一旦加上该字段，此处自动启用并随 PUT /admin/settings 下发。
+            本次 <code>GET /api/admin/settings</code> 的响应里没有 <code>device.imuSensitivity</code>，
+            故不下发该字段（避免被 <code>ConfigService.Replace</code> 静默丢弃）。
+            该字段已由服务端实现在位（<code>DeviceThresholdsConfig.ImuSensitivity</code>，默认 1.0，Normalize 夹取 0.2–3.0），
+            此处出现即说明连的是旧部署实例 —— 重启/更新服务端后本项自动启用。
+            规格见 <code>Web/docs/interfaces-needed-from-server.md</code> §T4。
           </n-alert>
         </n-card>
 
-        <!-- T5/E12：随机台词气泡（文本 Web 配置）——服务端配置模型无 speech 段 → 禁用占位 -->
+        <!-- E12：随机台词气泡（文本 Web 配置）——服务端 speech 段 + SpeechScheduler 均已就位 -->
         <n-card title="随机台词气泡（E12，静置久了冒预设台词）" size="small">
           <template #header-extra>
             <n-tag size="small" :bordered="false" :type="speechSupported ? 'success' : 'warning'">
-              {{ speechSupported ? '配置段在位' : '待服务端支持' }}
+              {{ speechSupported ? '配置段在位（真实读写）' : '服务端未返回 speech 段' }}
             </n-tag>
           </template>
           <n-space vertical :size="10">
             <n-alert v-if="!speechSupported" type="info" :show-icon="false" size="small">
-              <b>当前服务端没有台词配置段（禁用态占位）。</b>
-              <code>MinipetConfig</code>（<code>ConfigService.cs:61-68</code>）只有
-              Wz / QqMusic / Bgm / Device / Clock 五段，没有台词段；服务端也没有任何 admin 端点能把
-              <code>bubble</code> 指令入队（<code>AdminEndpoints.cs</code> 只有 manifest/ota/map/push），
-              因此「静置冒台词」三端目前都不存在。需要服务端补：
+              <b>本次响应没有 <code>config.speech</code> 段（禁用态占位）。</b>
+              服务端工作区已实现在位（<code>MinipetConfig.Speech</code> + <code>ConfigService.Replace</code> 显式搬运
+              <code>c.Speech = incoming.Speech ?? new SpeechConfig()</code>，<code>SettingsView</code> 保存即真实往返），
+              此处出现即说明连的是旧部署实例。仅当段缺失时才需要服务端支持：
               <div class="req">
-                <div>① 配置段 <code>speech</code>：<code>{ "enabled": true, "idleSec": 60, "lines": ["…", "…"] }</code>（随 PUT /admin/settings 增删改）</div>
-                <div>② 静置调度：空闲 ≥ idleSec 时随机挑一条 → <code>CommandQueue.Enqueue(deviceId, "bubble", line)</code>（payload 必须是裸字符串）</div>
-                <div>③ 手动测试端点：<code>POST /api/admin/devices/{id}/command { "type": "bubble", "value": "…" }</code>（与 T2 同一端点）</div>
+                <div>① 配置段 <code>speech</code>：<code>{ "enabled": true, "idleSec": 300, "lines": ["…", "…"] }</code>（随 PUT /admin/settings 增删改）</div>
+                <div>② 静置调度：<code>Services/SpeechScheduler.cs</code>（静置 ≥ idleSec → 随机挑一条 → <code>CommandQueue.Enqueue(id,"bubble",line)</code>，payload 为裸字符串）</div>
+                <div>③ 手动测试端点：<code>POST /api/admin/devices/{id}/command { "type": "bubble", "value": "…" }</code>（已在位，实测 202）</div>
               </div>
               完整规格见 <code>Web/docs/interfaces-needed-from-server.md</code> §T5。
               固件侧已就绪：<code>poller.c</code> 消费 <code>bubble</code> 指令 → <code>MP_CMD_BUBBLE</code>。
@@ -299,8 +303,8 @@ async function onSave() {
                 <n-form-item label="启用静置台词">
                   <n-switch v-model:value="speech.enabled" :disabled="saving || !speechSupported" />
                 </n-form-item>
-                <n-form-item label="静置多久冒一句（秒）">
-                  <n-input-number v-model:value="speech.idleSec" :min="10" :max="3600" :step="10" :disabled="saving || !speechSupported" style="width: 100%" />
+                <n-form-item label="静置多久冒一句（秒，服务端下限 30）">
+                  <n-input-number v-model:value="speech.idleSec" :min="30" :max="3600" :step="10" :disabled="saving || !speechSupported" style="width: 100%" />
                 </n-form-item>
               </div>
               <n-form-item label="台词库（一行一条）">
@@ -315,10 +319,18 @@ async function onSave() {
                 <div v-if="speechLinesError" class="err">{{ speechLinesError }}</div>
                 <div v-else class="hint">
                   {{ speechBytesHint }} · 单条 ≤ {{ BUBBLE_MAX_BYTES }} 字节（UTF-8，≈31 汉字，固件
-                  <code>mp_cmd_t.s = char[96]</code>）· 最多 50 条
+                  <code>mp_cmd_t.s = char[96]</code>）· 最多 50 条（此处为前端校验；服务端
+                  <code>SpeechScheduler.MaxUtf8Bytes=95</code> 还会再卡一次，超长条目跳过并记日志）
                 </div>
               </n-form-item>
             </n-form>
+            <div class="hint" style="margin-top: 6px">
+              生效链路（服务端工作区已实现）：<code>SpeechScheduler</code> 每 5s 一拍 →
+              仅<b>在线</b>设备、静置 ≥ <code>idleSec</code>（夹取 ≥30s）、两次台词间隔 ≥120s →
+              随机挑一条 → <code>CommandQueue.Enqueue(id,"bubble",line)</code> → 设备 poll 取走 →
+              固件 <code>MP_CMD_BUBBLE</code>。保存即随 <code>PUT /admin/settings</code> 落盘并热重载，
+              无需重启（是否已部署到目标实例以服务端实际版本为准）。
+            </div>
           </n-space>
         </n-card>
 
