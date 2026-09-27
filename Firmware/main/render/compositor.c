@@ -488,12 +488,16 @@ static void ent_screen_pos_at(int32_t tilt_mdeg, int32_t *sx, int32_t *sy)
      * ——真机表现就是"右下角一小块白块"。
      * 正确做法：把"可见内容在缓冲内的偏移"补偿掉——内容在缓冲内水平居中
      * （canvas 超限时 cx0=-max_w/2）与纵向留白都要减去，使**可见内容**居中/贴底。 */
-    /* 水平方向：实体缓冲只有 480 宽，而内容宽 2*cw 可能小于它，**偶数宽度下
-     * 左右各留白相同**，所以左内边距是 (RC_ENT_W - 2*cw)/2（不是整份差值）。 */
-    int32_t pad_x = (RC_ENT_W - g_ent_cw * RC_SCALE) / 2;   /* 可见内容在缓冲内的左内边距 */
+    /* 【用户定稿 2026-09-27："人物 origin 与屏幕正中心重叠"】
+     * 画布 = 该动作全部帧的部件联合包围盒，其原点 (0,0) 是**人物 body 锚点**
+     * （脚底基准），并不等于"内容的几何中心"（实测画布 107 宽，x∈[-133,80]，
+     * origin 落在内容宽度的 62% 处）。所以先前"按内容居中"摆出来 origin 是偏的。
+     * 定稿口径：**origin 直接钉在屏幕正中心**，内容按真实包围盒左右外溢/裁剪。
+     * 即水平不再补偿缓冲内边距（pad_x 项去掉），纵向仍贴底 40px
+     * （脚底距屏底=设计值；内容在缓冲内的纵向留白 pad_y 仍需减去）。 */
     int32_t pad_y = RC_ENT_H - g_ent_ch * RC_SCALE;          /* 可见内容在缓冲内的下内边距 */
 
-    *sx = g_sw / 2 + g_ent_cx0 * RC_SCALE - pad_x + RC_ENT_CENTER_OFF_X
+    *sx = g_sw / 2 + g_ent_cx0 * RC_SCALE + RC_ENT_CENTER_OFF_X
           + (g_ent_base_wx << RC_SCALE_SHIFT) + ent_tilt_off_px(tilt_mdeg)
           + drag_x;
     *sy = g_sh - RC_ENT_MARGIN_B + g_ent_cy0 * RC_SCALE - pad_y + RC_ENT_CENTER_OFF_Y
