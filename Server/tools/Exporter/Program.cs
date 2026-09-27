@@ -146,6 +146,28 @@ if (!string.IsNullOrEmpty(dumpFootholds))
     foreach (var r in rows) Console.WriteLine($"[dump]   {{{r.x1}, {r.y1}, {r.x2}, {r.y2}}},");
     int? gyWorld = MapService.GetGroundY(mi, (int)Math.Round(camX));
     Console.WriteLine("[dump] 中列地面 y(1x 视口) = " + (gyWorld is int gy ? (gy - oy).ToString("0.##") : "null"));
+    // 【相机实测】把整层渲染在若干候选 camY 上各出一张 240x240，供主机端与设备实际画面比对，
+    // 用来判定"设备那 240x240 到底取的是世界哪一块"（= 导出相机到底是多少）
+    for (int cy = -160; cy <= 300; cy += 10)
+    {
+        var cand = mapSvc.RenderViewport(mi, camX, camY + cy, 1f, 0, vw, vh);
+        if (cand == null) continue;
+        using var cfs = File.Create($"/tmp/camy_{cy + 1000}.png");
+        cand.Encode(cfs, SkiaSharp.SKEncodedImageFormat.Png, 90);
+    }
+    Console.WriteLine("[dump] 候选相机渲染 → /tmp/camy_*.png");
+
+    // 整图渲染（世界坐标 1:1 起于 MinX/MinY）→ 用于"设备那 240x240 到底取的是世界哪一块"的实测比对
+    {
+        int ww = mi.MaxX - mi.MinX, wh = mi.MaxY - mi.MinY;
+        var whole = mapSvc.RenderViewport(mi, mi.MinX + ww / 2f, mi.MinY + wh / 2f, 1f, 0, ww, wh);
+        if (whole != null)
+        {
+            using var wfs = File.Create("/tmp/whole_map.png");
+            whole.Encode(wfs, SkiaSharp.SKEncodedImageFormat.Png, 90);
+            Console.WriteLine($"[dump] 整图 {ww}x{wh} → /tmp/whole_map.png（世界原点 MinX={mi.MinX} MinY={mi.MinY}）");
+        }
+    }
     // 把 foothold 画在视口渲染图上（红线），用于肉眼核对"真地面 vs 画面里的草地"对不对
     mapSvc.MapShowFoothold = true;
     var ov = mapSvc.RenderViewport(mi, camX, camY, 1f, 0, vw, vh);

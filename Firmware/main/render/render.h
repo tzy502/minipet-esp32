@@ -141,9 +141,6 @@ void render_input_tilt(float tilt_deg);
 void render_set_drag_off(int32_t px);
 int32_t render_get_drag_off(void);
 void render_set_drag_off_y(int32_t py);
-/* 【松手落回地面线 2026-09-27】拖动结束调用：脚底回到当前 x 的地面线
- * （本图内置地面表 / 无表回落"屏底-20"），保证任何时刻都像站在地上 */
-void render_settle_on_ground(void);
 /* 【校准】红线坐标系 + 触摸落点回显（tx,ty <0 = 不更新落点） */
 void render_calib_set(bool on, int16_t tx, int16_t ty);
 int32_t render_get_drag_off_y(void);
