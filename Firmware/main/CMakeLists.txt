@@ -62,3 +62,8 @@ target_include_directories(${COMPONENT_LIB} PRIVATE
     "${CMAKE_CURRENT_LIST_DIR}/.."
     "${CMAKE_CURRENT_LIST_DIR}/../profiles"
 )
+
+# 【地面带内置 2026-09-27】实验：把 000010000 缺的下方地面条（当前导出视口之外、
+# 含真 foothold 那层地面）直接编进固件 —— 用户要求"先实验做一个，直接烧录到板子里"，
+# 不走 NAS、不换 TF 卡。见 render/compositor.c 的 MP_GROUND_CAM_SHIFT_PX 说明。
+target_add_binary_data(${COMPONENT_LIB} "render/data/ground_band_000010000.bin" BINARY)

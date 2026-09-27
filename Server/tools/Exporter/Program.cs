@@ -157,6 +157,43 @@ if (!string.IsNullOrEmpty(dumpFootholds))
     }
     Console.WriteLine("[dump] 候选相机渲染 → /tmp/camy_*.png");
 
+    // 【地面带烘焙】当前导出视口(240x240) 只到世界 y=131.5，而地面 foothold 在 y≈245.5：
+    // 把相机不动、加高视口到 500 行（视差仍按原相机算）→ 裁出缺失的下方那一条，
+    // 供固件"相机下移"实验直接内置（纯固件，不走 NAS/换卡）。
+    {
+        int tall = 500;
+        var tv = mapSvc.RenderViewport(mi, camX, camY, 1f, 0, vw, tall);
+        if (tv != null)
+        {
+            int topRow = (int)Math.Round(oy + vh - oy + 0);          // 视口底行 = 世界 oy+vh
+            // 目标：世界 y ∈ [oy+vh, oy+vh+130) 那 130 行（= 屏幕下沿再往下 130 世界像素）
+            int wantWorldTop = (int)Math.Round(oy + vh);
+            int cropY = (int)Math.Round(wantWorldTop - (camY - tall / 2f));
+            if (cropY < 0) cropY = 0;
+            int cropH = 130;
+            if (cropY + cropH > tall) cropH = tall - cropY;
+            var band = new SkiaSharp.SKBitmap(vw, cropH);
+            using (var cv = new SkiaSharp.SKCanvas(band))
+                cv.DrawBitmap(tv, new SkiaSharp.SKRect(0, cropY, vw, cropY + cropH),
+                              new SkiaSharp.SKRect(0, 0, vw, cropH));
+            using (var bfs = File.Create("/tmp/ground_band.png"))
+                band.Encode(bfs, SkiaSharp.SKEncodedImageFormat.Png, 100);
+            // RGB565 little-endian 原始数据（固件直接当 uint16 数组用，×2 展开到设备像素）
+            var raw = new byte[vw * cropH * 2];
+            int o = 0;
+            for (int yy = 0; yy < cropH; yy++)
+                for (int xx = 0; xx < vw; xx++)
+                {
+                    var c = band.GetPixel(xx, yy);
+                    ushort v = (ushort)(((c.Red >> 3) << 11) | ((c.Green >> 2) << 5) | (c.Blue >> 3));
+                    raw[o++] = (byte)(v & 0xFF); raw[o++] = (byte)(v >> 8);
+                }
+            Directory.CreateDirectory("/Users/<USER>/IdeaProjects/minipet-esp32/Firmware/main/render/data");
+            File.WriteAllBytes("/Users/<USER>/IdeaProjects/minipet-esp32/Firmware/main/render/data/ground_band_000010000.bin", raw);
+            Console.WriteLine($"[dump] 地面带 {vw}x{cropH} → /tmp/ground_band.png + 固件内置 bin ({raw.Length} B)");
+        }
+    }
+
     // 整图渲染（世界坐标 1:1 起于 MinX/MinY）→ 用于"设备那 240x240 到底取的是世界哪一块"的实测比对
     {
         int ww = mi.MaxX - mi.MinX, wh = mi.MaxY - mi.MinY;

@@ -548,6 +548,22 @@ static const mp_ground_seg_t kGround000010000[] = {
 };
 #define MP_GROUND_SEG_N ((int)(sizeof kGround000010000 / sizeof kGround000010000[0]))
 static const char kGroundMapId[] = "000010000";
+
+/* ══ 【相机下移实验 2026-09-27】把画面下移到真 foothold 那层地面 ═══════════════
+ * 用户问："不能把整张地图都渲染进去，然后调整位置？"——整图放不下（2270x1807 世界像素
+ * ×2B = 8.2MB > PSRAM 8MB / 素材分区 6MB），但缺的只是**当前视口下方那一条**：
+ * 主机端用 Exporter（同一个相机、视口加高到 500 行后裁剪）烘出 240x130 的"地面带"
+ * （见 /tmp/ground_band.png：泥土路沿 + 草 + 枫叶），以二进制内嵌进固件
+ * （main/CMakeLists.txt target_add_binary_data），装载地图时把 static/tile/掩码整体
+ * **上移 MP_GROUND_CAM_SHIFT_PX 行**、底部缺失行用地面带补上，条带 y 相应上移半个位移
+ * （世界 1x）。于是画面 = 世界 y ∈ [15.5, 255.5]，真 foothold（world 245.5）正好落到
+ * 设备 y=460 = 屏底-20 ✓ 人物脚底就踩在红线那层地面上。
+ * 关掉本实验：把 MP_GROUND_CAM_SHIFT_PX 置 0 即可（代码路径整体跳过）。 */
+#define MP_GROUND_CAM_SHIFT_PX 248          /* 设备像素；248 = 124 世界像素 */
+
+extern const uint8_t ground_band_000010000_bin_start[] asm("_binary_ground_band_000010000_bin_start");
+#define MP_GROUND_BAND_W 240
+#define MP_GROUND_BAND_H 130
 static bool g_ground_tbl_on;               /* 当前地图是否命中地面表 */
 
 /* ══ 拖拽范围：**整只宠物必须留在屏内** ═══════════════════════════════════
@@ -1777,6 +1793,52 @@ static void blit_be(int32_t x, int32_t y, int32_t w, int32_t h,
     }
 }
 
+/* 【相机下移实验】把已装载的 static/tile/掩码整体上移 MP_GROUND_CAM_SHIFT_PX 行，
+ * 底部缺失行用内嵌"地面带"补齐（tile 层补透明）；条带 y 上移 SHIFT/2 世界像素。
+ * 只在命中地面表（= 这张图）且开了实验开关时执行。 */
+static void ground_cam_shift_layers(void)
+{
+#if MP_GROUND_CAM_SHIFT_PX > 0
+    if (!g_ground_tbl_on) return;
+    const int32_t sh = MP_GROUND_CAM_SHIFT_PX;
+    if (sh <= 0 || sh >= g_sh) return;
+
+    if (g_static) {
+        for (int32_t r = 0; r + sh < g_sh; r++)
+            memcpy(g_static + (size_t)r * g_sw, g_static + (size_t)(r + sh) * g_sw,
+                   (size_t)g_sw * 2u);
+        /* 底部 sh 行 ← 地面带（1x → 2x 最近邻展开） */
+        const uint16_t *band = (const uint16_t *)(const void *)ground_band_000010000_bin_start;
+        for (int32_t r = g_sh - sh; r < g_sh; r++) {
+            int32_t by = (r - (g_sh - sh)) >> 1;
+            if (by >= MP_GROUND_BAND_H) by = MP_GROUND_BAND_H - 1;
+            uint16_t *drow = g_static + (size_t)r * g_sw;
+            const uint16_t *brow = band + (size_t)by * MP_GROUND_BAND_W;
+            for (int32_t x = 0; x < g_sw; x++)
+                drow[x] = brow[(x >> 1) < MP_GROUND_BAND_W ? (x >> 1) : MP_GROUND_BAND_W - 1];
+        }
+    }
+    if (g_tile) {
+        for (int32_t r = 0; r + sh < g_sh; r++)
+            memcpy(g_tile + (size_t)r * g_sw, g_tile + (size_t)(r + sh) * g_sw,
+                   (size_t)g_sw * 2u);
+        memset(g_tile + (size_t)(g_sh - sh) * g_sw, 0, (size_t)sh * g_sw * 2u);
+    }
+    if (g_tile_mask) {
+        const size_t stride = (size_t)((g_sw + 7) / 8);
+        for (int32_t r = 0; r + sh < g_sh; r++)
+            memcpy(g_tile_mask + (size_t)r * stride, g_tile_mask + (size_t)(r + sh) * stride, stride);
+        memset(g_tile_mask + (size_t)(g_sh - sh) * stride, 0, (size_t)sh * stride);
+    }
+    for (int i = 0; i < g_strip_n; i++) {
+        if (!g_strips[i].ok) continue;
+        g_strips[i].y = (int16_t)(g_strips[i].y - (sh >> 1));
+    }
+    ESP_LOGI(TAG, "相机下移实验：各层上移 %d 行（设备像素），底部用内嵌地面带补齐；条带 y -= %d",
+             (int)sh, (int)(sh >> 1));
+#endif
+}
+
 static void full_recompose(void)
 {
     /* 同 flush_dirty：跨任务（render_set_map/clock/exit_menu/force_redraw）可达，
@@ -2606,6 +2668,9 @@ static int render_set_map_nolock(const char *bgmap_path,
     g_ground_tbl_on = (strcmp(bg->map_id, kGroundMapId) == 0);
     ESP_LOGI(TAG, "地面线来源：%s（map_id=%s）",
              g_ground_tbl_on ? "本图内置地面表" : "通用线(屏底-20)", bg->map_id);
+
+    /* 【相机下移实验】装载完成后把各层上移，底部缺失行用内嵌地面带补 */
+    ground_cam_shift_layers();
 
     g_map_epoch_us = esp_timer_get_time();
     g_map_ok = true;
