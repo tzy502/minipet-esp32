@@ -49,6 +49,13 @@ public static class ManifestBuilder
                 foreach (var i in ia) arr.Add(i);
                 o[k] = arr;
             }
+            // 数值/布尔必须走 JsonValue.Create 保类型：ToString() 会把 scale=2 写成
+            // 字符串 "2"，下游按 number 取值（JSON.parse 后 ===2、cJSON_IsNumber）会失配。
+            else if (v is int i32) o[k] = i32;
+            else if (v is long i64) o[k] = i64;
+            else if (v is double d) o[k] = d;
+            else if (v is float f) o[k] = f;
+            else if (v is bool b) o[k] = b;
             else if (v != null) o[k] = v.ToString() ?? "";
         }
         return o;

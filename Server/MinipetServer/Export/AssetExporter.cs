@@ -294,6 +294,13 @@ public sealed class AssetExporter
             };
             if (core.LayoutBounds.TryGetValue(action, out var bounds))
                 extra["bounds"] = bounds; // [w,h] 画布联合包围盒（1x 像素，契约见类头注释）
+            /* 【E1 缺口补齐 2026-09-27】需求原文：「480 屏部件 1x + scale 2x nearest
+             * 由导出器标注」。此前该标注只存在于 PlacementMath 的编译期常量里，
+             * manifest 不含任何缩放信息 —— 缺口核对记为"E1 未实现项"。
+             * 这里把缩放契约随条目下发（设备端当前用编译期同名常量，读不读都不影响
+             * 既有渲染；服务端/未来机型可按条目取，无需再改固件）。 */
+            extra["scale"] = PlacementMath.Scale;                 // 2 = 2x nearest（禁双线性）
+            extra["bottomMargin"] = PlacementMath.BottomMargin;   // 缩放后画布底边距屏幕底边 px
             AddAsset(summary, MpakKind.Layout, payload, $"布局 {action}", selector: "paperdoll", extra: extra);
         }
     }
