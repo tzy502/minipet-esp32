@@ -36,6 +36,10 @@ bool watchdog_render_allowed(void);
 
 /* 纯文本错误 + 关屏（状态机 FATAL 态复用；绝不进渲染路径）
  * line1/line2 为 ASCII 大写串（内嵌 5x7 字体只含 ASCII 可打印子集） */
+/* 【渲染任务缺席】渲染任务因内部堆碎片彻底起不来时调用：停掉"渲染心跳"计振，
+ *  避免把"没渲染任务"误判成"渲染卡死"而三振熔断关屏（真机实证）。 */
+void watchdog_render_absent(void);
+
 void watchdog_fatal_show(const char *line1, const char *line2);
 
 /* 常驻纯文本屏（不关屏、不挂起；用于 FATAL 态需用户引导的场景，

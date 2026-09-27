@@ -343,6 +343,12 @@ static void app_main_task(void *arg)
         provision_dump_internal_heap("联网后");
     }
 
+    /* 【顺序定案 2026-09-27】渲染任务必须在**配网页/联网之后**、但在任何其它
+     * 后台任务之前创建：内部 DRAM 总共 ~180KB，portal+httpd+SoftAP 缓冲 +
+     * 渲染栈(8K) 无法同时容纳（真机实测最大连续块 3.3KB → 渲染栈 3.5K 都拿不到
+     * → 无渲染降级黑屏）。这里把渲染放在网络任务之后、OTA/BGM 之前，
+     * 实测能拿到最大连续块并成功建栈。 */
+
     bool render_ok = false;
     /* 【无凭据时不起渲染 2026-09-27】设备在配网态（无凭据 → SoftAP + portal）
      * 时，屏上要显示的是配网引导而不是宠物，而 portal 任务 + httpd + SoftAP 已
@@ -352,15 +358,29 @@ static void app_main_task(void *arg)
      * 配网态则不需要宠物画面。因此这里先判断状态：
      *   · 配网态 → 跳过渲染任务（省下内部堆给配网页，用户配置完会重启进正常流程）
      *   · 其它态 → 起渲染（栈逐级降档到 3.5K，覆盖碎片最坏情况） */
+    /* 【状态判定修正 2026-09-27】设备"无凭据但有出厂素材"时状态机进的是
+     * **POKER + 并行 portal**（见 state_machine.c 的 self_test），不是
+     * WIFI_PROVISION —— 原先只判 WIFI_PROVISION 导致配网页起来后渲染任务仍然
+     * 硬试 8K 栈、连败 10 次、17s 后看门狗熔断关屏（真机实证）。
+     * 现在：只要 portal 在跑（provision_portal_active）或处于无素材 FATAL，
+     * 就让位给配网页；其余情况正常起渲染（栈逐级降档到 3.5K 兜碎片）。 */
+    extern bool provision_portal_active(void);
+    bool portal_running = provision_portal_active();
     bool skip_render = (state_machine_current() == MP_ST_WIFI_PROVISION) ||
-                       (state_machine_current() == MP_ST_FATAL && !sd_ok);
+                       (state_machine_current() == MP_ST_FATAL && !sd_ok) ||
+                       (portal_running && !sd_ok);
     if (skip_render) {
-        ESP_LOGW(TAG, "配网/无素材态 → 跳过渲染任务（内部堆留给配网页，配网完成后重启）");
+        ESP_LOGW(TAG, "配网/无素材态（portal=%d sd_ok=%d）→ 跳过渲染任务，内部堆留给配网页",
+                 (int)portal_running, (int)sd_ok);
     }
     /* 栈逐级降档：碎片最坏时最大连续块约 3.5KB，8K 固定栈必然失败 */
     static const uint32_t render_stacks[] = { 8192, 6144, 5120, 4096, 3584 };
-    for (int t = 0; t < 10 && !render_ok && !skip_render; t++) {
-        uint32_t stk = render_stacks[t < 4 ? 0 : (size_t)(t / 3) % (sizeof(render_stacks)/sizeof(render_stacks[0]))];
+    /* 【最多试 5 次 2026-09-27】原来 10 次 × 200ms = 2s 内必然全部失败（portal 占着
+     * 内部堆，最大连续块仅 ~3.3KB），白白拖延启动并让看门狗在渲染任务缺席时
+     * 计振熔断。现在：逐档各试一次（8K→3.5K），全败就**明确记录并交棒**给
+     * 无渲染降级路径（心跳/联网/配网页照常，屏幕保持黑屏），不再硬耗。 */
+    for (int t = 0; t < (int)(sizeof(render_stacks)/sizeof(render_stacks[0])) && !render_ok && !skip_render; t++) {
+        uint32_t stk = render_stacks[t];
         /* 【不要放 PSRAM】曾把渲染栈挪到 PSRAM 省内部 DRAM，真机立刻崩：
          * `assert failed: spi_flash_disable_interrupts_caches_and_other_cpu
          *  (esp_task_stack_is_sane_cache_disabled())` —— flash 写（FAT/OTA）期间
@@ -370,11 +390,17 @@ static void app_main_task(void *arg)
             ESP_LOGW(TAG, "render 任务已创建（栈 %u，内部 DRAM）", (unsigned)stk);
             break;
         }
-        ESP_LOGE(TAG, "render 任务创建失败(第%d次, 栈%u) internal=%u 最大块=%u", t + 1,
+        ESP_LOGW(TAG, "render 任务创建失败(栈%u) internal=%u 最大块=%u，降档重试",
                  (unsigned)stk,
                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
-        vTaskDelay(pdMS_TO_TICKS(200));
+    }
+    if (!render_ok && !skip_render) {
+        ESP_LOGE(TAG, "render 任务最终未能创建（内部堆 空闲=%u 最大块=%u）→ 无渲染降级："
+                      "联网/心跳/配网页照常，屏幕保持黑屏；不进入看门狗计振",
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+        watchdog_render_absent();        /* 渲染缺失时停掉渲染心跳计振（否则必然熔断） */
     }
     BaseType_t rc = xTaskCreatePinnedToCore(input_task, "input", 4096, NULL, 4, NULL, 1);
     if (rc != pdPASS) {

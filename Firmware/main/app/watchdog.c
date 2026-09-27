@@ -60,6 +60,7 @@ static volatile bool    s_fatal_latched;      /* 熔断后停检 */
 static volatile uint8_t s_strikes;
 static bool             s_was_fatal_last_boot;
 static bool             s_fatal_lockdown;     /* 本次开机处于熔断锁定态（拒绝渲染） */
+static bool             s_render_absent;      /* 渲染任务彻底缺席（停计振） */
 static bool             s_render_subscribed;  /* 渲染任务已订阅（宽限期判定） */
 static TaskHandle_t     s_render_task;        /* 渲染任务句柄（订阅点自取，熔断时挂起它） */
 
@@ -197,6 +198,9 @@ static void watchdog_task(void *arg)
             cleared = true;
         }
 
+        if (s_render_absent) {
+            continue;   /* 渲染任务不存在：心跳年龄无意义（见 watchdog_render_absent） */
+        }
         int64_t age = mp_now_ms() - s_last_kick_ms;
         if (age <= MP_WDT_TIMEOUT_MS) {
             continue;
@@ -318,6 +322,15 @@ void watchdog_kick(void)
 bool watchdog_was_fatal_last_boot(void)
 {
     return s_was_fatal_last_boot;
+}
+
+void watchdog_render_absent(void)
+{
+    /* 渲染任务不存在 → 渲染心跳永远不再更新，计振毫无意义（必然熔断）。
+     * 这里把它标记为"已知缺席"，计振分支直接跳过；其余保护（TWDT 订阅、
+     * FATAL 文本、低电等）不受影响。 */
+    s_render_absent = true;
+    ESP_LOGW("wdt", "渲染任务缺席：已关闭渲染心跳计振（不再熔断关屏）");
 }
 
 void watchdog_fatal_show(const char *line1, const char *line2)
