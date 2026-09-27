@@ -37,6 +37,7 @@ static const char *TAG = "sm";
 #include "input_dispatch.h"   /* E7：切换后随机表情 */
 #include "clock_digits.h"    /* CLOCK_ANCHOR_AUTO（问题3 默认居中锚点） */
 #include "http_client.h"
+#include "mdns_discover.h"   /* E14：服务端 mDNS 兜底发现 */
 #include "asset_dl.h"
 #include "ota.h"
 #include "bgm.h"
@@ -44,6 +45,7 @@ static const char *TAG = "sm";
 static mp_state_t s_state = MP_ST_BOOT;
 static bool       s_online = false;       /* 服务端可达（poller 维护） */
 static bool       s_force_sleep = false;  /* <10% 强制睡眠保电（E11） */
+static bool       s_mdns_fallback_done;   /* E14：手输地址失败后的 mDNS 兜底只做一次 */
 static int64_t    s_last_activity_ms;
 static SemaphoreHandle_t s_lock;
 
@@ -190,6 +192,29 @@ static void transition(mp_state_t next)
 /* ------------------------------------------------------------------ */
 /* 自检（E14：WiFi/内存/TF/服务端连通）                                  */
 /* ------------------------------------------------------------------ */
+/* ------------------------------------------------------------------ */
+/* E14 mDNS 兜底：设备自动发现服务端（配网页手输地址的「补充」）           */
+/* ------------------------------------------------------------------ */
+/* 语义（严格按需求「手输地址优先」）：
+ *   1) NVS srv_url 有值且 hello 成功 → 一次 mDNS 都不发（手输优先）
+ *   2) srv_url 为空（用户配网时留空）→ 启动即发现一次，命中就用
+ *   3) srv_url 有值但连不上 → 发现一次兜底（服务端换了 IP / 手输地址写错）
+ * 约束：超时短（~2.2s，见 mdns_discover.c），失败静默；发现结果**不写 NVS**
+ * （否则会把手输地址顶掉，且 DHCP 换 IP 后永远用旧值）。
+ * 调用点都在自检期（WiFi 已拿 IP），不在任何高频路径上。 */
+static bool mdns_try_discover(void)
+{
+    char url[64];
+    if (!mp_mdns_discover_server(url, sizeof(url))) return false;
+    mp_http_set_server_url(url);
+    return true;
+}
+
+/* ------------------------------------------------------------------ */
+/* 自检（E14：WiFi/内存/TF/服务端连通）                                  */
+/* ------------------------------------------------------------------ */
+static bool mdns_try_discover(void);   /* E14：定义在同文件下方（mDNS 兜底） */
+
 static void self_test(bool sd_ok, bool psram_ok)
 {
     s_state = MP_ST_SELF_TEST;
@@ -231,11 +256,37 @@ static void self_test(bool sd_ok, bool psram_ok)
 
     /* 5) 服务端连通：hello（含 profile/UUID/固件版本注册，E2） */
     mp_http_init();
+    if (!mp_http_server_url()) {
+        /* 5a) srv_url 为空（配网页留空）：mDNS 兜底发现（E14）。
+         * 发现不到 = 保持未配置，走下方 offline_check_cache（绝不阻塞黑屏）。 */
+        ESP_LOGI(TAG, "srv_url 未配置 → 尝试 mDNS 发现 _minipet._tcp（E14）");
+        mdns_try_discover();
+    }
     if (mp_http_hello() == 0) {
         s_online = true;
         asset_dl_request_sync();          /* 联网成功：立即 manifest diff */
         transition(MP_ST_POKER);
         return;
+    }
+
+    /* 5b) 手输地址优先但连不上 → mDNS 兜一次（服务端换 IP / 地址写错）。
+     * 无论成败都把内存地址还原成手输值：发现结果只做「本次运行」的兜底，
+     * 绝不覆盖用户配置（手输优先 —— E14 原文）。每次开机至多一次。 */
+    if (mp_http_server_url() && !s_mdns_fallback_done) {
+        s_mdns_fallback_done = true;
+        char manual[128];
+        strlcpy(manual, mp_http_server_url(), sizeof(manual));
+        ESP_LOGW(TAG, "hello 失败（%s 不可达）→ mDNS 兜底发现（E14）", manual);
+        if (mdns_try_discover()) {
+            if (mp_http_hello() == 0) {
+                s_online = true;
+                asset_dl_request_sync();
+                transition(MP_ST_POKER);
+                return;
+            }
+            ESP_LOGW(TAG, "mDNS 发现的地址同样 hello 失败 → 回落离线");
+        }
+        mp_http_set_server_url(manual);   /* 还原手输地址（本次运行内的地址即配置快照） */
     }
 
 offline_check_cache:

@@ -21,14 +21,24 @@
 #include "cJSON.h"
 #include "lwip/sockets.h"
 #include <errno.h>
+#include <stdlib.h>
 
 #include "app_core.h"
 #include "hal_contract.h"
+#include "logbuf.h"
+#include "mdns_discover.h"
 
 static const char *TAG = "http";
 
 #define URL_BUF_LEN   256
 #define READ_CHUNK    2048
+
+/* E14 日志端点 */
+#define LOG_PATH          "/api/device/log"
+#define LOG_POST_TIMEOUT  4000        /* 短超时：绝不拖慢长轮询 */
+#define LOG_BODY_CAP      4608
+#define LOG_RESP_CAP      256
+#define LOG_HEX_MAX       512         /* 单次上报的 msg hex 上限（与 logbuf msg 上限对齐） */
 
 static char s_server_url[128];      /* 无结尾斜杠 */
 static char s_uuid[13];             /* 12 hex + NUL */
@@ -36,9 +46,36 @@ static char s_device_id[40];        /* hello 返回；未注册时 = s_uuid */
 static volatile bool s_hello_done;
 static char s_pairing_code[8];      /* hello 下发的 6 位配对码（暂存，字体绑定后重显） */
 
+/* 设备日志上报游标（已成功送达服务端的最大序号） */
+static uint32_t s_log_sent_seq;
+static uint32_t s_log_last_try_ms;
+static uint32_t s_log_fail_streak;
+
 /* ------------------------------------------------------------------ */
 /* 初始化                                                               */
 /* ------------------------------------------------------------------ */
+/* 归一化：去尾斜杠 + scheme 兜底（真机两坑）：
+ *   ①省略 scheme → 补 http://；②手机浏览器自动升级 https:// → NAS 服务端为
+ *   纯 HTTP，强制回 http（否则 TLS 握手被重置 → abort 重启循环）。 */
+static void url_apply(char *dst, size_t cap, const char *raw)
+{
+    while (*raw == ' ') raw++;
+    strlcpy(dst, raw, cap);
+    size_t len = strlen(dst);
+    while (len > 0 && dst[len - 1] == '/') dst[--len] = 0;
+    if (dst[0] == 0) return;
+    char tmp[128];
+    if (strncmp(dst, "http://", 7) == 0) {
+        /* 已是 http，保持 */
+    } else if (strncmp(dst, "https://", 8) == 0) {
+        snprintf(tmp, sizeof(tmp), "http://%s", dst + 8);
+        strlcpy(dst, tmp, cap);
+    } else {
+        snprintf(tmp, sizeof(tmp), "http://%s", dst);
+        strlcpy(dst, tmp, cap);
+    }
+}
+
 void mp_http_init(void)
 {
     if (s_uuid[0] == 0) {
@@ -48,26 +85,12 @@ void mp_http_init(void)
                  mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
         strlcpy(s_device_id, s_uuid, sizeof(s_device_id));   /* 匿名兜底（E13） */
     }
-    if (!mp_nvs_get_str("srv_url", s_server_url, sizeof(s_server_url))) {
+    char raw[128] = { 0 };
+    if (!mp_nvs_get_str("srv_url", raw, sizeof(raw)) || raw[0] == 0) {
         s_server_url[0] = 0;
+        return;
     }
-    size_t len = strlen(s_server_url);
-    while (len > 0 && s_server_url[len - 1] == '/') s_server_url[--len] = 0;
-    /* scheme 归一化（真机两坑）：①省略 scheme → 补 http://；②手机浏览器
-     * 自动升级 https:// → NAS 服务端为纯 HTTP，强制回 http（否则 TLS 握手
-     * 被重置 → abort 重启循环） */
-    if (s_server_url[0]) {
-        char tmp[sizeof(s_server_url)];
-        if (strncmp(s_server_url, "http://", 7) == 0) {
-            /* 已是 http，保持 */
-        } else if (strncmp(s_server_url, "https://", 8) == 0) {
-            snprintf(tmp, sizeof(tmp), "http://%s", s_server_url + 8);
-            strlcpy(s_server_url, tmp, sizeof(s_server_url));
-        } else {
-            snprintf(tmp, sizeof(tmp), "http://%s", s_server_url);
-            strlcpy(s_server_url, tmp, sizeof(s_server_url));
-        }
-    }
+    url_apply(s_server_url, sizeof(s_server_url), raw);
 }
 
 const char *mp_http_server_url(void) { return s_server_url[0] ? s_server_url : NULL; }
@@ -75,6 +98,19 @@ const char *mp_http_uuid(void)       { return s_uuid; }
 const char *mp_http_device_id(void)  { return s_device_id; }
 bool mp_http_hello_done(void) { return s_hello_done; }
 const char *mp_http_pairing_code(void)    { return s_pairing_code; }
+
+/* 覆盖本次运行的服务器地址（E14 mDNS 兜底用；**不写 NVS**，见 mdns_discover.h）。
+ * url 为 NULL 或空串 = 清空（地址不可达时清掉，避免对已知坏地址反复发请求）。 */
+void mp_http_set_server_url(const char *url)
+{
+    if (!url || url[0] == 0) {
+        s_server_url[0] = 0;
+        s_hello_done = false;      /* 地址换了：hello 需要重新做 */
+        return;
+    }
+    url_apply(s_server_url, sizeof(s_server_url), url);
+    s_hello_done = false;
+}
 
 /* ------------------------------------------------------------------ */
 /* 传输失败限频诊断（问题8 卡点）                                         */
@@ -377,4 +413,106 @@ int mp_http_hello(void)
     s_hello_done = true;
     ESP_LOGI(TAG, "hello ok, deviceId=%s", s_device_id);
     return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* POST /api/device/log（E14 设备环形日志上报）                          */
+/* ------------------------------------------------------------------ */
+/* 「Web 可拉取」的通路选择（三选一，见任务书）：
+ *   a) poll 响应捎带 —— 不合适：poll 是拉指令的下行通道，日志是上行数据；
+ *   b) 设备侧开 HTTP 服务端 —— 不可行：设备是纯 client，唯一 server 是配网 portal；
+ *   c) 【本实现】设备定期 POST 到服务端 /api/device/log，服务端存每设备环缓，
+ *      Web 从服务端拉 —— 与既有 hello/poll/event 同构，零新增任务/端口。
+ *
+ * 增量语义：body 带 since（上次成功送达的最大序号），服务端按 seq 去重/排序即可；
+ * 只有成功（HTTP 200）才推进游标，失败下轮重传（不丢日志）。
+ *
+ * 内存：body 缓冲是文件级 static（.bss，不占内部【动态】堆、不占 PSRAM，
+ * 一次分配永驻，规避碎片化导致的运行期 malloc 失败 —— 本板已有前车之鉴）。 */
+
+/* 单条日志的 msg 走 hex（json_escape 的替代：零堆分配、零栈大数组；
+ * 不可打印字节/引号/换行都不需要再转义；服务端 hex→UTF-8 即可）。
+ * 唯一读者是 poller 任务（单线程），故 scratch 用文件级 static 复用。 */
+static char s_log_hex[LOG_HEX_MAX * 2 + 1];
+
+static void log_msg_to_hex(const char *msg)
+{
+    static const char HEX[] = "0123456789abcdef";
+    size_t slen = strlen(msg);
+    size_t sn = slen > LOG_HEX_MAX ? LOG_HEX_MAX : slen;      /* 超长截断（保头） */
+    size_t hl = 0;
+    for (size_t i = 0; i < sn; i++) {
+        uint8_t b = (uint8_t)msg[i];
+        s_log_hex[hl++] = HEX[b >> 4];
+        s_log_hex[hl++] = HEX[b & 0x0F];
+    }
+    s_log_hex[hl] = 0;
+}
+
+/**
+ * 增量上报一步（由已在跑的 poller 任务周期调用 —— 不新建任务）。
+ *  - 仅在 hello 成功（网络/deviceId 就绪）且缓冲可用时动作
+ *  - 心跳间隔 20s；出现 E 级日志或从未上报过 → 立即上报
+ *  - 失败退避（连续失败 60s 一轮），绝不拖慢 poll（单次 4s 超时上限）
+ */
+void mp_http_device_log_step(void)
+{
+    if (!logbuf_ready() || !s_hello_done) return;
+    if (!s_server_url[0]) return;
+
+    uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    bool urgent = logbuf_take_err_flag() || s_log_sent_seq == 0;
+    uint32_t period = urgent ? 0 : (s_log_fail_streak ? 60000u : 20000u);
+    if (!urgent && (uint32_t)(now_ms - s_log_last_try_ms) < period) return;
+
+    uint32_t seq_now = logbuf_seq();
+    if (seq_now <= s_log_sent_seq) return;               /* 无新日志 */
+
+    s_log_last_try_ms = now_ms;
+
+    static char body[LOG_BODY_CAP];
+    int off = snprintf(body, sizeof(body),
+                       "{\"proto\":%d,\"deviceId\":\"%s\",\"since\":%lu,\"logs\":[",
+                       MP_PROTO_VER, s_device_id, (unsigned long)s_log_sent_seq);
+
+    logbuf_iter_t it;
+    uint32_t last_seq = s_log_sent_seq;
+    int n = 0;
+    if (logbuf_scan_start(&it, s_log_sent_seq)) {
+        logbuf_rec_t rec;
+        while (logbuf_scan_next(&it, &rec)) {
+            if (off <= 0 || (size_t)off >= sizeof(body) - 640) break;   /* 留余量给尾部 */
+            log_msg_to_hex(rec.msg);
+            char one[LOG_HEX_MAX * 2 + 160];
+            int w = snprintf(one, sizeof(one),
+                             "{\"seq\":%lu,\"ts\":%llu,\"t\":%lu,\"lvl\":\"%c\","
+                             "\"tag\":\"%s\",\"msgHex\":\"%s\"}",
+                             (unsigned long)rec.seq, (unsigned long long)rec.ts_ms,
+                             (unsigned long)rec.t_ms, rec.lvl, rec.tag, s_log_hex);
+            if (w <= 0 || (size_t)w >= sizeof(one)) continue;   /* 不该发生：跳过 */
+            if (off + w + 3 >= (int)sizeof(body)) break;
+            if (n) body[off++] = ',';
+            memcpy(body + off, one, (size_t)w);
+            off += w;
+            last_seq = rec.seq;
+            n++;
+        }
+    }
+    logbuf_scan_end(&it);
+
+    if (n == 0) return;                                  /* 一条都塞不进：等缓冲腾挪 */
+
+    off += snprintf(body + off, sizeof(body) - (size_t)off, "],\"count\":%d}", n);
+
+    char resp[LOG_RESP_CAP];
+    int status = mp_http_post_json(LOG_PATH, body, resp, sizeof(resp), LOG_POST_TIMEOUT);
+    if (status == 200) {
+        s_log_sent_seq = last_seq;
+        s_log_fail_streak = 0;
+        ESP_LOGD(TAG, "device log uploaded: %d lines, since→%lu",
+                 n, (unsigned long)last_seq);
+    } else {
+        if (s_log_fail_streak < 100) s_log_fail_streak++;
+        ESP_LOGD(TAG, "device log post failed: %d（下轮重传，n=%d）", status, n);
+    }
 }

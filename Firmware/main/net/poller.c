@@ -306,7 +306,14 @@ static void poller_task(void *arg)
         /* E9 常态化校时：借本任务执行（不新建 rtcsync 任务，绕开内部堆碎片） */
         provision_rtc_resync_step();
 
+        /* E14 设备日志增量上报：同样借本任务（不新建任务 —— 内部堆约束）。
+         * 内部自带 20s 心跳/失败退避，poll 长轮询期间不会叠加请求。 */
+        mp_http_device_log_step();
+
         bool ok = do_poll_once();
+
+        /* 长轮询可能 hold 50s：再补一次日志上报机会（内部节流，不会连发） */
+        mp_http_device_log_step();
 
         if (ok) {
             s_last_poll_status = 200;

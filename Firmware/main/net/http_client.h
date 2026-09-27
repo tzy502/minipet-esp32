@@ -13,6 +13,7 @@
  *   GET  /api/device/bgm/stream?id=   MP3 流
  *   POST /api/device/bgm/cmd          设备端 BGM 控制回传
  *   GET  /api/device/firmware/{v}.bin OTA 固件包
+ *   POST /api/device/log              E14 设备环形日志增量上报（服务端需实现）
  */
 #ifndef MP_HTTP_CLIENT_H
 #define MP_HTTP_CLIENT_H
@@ -36,6 +37,14 @@ void mp_http_init(void);
 
 /* 服务器 base URL（如 http://192.168.1.100:38090）；未配置返回 NULL */
 const char *mp_http_server_url(void);
+
+/* 覆盖本次运行的服务器地址（E14 mDNS 兜底，见 net/mdns_discover.h）。
+ * 不写 NVS（手输地址优先，绝不被发现结果覆盖）；NULL/"" = 清空并复位 hello。 */
+void mp_http_set_server_url(const char *url);
+
+/* E14 设备日志增量上报一步（POST /api/device/log）。由已在跑的 poller 任务
+ * 周期调用（不新建任务）：20s 心跳，E 级日志或首报则立即；失败退避重传。 */
+void mp_http_device_log_step(void);
 
 /* 设备 UUID（"AABBCCDDEEFF"，efuse MAC，开机生成，稳定不变） */
 const char *mp_http_uuid(void);

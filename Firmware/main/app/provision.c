@@ -37,6 +37,8 @@
 #include "esp_mac.h"
 #include "esp_system.h"
 #include "esp_log.h"
+#include "nvs.h"
+#include "esp_system.h"
 #include "cJSON.h"
 
 #include "app_core.h"
@@ -119,7 +121,8 @@ static const char PAGE_PORTAL_BODY[] =
 "</div>"
 "<div class=\"step\"><b>第 3 步：服务器地址</b>"
 "<label>服务器地址（不清楚可留空，或问部署服务的人）</label>"
-"<input name=\"server\" maxlength=\"127\" placeholder=\"例如：http://192.168.1.100:38090\">"
+"<input name=\"server\" maxlength=\"127\" placeholder=\"http://<服务器IP>:38090\">"
+"<div class=\"hint\">填运行 MiniPet 服务端的机器地址（如 NAS/PC 的局域网 IP）。设备也会尝试 mDNS 自动发现（_minipet._tcp），留空则回落示例地址。</div>"
 "<div class=\"hint\">格式：http://服务器IP:38090（端口默认 38090）。</div>"
 "</div>"
 "<button type=\"submit\" class=\"big\">保存并连接</button>"
@@ -858,6 +861,37 @@ void provision_get_ap_ssid(char *out, size_t cap)
     uint8_t mac[6] = { 0 };
     esp_read_mac(mac, ESP_MAC_WIFI_SOFTAP);
     snprintf(out, cap, "MiniPet-%02X%02X", mac[4], mac[5]);
+}
+
+/* 【E14 补齐 2026-09-27】恢复出厂配网：只清配网相关键（WiFi 凭据 + 服务器地址
+ * + 轮询游标），保留标定/中键计数等诊断键与 TF/Flash 素材分区。
+ * 清完重启 → 无配置但有本地素材时进 OFFLINE + 拉起 SoftAP portal；
+ * 无素材时进 WIFI_PROVISION 常驻提示。用户手机连 MiniPet-XXXX 重配即可。 */
+void provision_factory_reset(void)
+{
+    /* 【务必用 MP_NVS_NS】配网键写在 "minipet" 命名空间（app_core.h:49 +
+     * mp_nvs_set_str），此前写成字面量 "nvs" → 一个键都删不掉，Reset WiFi
+     * 会静默失效（"清了但没清"）。现统一走 MP_NVS_NS 并逐键校验结果。 */
+    nvs_handle_t h;
+    int erased = 0;
+    esp_err_t e = nvs_open(MP_NVS_NS, NVS_READWRITE, &h);
+    if (e == ESP_OK) {
+        static const char *keys[] = { "wifi_ssid", "wifi_pass", "srv_url", "poll_since" };
+        for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
+            esp_err_t r = nvs_erase_key(h, keys[i]);
+            if (r == ESP_OK) erased++;
+            else if (r != ESP_ERR_NVS_NOT_FOUND) {
+                ESP_LOGW(TAG, "清 %s 失败：%s", keys[i], esp_err_to_name(r));
+            }
+        }
+        nvs_commit(h);
+        nvs_close(h);
+    } else {
+        ESP_LOGE(TAG, "打开 NVS 命名空间 %s 失败：%s", MP_NVS_NS, esp_err_to_name(e));
+    }
+    ESP_LOGW(TAG, "配网凭据已清除 %d 项（ns=%s）→ 3s 后重启进配网", erased, MP_NVS_NS);
+    vTaskDelay(pdMS_TO_TICKS(3000));   /* 让屏上提示可见 */
+    esp_restart();
 }
 
 bool provision_has_config(void)

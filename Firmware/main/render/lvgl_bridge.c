@@ -32,6 +32,7 @@
 #include "app_core.h"
 #include "asset_dl.h"
 #include "bgm.h"
+#include "provision.h"   /* E14：Reset WiFi */
 #include "state_machine.h"
 
 static const char *TAG = "bridge";
@@ -73,6 +74,7 @@ typedef enum {
     MENU_PAGE_ACTIONS,       /* 动作演示（MP_ACTION_*，真实指令通道） */
     MENU_PAGE_NPC,           /* Monsters：NPC 素材清单（asset_dl_npc_list，T2） */
     MENU_PAGE_BGM,
+    MENU_PAGE_RESET,         /* 【E14 补齐】Reset WiFi：清 NVS 配网凭据并重启（免插线重配网） */
 } menu_page_t;
 
 #define MENU_ROWS_MAX   8       /* 单页可选行上限（含 Back/Exit 行） */
@@ -584,6 +586,7 @@ static const struct { const char *label; int page; } ROOT_ROWS[] = {
     { "Actions",   MENU_PAGE_ACTIONS   },
     { "Monsters",  MENU_PAGE_NPC       },
     { "BGM",       MENU_PAGE_BGM       },
+    { "Reset WiFi", MENU_PAGE_RESET    },   /* E14：清凭据重配网（无需连电脑擦 NVS） */
     { "Exit",      -1                  },   /* -1 = 收菜单（状态机 MENU_KEY 通道） */
 };
 #define ROOT_CNT ((int)(sizeof(ROOT_ROWS) / sizeof(ROOT_ROWS[0])))
@@ -719,6 +722,15 @@ static void menu_activate(int idx)
             s_menu.req_rebuild = true;
         }
         else if (idx == 6) menu_goto(MENU_PAGE_ROOT);   /* Back 行 */
+        break;
+
+    case MENU_PAGE_RESET:
+        if (idx == 0) {
+            ESP_LOGW(TAG, "用户确认 Reset WiFi → 清配网凭据并重启");
+            provision_factory_reset();      /* 清 NVS 里的 wifi_ssid/wifi_pass/srv_url */
+        } else if (idx == 1) {
+            menu_goto(MENU_PAGE_ROOT);
+        }
         break;
     }
 }
@@ -974,6 +986,19 @@ static void menu_rebuild(void)
         menu_add_row(scr, 6, "< Back",        462, 48, true);
         s_menu.row_cnt = 7;
         menu_add_hint(scr, "TOUCH OR TOP KEY");
+        break;
+    }
+
+    case MENU_PAGE_RESET: {
+        /* 【E14 补齐 2026-09-27】免插线重配网：清了配网凭据（WiFi + 服务器地址）
+         * 后重启 → 设备进 SoftAP portal（MiniPet-XXXX），手机连上重新填。
+         * 真机背景：AP 在认证阶段拒绝设备（reason=2）时，除重启 AP 外唯一的
+         * 设备侧自救手段；此前只能连电脑 esptool erase_region。 */
+        menu_add_title(scr, "Reset WiFi");
+        menu_add_row(scr, 0, "CONFIRM RESET", 190, 56, true);
+        menu_add_row(scr, 1, "< Back",        270, 56, true);
+        s_menu.row_cnt = 2;
+        menu_add_hint(scr, "CLEARS WIFI + SERVER, THEN REBOOT");
         break;
     }
     }
