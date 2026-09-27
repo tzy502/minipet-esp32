@@ -55,6 +55,7 @@ static const char *TAG = "provision";
 
 static bool           s_wifi_inited;       /* esp_wifi_init 只做一次 */
 static volatile bool  s_dns_run;           /* dns53 运行标志（与配网页启动时机解耦） */
+static bool           s_ap_up;             /* SoftAP 是否在跑（幂等 + STA 连上后关闭用） */
 static bool           s_portal_active;
 static bool           s_last_connect_failed; /* STA 失败重开 portal：页面顶部横幅 */
 static httpd_handle_t s_httpd;
@@ -478,10 +479,22 @@ bool provision_portal_active(void)
 
 
 /* 【临时诊断】内部堆布局转储：查 httpd 任务/listen 分配失败的真实内存状况 */
+void provision_dump_internal_heap(const char *stage);   /* 定义见下 */
+
 static void dump_internal_heap(void)
 {
     ESP_LOGW(TAG, "内部堆: 总 %u 空闲 %u 最大块 %u",
              (unsigned)heap_caps_get_total_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+    heap_caps_print_heap_info(MALLOC_CAP_INTERNAL);
+}
+
+/** 【真机取证 2026-09-27】分阶段内部堆明细：定位"最大连续块只剩 2KB"是谁吃掉的。
+ *  调用点：main.c 在 WiFi 预初始化后 / 渲染初始化后 / 各任务创建后各一次。 */
+void provision_dump_internal_heap(const char *stage)
+{
+    ESP_LOGW(TAG, "=== 内部堆 @%s：空闲=%u 最大块=%u ===", stage ? stage : "?",
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
     heap_caps_print_heap_info(MALLOC_CAP_INTERNAL);
@@ -596,6 +609,21 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
          * 改 PS 策略会干扰认证/关联，实测出现 reason=2 认证失败）。
          * 默认 WIFI_PS_MIN_MODEM 会让 TCP 建连偶发 select() timeout。 */
         esp_wifi_set_ps(WIFI_PS_NONE);
+        /* 【内部堆腾挪 2026-09-27】STA 连上后显式关掉 SoftAP：
+         * 早启路径为了"配网页可用"把 WiFi 起成了 APSTA，但设备一旦连上路由器，
+         * AP 侧的 beacon/管理帧缓冲就纯属浪费 —— 真机内部堆只剩 2KB 最大连续块，
+         * 驱动每 10s 报一次 `W:m f null`（管理帧分配失败），随后 TCP 一律建不起来
+         * （连服务端 38090 都打不开，而 Mac 侧 curl 200）。
+         * 切回纯 STA 让驱动释放 AP 侧资源；若后续需要配网，provision_start_portal()
+         * 会重新 set_mode(APSTA)（wifi_start_ap 幂等路径已处理）。 */
+        if (s_ap_up) {
+            esp_err_t me = esp_wifi_set_mode(WIFI_MODE_STA);
+            ESP_LOGW(TAG, "STA 已连上 → 关闭 SoftAP 释放内部堆：%s（空闲=%u 最大块=%u）",
+                     esp_err_to_name(me),
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                     (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+            if (me == ESP_OK) s_ap_up = false;
+        }
         xEventGroupClearBits(s_wifi_events, WIFI_FAIL_BIT);
         xEventGroupSetBits(s_wifi_events, WIFI_GOT_IP_BIT);
     }
@@ -681,7 +709,6 @@ static void wifi_init_once(void)
 /* SoftAP 已启动标记：main.c 的早启路径与 portal_task 共用本函数（幂等）。
  * 不幂等就会二次 esp_wifi_stop/start，把已 up 的 beacon 再分一次 → 内部堆
  * 挤爆（真机 Reset WiFi 后无线重启的崩溃现场之一）。 */
-static bool s_ap_up;
 
 /** SoftAP 启动/重配（幂等）。ssid 为空 → 自动取 MiniPet-<MAC4>。 */
 static esp_err_t wifi_start_ap(const char *ssid_in)

@@ -234,6 +234,7 @@ static void app_main_task(void *arg)
      * 崩因与修复口径见 provision.h 的 provision_ap_early_start_if_needed 注释：
      * portal_task 起 AP 太晚（渲染/BGM 之后），beacon 缓冲分配失败 → WiFi 驱动
      * 空指针 → rst:0xc 无限重启。必须在 render_init 与各任务创建之前。 */
+    provision_dump_internal_heap("wifi_preinit 后");
     provision_ap_early_start_if_needed();
 
     /* 【配网页可用性修复 2026-09-27】httpd(6~8KB 栈) 必须同样在这个干净窗口
@@ -243,6 +244,7 @@ static void app_main_task(void *arg)
 
     state_machine_init();
     render_init(&MINIPET_PROFILE_AMOLED216);   /* FATFS 挂载后、首 tick 前（render.h） */
+    provision_dump_internal_heap("render_init 后");
 
     /* 中键历史计数回显（永远生效：GPIO0 通路取证，与标定开关无关） */
     {
@@ -285,9 +287,9 @@ static void app_main_task(void *arg)
      * compose+blit，菜单构建期的深栈需求已由 lvgl_bridge 内部收敛；
      * 保留 10K 余量并保留下方有界重试。 */
     bool render_ok = false;
-    static const uint32_t render_stacks[] = { 10240, 8192 };
+    static const uint32_t render_stacks[] = { 8192, 6144 };
     for (int t = 0; t < 10 && !render_ok; t++) {
-        uint32_t stk = render_stacks[t < 6 ? 0 : 1];   /* 前 6 次 10K，之后降 8K */
+        uint32_t stk = render_stacks[t < 6 ? 0 : 1];   /* 前 6 次 8K，之后降 6K */
         if (xTaskCreatePinnedToCore(render_task, "render", stk, NULL, 5, NULL, 1) == pdPASS) {
             render_ok = true;
             ESP_LOGW(TAG, "render 任务已创建（栈 %u）", (unsigned)stk);
@@ -314,7 +316,9 @@ static void app_main_task(void *arg)
 
     /* 自检 + 初始迁移（BOOT→SELF_TEST→…；阻塞含 WiFi/服务端探测） */
     bool psram_ok = (heap_caps_get_total_size(MALLOC_CAP_SPIRAM) > 0);
+    provision_dump_internal_heap("state_machine_boot 前");
     state_machine_boot(sd_ok, psram_ok);
+    provision_dump_internal_heap("state_machine_boot 后");
 
     /* E9 常态化校时：自检后启动（内部等 STA 连上才动作；时间已有效则转 6h 周期）。
      * 真机缺口见 provision.c 的 rtc_resync_task 注释（待机时钟恒 --:--）。 */

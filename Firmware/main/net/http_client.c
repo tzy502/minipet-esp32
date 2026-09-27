@@ -156,8 +156,11 @@ static void raw_tcp_probe_once(const char *url)
      * 若连网关也失败 → 设备侧 socket/TCP 分配问题（内部堆最大连续块仅 2KB）；
      * 若网关通、服务端不通 → 路径/防火墙按源拦截。 */
     {
+        /* 【只测"确认在监听"的目标】上轮把网关 80 也当探针目标，但路由器多半
+         * 不监听 80 → 返回 RST 被 lwIP 记成 errno=113(ECONNABORTED)，据此得出
+         * "设备 TCP 坏了"是错误结论。现在只探服务端 38090（Mac 侧 nc/curl 均通），
+         * 并保留 3 次重试，结果才有判据价值。 */
         static const struct { const char *ip; int port; const char *name; } tgts[] = {
-            { "<LAN_IP>",    80,    "网关" },
             { "<NAS_IP>",   38090, "服务端" },
         };
         for (size_t i = 0; i < sizeof(tgts) / sizeof(tgts[0]); i++) {
@@ -173,7 +176,7 @@ static void raw_tcp_probe_once(const char *url)
             inet_aton(tgts[i].ip, &a2.sin_addr);
             int rc = -1, last_errno = 0;
             /* 连两次（间隔 2s）：区分"首次包丢/ARP 未就绪"与"稳定不通" */
-            for (int attempt = 0; attempt < 2; attempt++) {
+            for (int attempt = 0; attempt < 3; attempt++) {
                 rc = connect(s2, (struct sockaddr *)&a2, sizeof a2);
                 last_errno = (rc == 0) ? 0 : errno;
                 if (rc == 0) break;

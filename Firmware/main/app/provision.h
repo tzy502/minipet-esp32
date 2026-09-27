@@ -83,6 +83,10 @@ void provision_portal_early_start_if_needed(void);
 /* E14：恢复出厂配网（清 WiFi/服务器地址/轮询游标后重启 → 进 SoftAP portal）。 */
 void provision_factory_reset(void);
 
+/* 【真机取证】分阶段内部堆明细（空闲/最大连续块 + heap_caps 分段打印）。
+ *  用于定位"启动末期最大连续块仅 2KB → lwIP 无法建连"的分配来源。 */
+void provision_dump_internal_heap(const char *stage);
+
 /* 校时任务是否已成功创建（供失败重试判定）。 */
 bool provision_rtc_task_running(void);
 
