@@ -69,7 +69,13 @@ const columns = [
   { title: '曲名', key: 'title', ellipsis: { tooltip: true }, render: (row) => row.title || '（未命名）' },
   { title: '分类', key: 'category', width: 140, render: (row) => row.category || '—' },
   { title: '曲目 ID', key: 'id', ellipsis: { tooltip: true } },
-  { title: '大小', key: 'bytes', width: 110, render: (row) => h('span', fmtBytes(row.bytes)) },
+  {
+    // 【可读性 2026-09-27】WZ 曲库列表**不带体积**（服务端只在设备真取流时才解码，
+    // 见 WzMusicSource 注释），此前 1167 行全渲染 "0 B" —— 用户会以为曲目是空文件、
+    // 点了没声（真机报障"bgm 选择不合理"）。0/未知统一显示 "—（播放时取流）"。
+    title: '大小', key: 'bytes', width: 150,
+    render: (row) => h('span', row.bytes > 0 ? fmtBytes(row.bytes) : '—（播放时取流）'),
+  },
 ]
 
 function onSourceChange(v) {

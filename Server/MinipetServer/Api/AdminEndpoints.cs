@@ -118,7 +118,8 @@ public static class AdminEndpoints
             return Results.Json(new { ok = true, favorites = saved });
         });
 
-        // ── 纸娃娃预设 CRUD（data/presets/，供设备选择器「纸娃娃 tab」，E7/E4）──        g.MapGet("/presets", (PresetStore presets) => Results.Json(new { presets = presets.List() }));
+        // ── 纸娃娃预设 CRUD（data/presets/，供设备选择器「纸娃娃 tab」，E7/E4）──
+        g.MapGet("/presets", (PresetStore presets) => Results.Json(new { presets = presets.List() }));
         g.MapPost("/presets", (PresetUpsertRequest body, PresetStore presets) =>
         {
             if (string.IsNullOrWhiteSpace(body?.Name))
@@ -147,8 +148,23 @@ public static class AdminEndpoints
             var src = router.Resolve(source);
             if (src == null)
                 return Results.Json(new { error = $"未知音源：{source}（可用：{string.Join("/", router.Sources.Select(s => s.Name))}）" }, statusCode: 404);
-            var tracks = await src.ListTracksAsync(ct);
-            return Results.Json(new { source = src.Name, count = tracks.Count, tracks });
+            // 【口径统一 2026-09-27】WZ 未加载时此前抛未捕获 InvalidOperationException
+            // → 500 空 body，而 catalog/materials 同类情况规范返回 503（可重试语义）。
+            // 后端重启/换 WZ 路径期间页面会拿到 500，前端只能显示"服务器错误"，
+            // 排查时误以为是 bug（用户报障"bgm 选择不合理"期间正逢后端重启）。
+            try
+            {
+                var tracks = await src.ListTracksAsync(ct);
+                return Results.Json(new { source = src.Name, count = tracks.Count, tracks });
+            }
+            catch (InvalidOperationException ex)
+            {
+                return Results.Json(new
+                {
+                    error = ex.Message,
+                    hint = "WZ 未加载：请在「设置」页填写并保存 WZ 数据路径（保存后热重载）",
+                }, statusCode: 503);
+            }
         });
 
         // 音源健康（E8/E4）：qq 附带 cookie 导入时间与过期标记 —— Web 曲库页健康标签 +
