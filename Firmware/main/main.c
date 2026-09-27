@@ -333,15 +333,6 @@ static void app_main_task(void *arg)
      *   · 与总空闲内存无关（内部空闲 7.9KB、最大块 7.6KB 时依旧失败）→ 是驱动管理帧
      *     池与 LVGL 渲染互相抢内存。
      * 联网只需几百 ms，期间屏幕短暂黑屏可接受（心跳/OTA 优先）。 */
-    {
-        bool psram_ok_early = (heap_caps_get_total_size(MALLOC_CAP_SPIRAM) > 0);
-        poller_start();
-        events_start();
-        asset_dl_start();
-        provision_dump_internal_heap("联网前（渲染任务未创建）");
-        state_machine_boot(sd_ok, psram_ok_early);
-        provision_dump_internal_heap("联网后");
-    }
 
     /* 【顺序定案 2026-09-27】渲染任务必须在**配网页/联网之后**、但在任何其它
      * 后台任务之前创建：内部 DRAM 总共 ~180KB，portal+httpd+SoftAP 缓冲 +
@@ -401,6 +392,21 @@ static void app_main_task(void *arg)
                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
         watchdog_render_absent();        /* 渲染缺失时停掉渲染心跳计振（否则必然熔断） */
+    }
+
+    /* 【顺序定案（第三版）2026-09-27】网络任务与联网放在**渲染任务之后**：
+     * 内部 DRAM ~180KB 装不下"portal+httpd+SoftAP 缓冲 + 渲染栈"，谁先申请谁拿到
+     * 连续块。渲染栈是硬需求（没有它整块屏都是黑的），所以让渲染先拿；网络栈
+     * 本来就走 PSRAM（CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP）+ 碎片容忍度高。
+     * 实测顺序：渲染 → poller/events/asset_dl → state_machine_boot（含联网）。 */
+    {
+        bool psram_ok_early = (heap_caps_get_total_size(MALLOC_CAP_SPIRAM) > 0);
+        poller_start();
+        events_start();
+        asset_dl_start();
+        provision_dump_internal_heap("联网前（渲染任务已创建）");
+        state_machine_boot(sd_ok, psram_ok_early);
+        provision_dump_internal_heap("联网后");
     }
     BaseType_t rc = xTaskCreatePinnedToCore(input_task, "input", 4096, NULL, 4, NULL, 1);
     if (rc != pdPASS) {
