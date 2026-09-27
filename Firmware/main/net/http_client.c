@@ -87,6 +87,16 @@ void mp_http_init(void)
     }
     char raw[128] = { 0 };
     if (!mp_nvs_get_str("srv_url", raw, sizeof(raw)) || raw[0] == 0) {
+        /* 【编译期兜底 2026-09-27】NVS 里的 srv_url 为空（首次上电/被清）时，
+         * 用编译期默认地址，避免"有 WiFi、有 IP，却因为不知道服务器在哪而永远
+         * 不上线"（真机实测：配网页写入的地址在某些操作后丢失，设备静默卡在
+         * OFFLINE，日志里连一条 hello 都没有）。配网页写入的值始终优先。
+         * 留空即回到旧行为（等配网页写入）。 */
+        if (MP_DEFAULT_SRV_URL[0]) {
+            ESP_LOGW(TAG, "NVS 无 srv_url → 使用编译期默认服务器地址 %s", MP_DEFAULT_SRV_URL);
+            url_apply(s_server_url, sizeof(s_server_url), MP_DEFAULT_SRV_URL);
+            return;
+        }
         s_server_url[0] = 0;
         return;
     }

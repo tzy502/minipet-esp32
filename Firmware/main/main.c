@@ -34,6 +34,8 @@
 #include "esp_netif.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
+#include "driver/uart.h"
+#include "driver/uart_vfs.h"
 
 #include "app_core.h"
 #include "hal_contract.h"
@@ -79,9 +81,17 @@ static void render_task(void *arg)
 
     mp_cmd_t cmd;
     for (;;) {
+        /* 【看门狗熔断修复 2026-09-27】先喂狗再排空指令队列。
+         * 真机实证：启动期一次性涌入几十条指令，而每条都打一条 WARN 日志
+         * （115200 波特率下串口是阻塞写）→ 渲染任务连续 >5s 没喂狗 →
+         * `wdt: E14 熔断：已关屏待机（恢复 = 物理断电重上电）` → 后续必然掉线。
+         * ① 每条指令的 WARN 降为 DEBUG（启动期不再刷屏）；
+         * ② 喂狗提到排空之前，并在每条指令后补喂一次。 */
+        watchdog_kick();
         while (xQueueReceive(mp_cmd_q, &cmd, 0) == pdTRUE) {
-            ESP_LOGW("rt", "cmd 收到 type=%d", (int)cmd.type);
+            ESP_LOGD("rt", "cmd 收到 type=%d", (int)cmd.type);
             app_cmd_dispatch(&cmd);
+            watchdog_kick();              /* 单条指令若耗时（素材懒加载），也持续喂狗 */
         }
         render_tick();                    /* 4.2 帧循环（30fps） */
         watchdog_kick();
@@ -177,6 +187,23 @@ void app_main(void)
 static void app_main_task(void *arg)
 {
     (void)arg;
+    /* 【串口非阻塞 2026-09-27】默认 UART 写是阻塞的：无人读串口时 TX 缓冲满
+     * → 打日志的任务被挂住（真机表现：渲染任务 >5s 不喂狗 → E14 熔断关屏）。
+     * 设为非阻塞 + 允许覆盖，宁可丢日志也不能拖死任务。 */
+    {
+        static char txbuf[4096];
+        /* IDF5：uart_vfs 提供带缓冲的控制台输出；不接主机读串口时缓冲写满即丢，
+         * 不再把调用任务挂死（见上方注释）。失败仅告警，不阻断启动。 */
+        uart_vfs_dev_use_driver(-1);
+        esp_err_t ur = uart_driver_install(UART_NUM_0, 256, sizeof(txbuf), 0, NULL, 0);
+        if (ur != ESP_OK && ur != ESP_ERR_INVALID_STATE) {
+            ESP_LOGW("main", "UART 驱动安装失败（%s）→ 日志仍走默认阻塞模式",
+                     esp_err_to_name(ur));
+        } else {
+            uart_vfs_dev_use_driver(UART_NUM_0);
+        }
+    }
+
     /* NVS（配网凭据/服务器地址/看门狗计数/BGM 偏好都住这里） */
     esp_err_t err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -286,6 +313,26 @@ static void app_main_task(void *arg)
      * connect 失败 errno=113），而 Mac 侧同一 URL curl 200。渲染任务只做
      * compose+blit，菜单构建期的深栈需求已由 lvgl_bridge 内部收敛；
      * 保留 10K 余量并保留下方有界重试。 */
+    /* 【认证帧分配失败根因修复 2026-09-27】把「网络任务 + 自检联网」提前到渲染任务
+     * 创建**之前**。真机证据链：
+     *   · 成功连上的那几次：`state: init -> auth` 发生在 1.6s（渲染任务尚未推像素），
+     *     全程无 `m f auth`；
+     *   · 现在渲染任务先跑，认证被推到 4.0s，此后**每次**认证都 `W wifi:m f auth`
+     *     （802.11 层分配认证帧缓冲失败，串见 libnet80211.a 的 "m f auth"），1s 后
+     *     `auth -> init (0x200)`，对外表现为 reason=2/205 无限循环；
+     *   · 与总空闲内存无关（内部空闲 7.9KB、最大块 7.6KB 时依旧失败）→ 是驱动管理帧
+     *     池与 LVGL 渲染互相抢内存。
+     * 联网只需几百 ms，期间屏幕短暂黑屏可接受（心跳/OTA 优先）。 */
+    {
+        bool psram_ok_early = (heap_caps_get_total_size(MALLOC_CAP_SPIRAM) > 0);
+        poller_start();
+        events_start();
+        asset_dl_start();
+        provision_dump_internal_heap("联网前（渲染任务未创建）");
+        state_machine_boot(sd_ok, psram_ok_early);
+        provision_dump_internal_heap("联网后");
+    }
+
     bool render_ok = false;
     static const uint32_t render_stacks[] = { 8192, 6144 };
     for (int t = 0; t < 10 && !render_ok; t++) {
@@ -326,18 +373,10 @@ static void app_main_task(void *arg)
                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
     }
 
-    /* 任务：PRO(0) 网络/后台 —— 4.1 */
-    poller_start();        /* 长轮询+退避（内含 WiFi 回网重连） */
-    events_start();        /* POST event */
-    asset_dl_start();      /* manifest diff/下载/LRU（优先级低于 poller） */
+    /* 后台任务：OTA / BGM（网络任务已在渲染任务之前启动，见上） */
     ota_start();           /* 双分区升级 */
     bgm_start();           /* BGM 解码+feeder+环形缓冲（codec_init 在内） */
-
-    /* 自检 + 初始迁移（BOOT→SELF_TEST→…；阻塞含 WiFi/服务端探测） */
-    bool psram_ok = (heap_caps_get_total_size(MALLOC_CAP_SPIRAM) > 0);
-    provision_dump_internal_heap("state_machine_boot 前");
-    state_machine_boot(sd_ok, psram_ok);
-    provision_dump_internal_heap("state_machine_boot 后");
+    provision_dump_internal_heap("全部任务创建后");
 
     /* E9 常态化校时：自检后启动（内部等 STA 连上才动作；时间已有效则转 6h 周期）。
      * 真机缺口见 provision.c 的 rtc_resync_task 注释（待机时钟恒 --:--）。 */

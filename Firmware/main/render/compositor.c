@@ -733,7 +733,12 @@ static const rc_part_img_t *resolve_piece(const mpak_piece_t *piece)
 {
     const mpak_part_t *meta = mpak_parts_find(&g_parts, piece->part_id);
     if (!meta) {
-        ESP_LOGW(TAG, "piece part %u not in PARTS pkg", piece->part_id);
+        /* 【串口阻塞熔断修复 2026-09-27】这里原来是 ESP_LOGW，且**每帧每个部件**
+         * 都会命中：PARTS 缺失时 30fps × 16 件 = 480 条/秒。真机在没人读串口时
+         * UART TX 环形缓冲会塞满，日志写变成阻塞 → 渲染任务卡死 → E14 看门狗
+         * 三振熔断（`已关屏待机，需物理断电`）。降为 DEBUG：默认级别下零输出，
+         * 排障时把 LOG_DEFAULT_LEVEL 调到 Debug 才可见。 */
+        ESP_LOGD(TAG, "piece part %u not in PARTS pkg", piece->part_id);
         return NULL;
     }
     if (piece->expr_index != MPAK_EXPR_NONE && meta->expr_group != 0) {

@@ -403,12 +403,19 @@ static void poller_task(void *arg)
          * 现在改为：先确保连上家网，再补发 hello；补上后才进入正常轮询。 */
         if (!mp_http_hello_done()) {
             ESP_LOGW("poller", "hello 未完成 → 先确保联网再补发（自检阶段失败后的唯一补救路径）");
-            if (!provision_wifi_connect_sta(15000)) {
+            esp_err_t crc = provision_wifi_connect_sta(15000);
+            ESP_LOGW("poller", "connect_sta 返回 %s（%d）→ %s", esp_err_to_name(crc), (int)crc,
+                     crc == ESP_OK ? "继续补发 hello" : "退避重试（未到 hello）");
+            if (crc != ESP_OK) {
                 vTaskDelay(pdMS_TO_TICKS(backoff_ms));
                 if (backoff_ms < BACKOFF_MAX_MS) backoff_ms *= 2;
                 continue;
             }
-            if (mp_http_hello() == 0) {
+            ESP_LOGW("poller", "调用补发 hello：url=%s deviceId=%s",
+                     mp_http_server_url() ? mp_http_server_url() : "(未配置)", mp_http_device_id());
+            int hrc = mp_http_hello();
+            ESP_LOGW("poller", "补发 hello 返回 %d", hrc);
+            if (hrc == 0) {
                 ESP_LOGW("poller", "hello 补发成功 → 立即请求素材同步并回到在线");
                 asset_dl_request_sync();
                 backoff_ms = BACKOFF_MIN_MS;

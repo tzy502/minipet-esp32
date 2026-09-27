@@ -37,6 +37,16 @@ extern "C" {
 #define MP_PROTO_VER          1            /* E2: 协议版本号预留 */
 
 #define MP_TF_ROOT            "/sdcard"    /* drivers sd_mount() 挂载点（main.c 传入） */
+/* 编译期默认服务器地址（NVS srv_url 为空时的兜底；配网页写入值优先）。
+ * 由 Kconfig「MiniPet 固件配置 → 默认服务器地址」提供，默认空 = 旧行为。
+ * 不在这里硬编码任何私网地址（脱敏铁律）。 */
+#include "sdkconfig.h"
+#ifdef CONFIG_MINIPET_DEFAULT_SRV_URL
+#define MP_DEFAULT_SRV_URL    CONFIG_MINIPET_DEFAULT_SRV_URL
+#else
+#define MP_DEFAULT_SRV_URL    ""
+#endif
+
 #define MP_TF_MINIPET_DIR     MP_TF_ROOT "/minipet"
 #define MP_TF_MANIFEST        MP_TF_MINIPET_DIR "/manifest.json"
 #define MP_TF_FIRMWARE_DIR    MP_TF_MINIPET_DIR "/firmware"   /* 4.4 */
