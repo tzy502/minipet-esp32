@@ -283,7 +283,7 @@ const playBgm = (v, label) => sendBgm(v, label)
 
 /** 音量下发（需服务端放行 + 固件支持数值型 payload；202 只代表入队）。 */
 function sendVolume() {
-  return sendBgm(BGM_COMMAND.VOLUME, '音量下发', { n: Number(volume.value), busyKey: 'vol' })
+  return sendBgm(BGM_COMMAND.VOLUME, '音量', { n: Number(volume.value), busyKey: 'vol' })
 }
 
 /** 音量写入服务端设备偏好（PUT /admin/devices/{id}，服务端已支持；非即时下发）。 */

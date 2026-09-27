@@ -1,10 +1,24 @@
-# Web 侧待服务端支持的接口清单（T2 / T4 / T5）
+# Web 侧待服务端支持的接口清单（T2 / T4 / T5 / T6）
 
 > 生成时间：2026-09-27 · 提出方：Web（`Web/`，本轮只改 Web，未动 `Server/`）
 > 现状核对基线：`Server/MinipetServer` 工作区当前代码（`AdminEndpoints.cs` / `ConfigService.cs` /
 > `DeviceEndpoints.cs` / `Services/PaperdollService.cs`）+ 线上实例 `http://<NAS_IP>:38090` 实测。
 > 前端已按本文约定**预留调用与 UI**，并在运行时探测服务端是否已支持：
 > 字段/端点一旦上线，前端**无需改动**即自动启用（见每节的「前端现状与探测行为」）。
+>
+> **状态复核（2026-09-27 晚，曲库 BGM 控制轮实测）**：T2 / T4 / T5 已被服务端实现，
+> 本文对应章节的「缺什么」已过期（保留作历史记录）：
+> ```
+> $ curl -s -X POST -H 'Content-Type: application/json' -d '{"type":"expression","value":"default"}' \
+>     http://<NAS_IP>:38090/api/admin/devices/dev-693ea4/command
+> {"ok":true,"seq":30,"type":"expression","value":"default"}          # HTTP 202（T2 已上线）
+> $ curl -s http://<NAS_IP>:38090/api/admin/settings | jq '.config.device.imuSensitivity, .config.speech'
+> 1          # T4 字段在位（未验证固件是否消费）
+> {"enabled":false,"idleSec":300,"lines":[]}    # T5 配置段在位
+> ```
+> 影响：`Web/scripts/ui-smoke.mjs` 中「真实服务端尚无 T2/T4/T5」的 4 条断言因此转 FAIL
+> （它们断言的是「服务端缺」，不是「前端错」）——**本轮未改这 4 条断言**，留待服务端任务收口时同步。
+> **T6（bgm）仍未实现**（同一端点，但 type 白名单不含 bgm，见下）。
 
 ---
 
@@ -155,6 +169,88 @@ $ curl -s http://<NAS_IP>:38090/api/admin/settings | jq '.config.device | keys'
 
 ---
 
+## T6：BGM 播放控制 admin 下发（E8 附加：曲库页「设备播放控制」卡）
+
+> 背景：E8 定稿「控制入口在设备触摸屏（菜单内 BGM 入口 → 半屏控制条），Web 只管曲库/歌单/cookie」。
+> 用户实测反馈「服务器页面也没有播放 bgm 的按钮」→ 本项是**超出需求的附加能力**，
+> Web 侧按「只读展示 + 可选远程下发」实现，并**探测到才启用**。
+
+### 缺什么（实测证据）
+
+- 固件侧**播放/暂停/切歌已完备**，`Firmware/main/net/poller.c:208-217`（`commands[].type + payload`
+  通道）的 `bgm` 分支认 6 个**字符串**值：`play` / `pause` / `resume` / `stop` / `next` / `prev`
+  → `MP_AUDIO_*`（`Firmware/main/app/app_core.h:165`；处理见 `Firmware/main/audio/bgm.c:568-660`）。
+- 服务端 `POST /api/admin/devices/{id}/command` **端点已在位**（T2 已上线），但 type 白名单**不含 bgm**：
+  ```
+  $ curl -s -w ' [HTTP %{http_code}]' -X POST -H 'Content-Type: application/json' \
+      -d '{"type":"bgm","value":"play"}' \
+      http://<NAS_IP>:38090/api/admin/devices/dev-693ea4/command
+  {"error":"type 非法：bgm（可用：expression/action/bubble/brightness/reboot）"} [HTTP 400]
+  ```
+  （`Server/MinipetServer/Api/AdminEndpoints.cs:281-284` 的兜底分支）。
+- **音量缺两端**（重要，勿只改服务端）：
+  1. 服务端：白名单不含 bgm，且 `vol` 需要数值通道 `n`；
+  2. 固件：`poller.c:208` 的 bgm 分支条件是 `cJSON_IsString(vitem)`，而 `poller.c:171-173` 对
+     `{"n":50}` 形态会把 `vitem` 置 NULL → bgm 分支不匹配 → **静默丢弃**（既不出声也不报错）。
+     `vol` / `source` 目前只在 `poller.c:77-88` 的**旧扁平通道**（`{t,v,n}`）有分支，而
+     `CommandQueue` 只会产出 `{seq,type,payload}` 形态，永远走不到那条路。
+     → 音量要真生效，固件需在 `poller.c:208` 的 bgm 分支补 `pn` 支持，例如
+     `else if (strcmp(tbuf,"bgm")==0 && (!cJSON_IsString(vitem) && pn && strcmp(pid?...,"vol")...))`
+     的等价判断（按 §请求体约定：`{"type":"bgm","payload":{"n":50}}` → `MP_AUDIO_VOL, m.a = n`）。
+- 只读展示侧的缺口（可选，不阻塞）：设备现场控制的回传 `POST /api/device/bgm/cmd`
+  （`DeviceEndpoints.cs:242-273`）只更新 `dev.Bgm` 偏好，**不写设备事件日志**
+  （`HandleBgmCmd` 没注入 `DeviceEventLog`）→ Web「设备事件」里看不到「设备上按了播放/调了音量」。
+
+### 需要新增
+
+| 项 | 值 |
+| --- | --- |
+| 方法 | `POST`（复用 T2 已上线的端点，只扩 type 白名单） |
+| 路径 | `/api/admin/devices/{id}/command` |
+| 请求体（播放控制） | `{ "type": "bgm", "value": "play" \| "pause" \| "resume" \| "stop" \| "next" \| "prev" }` |
+| 请求体（音量，需固件同补） | `{ "type": "bgm", "value": "vol", "n": 0-100 }` |
+| 成功响应 | `202 { "ok": true, "seq": <long>, "type": "bgm", "value": "<value>" }`（vol 建议回显 `n`） |
+| 失败响应 | `400 { "error": "bgm 的 value 非法：<v>（可用：play/pause/resume/stop/next/prev/vol）" }`；`400 { "error": "bgm vol 需要 n∈[0,100]" }`；`404 { "error": "设备不存在：<id>" }` |
+
+**实现要点**
+
+1. `play/pause/resume/stop/next/prev` 的 payload 必须是**裸 JSON 字符串**：
+   `queue.Enqueue(id, "bgm", "play")`；写成 `{"value":"play"}` 固件不认（与 T2 要点 1 同）。
+2. 音量 payload 用对象 `{ n = ... }`（`queue.Enqueue(id, "bgm", new { n = body.N })`）——
+   与 `brightness` 同款数值通道；**但需固件补 `pn` 分支才会生效**（见上「缺什么」）。
+3. 探测约定（前端已按此实现，请勿改语义）：前端开卡发
+   `{"type":"bgm","value":"__probe__"}` 哨兵值——
+   - 服务端**未放行**时按现状回 `400 type 非法：bgm…` → 前端判「端点不支持 bgm」并禁用按钮；
+   - 服务端**已放行**时，哨兵值会被 value 白名单拒 → `400 bgm 的 value 非法：__probe__…`
+     → 前端判「端点在位」（`probeRejected`，这是**预期**响应，不是失败）；
+   - 2xx 也判「端点在位」。哨兵值固件不认（`m.type` 保持 `MP_AUDIO_NONE` → 不 `mp_post_audio`），
+     故探测对设备**零副作用**（不出声、不改音量）。
+4. 建议顺带（可选项）：`HandleBgmCmd` 增加一行
+   `eventLog.Append(deviceId, $"BGM：{cmd}（设备现场控制）{(trackId>0?$"，曲目 {trackId}":"")}")`，
+   这样 Web 的只读展示能反映「设备触摸屏上做了什么」。
+
+### 前端现状与探测行为
+
+- `Web/src/api/client.js`：`sendBgmCommand()` / `probeBgmCommand()` / `setDeviceBgmPrefs()` /
+  `getDeviceLogs()` / `BGM_COMMAND` / `BGM_PROBE_VALUE`；`sendDeviceCommand()` 扩了 `opts.n`（数值通道）。
+- `Web/src/views/MusicView.vue` 顶部「设备播放控制（E8 附加：只读展示 + 可选远程下发）」卡片：
+  - 只读：设备在线态 + BGM 偏好（`GET /admin/devices/{id}` 的 `bgm.source/volume`）+
+    设备事件（`GET /admin/logs/{id}` 最近 5 条）；
+  - 下发：`▶播放 / ⏸暂停 / ⏯续播 / ⏹停止 / ⏮上一首 / ⏭下一首 / 下发音量`（7 个按钮）——
+    `bgmSupport === 'missing'` 时**全部禁用** + 卡内贴出本节需求；`ok` 时全部启用；
+  - 音量另有**已在位**通道：`存为设备偏好` → `PUT /api/admin/devices/{id}` body
+    `{"bgm":{"volume":50}}`（服务端 `AdminEndpoints.cs:44-48`，HTTP 200 实测）——
+    只改服务端偏好，**非即时下发**（固件 hello 只消费阈值四件套，不读 `config.volume`，
+    见 `Firmware/main/net/http_client.c:363-383`）。
+- **实测**（2026-09-27）：
+  - 真实实例：卡片探测 → 标「端点不支持 bgm」，7 键 disabled、卡内贴出本节需求；
+    「存为设备偏好」可点，真实 `PUT` 回 200（`ui-smoke.mjs` T6 三条断言 PASS）。
+  - mock 实例（`PORT=5198 MINIPET_MOCK=1`，按本节形态模拟）→ 探针把「400 bgm 的 value 非法」
+    判为端点在位、7 键全启用、点「播放」真实发出
+    `POST /api/admin/devices/dev-693ea4/command body {"type":"bgm","value":"play"}` → 202 seq 42。
+
+---
+
 ## 附：可选的性能优化请求（不阻塞任何验收）
 
 **设备列表带 `petConfig`（T1 的 N+1 优化）**
@@ -184,3 +280,6 @@ PORT=5197 MINIPET_MOCK=1 MOCK_PUSH_FAIL=503 node scripts/preview-with-live-api.m
 node scripts/ui-smoke.mjs --base http://127.0.0.1:5199 \
      --mock-base http://127.0.0.1:5198 --push-fail-base http://127.0.0.1:5197 --push
 ```
+
+> T6（bgm 播放控制）自测点已并入 `ui-smoke.mjs`：真实实例 3 条（端点不支持 → 7 键禁用 + 需求文案 /
+> 「存为设备偏好」可用 / 真实 PUT 200）、mock 实例 3 条（端点在位 + 7 键启用 / 播放 202 / 音量 202）。

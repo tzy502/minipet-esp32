@@ -168,8 +168,14 @@ static bool do_poll_once(void)
                 vitem = pid;
             } else if (pver && cJSON_IsString(pver)) {  /* ota: {"ver","url"} */
                 vitem = pver;
-            } else if (!vitem && pn) {
-                vitem = NULL;                           /* 数值型走 n 通道 */
+            } else if (!vitem) {
+                /* 【契约补链 2026-09-27】服务端 CommandQueue.EnqueueLegacy 产出
+                 * payload = {"v":"vol","n":50}（旧口径），固件此前只认 payload 本身
+                 * 是字符串或 payload.id/ver/url → 这类指令被静默丢弃（Web 音量下发
+                 * 因此永远无效）。现补读 payload.v（字符串）作为 vitem。 */
+                cJSON *pv = cJSON_GetObjectItem(payload, "v");
+                if (pv && cJSON_IsString(pv)) vitem = pv;
+                else if (pn) vitem = NULL;              /* 纯数值型走 n 通道 */
             }
             /* —— 专用解析：type + payload 字段 → 既有 handle_cmd 语义 —— */
             {
@@ -214,6 +220,15 @@ static bool do_poll_once(void)
                     else if (strcmp(vv, "stop") == 0)   m.type = MP_AUDIO_STOP;
                     else if (strcmp(vv, "next") == 0)   m.type = MP_AUDIO_NEXT;
                     else if (strcmp(vv, "prev") == 0)   m.type = MP_AUDIO_PREV;
+                    else if (strcmp(vv, "vol") == 0) {
+                        /* 【Web BGM 控制补链 2026-09-27】音量走数值通道：
+                         * 服务端 payload = {n:0..100}，vitem 恒 NULL → 此前落到
+                         * 本分支外被静默丢弃，音量永远无效。现显式认 "vol"。 */
+                        if (pn) {
+                            m.type = MP_AUDIO_VOL;
+                            m.a = (int32_t)cJSON_GetNumberValue(pn);
+                        }
+                    }
                     if (m.type != MP_AUDIO_NONE) mp_post_audio(&m);
                 } else if (strcmp(tbuf, "ota") == 0 && pver && cJSON_IsString(pver)) {
                     const char *u = (purl && cJSON_IsString(purl)) ? purl->valuestring : "";

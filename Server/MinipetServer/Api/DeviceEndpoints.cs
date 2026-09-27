@@ -241,9 +241,11 @@ public static class DeviceEndpoints
         }
     }
 
-    /// <summary>播放/暂停/切歌/音量（设备端现场控制的回传，E8：控制权在设备）。</summary>
+    /// <summary>播放/暂停/切歌/音量（设备端现场控制的回传，E8：控制权在设备）。
+    /// 回传同时记一行设备事件日志——Web 曲库页「设备事件」要能看到「设备触摸屏上做了什么」
+    /// （Web/docs/interfaces-needed-from-server.md §T6 实现要点 4）。</summary>
     private static async Task<IResult> HandleBgmCmd(
-        BgmCmdRequest body, DeviceRegistry reg, ConfigService cfg, BgmRouter router)
+        BgmCmdRequest body, DeviceRegistry reg, ConfigService cfg, BgmRouter router, DeviceEventLog eventLog)
     {
         var valid = new[] { "play", "pause", "next", "prev", "select", "volume" };
         if (string.IsNullOrWhiteSpace(body?.DeviceId))
@@ -272,6 +274,11 @@ public static class DeviceEndpoints
             d.Bgm.Source = source;
             d.Bgm.Volume = volume;
         });
+
+        // 事件日志：source/cmd 取固件字面量；trackId 有值才带（select/next/prev 才有曲目）
+        eventLog.Append(dev.DeviceId,
+            $"BGM：{cmd}（设备现场控制）· source={source} · volume={volume}"
+            + (string.IsNullOrWhiteSpace(trackId) ? "" : $" · 曲目 {trackId}"));
 
         return Results.Json(new { ok = true, cmd, source, trackId, volume });
     }

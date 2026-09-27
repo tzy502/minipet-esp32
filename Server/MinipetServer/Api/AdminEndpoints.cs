@@ -233,12 +233,16 @@ public static class AdminEndpoints
             return Results.Json(new { ok, message });
         });
 
-        // ── 设备实时指令下发（E4 25 表情手动指定 / E12 台词气泡 / 亮度 / 重启）──
+        // ── 设备实时指令下发（E4 25 表情手动指定 / E12 台词气泡 / 亮度 / 重启 / E8 BGM）──
         // Web 侧已就绪（Web/src/api/client.js sendDeviceCommand），此前无端点（405）→ 前端禁用态。
-        // payload 形状必须与固件 poller.c:182-197 对齐：
+        // payload 形状必须与固件 poller.c 的两条解析路径逐字对齐：
         //   expression / action / bubble → 【裸 JSON 字符串】（固件找 payload 本身或 payload.id）
         //   brightness                   → 数值放 n（固件走 pn 通道）
-        //   ⚠ 写成 {"value":"…"} 会被固件静默忽略（既不报错也不生效）——勿改。
+        //   bgm play/pause/resume/stop/next/prev → 裸 JSON 字符串（poller.c:208-217 主解析分支）
+        //   bgm vol / source             → **不带 type 的旧口径** {t:"bgm",v:"vol"|"source",n:N}
+        //                                  （主解析分支的 bgm 没有 vol/source；只有旧口径
+        //                                   handle_cmd（poller.c:77-88）实现）
+        //   ⚠ 写成 {"value":"…"} / {"n":…} 之类的对象会被固件静默忽略（既不报错也不生效）——勿改。
         g.MapPost("/devices/{id}/command", (string id, DeviceCommandRequest body,
             DeviceRegistry reg, CommandQueue queue, DeviceEventLog eventLog) =>
         {
@@ -262,6 +266,51 @@ public static class AdminEndpoints
                 return Results.Json(new { ok = true, seq = cmd.Seq, type, value }, statusCode: 202);
             }
 
+            // BGM（E8：控制入口在设备，Web 也可下发纯桌宠指令；曲目流仍由设备走
+            // /api/device/bgm/stream 实时拉取）。value 用固件字面量，勿改写。
+            if (type == "bgm")
+            {
+                var bgmValue = body?.Value?.Trim().ToLowerInvariant() ?? "";
+                // 6 个「开关/切歌」动词：固件主解析分支直接认字符串 payload
+                string[] bgmVerbs = { "play", "pause", "resume", "stop", "next", "prev" };
+                if (bgmVerbs.Contains(bgmValue))
+                {
+                    var cmd = queue.Enqueue(id, "bgm", bgmValue);
+                    eventLog.Append(id, $"指令下发：bgm={bgmValue}");
+                    return Results.Json(new { ok = true, seq = cmd.Seq, type, value = bgmValue }, statusCode: 202);
+                }
+                // 音量绝对值：固件 v="vol"（MP_AUDIO_VOL，a=n），仅旧口径可达；顺带落设备偏好
+                // （vol 生效后设备还会经 POST /api/device/bgm/cmd 回传一次，两处口径一致）
+                if (bgmValue is "vol" or "volume")
+                {
+                    if (body?.N is not (>= 0 and <= 100))
+                        return Results.Json(new { error = "bgm=vol 需要 n∈[0,100]（固件 vol_apply 夹取 0..100）" },
+                            statusCode: 400);
+                    var cmd = queue.EnqueueLegacy(id, "bgm", "vol", body.N);
+                    reg.Update(id, d => d.Bgm.Volume = body.N!.Value);
+                    eventLog.Append(id, $"指令下发：bgm=vol n={body.N}");
+                    return Results.Json(new { ok = true, seq = cmd.Seq, type, value = "vol", n = body.N },
+                        statusCode: 202);
+                }
+                // 音源切换：固件 v="source"（MP_AUDIO_SOURCE，a=n；0=WZ 曲库 / 1=QQ 音乐），同样仅旧口径可达
+                if (bgmValue == "source")
+                {
+                    if (body?.N is not (0 or 1))
+                        return Results.Json(new { error = "bgm=source 需要 n=0（WZ 曲库）或 1（QQ 音乐）" },
+                            statusCode: 400);
+                    var cmd = queue.EnqueueLegacy(id, "bgm", "source", body.N);
+                    reg.Update(id, d => d.Bgm.Source = body.N == 1 ? "qq" : "wz");
+                    eventLog.Append(id, $"指令下发：bgm=source n={body.N}");
+                    return Results.Json(new { ok = true, seq = cmd.Seq, type, value = "source", n = body.N },
+                        statusCode: 202);
+                }
+                return Results.Json(new
+                {
+                    error = $"bgm 的 value 非法：{body?.Value}"
+                        + "（可用：play/pause/resume/stop/next/prev；音量 vol + n；音源 source + n）"
+                }, statusCode: 400);
+            }
+
             if (type == "brightness")
             {
                 if (body?.N is not (>= 0 and <= 100))
@@ -280,7 +329,7 @@ public static class AdminEndpoints
 
             return Results.Json(new
             {
-                error = $"type 非法：{body?.Type}（可用：expression/action/bubble/brightness/reboot）"
+                error = $"type 非法：{body?.Type}（可用：expression/action/bubble/brightness/reboot/bgm）"
             }, statusCode: 400);
         });
 
@@ -547,8 +596,10 @@ public static class AdminEndpoints
 
     /// <summary>
     /// 设备实时指令（POST /devices/{id}/command）：
-    /// type = expression | action | bubble（用 Value）| brightness（用 N）| reboot。
-    /// 与固件 poller.c:182-197 的 payload 约定一一对应，勿改字段语义。
+    /// type = expression | action | bubble（用 Value）| brightness（用 N）| reboot |
+    ///        bgm（Value = play|pause|resume|stop|next|prev；音量 Value=vol + N∈[0,100]；
+    ///             音源 Value=source + N∈{0,1}）。
+    /// 与固件 poller.c 的 payload 约定一一对应（bgm 的 vol/source 走旧口径 {t,v,n}），勿改字段语义。
     /// </summary>
     public sealed class DeviceCommandRequest
     {

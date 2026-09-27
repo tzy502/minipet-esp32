@@ -466,7 +466,7 @@ async function main() {
       const volRun = await cdp.eval(`(() => { const c = window.__mini.bgmCard(); return { toast: window.__mini.toastText(), text: c ? c.innerText : '' } })()`)
       record(
         'T6 mock：点下发音量 → POST {type:"bgm",value:"vol",n:50} → 202 seq 42',
-        /音量下发已下发/.test(volRun.toast) && /"value":"vol","n":\d+/.test(volRun.text) && /seq 42/.test(volRun.text),
+        /音量已下发/.test(volRun.toast) && /"value":"vol","n":\d+/.test(volRun.text) && /seq 42/.test(volRun.text),
         `toast=${volRun.toast} | ${(volRun.text.match(/HTTP 202[^\n]*/) || [''])[0]}`.slice(0, 240),
       )
       await cdp.shot(path.join(SHOT_DIR, 't6-mock-bgm-sent.png'))
