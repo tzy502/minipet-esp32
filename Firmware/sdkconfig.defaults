@@ -92,3 +92,12 @@ CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=8
 # 不是路由器。本板有 8MB PSRAM（几乎全空），让 lwIP/WiFi 的收发缓冲与 socket
 # 结构去 PSRAM 取，内部 DRAM 只留必须的部分。
 CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
+
+# 【方案 A · 内部 RAM 腾挪 2026-09-27】关闭 WiFi 驱动代码的 IRAM 驻留。
+# 真机根因：内部 DRAM 的 99328B 段在 WiFi 驱动构造期就被 154 个分配块占满
+# （`allocated 95956 / free 24`），运行期稳定只剩 ~2.3KB →
+# `probe: socket 失败 errno=105 (lwIP ENOBUFS)` → 心跳/指令/BGM 断续，
+# hello 要 22s 才成功。IRAM 驻留是为吞吐优化，本设备是哑终端（单连接、
+# 几 KB/s 指令 + 一路 mp3 流），吞吐不是瓶颈，内部 RAM 才是。
+CONFIG_ESP_WIFI_IRAM_OPT=n
+CONFIG_ESP_WIFI_RX_IRAM_OPT=n
