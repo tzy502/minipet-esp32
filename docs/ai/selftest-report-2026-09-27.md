@@ -238,3 +238,53 @@ d513c29 fix(poller): 掉线自愈——连续真失败 3 次重新 hello（重�
 cd80691 fix(provision): 配网页真正可用（192.168.4.1 能打开）+ 时钟漂移校时
 971392a perf(mem): 上报缓冲 5.6KB 从内部堆移到 PSRAM
 ```
+
+---
+
+## 九、2026-09-27 第三轮：人物消失（换装错配）与出厂素材重建
+
+### 9.1 用户报障与根因
+
+**报障**：「人物也没了」（屏幕上只剩地图/时钟，看不到宠物）。
+
+**根因（真机日志实证）**：
+```
+W rc: piece part 1106 not in PARTS pkg
+W rc: piece part 821 not in PARTS pkg
+W rc: piece part 1755 not in PARTS pkg      ← 整帧部件全部解析失败 → 人物空白
+W sm: parts 路径=/sdcard/minipet/parts/abfa92dadac8183b.mpk rc=-1
+```
+- 设备 TF 卡损坏 → 固件回落到**内部 Flash assets 分区**（出厂素材，partitions.csv `assets @0x620000 6MB`）
+- 服务端当前 rev24 按新 petConfig 生成的资产是 `PARTS d2dac1ab278dea8b` + `LAYOUT 69cb6a45b94f1161(stand1)…`
+- 设备 Flash 里还是**旧外观**（`PARTS abfa92dadac8183b`）→ LAYOUT 与 PARTS 版本错配
+- 且 PARTS 与 LAYOUT 是两份独立资产、分开下载落地，**没有"整对就绪才换"的约束**
+
+### 9.2 修复
+
+| # | 修法 | 位置 |
+|---|---|---|
+| 1 | 换绑前校验 LAYOUT 与当前 PARTS 的配套性，命中率 <50% 拒绝换绑并请求素材全量同步（保留旧画面，不再画空白） | `Firmware/main/render/compositor.c` `layout_matches_current_parts()` |
+| 2 | 渲染期兜底自愈：单帧部件解析失败过半 → 15s 节流触发一次 `asset_dl_request_sync()`（LAYOUT 换新、配套 PARTS 还在路上的窗口可自愈） | 同文件 `recompose_entity()` |
+| 3 | **出厂素材重建脚本**（TF 坏/未插时的恢复手段）：取服务端当前 petConfig → 本地 Exporter 导出 → 组装 `minipet/{parts,layout,bg,font,audio}+manifest.json` → fatfsgen 打 6MB FAT 镜像 → 写 `0x620000` | `Server/tools/rebuild-flash-assets.sh`（新增） |
+
+### 9.3 自测证据
+
+- 导出哈希与服务端 rev24 **逐条一致**（12 个 LAYOUT + `PARTS d2dac1ab278dea8b`）
+- 脚本实跑（`--no-flash`）：
+```
+① 取设备外观配置（petConfig） → /tmp/.../appearance.json
+② 用同一外观导出素材
+③ 组装设备端目录树  拷入 12 个资产包
+④ 生成 FAT 镜像     → assets.bin (6291456 bytes)
+```
+- 镜像已按同一流程刷入设备 `0x620000`（`Hash of data verified.`），待设备侧串口确认
+  `内部 Flash assets 分区已挂载 /sdcard（出厂素材模式）` 且不再出现 `not in PARTS pkg`
+
+### 9.4 复现命令（TF 坏时的恢复流程）
+
+```bash
+Server/tools/rebuild-flash-assets.sh \
+  --server http://<NAS_IP>:38090 --device <deviceId> \
+  --wz /path/to/wz/Data --port /dev/cu.usbmodemXXXX
+# 只出镜像不刷机：加 --no-flash
+```
