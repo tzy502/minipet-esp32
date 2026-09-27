@@ -71,12 +71,13 @@ CONFIG_MDNS_ENABLE_DEBUG_PRINTS=n
 # 此处**不改** LOG_MAXIMUM_LEVEL：既有 events/驱动的 ESP_LOGD 依赖它（避免
 # 「修 A 坏 B」，见 AGENTS 硬规矩 1）。
 
-# 【内部堆腾挪 2026-09-27】WiFi 驱动收发缓冲池缩容
-# 真机根因：默认 16 动态 TX + 16 动态 RX（每块 ~1.6KB）长期占满内部堆，导致
-# 启动末期只剩 ~1KB 最大连续块 → SoftAP 侧 `wifi:mem fail`，
-# httpd 回包时 `httpd_sock_err: error in send : 113 (EHOSTUNREACH)`，
-# 配网页永远只有响应头没有 body（用户症状："192.168.4.1 打不开"）。
-# 本设备并发连接极少（1 个手机 / poller 单连接），8/8/4 足够。
-CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=4
-CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=8
+# 【内部堆腾挪 2026-09-27】WiFi 驱动发送缓冲池略缩容
+# 起因：默认 16 动态 TX（每块 ~1.6KB）使启动末期内部堆只剩 ~1KB 最大连续块，
+# AP 侧出现 `wifi:mem fail`，httpd 回包 `error in send : 113 (EHOSTUNREACH)`
+# → 配网页只有响应头没有 body。
+# 注意：**RX 缓冲不要动**。曾把 STATIC_RX 6→4 / DYNAMIC_RX 16→8 以省更多内存，
+# 真机随即出现 `WiFi 断开 reason=2（认证失败）`——关联/DHCP 对 RX 缓冲敏感，
+# 故 RX 回默认，只把 TX 从 16 收到 12（本设备并发连接极少）。
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=6
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=16
 CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=8

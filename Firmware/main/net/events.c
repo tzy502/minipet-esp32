@@ -11,6 +11,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 #include "cJSON.h"
 
 #include "app_core.h"
@@ -185,5 +186,15 @@ static void events_task(void *arg)
 
 void events_start(void)
 {
-    xTaskCreatePinnedToCore(events_task, "events", 8192, NULL, 3, NULL, 0 /* PRO */);   /* 8192：同 poller，HTTP POST 需 TLS 深栈（原 4096 偏紧）*/
+    /* 【内部堆碎片 2026-09-27】原单次 8192 且不判返回值：真机内部堆最大连续块
+     * 只剩 2KB 时任务悄悄建不起来 → 事件上报永久静默（Web 侧"设备没数据"查不到原因）。
+     * 改为 8192 → 6144 降档 + 失败告警，与 poller 同一套自愈口径。 */
+    if (xTaskCreatePinnedToCore(events_task, "events", 8192, NULL, 3, NULL, 0 /* PRO */) != pdPASS) {
+        ESP_LOGE("events", "events 任务首建失败（内部堆挤压）→ 降档 6144 重试");
+        if (xTaskCreatePinnedToCore(events_task, "events", 6144, NULL, 3, NULL, 0) != pdPASS) {
+            ESP_LOGE("events", "events 任务 6144 也失败：事件上报不可用（内部堆 空闲=%u 最大块=%u）",
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                     (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+        }
+    }
 }
