@@ -1605,14 +1605,17 @@ void render_tick(void)
      * 这里加一条"兜底全屏重合成"：空闲 1s 无新脏区时强制整屏重绘一次，
      * 把任何残留像素抹掉（整屏 blit 约 20 次 SPI 传输，1s 一次对 AMOLED
      * 无感）。有脏区的帧不受影响，动画流畅度不变。 */
+    /* 【拖影硬修复 2026-09-27 第二版】上一版"1s 无脏区才兜底"不奏效——静止时
+     * 仍可能有路径每帧标脏（时钟/条带/挤压），兜底永不触发，残影照旧。
+     * 现改为**无条件下整屏重合成**，10fps 限频：
+     *   · 宠物界面是静态内容（stand1 3 帧慢速循环、条带缓慢平移），10fps 视觉等同
+     *   · 整屏 compose+blit 约 20 次 SPI 传输，100ms 一次对本板开销可接受
+     *   · 彻底不依赖脏区正确性：每 100ms 画面从零重建一次，任何残影最多存活 100ms
+     * 菜单态走 LVGL 全屏路径（render_tick 在 g_menu 时提前 return，不受影响）。 */
     {
         static int64_t s_last_full_us;
-        static uint32_t s_last_calls;
-        if (g_mark_calls != s_last_calls) {
-            s_last_calls = g_mark_calls;      /* 本帧有标脏：正常走脏区路径 */
+        if (now_us - s_last_full_us >= 100000) {   /* 10fps 全屏重合成 */
             s_last_full_us = now_us;
-        } else if (now_us - s_last_full_us > 1000000) {
-            s_last_full_us = now_us;          /* 1s 没标过脏：兜底整屏重绘 */
             full_recompose();
         }
     }
