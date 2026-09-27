@@ -230,6 +230,14 @@ static bool resp_collect(void *ctx, const char *data, size_t len)
     return false;    /* 超限：截断（防御服务端异常大响应） */
 }
 
+/* 【取证计数器 2026-09-27】poller 循环/成功/失败 计数 + 末次 HTTP 状态：
+ * 渲染任务的 tprobe 每 10s 打印；计数冻结 = poller 被阻塞（见 main.c 探针说明）。 */
+volatile uint32_t g_poll_loops, g_poll_ok, g_poll_fail;
+volatile int32_t  g_poll_last_status = -999;
+/* 逐阶段计数（0 循环起 / 1 过 portal / 2 过 hello / 3 过 WiFi / 4 过断线块 /
+ * 5 过 rtc / 6 过日志上报 / 7 过 TCP 探针 / 8 过 poll）——定位卡在哪一步 */
+volatile uint32_t g_pol_stage[10];
+
 static bool do_poll_once(void)
 {
     char path[POLL_PATH_LEN];    /* poll 端点服务端必填 deviceId（DeviceEndpoints.cs HandlePoll 签名
@@ -428,6 +436,7 @@ static void poller_task(void *arg)
          * 但 poll 心跳仍不出现 → 怀疑卡在这个 portal 等待里（s_portal_active 被
          * provision_start_portal() 置位后若任务创建失败/未拆栈，就永远为 true）。
          * 这里进入等待时打一条（30s 限频），把"是否卡在这"变成事实。 */
+        g_pol_stage[0]++;
         if (provision_portal_active()) {
             static int64_t s_pw_log_ms;
             int64_t now_ms = esp_timer_get_time() / 1000;
@@ -437,6 +446,7 @@ static void poller_task(void *arg)
             }
             while (provision_portal_active()) vTaskDelay(pdMS_TO_TICKS(1000));
         }
+        g_pol_stage[1]++;
 
         /* 【真机根因 2026-09-27】本任务在 app_main 里先于 state_machine_boot()
          * 启动，而 deviceId 是 hello 从服务端取回的。此前会在 hello 之前就用
@@ -502,19 +512,37 @@ static void poller_task(void *arg)
             }
         }
 
-        /* WiFi 掉线先重连（OFFLINE 期间唯一回网驱动，E11） */
+        g_pol_stage[2]++;
+        /* WiFi 掉线先重连（OFFLINE 期间唯一回网驱动，E11）。
+         * 【真机根因 2026-09-27】事件旗标可能滞后于现实（驱动自动重连成功但
+         * GOT_IP 不再触发 → provision 的 s_sta_connected 恒假）。此处若 connect
+         * 报失败，**再用裸 TCP 探针实测一次链路**：探得通就照常 poll（真机实证
+         * 设备能 ping 通、服务端能连上，却因为这道门永远进不到 poll → Web 指令
+         * 全部取不走）。旗标问题由 provision 侧自愈修复。 */
         if (!provision_wifi_connect_sta(15000)) {
-            /* 连不上家网：慢退避重试，不忙转 */
-            vTaskDelay(pdMS_TO_TICKS(backoff_ms));
-            if (backoff_ms < BACKOFF_MAX_MS) backoff_ms *= 2;
-            if (s_reported_online) {
-                s_reported_online = false;
-                s_offline_since_ms = mp_now_ms();
-                state_machine_handle(MP_SM_EV_NET_OFFLINE);
+            g_pol_stage[9]++;
+            int p2 = server_tcp_probe(POLL_PROBE_MS);
+            if (p2 == PROBE_UP) {
+                static int64_t s_probe_ok_ms;
+                int64_t now2 = esp_timer_get_time() / 1000;
+                if (now2 - s_probe_ok_ms > 10000) {
+                    s_probe_ok_ms = now2;
+                    ESP_LOGW(TAG, "WiFi 旗标为假但 TCP 探针已通 → 照常轮询（旗标滞后，链路正常）");
+                }
+            } else {
+                /* 连不上家网：慢退避重试，不忙转 */
+                vTaskDelay(pdMS_TO_TICKS(backoff_ms));
+                if (backoff_ms < BACKOFF_MAX_MS) backoff_ms *= 2;
+                if (s_reported_online) {
+                    s_reported_online = false;
+                    s_offline_since_ms = mp_now_ms();
+                    state_machine_handle(MP_SM_EV_NET_OFFLINE);
+                }
+                continue;
             }
-            continue;
         }
 
+        g_pol_stage[3]++;
         /* 【掉线自愈 · 新增】WiFi 侧掉过线（provision 的断线计数自增）→ 回网立刻补 hello：
          * 服务端 lastSeen 马上刷新，不必等下一轮 55s 长轮询结束。
          * 计数只在 DISCONNECTED 事件里自增，天然限频（不会变成每轮都发）。 */
@@ -528,17 +556,21 @@ static void poller_task(void *arg)
             }
         }
 
+        g_pol_stage[4]++;
         /* E9 常态化校时：借本任务执行（不新建 rtcsync 任务，绕开内部堆碎片） */
         provision_rtc_resync_step();
+        g_pol_stage[5]++;
 
         /* E14 设备日志增量上报：同样借本任务（不新建任务 —— 内部堆约束）。
          * 内部自带 20s 心跳/失败退避，poll 长轮询期间不会叠加请求。 */
         mp_http_device_log_step();
+        g_pol_stage[6]++;
 
         /* 【可达性门 · 新增】1.5s 裸 TCP 探针：分辨"真断线"与"长轮询抖动"。
          * 探不通就跳过本轮 poll（省下 65s 的建连黑洞），直接走重连/退避；
          * 探得通则说明链路在，上一轮 -1 只是长轮询抖动，保持 5s 快速重试。 */
         int probe = server_tcp_probe(POLL_PROBE_MS);
+        g_pol_stage[7]++;
         if (probe != PROBE_UP) {
             int streak = ++s_unreach_streak;
             s_link_up = false;
@@ -609,7 +641,10 @@ static void poller_task(void *arg)
                          (int)provision_portal_active());
             }
         }
+        g_poll_loops++;
         bool ok = do_poll_once();
+        g_pol_stage[8]++;
+        if (ok) g_poll_ok++; else g_poll_fail++;
         int64_t poll_dt_ms = mp_now_ms() - poll_t0;
 
         /* 长轮询可能 hold 50s：再补一次日志上报机会（内部节流，不会连发） */

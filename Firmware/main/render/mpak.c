@@ -810,7 +810,14 @@ int mpak_font_read_glyph_bmp(const mpak_t *m, const mpak_glyph_t *g, uint8_t *ds
 /* kind=5 AUDIO_META                                                   */
 /* ------------------------------------------------------------------ */
 
-#define MPAK_AUDIO_MAX_TRACKS 1024u
+/* 【曲库上限 2026-09-27 真机根因】WZ 曲库实测 **1167 首**（本机 AUDIO_META
+ * 8d618b5d337f2818：track_count=1167，4+108×1167=126040 = payload 全长）。
+ * 旧上限 1024 → parse_audio 直接 MPAK_ERR_FMT → mpak_open 失败 →
+ * 设备侧 "audio pack unusable, skipped" → `曲目表构建：命中 0 首` →
+ * 曲目表恒空：next/prev 无表可走、点播无曲可播（用户报障"设了 BGM 没声"）。
+ * 表本体在 PSRAM（1167×108B≈123KB 索引 + 设备侧 ids/titles≈41KB），放宽到 4096
+ * 仍只占 PSRAM，不动内部堆。 */
+#define MPAK_AUDIO_MAX_TRACKS 4096u
 
 static int parse_audio(mpak_t *m)
 {

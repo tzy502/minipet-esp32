@@ -30,6 +30,7 @@
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
+#include "freertos/idf_additions.h"   /* xTaskCreatePinnedToCoreWithCaps（PSRAM 栈） */
 #include "cJSON.h"
 
 #include "app_core.h"
@@ -584,28 +585,51 @@ static void drain_audio_q_nonblock(void)
     }
 }
 
+/* 【取证计数器 2026-09-27】bgm 任务收到消息数 / 播放状态 / feeder 循环数：
+ * 与 poller 计数一起由 main.c 的 tprobe 打印，用于判定"起播后设备掉线"是
+ * 哪个任务被阻塞。 */
+volatile uint32_t g_bgm_msgs, g_feeder_loops;
+volatile int32_t  g_bgm_state_probe;
+/* PLAY 分支逐点标记：1 入口 / 2 bgm_cmd 后 / 3 codec_start 后 / 4 表情后 /
+ * 5 取到表锁 / 6 tbl_ensure 后 / 7 play_session 后 —— 卡在哪一步看它 */
+volatile uint32_t g_bgm_step;
+
 static void handle_audio_msg(const mp_audio_msg_t *m)
 {
     switch (m->type) {
     case MP_AUDIO_PLAY: {
+        g_bgm_step = 1;
         if (s_greyed[s_source]) return;                 /* 置灰源禁播（E8） */
         int id = m->a;                              /* 0=服务端决定；负数=高位 u32 id 的位型 */
         if (id == 0) {
-            if (bgm_cmd("play", 0, &id) != 0 || id == 0) return;
+            if (bgm_cmd("play", 0, &id) != 0 || id == 0) {
+                /* 【不再静默 2026-09-27】此前这里直接 return：服务端没给曲目 id
+                 * 时（旧实现 play 不选曲 → 回 id:null）设备不发流、不报错、
+                 * 状态还停在 PLAYING，用户侧就是"点了播放没声音"。
+                 * 现在至少留一条日志，且服务端已修为 play 必回曲目。 */
+                ESP_LOGW(TAG, "play：未取得曲目 id（服务端返回空/请求失败）→ 本次不起播");
+                return;
+            }
         }
+        g_bgm_step = 2;                             /* bgm_cmd 已拿到曲目 id */
         s_pending_op = 0;
         s_pending_play = false;                     /* 本次 PLAY 直接落地，清延后记账 */
         s_state = MP_BGM_PLAYING;
         s_playing = true;
         mp_codec_start(s_rate ? s_rate : 44100);
+        g_bgm_step = 3;                             /* I2S/codec 已就绪 */
         input_trigger_expression(MP_EXPR_HUM, 1500);     /* E10：BGM 播放=hum */
+        g_bgm_step = 4;
         /* 表内有此 id → 按表位起播（next/prev 循环锚点）；
          * 表不可用/不在表内 → 服务端 id 兜底路径 */
         xSemaphoreTake(s_tbl_lock, portMAX_DELAY);
+        g_bgm_step = 5;
         tbl_ensure_locked();
+        g_bgm_step = 6;
         int idx = tbl_find_locked((uint32_t)id);
         xSemaphoreGive(s_tbl_lock);
         bgm_play_session(idx, idx < 0 ? id : 0);
+        g_bgm_step = 7;                             /* 会话已返回 */
         break;
     }
     case MP_AUDIO_RESUME:
@@ -697,6 +721,21 @@ static void handle_audio_msg(const mp_audio_msg_t *m)
 /* ------------------------------------------------------------------ */
 /* bgm 任务 / feeder 任务                                                */
 /* ------------------------------------------------------------------ */
+/* ══ 【BGM 任务栈 2026-09-27 真机根因：起播即崩】══════════════════════════
+ * 证据链：
+ *   · 6144 栈 → `***ERROR*** A stack overflow in task bgm has been detected` → 重启；
+ *   · 抬到 10240 后不再是 canary 报错，而是 minimp3 内部
+ *     `Guru Meditation (LoadProhibited, EXCVADDR=0)`：
+ *     addr2line 反解 → bgm_task → handle_audio_msg → bgm_play_session → play_track
+ *     → stream_chunk → decode_pending → mp3dec_decode_frame → L3_huffman。
+ *   · 根因就是本仓库 minimp3.h 文件头写明的栈核算：
+ *     `mp3dec_decode_frame 的 mp3dec_scratch_t ≈16KB 在调用栈上 —— bgm 任务栈须 ≥20KB`。
+ * 而内部 DRAM 运行期最大连续块只有 ~7.6~24KB，24KB **内部**栈建不起来（旧注释已实证
+ * "12KB 栈永远建不起来"）。因此改为**PSRAM 栈**（sdkconfig 已开
+ * CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY=y，本板 8MB PSRAM 几乎全空），
+ * 既满足 24KB 需求，又不吃内部堆。创建失败时仍走原有 10s 重试（内部栈兜底）。 */
+#define MP_BGM_TASK_STACK 24576
+
 static void bgm_task(void *arg)
 {
     (void)arg;
@@ -718,6 +757,8 @@ static void bgm_task(void *arg)
     for (;;) {
         mp_audio_msg_t m;
         if (xQueueReceive(mp_audio_q, &m, portMAX_DELAY) == pdTRUE) {
+            g_bgm_msgs++;
+            g_bgm_state_probe = (int32_t)s_state;
             if (!s_dec) continue;                       /* 解码器不可用 */
             if (m.type == MP_AUDIO_VOL || m.type == MP_AUDIO_VOLUME) {
                 handle_audio_msg(&m); continue;     /* 音量本地可用，断网也不拦 */
@@ -754,6 +795,7 @@ static void feeder_task(void *arg)
     int underruns = 0;
 
     for (;;) {
+        g_feeder_loops++;
         /* 采样率变更：先清缓冲再重配（避免新旧采样率混流） */
         if (s_rate_dirty) {
             pcm_ring_flush(s_ring);
@@ -801,15 +843,31 @@ static void feeder_task(void *arg)
 static esp_timer_handle_t s_task_retry_timer;
 static volatile bool s_task_up;   /* bgm 任务是否已就绪（自愈重试判据） */
 
+/* 【为什么不能用 PSRAM 栈 2026-09-27 真机实证】用
+ * xTaskCreatePinnedToCoreWithCaps(..., MALLOC_CAP_SPIRAM) 建栈后，任务一碰 Flash
+ * （FATFS 读曲库/日志）就命中
+ *   `assert failed: spi_flash_disable_interrupts_caches_and_other_other_cpu
+ *    (esp_task_stack_is_sane_cache_disabled())`
+ * → 1.5s 一次的重启循环。PSRAM 栈在关 cache 的临界区不可访问，本任务必须读 Flash
+ * 取流/曲目表，因此只能用**内部 DRAM 栈**。
+ * 内部栈 24KB 的可行性：真机日志 `@bgm 任务后（渲染任务未创建）最大块=24564`
+ * 说明建立之前最大连续块 ≈34.8KB —— 只要**在其它内部堆客户之前**建栈就能成。
+ * 本函数因此把建栈提到 mp_codec_init 之前（解码器 scratch ≈16KB 必须在调用栈上，
+ * 见 minimp3.h 文件头栈核算）。 */
+static BaseType_t bgm_task_create(void)
+{
+    return xTaskCreatePinnedToCore(bgm_task, "bgm", MP_BGM_TASK_STACK, NULL, 3,
+                                   NULL, 0 /* PRO */);
+}
+
 /* 内部堆回稳后补建 bgm 任务（成功即停表自删） */
 static void bgm_task_retry_cb(void *arg)
 {
     (void)arg;
     if (s_task_up) return;
-    if (xTaskCreatePinnedToCore(bgm_task, "bgm", 6144, NULL, 3,
-                                NULL, 0 /* PRO */) == pdPASS) {
+    if (bgm_task_create() == pdPASS) {
         s_task_up = true;
-        ESP_LOGI(TAG, "bgm 任务延迟创建成功（内部堆已回稳）");
+        ESP_LOGI(TAG, "bgm 任务延迟创建成功（PSRAM 栈）");
         esp_timer_stop(s_task_retry_timer);
         esp_timer_delete(s_task_retry_timer);
         s_task_retry_timer = NULL;
@@ -828,24 +886,20 @@ void bgm_start(void)
         ESP_LOGE(TAG, "pcm ring alloc failed (PSRAM?)");
         return;
     }
-    mp_codec_init(44100);
-    /* 【栈 6144 依据 2026-09-27 真机实证】真机内部 DRAM 运行期最大连续块仅
-     * ~7.6KB，12KB 栈**永远建不起来**（日志 "bgm 任务首建失败（内部堆挤压）"
-     * 每 10s 重试一次、永不成功）→ 用户"设了 BGM 也没声音"的直接原因。
-     * bgm 任务本体只做 HTTP 流读取 + minimp3 解码 + 喂 PSRAM 环，帧级缓冲都在
-     * PSRAM/堆上，6KB 够用；宁可栈小一点也要让任务存在。
-     * 原注释（16384）：mp3dec_decode_frame 的
-     * mp3dec_scratch_t 实际 ≈10KB（maindata 4.6KB + grbuf 4.6KB + syn 4.2KB +
-     * gr_info/bs/ist_pos，按 minimp3.h:252-259 逐字段核算），叠加解码经
-     * mp_http_get→stream_chunk→esp_http_client 的调用链（~2KB）仍有充分余量。
-     * 原 24576 是内部堆大客户：真机 3/3 boot 拿不到连续块 → 转 10s 自愈重试，
-     * BGM 实际起不来（无声）。收紧到 16K 后可在启动期直接分配成功。
+    /* 【建栈顺序 + 栈大小 2026-09-27 真机实证】
+     * ① 必须在 mp_codec_init / 渲染任务之前建栈：真机日志显示这两步之后的内部堆
+     *    最大连续块只剩 ~24.5KB，24KB 栈建不起来；此刻（刚过 WiFi 初始化）还有
+     *    ~34KB 连续块，一次成功。
+     * ② 24KB 不是拍脑袋：minimp3.h 文件头写明 `mp3dec_decode_frame` 的
+     *    mp3dec_scratch_t ≈16KB 在**调用栈**上 → 栈 <20KB 时解码必崩（真机两种
+     *    形态都复现过：6144 → canary stack overflow 重启；10240 → minimp3 内
+     *    L3_huffman 空指针 panic，addr2line 已反解到该调用链）。
+     * ③ 不能用 PSRAM 栈（xTaskCreatePinnedToCoreWithCaps(SPIRAM) 试过）：本任务
+     *    要读 Flash（FATFS 曲目表/流），PSRAM 栈在关 cache 临界区不可访问 →
+     *    `assert failed: esp_task_stack_is_sane_cache_disabled()` 1.5s 重启循环。
+     * 首建失败仍走 10s 自愈重试（内部堆回稳后补建）。
      * feeder 无解码，4096 够用。 */
-    /* 24K 栈是内部堆大客户（render 12K 已先行分配）：开机挤压窗口期可能
-     * 拿不到连续块（真机 3/3 boot 全败）。首试失败不阻塞开机，转 10s 周期
-     * 自愈定时器，内部堆回稳后自动补建（否则 BGM 静默不可用）。 */
-    if (xTaskCreatePinnedToCore(bgm_task, "bgm", 6144, NULL, 3,
-                                NULL, 0 /* PRO */) == pdPASS) {
+    if (bgm_task_create() == pdPASS) {
         s_task_up = true;
     } else {
         ESP_LOGW(TAG, "bgm 任务首建失败（内部堆挤压），转 10s 周期自愈重试");

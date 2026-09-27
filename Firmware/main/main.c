@@ -21,6 +21,8 @@
  *   队列：event_q（input→net 上报）/ cmd_q（net→render 执行）/
  *         audio_q（UI/net→bgm 控制；PCM 走 PSRAM 环形缓冲）
  */
+#define MP_TASK_PROBE 0   /* 任务存活取证（排障时置 1：poller 阶段/bgm 步骤/消息计数） */
+
 #include <stdio.h>
 #include <assert.h>
 
@@ -97,6 +99,39 @@ static void render_task(void *arg)
         }
         render_tick();                    /* 4.2 帧循环（30fps） */
         watchdog_kick();
+
+#if MP_TASK_PROBE
+        /* 【任务存活取证 2026-09-27】用户报障「BGM 一起播设备就从服务器掉线」
+         * （真机：发 bgm=play 后 /api/admin/devices 的 lastSeen 不再更新，串口也
+         * 没有 BGM 日志）。这里每 10s 打一次各任务的自增计数：
+         * 计数在涨 = 任务在跑（问题在协议层）；计数冻结 = 该任务被阻塞。
+         * 定稿后 MP_TASK_PROBE 置 0。 */
+        {
+            static int64_t s_tp_ms;
+            int64_t now_ms = esp_timer_get_time() / 1000;
+            if (now_ms - s_tp_ms > 10000) {
+                s_tp_ms = now_ms;
+                extern volatile uint32_t g_poll_loops, g_poll_ok, g_poll_fail;
+                extern volatile int32_t  g_poll_last_status;
+                extern volatile uint32_t g_bgm_msgs, g_feeder_loops;
+                extern volatile uint32_t g_bgm_step;
+                extern volatile uint32_t g_pol_stage[10];
+                extern volatile int32_t  g_bgm_state_probe;
+                ESP_LOGW("tprobe", "poller 阶段=[%u %u %u %u %u %u %u %u %u] 门失败=%u 成功=%u 失败=%u | "
+                                   "bgm 消息=%u 状态=%d feeder=%u",
+                         (unsigned)g_pol_stage[0], (unsigned)g_pol_stage[1],
+                         (unsigned)g_pol_stage[2], (unsigned)g_pol_stage[3],
+                         (unsigned)g_pol_stage[4], (unsigned)g_pol_stage[5],
+                         (unsigned)g_pol_stage[6], (unsigned)g_pol_stage[7],
+                         (unsigned)g_pol_stage[8], (unsigned)g_pol_stage[9],
+                         (unsigned)g_poll_ok, (unsigned)g_poll_fail,
+                         (unsigned)g_bgm_msgs, (int)g_bgm_state_probe,
+                         (unsigned)g_feeder_loops);
+                ESP_LOGW("tprobe", "bgm 步骤=%u（1入口 2拿到id 3codec 4表情 5表锁 6表建成 7会话返回）",
+                         (unsigned)g_bgm_step);
+            }
+        }
+#endif
         vTaskDelay(pdMS_TO_TICKS(33));    /* 30fps ≈ 33ms */
     }
 }

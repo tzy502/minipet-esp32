@@ -106,7 +106,34 @@
 > 顺带把常态日志收敛：`RC_FORENSIC` 默认 0（需要时改 1 复跑取证），周期探针 3s → 30s，
 > flush 日志仅在取证窗口打印。最终固件 60s 只输出 **307 行**日志、**0 次 TWDT**、0 条 ERROR。
 
-## 8. 仍需人眼确认的一点
+## 8. 追加：把「Web 指令全部不生效 / BGM 永远没声」也挖到底了（同日深夜）
+
+用户报障「服务器页面也没有播放 bgm 的按钮（已补）」「时钟好像也不能用」，
+在真机取证中发现一条**更严重的链路断裂**：Web 下发的任何指令其实**从未送达设备**。
+四个独立根因，逐个实测确认：
+
+| # | 根因 | 真机证据 | 修复 |
+|---|------|---------|------|
+| 1 | **poller 卡在"WiFi 重连"这一跳，永不轮询** | `ping <PET_IP>` 4/4 通（5~25ms），但串口阶段计数 `poller 阶段=[7 7 7 0 …]`：**7 轮循环全部卡在 WiFi 连接门**，`g_pol_stage[3]` 恒 0 → 永远进不到 poll；服务端只看到开机那次 hello，之后 Web 指令全躺在队列里 | ① `provision_wifi_connect_sta()` 补"实测已连"判据（驱动已关联 + netif 有 IP 即复位 `s_sta_connected`；GOT_IP 事件在 netif 保留 IP 时**不会**再触发，这是旗标永久为假的机理）；② poller 在该门失败时**再用裸 TCP 探针实测**，探得通就照常 poll（链路真断才退避） |
+| 2 | **曲库表恒空（0 首）** | `bgm: audio pack 8d618b5d337f2818.mpk unusable, skipped` → `曲目表构建：src=0 命中 0 首` | `MPAK_AUDIO_MAX_TRACKS` 1024 < 实际 **1167 首** → `parse_audio` 直接 `MPAK_ERR_FMT`。放宽到 4096（表在 PSRAM）→ 真机 `命中 1167 首`、`track table: 1167 tracks` |
+| 3 | **BGM 任务起播即崩（重启循环）** | 6144 栈：`***ERROR*** A stack overflow in task bgm` → 重启；10240 栈：`Guru Meditation (LoadProhibited, EXCVADDR=0)`，`addr2line` 反解 = `bgm_task→handle_audio_msg→bgm_play_session→play_track→stream_chunk→decode_pending→mp3dec_decode_frame→L3_huffman` | 根因写在本仓库 `minimp3.h` 文件头：`mp3dec_scratch_t ≈16KB 在调用栈上 → 任务栈须 ≥20KB`。改回 **24576 内部栈**并把**建栈提前到 `mp_codec_init`/渲染任务之前**（此刻最大连续块 ≈34KB，一次成功）。PSRAM 栈试过不行：本任务读 Flash，PSRAM 栈在关 cache 临界区触发 `assert esp_task_stack_is_sane_cache_disabled()` → 1.5s 重启 |
+| 4 | **`play` 永远不选曲** | 服务端事件只有 `BGM：play（设备现场控制）`，设备侧 `bgm 步骤` 恒 =1（连 track table 都没打） | 固件 PLAY 分支 `if (id==0) { bgm_cmd("play",0,&id); if (id==0) return; }`，而服务端 `HandleBgmCmd` 对 `play` **不选曲**（只有 next/prev 调 `NextTrackAsync`）→ 回 `id:null` → 静默返回。服务端已改为 play/resume 未指定曲目时 `NextTrackAsync(source, 当前曲目, 0)`；固件该分支补 WARN 日志（不再静默） |
+
+**修复后的端到端实测**（旧服务端 + 新固件，用 next 绕开服务端选曲）：
+
+```
+曲目表构建：src=0 命中 1167 首（audio 目录存在）
+track table: 1167 tracks (source=wz)
+（无 stack overflow / 无 panic）
+feeder 计数 20s 内 +2161（=108 次/s I2S 写入 = 正在出声）
+→ 下发 bgm=pause 后 feeder 回落到 20 次/s（空闲节流）
+服务端事件：指令下发：bgm=source/play/next → BGM：play（设备现场控制）
+```
+
+> ⚠️ 服务端侧改动（play 选曲 / `bgm=track` 点播 / Web 曲库行内播放 + 当前曲目）
+> **需要重建并重新部署 NAS 镜像**才生效；固件侧改动已烧进设备。
+
+## 9. 仍需人眼确认的一点
 
 面板侧没有 TE（撕裂同步）引脚（BSP 里 `BSP_LCD_*` 无 TE、`tear_avoid_mode = NONE`），
 所以"写入 GRAM 时面板正在扫描"这件事在硬件上无法消除；本次修复把**内容错帧/残影/越界裁切**

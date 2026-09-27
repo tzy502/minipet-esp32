@@ -317,7 +317,22 @@ public static class DeviceEndpoints
         string? trackId = body.Id;
         if (cmd is "next" or "prev")
         {
-            trackId = await router.NextTrackAsync(source, body.Id, cmd == "next" ? 1 : -1);
+            trackId = await router.NextTrackAsync(source, body.Id ?? dev.Bgm.TrackId,
+                                                  cmd == "next" ? 1 : -1);
+        }
+        else if (cmd is "play" or "resume" && string.IsNullOrWhiteSpace(trackId))
+        {
+            /* 【"点播放没声音"最终根因 2026-09-27】固件 PLAY 分支是
+             *   if (id == 0) { bgm_cmd("play",0,&id); if (id==0) return; }
+             * 而本端点此前对 play **不选曲**（只有 next/prev 调 NextTrackAsync）
+             * → 响应里没有 id → 固件 Out_id 保持 0 → 直接 return：不发流、
+             * 不报错、不置状态（真机串口取证：bgm 步骤恒 =1，连 track table 都
+             * 没打出来；服务端侧只有一条"BGM：play（设备现场控制）"）。
+             * 现在：play/resume 未指定曲目时由服务端选一首（step=0 → 未选过则取
+             * 曲库第一首，选过则续当前曲），保证 id 一定非空。 */
+            trackId = await router.NextTrackAsync(source, dev.Bgm.TrackId, 0);
+            if (!string.IsNullOrWhiteSpace(trackId))
+                eventLog.Append(dev.DeviceId, $"BGM：{cmd} 自动选曲 → {trackId}");
         }
 
         var volume = body.Volume is >= 0 and <= 100 ? body.Volume.Value : dev.Bgm.Volume;
@@ -325,6 +340,8 @@ public static class DeviceEndpoints
         {
             d.Bgm.Source = source;
             d.Bgm.Volume = volume;
+            /* 当前曲目落设备表：Web「当前曲目」显示 + play/resume 续播锚点 */
+            if (!string.IsNullOrWhiteSpace(trackId)) d.Bgm.TrackId = trackId;
         });
 
         // 事件日志：source/cmd 取固件字面量；trackId 有值才带（select/next/prev 才有曲目）

@@ -1371,6 +1371,47 @@ esp_err_t provision_wifi_connect_sta(uint32_t timeout_ms)
     mp_nvs_get_str("wifi_pass", pass, sizeof(pass));
 
     if (s_sta_connected) return ESP_OK;   /* 已连接：绝不可断开重连（会掐断活连接→闪烁/轮询失败循环） */
+
+    /* ══ 【真机根因 2026-09-27：poller 永不轮询 / Web 指令全都取不走】══════════
+     * 只信事件旗标会永久卡死：一旦收到一次 STA_DISCONNECTED（换 AP/省电踢/握手
+     * 重协商），旗标转 false；随后驱动自动重连成功，但 **netif 已持有 IP →
+     * 不会再触发 IP_EVENT_STA_GOT_IP** → 旗标永远回不来。
+     * 真机实证（本函数调用者=poller 第一跳）：
+     *   · `ping <PET_IP>` 4/4 通（5~25ms），说明链路完全正常；
+     *   · 串口阶段计数 `poller 阶段=[7 7 7 0 0 …]`：7 轮循环全部卡在"WiFi 重连"
+     *     这一跳，`g_pol_stage[3]` 恒 0 → 永远进不到 poll；
+     *   · 服务端因此只看到开机那次 hello（online 短暂 true）→ 之后 Web 下发的
+     *     播放/音量/切歌/点播指令全部躺在队列里取不走（用户报障"没反应"）。
+     * 修法：补一条"实测已连"判据——驱动已关联且有 IP 即视为已连接，并把旗标
+     * 复位（自愈）。这样即便 GOT_IP 不再触发也不会卡死重连分支。 */
+    {
+        wifi_ap_record_t ap;
+        esp_netif_ip_info_t ipi;
+        esp_netif_t *nif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+        bool assoc = (esp_wifi_sta_get_ap_info(&ap) == ESP_OK);
+        bool has_ip = nif && esp_netif_get_ip_info(nif, &ipi) == ESP_OK && ipi.ip.addr != 0;
+        {
+            static int64_t s_diag_ms;
+            int64_t now_ms = esp_timer_get_time() / 1000;
+            if (now_ms - s_diag_ms > 5000) {
+                s_diag_ms = now_ms;
+                ESP_LOGW(TAG, "STA 自查：assoc=%d(裸返回值 %d) netif=%p has_ip=%d ip=" IPSTR,
+                         (int)assoc, (int)esp_wifi_sta_get_ap_info(&ap),
+                         (void *)nif, (int)has_ip, IP2STR(&ipi.ip));
+            }
+        }
+        if (assoc && has_ip) {
+            static int64_t s_selfheal_log_ms;
+            int64_t now_ms = esp_timer_get_time() / 1000;
+            if (now_ms - s_selfheal_log_ms > 5000) {
+                s_selfheal_log_ms = now_ms;
+                ESP_LOGW(TAG, "STA 自查已连（rssi=%d, ip=" IPSTR "）但旗标为假 → 自愈复位"
+                              "（GOT_IP 不会再触发）", (int)ap.rssi, IP2STR(&ipi.ip));
+            }
+            s_sta_connected = true;
+            return ESP_OK;
+        }
+    }
     wifi_init_once();
     bool owner = false;
     if (!s_conn_busy) { s_conn_busy = true; owner = true; }
