@@ -46,6 +46,9 @@ done
 [ -n "$SERVER_URL" ] || { echo "缺少 --server（例：http://<NAS_IP>:38090）" >&2; exit 2; }
 [ -n "$DEVICE_ID" ]  || { echo "缺少 --device（设备 id，例：dev-693ea4）" >&2; exit 2; }
 [ -d "$WZ_PATH" ]    || { echo "WZ 数据目录不存在：$WZ_PATH（用 --wz 指定）" >&2; exit 2; }
+# 出厂素材要覆盖的不只是人物：AUDIO_META（BGM 曲目表）、默认地图 BGMAP + 其小部件包、
+# 三档字体。TF 卡损坏/未插时设备只能靠这份出厂快照——曲目表缺失会导致"设了 BGM 没声"。
+DEFAULT_MAP="${FACTORY_MAP:-000010000}"
 OUT_DIR="${OUT_DIR:-$(mktemp -d /tmp/minipet-assets.XXXXXX)}"
 mkdir -p "$OUT_DIR"
 
@@ -59,7 +62,8 @@ echo "② 用同一外观导出素材（哈希须与服务端 manifest 一致）
 EXPORT_ROOT="$OUT_DIR/export"
 "$DOTNET" run --project "$ROOT/Server/tools/Exporter" -- \
   --wz "$WZ_PATH" --appearance "$APPEARANCE" --profile amoled216 \
-  --device-id "$DEVICE_ID" --no-fonts --no-audio --no-fonttime \
+  --device-id "$DEVICE_ID" --maps "${FACTORY_MAPS:-$DEFAULT_MAP}" \
+  --fonts "${FACTORY_FONTS:-16,24,32}" \
   --out "$EXPORT_ROOT" > "$OUT_DIR/export.log" 2>&1 || { tail -20 "$OUT_DIR/export.log"; exit 1; }
 SRC="$EXPORT_ROOT/$DEVICE_ID"
 [ -f "$SRC/manifest-assets.json" ] || { echo "导出失败：没有 manifest-assets.json" >&2; tail -20 "$OUT_DIR/export.log"; exit 1; }
