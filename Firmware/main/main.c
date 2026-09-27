@@ -148,8 +148,31 @@ void mp_orient_calib_tap(void)
 /* ------------------------------------------------------------------ */
 /* app_main                                                              */
 /* ------------------------------------------------------------------ */
+/* 【真机栈溢出修复 2026-09-27】IDF 的 main 任务默认栈仅 ~3.5KB，而
+ * state_machine_boot() 在 main 上同步执行 WiFi 连接（最长 20s）+ TLS 握手 +
+ * hello（cJSON 解析响应）+ 素材清单加载——真机实测：
+ *   `***ERROR*** A stack overflow in task main has been detected.`
+ *   Backtrace: ... |<-CORRUPTED   → rst:0xc (RTC_SW_CPU_RST)
+ * 表现为设备每 ~2.7s 一轮重启循环（网络 GOT_IP 那一刻崩）。
+ * 修法：app_main 只做"起一个带大栈的 app_main_task"，全部启动逻辑搬进去。
+ * 大栈分配失败时回退到原行为（原栈上直接跑），至少不改变既有可用性。 */
+#define MP_MAIN_STACK  12288
+
+static void app_main_task(void *arg);
+
 void app_main(void)
 {
+    if (xTaskCreatePinnedToCore(app_main_task, "mp_main", MP_MAIN_STACK, NULL,
+                                tskIDLE_PRIORITY + 1, NULL, 0 /* PRO */) != pdPASS) {
+        ESP_LOGW("main", "mp_main 大栈任务创建失败（内部堆挤压）→ 原栈直接启动");
+        app_main_task(NULL);      /* 不返回 */
+    }
+    /* app_main 功成身退，由 mp_main 继续承载原启动流程 */
+}
+
+static void app_main_task(void *arg)
+{
+    (void)arg;
     /* NVS（配网凭据/服务器地址/看门狗计数/BGM 偏好都住这里） */
     esp_err_t err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {

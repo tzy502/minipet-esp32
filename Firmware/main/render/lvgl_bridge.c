@@ -604,6 +604,11 @@ static void menu_activate_item(int idx, mp_cmd_type_t cmd)
 {
     const menu_item_t *it = &s_menu.items[idx];
 
+    /* 【派发探针 2026-09-27】用户报"无论怎么点选中的都是第一个 map"：
+     * 记录 行号→hash→cmd→cached，用于区分「选中索引没生效」与「派发静默失败」。 */
+    ESP_LOGI(TAG, "menu: activate idx=%d cmd=%d cached=%d hash=%.16s label=%.24s",
+             idx, (int)cmd, (int)it->cached, it->hash, it->label);
+
     if (it->cached) {
         if (cmd != MP_CMD_NONE) {
             mp_cmd_t c = { .type = cmd };
@@ -743,8 +748,15 @@ static void menu_dl_poll(void)
 
 static void menu_style_row(lv_obj_t *btn, bool selected)
 {
-    lv_obj_set_style_bg_color(btn, lv_color_hex(selected ? 0x1E2A3A : 0x121216), 0);
-    lv_obj_set_style_border_color(btn, lv_color_hex(selected ? 0x4DA3FF : 0x34343C), 0);
+    /* 【光标不可见修复 2026-09-27】用户实测"高亮框不跟着走"。除颜色对比不足外，
+     * 更可能是"取消选中"的行没有把选中态视觉撤干净（DIRECT 整屏缓冲下失效区域
+     * 也可能被漏掉）。这里三重加固：①明显色差 ②状态样式 ③末尾显式 invalidate。 */
+    lv_obj_set_style_bg_color(btn, lv_color_hex(selected ? 0x2A4A7A : 0x121216), 0);
+    lv_obj_set_style_border_color(btn, lv_color_hex(selected ? 0x7FC4FF : 0x34343C), 0);
+    lv_obj_set_style_border_width(btn, selected ? 3 : 2, 0);
+    if (selected) lv_obj_add_state(btn, LV_STATE_FOCUSED);
+    else          lv_obj_remove_state(btn, LV_STATE_FOCUSED);
+    lv_obj_invalidate(btn);
 }
 
 /* 置灰行（T3）配色：DISABLED 选择器覆盖默认态；选中态只提亮边框，
@@ -960,9 +972,26 @@ static void menu_apply_selection(void)
         styled++;
     }
     s_menu.sel_applied = s_menu.sel;
-    /* 【取证探针 2026-09-27】用户报"光标没动"：把"贴了哪些行、贴到第几行"变成
-     * 日志事实。styled/row_cnt 不符 = rows[] 空洞；sel 变化但日志连续出现 = tick
-     * 在跑、样式已改 → 问题在重绘（DIRECT 缓冲失效范围）而非逻辑。 */
+    /* 【文字光标 2026-09-27】样式高亮在真机上用户判读不出（"高亮框不跟着走"），
+     * 加一条不依赖样式的光标通道：选中行标签前缀 "> "，未选中行去掉前缀。
+     * 这样即便配色/无效区有问题，光标移动也一定看得见。 */
+    for (int i = 0; i < s_menu.row_cnt && i < MENU_ROWS_MAX; i++) {
+        lv_obj_t *btn = s_menu.rows[i];
+        if (!btn) continue;
+        lv_obj_t *lb = lv_obj_get_child(btn, 0);
+        if (!lb || !lv_obj_has_class(lb, &lv_label_class)) continue;
+        const char *cur = lv_label_get_text(lb);
+        if (!cur) continue;
+        bool want = (i == s_menu.sel);
+        bool have = (cur[0] == '>' && cur[1] == ' ');
+        if (want == have) continue;                 /* 已一致，避免每 tick 重设文本 */
+        char buf[64];
+        if (want) snprintf(buf, sizeof(buf), "> %.58s", cur);
+        else      snprintf(buf, sizeof(buf), "%.60s", cur + 2);
+        lv_label_set_text(lb, buf);
+        lv_obj_invalidate(btn);
+    }
+    /* 【取证探针 2026-09-27】把"贴到第几行"变成日志事实，便于与用户观察对照 */
     ESP_LOGI("menu", "高亮已贴：sel=%d/%d styled=%d rows=%d childs=%u",
              s_menu.sel, s_menu.row_cnt, styled,
              (s_menu.rows[s_menu.sel] != NULL) ? 1 : 0,
