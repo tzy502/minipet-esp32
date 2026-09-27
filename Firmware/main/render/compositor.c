@@ -1177,7 +1177,17 @@ static void flush_dirty(void)
  * 失败 → esp_lcd draw_bitmap 返回 ESP_ERR_NO_MEM（真机风暴根因：
  * "send color data failed" 与 WiFi GOT_IP 强相关即此）。静态 64B 对齐
  * = 驱动零分配，风暴根除。 */
-static uint8_t s_blit_stage[12288] __attribute__((aligned(64)));   /* 12KB：内部堆仅 ~143KB，24KB 曾把任务栈创建挤到随机失败（boot7），12KB=480宽12行/352宽16行 */
+/* 【为什么必须是 24KB（= 480 宽 × 25 行 × 2B）2026-09-27 真机定案】
+ * 块行数 = chunk_px / w 会向下取整：12KB 时 480 宽只能 12 行，于是
+ * `rows_per & 1` 修正后仍可能在"全帧重绘"这类非整块场景下产生奇数块高；
+ * 而 display_blit 对奇数行高会做 even_round(+1)，导致 (aw!=w || ah!=h)
+ * 掉进 PSRAM 暂存路径 → esp_lcd 对 PSRAM 缓冲**每次强行 malloc ~25KB 内部
+ * DMA**（真机溯源：blit len=25024 与 12288 缓冲矛盾即此）→ 内部堆一次性
+ * 见底（实测"联网后 空闲=423B / 最大块=244B"）→ socket/帧缓冲全部分配失败
+ * → 心跳停、指令收不到、BGM 不出声。
+ * 24KB 取 480×25×2，保证 480 宽下 rows_per=25 → 仍是奇数，故这里**主动取偶数
+ * 行数**（见下方 rows_per 计算），让每块恒为整行高，快速通道恒命中、驱动零分配。 */
+static uint8_t s_blit_stage[24576] __attribute__((aligned(64)));
 
 static void blit_be(int32_t x, int32_t y, int32_t w, int32_t h,
                     const uint16_t *src, int32_t src_stride)
@@ -1185,7 +1195,7 @@ static void blit_be(int32_t x, int32_t y, int32_t w, int32_t h,
     const int32_t chunk_px = (int32_t)sizeof s_blit_stage / 2;
     int32_t rows_per = (w > 0) ? chunk_px / w : 0;
     if (rows_per < 2) rows_per = 2;
-    if (rows_per & 1) rows_per--;
+    if (rows_per & 1) rows_per--;         /* 恒偶：避免 display_blit 的 even_round 把块高改奇 */
     /* 行高恒偶（+h 本身恒偶：脏区 16px 网格）→ display_blit 内 even_round
      * 不再外扩出行 → aw==w && ah==h 快速通道恒命中（大端缓冲直推 SPI，
      * 零 PSRAM 暂存、零驱动侧 DMA 拷贝分配）。此前 rows_per=25（奇）使

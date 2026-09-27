@@ -401,11 +401,12 @@ static void app_main_task(void *arg)
         watchdog_render_absent();        /* 渲染缺失时停掉渲染心跳计振（否则必然熔断） */
     }
 
-    /* 【顺序定案（第三版）2026-09-27】网络任务与联网放在**渲染任务之后**：
-     * 内部 DRAM ~180KB 装不下"portal+httpd+SoftAP 缓冲 + 渲染栈"，谁先申请谁拿到
-     * 连续块。渲染栈是硬需求（没有它整块屏都是黑的），所以让渲染先拿；网络栈
-     * 本来就走 PSRAM（CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP）+ 碎片容忍度高。
-     * 实测顺序：渲染 → poller/events/asset_dl → state_machine_boot（含联网）。 */
+    /* 【顺序（第四版）2026-09-27】网络任务与联网**放在渲染任务之后**：
+     * 真机实测三种顺序后的内部堆空闲/最大块：
+     *   渲染先 → 联网后：423B / 244B   （socket 开不出来，指令全丢）
+     *   联网先 → 渲染后：3167B / 2804B （渲染栈拿不到 8K，屏幕黑）
+     * 本次（bgm → 网络+联网 → 渲染）：让网络栈先拿到它的小块，
+     * 渲染再拿大块（8K 栈），期望两者都能落地。 */
     {
         bool psram_ok_early = (heap_caps_get_total_size(MALLOC_CAP_SPIRAM) > 0);
         poller_start();
@@ -414,7 +415,15 @@ static void app_main_task(void *arg)
         provision_dump_internal_heap("联网前（渲染任务已创建）");
         state_machine_boot(sd_ok, psram_ok_early);
         provision_dump_internal_heap("联网后");
+        provision_dump_internal_heap("全部任务创建后");
     }
+
+    /* 【顺序定案（第三版）2026-09-27】网络任务与联网放在**渲染任务之后**：
+     * 内部 DRAM ~180KB 装不下"portal+httpd+SoftAP 缓冲 + 渲染栈"，谁先申请谁拿到
+     * 连续块。渲染栈是硬需求（没有它整块屏都是黑的），所以让渲染先拿；网络栈
+     * 本来就走 PSRAM（CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP）+ 碎片容忍度高。
+     * 实测顺序：渲染 → poller/events/asset_dl → state_machine_boot（含联网）。 */
+
     BaseType_t rc = xTaskCreatePinnedToCore(input_task, "input", 4096, NULL, 4, NULL, 1);
     if (rc != pdPASS) {
         ESP_LOGE(TAG, "input 任务创建失败 rc=%d internal=%u", rc,
