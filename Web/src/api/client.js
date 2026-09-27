@@ -194,8 +194,9 @@ export function setDeviceBgmPrefs(deviceId, { source, volume } = {}) {
   return updateDevice(deviceId, { bgm })
 }
 
-/** 设备事件环形日志（GET /admin/logs/{id} → { deviceId, online, note, lines: [...], events: [...] }）。 */
-export function getDeviceLogs(deviceId) {
+/** 服务端**事件**日志（GET /admin/logs/{id} → { deviceId, online, note, lines, events }）。
+ *  与下面 getDeviceLogs（设备串口日志副本，E14）不是同一份数据，勿混用。 */
+export function getServerEventLog(deviceId) {
   return http.get(`/admin/logs/${encodeURIComponent(deviceId)}`).then((r) => r.data)
 }
 
@@ -405,6 +406,20 @@ export async function validateWzPath(path) {
     if (e?.response?.status === 404 || e?.response?.status === 405) return { supported: false }
     throw e
   }
+}
+
+/**
+ * 设备端环形日志（E14：「排障不用插线」）。
+ * GET /admin/device-logs/{id}?sinceSeq&limit&level&tag
+ * → { deviceId, lastSeq, clockSynced, total, lastReceivedUtc, note, items:[{seq,tsUtc,t,lvl,tag,msg,receivedUtc}] }
+ * 服务端尚未实现时返回 404 → 调用方按「端点缺失」提示（与收藏/指令端点同一套探测口径）。
+ * 注意：clockSynced=false 表示设备未校时（tsRawMs 是开机毫秒），展示应回退 receivedUtc。
+ */
+export function getDeviceLogs(deviceId, { sinceSeq = 0, limit = 200, level = '', tag = '' } = {}) {
+  const params = { sinceSeq, limit }
+  if (level) params.level = level
+  if (tag) params.tag = tag
+  return http.get(`/admin/device-logs/${encodeURIComponent(deviceId)}`, { params }).then((r) => r.data)
 }
 
 export default http

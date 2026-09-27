@@ -29,6 +29,8 @@ public static class DeviceEndpoints
         g.MapGet("/asset/{hash}", HandleAsset);
         g.MapGet("/poll", HandlePoll);
         g.MapPost("/event", HandleEvent);
+        // E14：设备环形日志上报（契约见 docs/ai/keys-touch-handoff.md §7.2）
+        g.MapPost("/log", HandleLog);
         g.MapGet("/bgm/stream", HandleBgmStream);
         g.MapPost("/bgm/cmd", HandleBgmCmd);
         g.MapGet("/firmware/{ver}.bin", HandleFirmware);
@@ -60,6 +62,30 @@ public static class DeviceEndpoints
         public JsonElement? Data { get; set; }
         /// <summary>可选：设备本地缓存 hash 集（E7 cached 标记的服务端计算源）。</summary>
         public List<string>? Hashes { get; set; }
+    }
+
+    /// <summary>POST /api/device/log：设备端环形日志增量上报（字段名与固件严格一致）。</summary>
+    public sealed class DeviceLogRequest
+    {
+        public int Proto { get; set; } = 1;
+        public string? DeviceId { get; set; }
+        /// <summary>设备侧上次成功送达的 seq；本次 logs 的 seq 均大于它。</summary>
+        public uint Since { get; set; }
+        public int Count { get; set; }
+        public List<DeviceLogItem>? Logs { get; set; }
+    }
+
+    public sealed class DeviceLogItem
+    {
+        public uint Seq { get; set; }
+        /// <summary>epoch 毫秒；未校时时是开机毫秒（&lt;&lt; 1.7e12）。</summary>
+        public long Ts { get; set; }
+        /// <summary>设备开机毫秒（本地时基，恒单调）。</summary>
+        public uint T { get; set; }
+        public string Lvl { get; set; } = "I";
+        public string Tag { get; set; } = "";
+        /// <summary>日志正文的 hex（UTF-8 字节的十六进制小写）。</summary>
+        public string MsgHex { get; set; } = "";
     }
 
     public sealed class BgmCmdRequest
@@ -217,6 +243,32 @@ public static class DeviceEndpoints
         if (body.Hashes != null) mfst.SetCachedHashes(dev.DeviceId, body.Hashes);
 
         return Results.Json(new { ok = true, manifestRev = mfst.GetCurrentRev(dev.DeviceId) });
+    }
+
+    /// <summary>
+    /// 设备端日志上报（E14）：hex 解码 → 去重入库 → 200。
+    /// 响应必须 200 设备才推进游标；非 200 设备 60s 后整批重传（幂等已由
+    /// DeviceLogStore 的会话/seq 判重保证，重传不会产生重复行）。
+    /// </summary>
+    private static IResult HandleLog(DeviceLogRequest body, DeviceRegistry reg, DeviceLogStore logs)
+    {
+        if (string.IsNullOrWhiteSpace(body?.DeviceId))
+            return Results.Json(new { error = "deviceId 必填" }, statusCode: 400);
+        if (reg.Get(body.DeviceId) == null) return NotFoundDevice(body.DeviceId);
+
+        var now = DateTime.UtcNow;
+        var list = new List<DeviceLogStore.LogLine>(body.Logs?.Count ?? 0);
+        int bad = 0;
+        foreach (var it in body.Logs ?? new List<DeviceLogItem>())
+        {
+            var msg = DeviceLogStore.DecodeHex(it.MsgHex);
+            if (msg == null) { bad++; continue; }     // 非法 hex：跳过该行但不整批拒收
+            list.Add(new DeviceLogStore.LogLine(it.Seq, it.Ts, it.T, it.Lvl, it.Tag, msg, now));
+        }
+
+        var (lastSeq, added) = logs.Append(body.DeviceId, body.Since, list);
+        reg.Touch(body.DeviceId);
+        return Results.Json(new { ok = true, accepted = added, skipped = bad, lastSeq });
     }
 
     /// <summary>MP3 流：BgmRouter 流式转发（E8：设备只见此 URL；服务端实时取链/取文件，禁整载内存）。</summary>

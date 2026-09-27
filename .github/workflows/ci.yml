@@ -194,6 +194,28 @@ jobs:
           echo "$back" | grep -q '"200000100"' || { echo "::error::回读不一致（未落盘）"; exit 1; }
           echo "favorites OK"
 
+      # ── 2026-09-27 新增：设备端日志端点（E14）防回归 ──────────────────
+      # 设备固件每 20s POST /api/device/log（环形日志增量上报），失败会整批重传。
+      # 这里断言三件事：① hello 能注册设备拿到 deviceId；② 首次上报被接收；
+      # ③ **重传同批不产生重复行**（幂等是固件重传语义的前提，历史上正因
+      #    会话判定写错而反复重建库）。
+      - name: Assert device log endpoint (ingest + idempotent retransmit)
+        run: |
+          dev=$(curl -fsS -X POST "http://127.0.0.1:${PORT}/api/device/hello"             -H 'Content-Type: application/json'             -d '{"proto":1,"uuid":"CI-LOG-0001","firmware":"ci","profile":{"w":480,"h":480,"shape":"round"}}'             | sed -n 's/.*"deviceId":"\([^"]*\)".*/\1/p')
+          [ -n "$dev" ] || { echo "::error::hello 未返回 deviceId"; exit 1; }
+          body=$(printf '{"proto":1,"deviceId":"%s","since":0,"count":2,"logs":[{"seq":1,"ts":1769999999000,"t":45000,"lvl":"I","tag":"ci","msgHex":"68656c6c6f"},{"seq":2,"ts":1769999999500,"t":45500,"lvl":"W","tag":"ci","msgHex":"776f726c64"}]}' "$dev")
+          r1=$(curl -fsS -X POST "http://127.0.0.1:${PORT}/api/device/log" -H 'Content-Type: application/json' -d "$body")
+          echo "首次上报 -> $r1"
+          echo "$r1" | grep -q '"accepted":2' || { echo "::error::首次上报未被接收：$r1"; exit 1; }
+          r2=$(curl -fsS -X POST "http://127.0.0.1:${PORT}/api/device/log" -H 'Content-Type: application/json' -d "$body")
+          echo "重传同批 -> $r2"
+          echo "$r2" | grep -q '"accepted":0' || { echo "::error::重传产生重复（幂等失效）：$r2"; exit 1; }
+          got=$(curl -fsS "http://127.0.0.1:${PORT}/api/admin/device-logs/${dev}")
+          echo "拉取 -> $got" | head -c 400
+          echo "$got" | grep -q '"msg":"hello"' || { echo "::error::hex 未解码为明文"; exit 1; }
+          echo "$got" | grep -q '"total":2' || { echo "::error::落库行数不是 2（重复或丢失）"; exit 1; }
+          echo "device-logs OK"
+
       - name: Container logs (on failure)
         if: failure()
         run: docker logs minipet-smoke || true

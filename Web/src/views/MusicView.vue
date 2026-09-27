@@ -27,7 +27,7 @@ import {
 } from 'naive-ui'
 import {
   musicTracks, listMusicSources, setMusicSourceEnabled, setQqCookie,
-  listDevices, getDevice, getDeviceLogs, sendBgmCommand, probeBgmCommand, setDeviceBgmPrefs,
+  listDevices, getDevice, getServerEventLog, sendBgmCommand, probeBgmCommand, setDeviceBgmPrefs,
   BGM_COMMAND, errText, musicStateKey, qqCookieInfo, qqGatewayInfo,
 } from '../api/client'
 import { useSettingsStore } from '../stores/settings'
@@ -288,7 +288,7 @@ async function loadDeviceInfo() {
 async function loadDeviceLogs() {
   if (!deviceId.value) return
   try {
-    const data = await getDeviceLogs(deviceId.value)
+    const data = await getServerEventLog(deviceId.value)
     devLogs.value = (data?.lines ?? []).slice(0, 5)
   } catch { devLogs.value = [] }
 }

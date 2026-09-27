@@ -9,7 +9,7 @@
  * Web/docs/interfaces-needed-from-server.md）；端点在线时探测转 ok，无需改前端。
  * 素材选择器按 E4 分组「★收藏 / 🕘最近 / 全部目录」（读 utils/favorites.js）。
  */
-import { computed, onMounted, reactive, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import {
   NCard, NSpace, NButton, NTag, NDescriptions, NDescriptionsItem, NInput,
@@ -19,7 +19,7 @@ import {
 import {
   getDevice, updateDevice, triggerOta, getCatalog, getMaterials, paperdollThumbUrl,
   pushMaterial, errText, sendDeviceCommand, probeDeviceCommand, deviceCommandPath,
-  DEVICE_COMMAND_TYPE,
+  DEVICE_COMMAND_TYPE, getDeviceLogs,
 } from '../api/client'
 import { useDevicesStore } from '../stores/devices'
 import AppearancePicker from '../components/AppearancePicker.vue'
@@ -187,6 +187,57 @@ async function saveThresholds() {
 }
 
 // ── OTA（E11：WiFi 拉包自更新，双分区回滚）──────────────────────────────
+// ── 设备端日志（E14）────────────────────────────────────────────────────
+const logBusy = ref(false)
+const logAuto = ref(false)
+const logLevel = ref('')
+const logTag = ref('')
+const logItems = ref([])
+const logMeta = ref(null)
+const logNote = ref('')
+let logTimer = null
+
+function fmtLogTs(l, clockSynced) {
+  // clockSynced=false 时设备 ts 是开机毫秒，用接收时刻兜底（契约 §7.2）
+  if (clockSynced && l.tsUtc) return fmtTime(l.tsUtc)
+  return l.receivedUtc ? `${fmtTime(l.receivedUtc)}(收)` : `t=${l.t}`
+}
+
+async function loadLogs(silent = false) {
+  if (!deviceId.value) return
+  logBusy.value = true
+  try {
+    const d = await getDeviceLogs(deviceId.value, {
+      sinceSeq: 0, limit: 200, level: logLevel.value, tag: logTag.value,
+    })
+    logMeta.value = { total: d.total ?? 0, lastSeq: d.lastSeq ?? 0, clockSynced: !!d.clockSynced }
+    logNote.value = ''
+    logItems.value = (d.items ?? []).slice(-200).reverse().map((l) => ({
+      ...l,
+      tsText: fmtLogTs(l, !!d.clockSynced),
+    }))
+  } catch (e) {
+    // 404/405 → 服务端还没实现该端点（旧镜像）；不要当成错误弹窗
+    const st = e?.response?.status
+    logItems.value = []
+    logMeta.value = null
+    logNote.value = (st === 404 || st === 405)
+      ? '服务端未实现 GET /api/admin/device-logs/{id}（旧镜像）→ 需要重新构建部署 Server 后可用；设备侧上报通道已在跑。'
+      : `拉取失败：${errText(e)}`
+    if (!silent && st !== 404 && st !== 405) message.error(logNote.value)
+  } finally {
+    logBusy.value = false
+  }
+}
+
+function syncLogAuto(on) {
+  if (logTimer) { clearInterval(logTimer); logTimer = null }
+  if (on) logTimer = setInterval(() => loadLogs(true), 5000)
+}
+watch(logAuto, syncLogAuto)
+watch([logLevel, logTag], () => loadLogs(true))
+onUnmounted(() => { if (logTimer) clearInterval(logTimer) })
+
 const otaVer = ref('')
 const otaBusy = ref(false)
 async function doOta() {
@@ -562,6 +613,31 @@ async function sendBubble() {
         </template>
       </n-card>
 
+      <!-- 设备串口日志（E14「排障不用插线」）：数据来自 POST /api/device/log，
+           是设备端环形缓冲的服务端副本；端点缺失时给出可读提示而非报错 -->
+      <n-card title="设备日志（E14 排障不用插线）" size="small">
+        <n-space vertical :size="10">
+          <n-space align="center" :size="8">
+            <n-select v-model:value="logLevel" size="small" style="width: 120px"
+              :options="[{ label: '全部级别', value: '' }, { label: '仅 E 错误', value: 'E' }, { label: '仅 W 警告', value: 'W' }, { label: '仅 I 信息', value: 'I' }]" />
+            <n-input v-model:value="logTag" size="small" placeholder="按 TAG 过滤（如 poller）" style="width: 200px" />
+            <n-button size="small" :loading="logBusy" @click="loadLogs()">刷新</n-button>
+            <n-switch v-model:value="logAuto" size="small"><template #checked>自动 5s</template><template #unchecked>手动</template></n-switch>
+            <span class="hint" v-if="logMeta">共 {{ logMeta.total }} 条 · lastSeq {{ logMeta.lastSeq }} · 设备校时{{ logMeta.clockSynced ? '正常' : '未校准（时间用接收时刻兜底）' }}</span>
+          </n-space>
+          <n-alert v-if="logNote" type="warning" :show-icon="false" size="small">{{ logNote }}</n-alert>
+          <div class="logbox" v-if="logItems.length">
+            <div v-for="l in logItems" :key="l.seq" class="logline" :class="'lv-' + l.lvl">
+              <span class="lt">{{ l.tsText }}</span>
+              <span class="ll">{{ l.lvl }}</span>
+              <span class="lg">{{ l.tag }}</span>
+              <span class="lm">{{ l.msg }}</span>
+            </div>
+          </div>
+          <div v-else class="hint">{{ logMeta ? '（该设备暂无可展示日志）' : '点「刷新」拉取设备端最近日志' }}</div>
+        </n-space>
+      </n-card>
+
       <n-card title="固件升级（OTA，E11）" size="small">
         <n-space align="center">
           <n-input v-model:value="otaVer" placeholder="目标版本，如 0.3.1" style="width: 200px" :disabled="otaBusy" />
@@ -728,4 +804,23 @@ async function sendBubble() {
 .preview-col { display: flex; flex-direction: column; align-items: center; gap: 8px; }
 .preview-box { width: 160px; height: 160px; display: flex; align-items: center; justify-content: center; }
 .block-center { display: flex; justify-content: center; padding: 48px 0; }
+
+.logbox {
+  max-height: 300px;
+  overflow: auto;
+  background: #0f1014;
+  border: 1px solid #2a2a32;
+  border-radius: 8px;
+  padding: 8px 10px;
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.55;
+}
+.logline { display: flex; gap: 8px; white-space: pre-wrap; word-break: break-all; }
+.logline .lt { color: #6b7280; flex: 0 0 132px; }
+.logline .ll { flex: 0 0 12px; font-weight: 700; }
+.logline .lg { color: #7dd3fc; flex: 0 0 92px; overflow: hidden; text-overflow: ellipsis; }
+.logline .lm { flex: 1; color: #d8dee9; }
+.logline.lv-E .ll, .logline.lv-E .lm { color: #ff6b81; }
+.logline.lv-W .ll, .logline.lv-W .lm { color: #fbbf24; }
 </style>

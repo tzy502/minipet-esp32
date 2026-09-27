@@ -372,6 +372,27 @@ public static class AdminEndpoints
             });
         });
 
+        // ── 设备端环形日志（E14：「排障不用插线」；设备每 20s 增量上报，
+        //    契约见 docs/ai/keys-touch-handoff.md §7.2）──
+        // 与上面 /logs/{id} 的区别：/logs 是**服务端事件**（在线/指令/错误），
+        // 本端点是**设备串口日志**的服务端副本（固件环形缓冲 152 条 → 这里 512 条）。
+        g.MapGet("/device-logs/{id}", (string id, uint? sinceSeq, int? limit, string? level, string? tag,
+            DeviceRegistry reg, DeviceLogStore logs) =>
+        {
+            var dev = reg.Get(id);
+            if (dev == null) return NotFoundDevice(id);
+            return DeviceLogsView(id, sinceSeq ?? 0, limit ?? 200, level, tag, logs);
+        });
+        // UUID 口径（.NET 侧设备记录主键是 deviceId；UUID 便于按硬件号直接查）
+        g.MapGet("/device-logs/by-uuid/{uuid}", (string uuid, uint? sinceSeq, int? limit, string? level, string? tag,
+            DeviceRegistry reg, DeviceLogStore logs) =>
+        {
+            var dev = reg.List().FirstOrDefault(d =>
+                string.Equals(d.Uuid, uuid, StringComparison.OrdinalIgnoreCase));
+            if (dev == null) return Results.Json(new { error = $"未注册设备 uuid：{uuid}" }, statusCode: 404);
+            return DeviceLogsView(dev.DeviceId, sinceSeq ?? 0, limit ?? 200, level, tag, logs);
+        });
+
         // ── OTA 触发（E11：入队升级指令，设备 WiFi 拉包自更新，双分区回滚）──
         g.MapPost("/ota/{id}", (string id, OtaRequest body, DeviceRegistry reg, CommandQueue queue,
             DeviceManifestService mfst, DeviceEventLog eventLog) =>
@@ -632,6 +653,48 @@ public static class AdminEndpoints
     }
 
     // ── 视图组装 ──────────────────────────────────────────────────────────
+
+    /// <summary>设备串口日志视图（E14）。契约形态见 docs/ai/keys-touch-handoff.md §7.2：
+    /// 未校时（ts 是开机毫秒）时 ClockSynced=false，Web 应回退显示 ReceivedUtc。</summary>
+    private static IResult DeviceLogsView(string deviceId, uint sinceSeq, int limit, string? level, string? tag,
+        DeviceLogStore logs)
+    {
+        var r = logs.Query(deviceId, sinceSeq, limit <= 0 ? 200 : Math.Min(limit, 2000), level, tag);
+        if (r == null)
+        {
+            return Results.Json(new
+            {
+                deviceId,
+                lastSeq = 0u,
+                clockSynced = false,
+                total = 0,
+                note = "尚未收到该设备的日志上报（设备每 20s POST /api/device/log；离线或旧固件无此通道）",
+                items = Array.Empty<object>(),
+            });
+        }
+        var (items, lastSeq, clockSynced, total, lastReceived) = r.Value;
+        return Results.Json(new
+        {
+            deviceId,
+            lastSeq,
+            clockSynced,
+            total,
+            lastReceivedUtc = lastReceived == DateTime.MinValue ? (DateTime?)null : lastReceived,
+            note = "设备端环形日志（固件 152 条 → 服务端副本 512 条，超出丢最旧）",
+            items = items.Select(l => new
+            {
+                seq = l.Seq,
+                // 未校时时 ts 是开机毫秒：给出接收时间兜底，Web 按 clockSynced 判定
+                tsUtc = clockSynced ? DateTimeOffset.FromUnixTimeMilliseconds(l.TsMs).UtcDateTime : (DateTime?)null,
+                tsRawMs = l.TsMs,
+                t = l.TMs,
+                lvl = l.Lvl,
+                tag = l.Tag,
+                msg = l.Msg,
+                receivedUtc = l.ReceivedUtc,
+            }).ToList(),
+        });
+    }
 
     private static object DeviceCard(DeviceRecord d, DeviceRegistry reg, HealthReport health)
     {
