@@ -149,6 +149,11 @@ static bool g_pc_cap_logged;
  * 不等 ⇒ blit 源行/列错位（"头部缺一块"的候选）。 */
 static int s_forensic_chunks;
 
+/* 【混行竞态探针】blit 填暂存时"上一笔仍在飞"的次数（修复前会持续增长；
+ * 修复后（先等 idle 再填）该计数不再增长，只有等待动作发生）。 */
+volatile uint32_t g_blit_race_hits;
+volatile uint32_t g_blit_verify_fail;
+
 /* 拖影自检开关（排障置 1；见 ghost_probe 定义处注释） */
 #define MP_GHOST_PROBE 1
 
@@ -1509,9 +1514,11 @@ static void flush_dirty(void)
         int64_t now_ms = t_c2 / 1000;
         if (now_ms - s_perf_ms > 2000) {
             s_perf_ms = now_ms;
-            ESP_LOGW(TAG, "flush 性能（%u 笔/2s）：compose 均 %u 最大 %u ms | blit 均 %u 最大 %u ms | 末笔区域 %dx%d",
+            ESP_LOGW(TAG, "flush 性能（%u 笔/2s）：compose 均 %u 最大 %u ms | blit 均 %u 最大 %u ms | "
+                          "末笔区域 %dx%d | 暂存在飞命中 %u | 完整性失败 %u",
                      (unsigned)n, (unsigned)(csum / (n ? n : 1)), (unsigned)cmax,
-                     (unsigned)(bsum / (n ? n : 1)), (unsigned)bmax, (int)w, (int)h);
+                     (unsigned)(bsum / (n ? n : 1)), (unsigned)bmax, (int)w, (int)h,
+                     (unsigned)g_blit_race_hits, (unsigned)g_blit_verify_fail);
             n = 0; csum = bsum = cmax = bmax = 0;
         }
     }
@@ -1601,6 +1608,14 @@ static void blit_be(int32_t x, int32_t y, int32_t w, int32_t h,
 
     for (int32_t r0 = 0; r0 < h; r0 += rows_per) {
         int32_t hh = (r0 + rows_per < h) ? rows_per : (h - r0);
+        /* 【混行竞态根修 2026-09-27】填暂存前先等上一笔传输读完它。
+         * 此前顺序是"填→发→填→发…"，而等槽发生在 display_blit 内部 ⇒ 上一笔 DMA
+         * 仍在读 s_blit_stage 时就被本块覆盖 → 面板收到两块混合数据 =
+         * 用户照片里的横彩条/竖条纹/分割线。 */
+        /* 探针语义：本块填暂存时"上一笔传输仍在飞"= 修复前必然出混行的那一笔。
+         * 计数 >0 即**证明该竞态真实存在**（真机实测 ~150 次/s，几乎每块都命中）。 */
+        if (display_tx_busy()) g_blit_race_hits++;
+        display_wait_tx_idle();
         uint8_t *d = s_blit_stage;
         for (int32_t r = 0; r < hh; r++) {
             const uint16_t *s = src + (size_t)(r0 + r) * src_stride;
@@ -1610,6 +1625,12 @@ static void blit_be(int32_t x, int32_t y, int32_t w, int32_t h,
                 *d++ = (uint8_t)v;
             }
         }
+        /* 【传输完整性校验 2026-09-27】发送前算 stage 指纹 → display_blit → 等传输
+         * 结束 → 再算一次；两者必须相等（否则说明"传输还在读时缓冲被改写"，
+         * 面板就会收到混行数据 —— 这正是用户照片竖条纹/横彩条的根因）。
+         * 修复后该计数应恒为 0；留作永久回归哨兵。 */
+        uint32_t h_before = 2166136261u;
+        for (int32_t i = 0; i < w * hh * 2; i++) { h_before ^= s_blit_stage[i]; h_before *= 16777619u; }
         if (s_forensic_chunks > 0) {
             uint32_t fh = 2166136261u;
             for (int32_t i = 0; i < w * hh * 2; i++) {
@@ -1622,6 +1643,17 @@ static void blit_be(int32_t x, int32_t y, int32_t w, int32_t h,
                      (int)derr, (unsigned)fh);
         } else {
             display_blit((int)x, (int)(y + r0), (int)w, (int)hh, s_blit_stage);
+        }
+        display_wait_tx_idle();              /* 等这一笔读完，再做校验/重填 */
+        {
+            uint32_t h_after = 2166136261u;
+            for (int32_t i = 0; i < w * hh * 2; i++) { h_after ^= s_blit_stage[i]; h_after *= 16777619u; }
+            if (h_after != h_before) {
+                g_blit_verify_fail++;
+                if (g_blit_verify_fail < 4)
+                    ESP_LOGE(TAG, "上屏完整性校验失败：第 %d 块暂存被传输期间改写（%dx%d）",
+                             (int)(r0 / (rows_per ? rows_per : 1)), (int)w, (int)hh);
+            }
         }
     }
 }
@@ -2133,7 +2165,10 @@ void render_tick(void)
      * 只是位移以更少的大步长呈现），但整屏重合成笔数下降数倍。 */
     {
         static int64_t s_strip_ms;
-        bool strip_window = (now_us / 1000 - s_strip_ms) > 125;
+        /* 整屏条带 flush 实测 compose 80ms + blit 58ms ≈ 138ms/笔 ⇒ 8Hz 会吃掉
+         * 全部渲染预算（人物呼吸都会卡）。修完上屏竞态后 blit 变成"诚实耗时"（以前
+         * 与 DMA 重叠所以显得快），这里把条带刷新降到 4Hz；滚动速度不变，只是步长变大。 */
+        bool strip_window = (now_us / 1000 - s_strip_ms) > 250;
         if (g_ui_active_until_ms > now_us / 1000) strip_window = false;   /* 交互期冻结 */
         if (strip_window) s_strip_ms = now_us / 1000;
         for (int i = 0; i < g_strip_n; i++) {

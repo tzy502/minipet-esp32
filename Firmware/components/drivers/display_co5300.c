@@ -193,6 +193,26 @@ void display_set_orientation(bool swap_xy, bool mirror_x, bool mirror_y)
     ESP_LOGI(TAG, "orientation swap=%d mx=%d my=%d", swap_xy, mirror_x, mirror_y);
 }
 
+/* 【上屏暂存复用竞态修复 2026-09-27】给合成器用：在**重填共用暂存缓冲之前**
+ * 必须确认上一笔 color 传输已经读完它。此前 blit_be 的循环是
+ *   填暂存(第 N 块) → display_blit(第 N 块) → 填暂存(第 N+1 块) → ...
+ * 而 display_blit 内部才做 tx_slot_take()（等槽）——于是第 N 笔 DMA 还在读暂存时，
+ * 第 N+1 块的填充已经把同一块内存覆盖 ⇒ 面板收到**两个块的数据混在一起**：
+ * 真机表现就是横彩条/竖条纹/"分割线"（用户照片实证）。
+ * 本函数取槽再立刻归还：返回时保证"无在飞传输"，可安全重填暂存。 */
+void display_wait_tx_idle(void)
+{
+    if (!s_inited) return;
+    if (tx_slot_take()) tx_slot_give();
+}
+
+/* 在飞传输数 >0（探针用：填暂存时若为真即命中竞态） */
+bool display_tx_busy(void)
+{
+    if (!s_inited || !s_tx_slots) return false;
+    return uxSemaphoreGetCount(s_tx_slots) == 0;
+}
+
 esp_err_t display_blit(int x, int y, int w, int h, const uint8_t *rgb565_be)
 {
     if (!s_inited || !rgb565_be) {
