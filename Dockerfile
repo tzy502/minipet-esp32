@@ -40,10 +40,12 @@ RUN set -eux; \
         printf '<!doctype html><meta charset="utf-8"><title>MiniPet</title><p>Web UI build produced no dist/.' > dist/index.html; \
       }; \
     fi
-# 本次前端产物的指纹（final stage 断言 /app/wwwroot 就是这一份用；只传指纹文件，不重复拷 dist）
+# 本次前端产物的指纹（final stage 断言 /app/wwwroot 就是这一份用；只传指纹文件，不重复拷 dist）。
+# 格式自己 printf 定死（"<sha256> <相对路径>"）：webbuild 是 busybox sha256sum、final 是
+# GNU coreutils sha256sum，两者输出空格数不必依赖 —— 只取哈希列，两边逐字节可比。
 RUN set -eux; \
     cd dist; \
-    for f in $(find . -type f | sort); do sha256sum "$f"; done > /tmp/dist.sha256; \
+    for f in $(find . -type f | sort); do printf '%s %s\n' "$(sha256sum "$f" | cut -d' ' -f1)" "$f"; done > /tmp/dist.sha256; \
     wc -l < /tmp/dist.sha256
 
 # ---------- Stage 2: Server 发布 ----------
@@ -119,7 +121,7 @@ RUN set -eux; \
     else \
       echo '警告：wwwroot/index.html 未引用 assets/*.js —— 占位首页路径（本次前端构建无产物）'; \
     fi; \
-    (cd ./wwwroot && for f in $(find . -type f | sort); do sha256sum "$f"; done) > /tmp/wwwroot.sha256; \
+    (cd ./wwwroot && for f in $(find . -type f | sort); do printf '%s %s\n' "$(sha256sum "$f" | cut -d' ' -f1)" "$f"; done) > /tmp/wwwroot.sha256; \
     echo "本次前端产物文件数：$(wc -l < /tmp/dist.sha256)"; \
     test "$(cat /tmp/dist.sha256)" = "$(cat /tmp/wwwroot.sha256)"; \
     echo 'wwwroot 断言通过：镜像内 UI = 本次前端构建产物'; \
