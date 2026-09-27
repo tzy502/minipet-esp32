@@ -11,9 +11,13 @@
  *   - mp3dec_t ≈6.7KB（float 合成状态），ID3v2/自由格式/VBR（Xing/Info）均内置处理
  *
  * 实现经 minimp3.c（#define MINIMP3_IMPLEMENTATION + include 本文件）编入，
- * 见 main/CMakeLists.txt。栈核算：mp3dec_decode_frame 的 mp3dec_scratch_t
- * ≈16KB（maindata 2815B + grbuf 4608B + syn 8448B 等）在调用栈上——
- * bgm 任务栈须 ≥20KB（bgm.c bgm_start 设 24576）。
+ * 见 main/CMakeLists.txt。栈核算（**本仓库已打补丁，改看下条**）：上游
+ * `mp3dec_decode_frame` 把 mp3dec_scratch_t（≈16KB：maindata 2815B + grbuf 4608B
+ * + syn 8448B 等）放在调用栈上，任务栈须 ≥20KB；本板内部 DRAM 给不出 20KB
+ * （给 24KB 会挤死 lwIP/事件任务 → 联网失败），PSRAM 栈又因本任务读 Flash 而
+ * 触发 `assert esp_task_stack_is_sane_cache_disabled()`。
+ * **本仓库补丁**：scratch 改由 `mp3d_scratch_psram()` 从 PSRAM 取单例（分配失败
+ * 回退栈上），于是 bgm 任务栈 8192 即可。补丁点见 `mp3d_scratch_psram` 注释。
  *
  * 上游许可：CC0 / public domain（lieff）。
  */
@@ -27,6 +31,8 @@
     See <http://creativecommons.org/publicdomain/zero/1.0/>.
 */
 #include <stdint.h>
+#include "esp_heap_caps.h"   /* 本板补丁：scratch 走 PSRAM（见 mp3d_scratch_psram） */
+#include "esp_log.h"
 
 #define MINIMP3_MAX_SAMPLES_PER_FRAME (1152*2)
 
@@ -257,6 +263,30 @@ typedef struct
     float grbuf[2][576], scf[40], syn[18 + 15][2*32];
     uint8_t ist_pos[2][39];
 } mp3dec_scratch_t;
+
+/* ══ 【本板补丁 2026-09-27：把解码 scratch 搬出调用栈】════════════════════════
+ * 上游 `mp3dec_decode_frame` 把 mp3dec_scratch_t（grbuf 2×576×4B + syn 33×64×4B
+ * + maindata/gr_info/ist_pos ≈16KB）声明成**栈上局部**，于是解码任务栈必须 ≥20KB。
+ * 本板内部 DRAM 只有十几 KB 可用：
+ *   · 给 BGM 任务 24KB 内部栈 → 事件任务建不起来（"events 任务首建失败"）
+ *     + lwIP `thread_sem_init: out of memory` → socket 分配失败 → **联网直接失败**；
+ *   · 用 PSRAM 栈 → 该任务要读 Flash，PSRAM 栈在关 cache 临界区不可访问 →
+ *     `assert esp_task_stack_is_sane_cache_disabled()` 1.5s 重启循环。
+ * 故把 scratch 改成 PSRAM 单例（hexdump 级等价，只换存储位置）：
+ *   · 解码只在 BGM 任务单线程进行（play_track→mp_http_get→stream_chunk→
+ *     本函数），无并发，单例安全；
+ *   · PSRAM 8MB 几乎全空，16KB 无压力；
+ *   · 分配失败时**回退原来的栈上 scratch**（保功能，不引入新失败模式）。
+ * 这是本仓库 vendored 副本的唯一改动，已在 docs 记录。 */
+static mp3dec_scratch_t *mp3d_scratch_psram(void)
+{
+    static mp3dec_scratch_t *s_scratch;
+    if (!s_scratch) {
+        s_scratch = (mp3dec_scratch_t *)heap_caps_malloc(
+            sizeof(mp3dec_scratch_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    }
+    return s_scratch;
+}
 
 static void bs_init(bs_t *bs, const uint8_t *data, int bytes)
 {
@@ -1735,7 +1765,19 @@ int mp3dec_decode_frame(mp3dec_t *dec, const uint8_t *mp3, int mp3_bytes, mp3d_s
     int i = 0, igr, frame_size = 0, success = 1;
     const uint8_t *hdr;
     bs_t bs_frame[1];
-    mp3dec_scratch_t scratch;
+    /* 【本板补丁】scratch 一律走 PSRAM 单例：**不能**在这里留"栈上回退"局部，
+     * 因为那 16KB 会被编译器无条件计入本函数栈帧（真机复现：留着回退时
+     * BGM 任务 8192 栈直接 InstructionFetchError，PC 落在栈地址上）。
+     * 分配失败（8MB PSRAM 几乎不可能）→ 本帧不解码，返回 0；调用方
+     * decode_pending 见 frame_bytes<=0 会 break，数据留待下个 chunk 重试。 */
+    mp3dec_scratch_t *scratch = mp3d_scratch_psram();
+    if (!scratch)
+    {
+        static int logged;
+        if (!logged) { logged = 1; ESP_LOGE("mp3", "PSRAM decode scratch alloc failed"); }
+        info->frame_bytes = 0;
+        return 0;
+    }
 
     if (mp3_bytes > 4 && dec->header[0] == 0xff && hdr_compare(dec->header, mp3))
     {
@@ -1778,23 +1820,23 @@ int mp3dec_decode_frame(mp3dec_t *dec, const uint8_t *mp3, int mp3_bytes, mp3d_s
 
     if (info->layer == 3)
     {
-        int main_data_begin = L3_read_side_info(bs_frame, scratch.gr_info, hdr);
+        int main_data_begin = L3_read_side_info(bs_frame, scratch->gr_info, hdr);
         if (main_data_begin < 0 || bs_frame->pos > bs_frame->limit)
         {
             mp3dec_init(dec);
             return 0;
         }
-        success = L3_restore_reservoir(dec, bs_frame, &scratch, main_data_begin);
+        success = L3_restore_reservoir(dec, bs_frame, scratch, main_data_begin);
         if (success)
         {
             for (igr = 0; igr < (HDR_TEST_MPEG1(hdr) ? 2 : 1); igr++, pcm += 576*info->channels)
             {
-                memset(scratch.grbuf[0], 0, 576*2*sizeof(float));
-                L3_decode(dec, &scratch, scratch.gr_info + igr*info->channels, info->channels);
-                mp3d_synth_granule(dec->qmf_state, scratch.grbuf[0], 18, info->channels, pcm, scratch.syn[0]);
+                memset(scratch->grbuf[0], 0, 576*2*sizeof(float));
+                L3_decode(dec, scratch, scratch->gr_info + igr*info->channels, info->channels);
+                mp3d_synth_granule(dec->qmf_state, scratch->grbuf[0], 18, info->channels, pcm, scratch->syn[0]);
             }
         }
-        L3_save_reservoir(dec, &scratch);
+        L3_save_reservoir(dec, scratch);
     } else
     {
 #ifdef MINIMP3_ONLY_MP3
@@ -1803,15 +1845,15 @@ int mp3dec_decode_frame(mp3dec_t *dec, const uint8_t *mp3, int mp3_bytes, mp3d_s
         L12_scale_info sci[1];
         L12_read_scale_info(hdr, bs_frame, sci);
 
-        memset(scratch.grbuf[0], 0, 576*2*sizeof(float));
+        memset(scratch->grbuf[0], 0, 576*2*sizeof(float));
         for (i = 0, igr = 0; igr < 3; igr++)
         {
-            if (12 == (i += L12_dequantize_granule(scratch.grbuf[0] + i, bs_frame, sci, info->layer | 1)))
+            if (12 == (i += L12_dequantize_granule(scratch->grbuf[0] + i, bs_frame, sci, info->layer | 1)))
             {
                 i = 0;
-                L12_apply_scf_384(sci, sci->scf + igr, scratch.grbuf[0]);
-                mp3d_synth_granule(dec->qmf_state, scratch.grbuf[0], 12, info->channels, pcm, scratch.syn[0]);
-                memset(scratch.grbuf[0], 0, 576*2*sizeof(float));
+                L12_apply_scf_384(sci, sci->scf + igr, scratch->grbuf[0]);
+                mp3d_synth_granule(dec->qmf_state, scratch->grbuf[0], 12, info->channels, pcm, scratch->syn[0]);
+                memset(scratch->grbuf[0], 0, 576*2*sizeof(float));
                 pcm += 384*info->channels;
             }
             if (bs_frame->pos > bs_frame->limit)

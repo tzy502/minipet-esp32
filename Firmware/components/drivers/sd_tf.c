@@ -34,7 +34,11 @@ static const char *TAG = "sd_tf";
  * + 渲染任务 TWDT 连续触发（人物整只消失，实体缓冲全 0）。
  * 每个打开文件在内部堆上约 0.6~0.7KB（FIL + vfs 包装），12 个 ≈ 8KB；
  * 每次开机都会打印内部堆水位（provision_dump_internal_heap）便于回归。 */
-#define SD_MAX_FILES    12
+/* 注意：ESP-IDF 的 FATFS VFS 是**按 max_files 预分配 FIL 数组**的
+ * （vfs_fat.c:202 `ctx_size = sizeof(vfs_fat_ctx_t) + max_files * sizeof(FIL)`，
+ * FIL ≈0.6KB）→ 每多一个名额就多吃内部 DRAM。实测常驻打开数为 7（时钟 PARTS 1
+ * + 三档 FONT 3 + 纸娃娃 PARTS 1 + LAYOUT ≤2），留 3 个瞬时名额即 10。 */
+#define SD_MAX_FILES    10
 
 /* TF 挂载失败时的兜底：内部 Flash 的 "assets" FAT 分区挂到同一 /sdcard
  * （出厂预置默认素材，无 TF 也能起播——design-review 3.11 出厂保底） */

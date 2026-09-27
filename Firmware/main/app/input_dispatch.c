@@ -1262,6 +1262,14 @@ static void imu_link_selfcheck(void)
 /* ================================================================== */
 void input_dispatch_task(void *arg)
 {
+    /* 【放行旗标 2026-09-27】本任务被提前创建（内部堆宽裕时抢 4096 栈，
+     * 否则真机上它建不起来 → 触摸/按键/IMU 全失效）。为保证初始化顺序不变
+     * （I2C/触摸/IMU 依赖启动中段的驱动就绪），这里先等 app_main 放行。 */
+    {
+        extern volatile bool g_input_go;
+        while (!g_input_go) vTaskDelay(pdMS_TO_TICKS(50));
+    }
+
     (void)arg;
     key_gpio18_init();
     key_gpio0_init();             /* 中键 GPIO0（输入+上拉+轮询消抖，绝不输出） */

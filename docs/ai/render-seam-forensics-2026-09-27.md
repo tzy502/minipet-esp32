@@ -133,7 +133,22 @@ feeder 计数 20s 内 +2161（=108 次/s I2S 写入 = 正在出声）
 > ⚠️ 服务端侧改动（play 选曲 / `bgm=track` 点播 / Web 曲库行内播放 + 当前曲目）
 > **需要重建并重新部署 NAS 镜像**才生效；固件侧改动已烧进设备。
 
-## 9. 仍需人眼确认的一点
+## 9. 追加：BGM 出声链的最后一公里（同日更晚）
+
+接 §8，把"设了 BGM 就是没声"彻底跑通，又挖出三处（都已实测修复）：
+
+| # | 根因 | 证据 | 修复 |
+|---|------|------|------|
+| 5 | **解码 scratch 在调用栈上 → 任务栈要么爆要么挤死系统** | 24KB 内部栈：`events 任务首建失败` + `lwip_arch: thread_sem_init: out of memory` → 联网直接失败；PSRAM 栈：本任务读 Flash → `assert esp_task_stack_is_sane_cache_disabled()` 1.5s 重启循环；8KB 栈 + 栈上回退：`InstructionFetchError`，PC 落在**栈地址**上（回退的那 16KB 局部被无条件计入栈帧） | 给本仓库 vendored 的 `minimp3.h` 打**唯一一处补丁**：`mp3dec_scratch_t` 改由 `mp3d_scratch_psram()` 从 PSRAM 取单例（不保留栈上回退，分配失败即本帧不解码），BGM 任务栈 8192 即可 |
+| 6 | **input 任务建不起来 → 触摸/按键/IMU 全失效** | `main: input 任务创建失败 rc=-1 internal=1875` —— 素材全绑+联网后内部堆只剩 1875B（<4096 栈）。用户报障"点哪都没反应/中键按了没反应"正对应此 | ① input 任务**提前到渲染任务之后**创建（此刻内部堆 ~15KB）；任务体先等 `g_input_go` 放行旗标再初始化（保持 I2C/触摸/IMU 时序）；② 启动尾段兜底重试；③ `SD_MAX_FILES` 12→10（IDF 的 FATFS VFS 是**按 max_files 预分配 FIL 数组**，每个 ≈0.6KB） |
+| 7 | 内部堆水位可观测性 | 修复前后 `@联网后`：1875B → **18287B**；`@素材全绑后`：15691 → 16507 | `provision_dump_internal_heap("@素材全绑后")` + 清单汇总日志（条目数/FONT 档位） |
+
+**最终真机状态（本次构建）**：`TWDT=0`、`panic/abort=0`、55s 只输出 308 行日志、
+`地图装载 000010000（条带 2）rc=0`、三档字体绑定、`实体渲染 miss=0`、
+`input 任务已创建` + `IMU 通路自检 OK`；BGM：`曲目表 1167 首` → 下一条指令起播后
+**feeder 由空闲 20 次/s 升到 135 次/s（I2S 写入 = 正在出声）**，`bgm=pause` 立刻回落。
+
+## 10. 仍需人眼确认的一点
 
 面板侧没有 TE（撕裂同步）引脚（BSP 里 `BSP_LCD_*` 无 TE、`tear_avoid_mode = NONE`），
 所以"写入 GRAM 时面板正在扫描"这件事在硬件上无法消除；本次修复把**内容错帧/残影/越界裁切**

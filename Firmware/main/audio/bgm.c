@@ -734,7 +734,16 @@ static void handle_audio_msg(const mp_audio_msg_t *m)
  * "12KB 栈永远建不起来"）。因此改为**PSRAM 栈**（sdkconfig 已开
  * CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY=y，本板 8MB PSRAM 几乎全空），
  * 既满足 24KB 需求，又不吃内部堆。创建失败时仍走原有 10s 重试（内部栈兜底）。 */
-#define MP_BGM_TASK_STACK 24576
+/* 【栈大小最终定案 2026-09-27】minimp3 的 16KB 解码 scratch 已改到 PSRAM
+ * （见 minimp3.h 的 mp3d_scratch_psram 补丁），任务栈只需覆盖
+ * esp_http_client 读链（~2KB）+ 解码调用帧（~2KB）+ 曲目表构建 ≈ 8KB。
+ * 试过的三条路与实测结果：
+ *   · 24KB 内部栈 → 事件任务建不起来 + lwIP `thread_sem_init: out of memory`
+ *     → socket 分配失败、联网直接失败（内部 DRAM 只有十几 KB）；
+ *   · PSRAM 栈（xTaskCreatePinnedToCoreWithCaps）→ 本任务读 Flash，
+ *     PSRAM 栈在关 cache 临界区触发 assert → 1.5s 重启循环；
+ *   · 把 scratch 搬到 PSRAM + 8KB 内部栈 → 内部堆回到健康水位、解码正常。 */
+#define MP_BGM_TASK_STACK 8192
 
 static void bgm_task(void *arg)
 {

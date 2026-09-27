@@ -136,6 +136,10 @@ static void render_task(void *arg)
     }
 }
 
+/* input 任务是否已创建（早建/兜底共用）+ 放行旗标（任务体等它再初始化） */
+volatile bool g_input_go;
+static bool g_input_created;
+
 static void input_task(void *arg)
 {
     input_dispatch_task(arg);             /* 不返回 */
@@ -421,6 +425,15 @@ static void app_main_task(void *arg)
         watchdog_render_absent();        /* 渲染缺失时停掉渲染心跳计振（否则必然熔断） */
     }
 
+    /* 早建 input（见尾段注释）：此刻内部堆最宽裕，4096 栈必然拿得到 */
+    if (xTaskCreatePinnedToCore(input_task, "input", 4096, NULL, 4, NULL, 1) == pdPASS) {
+        g_input_created = true;
+        ESP_LOGW(TAG, "input 任务已创建（栈 4096，提前到联网/素材之前）");
+    } else {
+        ESP_LOGW(TAG, "input 任务早建失败（internal=%u）→ 启动尾段兜底重试",
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+    }
+
     /* 【顺序（第四版）2026-09-27】网络任务与联网**放在渲染任务之后**：
      * 真机实测三种顺序后的内部堆空闲/最大块：
      *   渲染先 → 联网后：423B / 244B   （socket 开不出来，指令全丢）
@@ -444,11 +457,28 @@ static void app_main_task(void *arg)
      * 本来就走 PSRAM（CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP）+ 碎片容忍度高。
      * 实测顺序：渲染 → poller/events/asset_dl → state_machine_boot（含联网）。 */
 
-    BaseType_t rc = xTaskCreatePinnedToCore(input_task, "input", 4096, NULL, 4, NULL, 1);
-    if (rc != pdPASS) {
-        ESP_LOGE(TAG, "input 任务创建失败 rc=%d internal=%u", rc,
-                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+    /* 【任务创建时机修复 2026-09-27：触摸/按键/IMU 全失效的真机根因】
+     * 原先在这里（素材全绑 + 联网完成之后）才建 input 任务，而那一刻内部堆实测
+     * 只剩 `internal=1875`（素材/字体/LVGL/网络缓冲把内部 DRAM 吃到见底）：
+     *   `main: input 任务创建失败 rc=-1 internal=1875`
+     * → **input 任务不存在 ⇒ 触摸、三键、IMU 全部失效**（用户报障"点哪都没反应、
+     *   中键按了没反应"）。现改为：
+     *   ① 渲染任务建好后立刻建 input（此刻内部堆 ~15KB 空闲，4096 栈稳拿到）；
+     *   ② 任务本体先等 g_input_go 放行旗标再跑初始化 —— 保持原有初始化顺序
+     *      （I2C/触摸/IMU 依赖 state_machine_boot 之后的驱动状态）；
+     *   ③ 这里再兜底重试一次（早建失败时）。 */
+    if (!g_input_created) {
+        if (xTaskCreatePinnedToCore(input_task, "input", 4096, NULL, 4, NULL, 1) == pdPASS) {
+            g_input_created = true;
+            ESP_LOGW(TAG, "input 任务兜底创建成功（internal=%u）",
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+        } else {
+            ESP_LOGE(TAG, "input 任务创建失败 internal=%u 最大块=%u → 触摸/按键/IMU 将不可用",
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                     (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+        }
     }
+    g_input_go = true;      /* 放行 input 任务初始化（无论早晚建，此处统一放行） */
 
     /* 后台任务：OTA（BGM 已提到渲染任务之前，见上） */
     ota_start();           /* 双分区升级 */
