@@ -105,6 +105,10 @@ export function sendDeviceCommand(deviceId, type, value, opts = {}) {
   if (opts.durationMs != null) body.durationMs = Number(opts.durationMs)
   // 数值通道：服务端 DeviceCommandRequest.N → JSON `n`（固件 poller.c 的 pn 通道）
   if (opts.n != null) body.n = Number(opts.n)
+  // 点播通道：服务端把源内 key 折算成 u32（XxHash32，与设备曲目表同口径）再发 n
+  if (opts.trackId != null) body.trackId = String(opts.trackId)
+  if (opts.trackTitle != null) body.trackTitle = String(opts.trackTitle)
+  if (opts.source != null) body.source = String(opts.source)
   return http.post(`/admin/devices/${encodeURIComponent(deviceId)}/command`, body).then((r) => r.data)
 }
 
@@ -145,6 +149,8 @@ export const DEVICE_COMMAND_BGM = 'bgm'
 /** 固件认的 bgm 值（poller.c:211-216 字符串分支）。 */
 export const BGM_COMMAND = Object.freeze({
   PLAY: 'play', PAUSE: 'pause', RESUME: 'resume', STOP: 'stop', NEXT: 'next', PREV: 'prev', VOLUME: 'vol',
+  // 点播指定曲目（曲库行内「播放」）：body {type:'bgm',value:'track',trackId:<key>,trackTitle?,source?}
+  TRACK: 'track',
 })
 
 /**
@@ -153,7 +159,10 @@ export const BGM_COMMAND = Object.freeze({
  */
 export const BGM_PROBE_VALUE = '__probe__'
 
-/** 下发一条 bgm 指令：value 取 BGM_COMMAND；音量（VOLUME）需带 opts.n。 */
+/**
+ * 下发一条 bgm 指令：value 取 BGM_COMMAND；音量（VOLUME）需带 opts.n；
+ * 点播（TRACK）需带 opts.trackId（曲目源内 key）+ 可选 opts.trackTitle / opts.source。
+ */
 export function sendBgmCommand(deviceId, value, opts = {}) {
   return sendDeviceCommand(deviceId, DEVICE_COMMAND_BGM, value, opts)
 }

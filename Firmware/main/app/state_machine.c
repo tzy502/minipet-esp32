@@ -594,18 +594,44 @@ static void dispatch_set_parts_by_hash(const char *hash)
     ESP_LOGI(TAG, "换装 %s rc=%d", path, rc);
 }
 
+/* 是否已成功装载过 BGMAP（默认地图重投判据） */
+static bool g_map_loaded;
+
 static void dispatch_map(const char *hash)
 {
     char bg[MP_MPK_PATH_MAX];
     static char strips[8][MP_MPK_PATH_MAX];   /* BGMAP 条带引用（§五） */
+    /* 【指针数组修复 2026-09-27】render_set_map 的形参是 const char **，
+     * 此前直接 `(const char **)strips` 强转二维数组 —— 布局是"每行 96B 连续"，
+     * 按 char* 解释会把行首 8 个字节当成指针 → 传进去的是野指针，
+     * 真机表现：`mpak: open  failed` / `strip 0 load failed ()`（路径恒空）
+     * → 默认地图的视差条带永远加载不了（地图静默退化成只有 static_back）。
+     * 正确做法：显式建指针数组。 */
+    const char *strip_ptrs[8];
 
     asset_dl_set_active_map(hash);
     asset_dl_touch(hash);                     /* E7：切过的秒切（LRU 前排） */
 
-    if (!asset_dl_map_path(hash, bg, sizeof(bg))) return;
+    /* 【默认地图必须落地 2026-09-27】无 TF 卡时启动早期（1.3s）就 post 了
+     * SET_MAP 000010000，但那时清单还没解析（MANIFEST_SYNCED 在 ~5s 才到）
+     * → asset_dl_map_path 查不到 BGMAP → 此前**静默 return**，用户看到的
+     * 是纯黑底（需求："没有 TF 卡就渲染默认，地图默认渲染 000010000"）。
+     * 现在：查不到就记 ERROR 并请求一次清单/素材同步，等
+     * dispatch_manifest_synced 末尾重投默认地图（见 mp_post_cmd(MP_CMD_SET_MAP)）。 */
+    if (!asset_dl_map_path(hash, bg, sizeof(bg))) {
+        ESP_LOGE(TAG, "地图 %s 路径查询失败（清单未就绪/无 BGMAP 条目）→ 待清单同步后重投", hash);
+        asset_dl_request_sync();
+        return;
+    }
     int n = asset_dl_map_strips(bg, strips, 8);
     if (n < 0) n = 0;
-    render_set_map(bg, (n > 0) ? (const char **)strips : NULL, n);
+    if (n > 8) n = 8;
+    for (int i = 0; i < n; i++) strip_ptrs[i] = strips[i];
+    int mrc = render_set_map(bg, (n > 0) ? strip_ptrs : NULL, n);
+    if (n > 0)
+        ESP_LOGI(TAG, "地图条带 %d 条：%s | %s", n, strips[0], (n > 1) ? strips[1] : "-");
+    ESP_LOGW(TAG, "地图装载 %s（条带 %d）rc=%d", hash, n, mrc);
+    if (mrc == 0) g_map_loaded = true;
 
     /* 地图时钟锚点随地图切换预置（E9/R15；开关留待 CLOCK 指令）。
      * 问题3：无锚点 → CLOCK_ANCHOR_AUTO（渲染层整块居中屏幕 240,120） */
@@ -692,9 +718,26 @@ static void dispatch_manifest_synced(void)
         }
     }
 
+    /* 【默认地图重投】无 TF 卡（出厂素材模式）启动早期投的 SET_MAP 早于清单解析，
+     * 查不到 BGMAP 路径 → 这里清单就绪后补投一次，保证"没有 TF 卡也渲染默认地图
+     * 000010000"这条需求真的落地（此前静默失败，屏幕永远纯黑底）。 */
+    if (sd_tf_is_flash_fallback() && !g_map_loaded) {
+        mp_cmd_t mc = { .type = MP_CMD_SET_MAP };
+        strlcpy(mc.s, MP_DEFAULT_MAP_ID, sizeof(mc.s));
+        mp_post_cmd(&mc);
+        ESP_LOGW(TAG, "出厂素材模式：清单就绪 → 重投默认地图 %s", MP_DEFAULT_MAP_ID);
+    }
+
     /* 素材全量重绑后强制一次全屏重绘：清除面板自检色块/旧画面残留
      * （无 BGMAP → 全屏填黑；有 BGMAP → static_back+tile），此后每帧走脏区 */
     render_force_redraw();
+
+    /* 素材全绑完后的内部堆水位（可观测性：文件描述符/字模/位图都在内部堆或 PSRAM，
+     * 真机曾因 max_files 用尽导致后续 mpak_open 全失败 → 一条水位日志能提前发现） */
+    {
+        extern void provision_dump_internal_heap(const char *stage);
+        provision_dump_internal_heap("@素材全绑后");
+    }
 }
 
 void app_cmd_dispatch(const mp_cmd_t *cmd)

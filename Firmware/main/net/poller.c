@@ -154,7 +154,12 @@ static void handle_cmd(cJSON *jc)
     const char *t = cJSON_GetStringValue(cJSON_GetObjectItem(jc, "t"));
     const char *v = cJSON_GetStringValue(cJSON_GetObjectItem(jc, "v"));
     cJSON *jn = cJSON_GetObjectItem(jc, "n");
-    int32_t n = jn ? (int32_t)cJSON_GetNumberValue(jn) : 0;
+    /* 【曲目 id u32 安全折算 2026-09-27】曲目数字 id = XxHash32(key) 是 u32，近半数
+     * ≥2^31。旧写法 (int32_t)double 对超范围值属未定义行为，真机可能拿到 0/饱和值
+     * → 点播无效。先在 double 域判定范围再折算：n 走 int32（音量/音源），nu 走 u32（曲目）。 */
+    double nd = jn ? cJSON_GetNumberValue(jn) : 0.0;
+    int32_t n = (nd >= -2147483648.0 && nd <= 2147483647.0) ? (int32_t)nd : 0;
+    uint32_t nu = (nd > 0.0 && nd < 4294967296.0) ? (uint32_t)nd : 0u;
     if (!t) return;
 
     mp_cmd_t c = { 0 };
@@ -193,6 +198,9 @@ static void handle_cmd(cJSON *jc)
         else if (strcmp(v, "prev") == 0)   m.type = MP_AUDIO_PREV;
         else if (strcmp(v, "vol") == 0)  { m.type = MP_AUDIO_VOL; m.a = n; }
         else if (strcmp(v, "source") == 0) { m.type = MP_AUDIO_SOURCE; m.a = n; }
+        /* 点播指定曲目（Web 曲库行内「播放」按钮 → 服务端 {t:"bgm",v:"track",n:<u32>}）：
+         * a = 曲目数字 id，bgm.c 的 MP_AUDIO_PLAY 分支据此走 /api/device/bgm/stream?id=… */
+        else if (strcmp(v, "track") == 0 && nu != 0u) { m.type = MP_AUDIO_PLAY; m.a = (int32_t)nu; }
         if (m.type != MP_AUDIO_NONE) mp_post_audio(&m);
     } else if (strcmp(t, "ota") == 0 && v) {
         /* E11：poll 指令含固件版本 + 下载地址 */
@@ -339,6 +347,17 @@ static bool do_poll_once(void)
                     else if (strcmp(vv, "stop") == 0)   m.type = MP_AUDIO_STOP;
                     else if (strcmp(vv, "next") == 0)   m.type = MP_AUDIO_NEXT;
                     else if (strcmp(vv, "prev") == 0)   m.type = MP_AUDIO_PREV;
+                    else if (strcmp(vv, "track") == 0) {
+                        /* 点播：n = 曲目数字 id（u32 位型）。同 handle_cmd 的说明，
+                         * 先在 double 域判范围再折算，避免 UB。 */
+                        if (pn) {
+                            double d = cJSON_GetNumberValue(pn);
+                            if (d > 0.0 && d < 4294967296.0) {
+                                m.type = MP_AUDIO_PLAY;
+                                m.a = (int32_t)(uint32_t)d;
+                            }
+                        }
+                    }
                     else if (strcmp(vv, "vol") == 0) {
                         /* 【Web BGM 控制补链 2026-09-27】音量走数值通道：
                          * 服务端 payload = {n:0..100}，vitem 恒 NULL → 此前落到

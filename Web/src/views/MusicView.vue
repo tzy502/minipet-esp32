@@ -66,6 +66,18 @@ const filteredTracks = computed(() => {
 })
 
 const columns = [
+  {
+    // 【Web 点歌 2026-09-27】用户报障「页面 bgm 没有选择歌曲的地方」：此前曲库表只有
+    // 展示列（曲名/分类/ID/大小），播放控制只有上一首/下一首。这里给每行加「播放」
+    // ——POST {type:'bgm',value:'track',trackId:<key>}，服务端折算 u32 后下发设备点播。
+    title: '', key: 'play', width: 78,
+    render: (row) => h(NButton, {
+      size: 'tiny', type: 'primary', secondary: true,
+      disabled: !deviceId.value || bgmSupport.value === 'missing',
+      loading: bgmBusy.value === `track:${row.id}`,
+      onClick: () => playTrack(row),
+    }, { default: () => '▶ 播放' }),
+  },
   { title: '曲名', key: 'title', ellipsis: { tooltip: true }, render: (row) => row.title || '（未命名）' },
   { title: '分类', key: 'category', width: 140, render: (row) => row.category || '—' },
   { title: '曲目 ID', key: 'id', ellipsis: { tooltip: true } },
@@ -333,9 +345,11 @@ async function sendBgm(value, label, opts = {}) {
   if (!deviceId.value) return
   bgmBusy.value = opts.busyKey || value
   lastResult.value = null
-  const bodyText = opts.n != null
-    ? `{"type":"bgm","value":"${value}","n":${opts.n}}`
-    : `{"type":"bgm","value":"${value}"}`
+  const bodyText = opts.trackId != null
+    ? `{"type":"bgm","value":"${value}","trackId":"${opts.trackId}"${opts.source ? `,"source":"${opts.source}"` : ''}}`
+    : opts.n != null
+      ? `{"type":"bgm","value":"${value}","n":${opts.n}}`
+      : `{"type":"bgm","value":"${value}"}`
   try {
     const r = await sendBgmCommand(deviceId.value, value, opts)
     bgmSupport.value = 'ok'
@@ -361,6 +375,23 @@ async function sendBgm(value, label, opts = {}) {
 }
 
 const playBgm = (v, label) => sendBgm(v, label)
+
+/**
+ * 点播指定曲目：把曲库行（源内 key + 曲名）发给设备。
+ * 服务端 POST /admin/devices/{id}/command {type:'bgm',value:'track',trackId,trackTitle,source}
+ * → 折算 u32 后以旧口径 {t:'bgm',v:'track',n:<u32>} 下发；固件 poller.c 认 "track"
+ * → MP_AUDIO_PLAY(a=曲目 id) → GET /api/device/bgm/stream?id=<u32> 取流。
+ * 源不同时服务端会先补发一条 bgm=source 指令，避免点 QQ 曲目却按 WZ 取流。
+ */
+function playTrack(row) {
+  if (!row?.id) return
+  return sendBgm(BGM_COMMAND.TRACK, `点播《${row.title || row.id}》`, {
+    trackId: row.id,
+    trackTitle: row.title || row.id,
+    source: source.value,
+    busyKey: `track:${row.id}`,
+  })
+}
 
 /** 音量下发（需服务端放行 + 固件支持数值型 payload；202 只代表入队）。 */
 function sendVolume() {
@@ -442,6 +473,10 @@ onBeforeUnmount(() => clearInterval(refreshTimer))
             BGM 偏好：源 <b>{{ bgmPref?.source ?? '—' }}</b> · 音量 <b>{{ bgmPref?.volume ?? '—' }}</b>
             （GET /api/admin/devices/{{ deviceId || '{id}' }} · 只读，设备端现场控制会回写此处）
           </span>
+          <!-- 当前曲目（Web 点歌回执 + 设备现场切歌回写；来源 DeviceBgmPrefs.TrackId/TrackTitle） -->
+          <n-tag v-if="bgmPref?.trackTitle || bgmPref?.trackId" size="small" :bordered="false" type="info">
+            当前曲目：{{ bgmPref.trackTitle || bgmPref.trackId }}
+          </n-tag>
         </n-space>
 
         <n-space v-if="devLogs.length" vertical size="2">
@@ -665,7 +700,10 @@ onBeforeUnmount(() => clearInterval(refreshTimer))
       />
       <div class="hint" style="margin-top: 8px">
         共 {{ trackCount }} 首{{ query ? ` · 过滤后 ${filteredTracks.length} 首` : '' }}；
-        播放控制在设备触摸屏（E8），上方控制卡为附加的 Web 远程通道
+        行内「▶ 播放」= <b>点播到上方选中的设备</b>
+        （<code>POST {{ cmdPath }} body {"type":"bgm","value":"track","trackId":"&lt;曲目ID&gt;"}</code>，
+        服务端折算曲目数字 id 后下发）；设备触摸屏的播放控制（E8）不受影响
+        <template v-if="!deviceId">—— 当前<b>未选择设备</b>，点播按钮不可用</template>
       </div>
     </n-card>
   </div>

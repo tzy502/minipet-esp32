@@ -18,6 +18,9 @@
 #include <string.h>
 #include <time.h>
 
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+
 #include <lvgl.h>
 
 #include "drivers.h"
@@ -38,6 +41,40 @@ static const char *TAG = "rc";
 /* ================= 静态状态 ================= */
 
 static bool g_inited, g_menu;
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * 【合成器互斥 2026-09-27 真机根因修复：面板"一条明显的分割线 + 头缺一块"】
+ *
+ * 取证证据（开机抓串口，flush 分块指纹与主机端同算法合成结果逐块对拍）：
+ *   同一笔 flush rect=(240,240 160x160) 的 5 个分块里，
+ *   前 2 块 = fly 帧 0 的像素，后 3 块 = fly 帧 1 的像素（FNV 与主机端逐块全等）。
+ *   ⇒ g_fb 在 blit_be 分块之间被【另一个任务】重新合成了一次：
+ *     同一屏上出现两个不同时刻的画面 = 用户照片里的水平分割线 + 人物某块内容错帧。
+ *
+ * 机理：compositor 全静态状态（g_fb / g_ent_px / g_mark / s_blit_stage）无任何锁，
+ * 而 render.h 的调用约定（"所有函数必须与 render_tick 同任务调用"）在应用层被违反：
+ *   · 输入任务：input_dispatch → state_machine_tick_1hz → CLOCK_DOZE/render_set_clock
+ *     → full_recompose()；
+ *   · 输入/状态机任务：render_set_map / render_set_clock / render_exit_menu /
+ *     render_force_redraw → full_recompose()；
+ *   · render_set_parts / render_set_layout / render_set_expression → recompose_entity()
+ *     + mark_rect()（写实体缓冲与脏区网格）。
+ * 于是渲染任务的 flush（compose_region + blit_be，屏上实测约 10ms）会被上述调用
+ * 从中间截断 → 面板收到跨帧混合内容（且共用 s_blit_stage 还会串数据）。
+ *
+ * 修法：**递归互斥**把"合成+上屏"与"实体重合成/标脏"整体串行化（同任务嵌套可取，
+ * 不会自锁）。这不是把并发"藏起来"，而是把 render.h 里那句约定变成运行时保证。
+ * ══════════════════════════════════════════════════════════════════════════ */
+static SemaphoreHandle_t s_rlock;
+
+static void rc_lock(void)
+{
+    if (s_rlock) xSemaphoreTakeRecursive(s_rlock, portMAX_DELAY);
+}
+static void rc_unlock(void)
+{
+    if (s_rlock) xSemaphoreGiveRecursive(s_rlock);
+}
 static int32_t g_sw, g_sh;                 /* 屏幕尺寸（480×480） */
 
 static uint16_t *g_fb;                     /* framebuffer（单一所有权） */
@@ -88,11 +125,19 @@ typedef struct rc_part_img {
     uint8_t  *mask;
     uint32_t px_hash;      /* 位图指纹（可见性探针）：part_id 不同但指纹相同
                             * = PARTS 包内数据共享/坏偏移（帧静止嫌疑判据） */
+    uint32_t mask_hash;    /* 掩码指纹（取证探针：主机端 mpk 解码对拍用） */
+    uint32_t mask_bits;    /* 掩码非零位数（= 该件实际覆盖像素数） */
     struct rc_part_img *next;
 } rc_part_img_t;
 static rc_part_img_t *g_pc;
 static uint32_t g_pc_bytes;
 static bool g_pc_cap_logged;
+
+/* 【取证探针 2026-09-27】>0 = 对接下来 N 次 flush 的每个分块打印
+ * (rect,len,FNV)：与主机端按同一合成结果算出的分块指纹对拍——
+ * 全等 ⇒ 交给 panel 的字节完全正确，故障必在面板同步/时序；
+ * 不等 ⇒ blit 源行/列错位（"头部缺一块"的候选）。 */
+static int s_forensic_chunks;
 
 /* 气泡 */
 static struct { bool active; uint16_t *px; int32_t w, h, x, y; } g_bub;
@@ -438,12 +483,45 @@ static int32_t ent_tilt_off_px(int32_t tilt_mdeg)
     return px;
 }
 
-/* 拖拽 1:1 跟手偏移（X 横向 ±160；Y 纵向 -300..+30，保证人物不出屏） */
+/* ══ 拖拽范围：**整只宠物必须留在屏内** ═══════════════════════════════════
+ * 【2026-09-27 用户报障"头明显锁了一块 + 一条明显的分割线"的第二个真凶】
+ * 取证（真机串口探针）：故障时刻 `drag=(61,172)`、`落点=(301,412 179x68)`——
+ * 即人物被上一次拖拽留在右下角，显示矩形 214x168 只有 179x68 落在屏内，
+ * 头像被屏幕边缘切出一个**直角块**（黑底上就是"头缺一块 + 分割线"）。
+ * 旧的 ±屏宽/±屏高 夹取允许人物被拖到几乎完全出屏且**松手后原地保留**，
+ * 用户无法区分"被屏幕边缘裁掉"与"渲染坏了"。
+ *
+ * 现口径：跟手拖动 1:1，但显示矩形整块夹在屏内——屏幕四边都能到达
+ * （214x168 的人物在 480x480 上仍有 266x312 的活动范围，"可以全屏拖动"成立），
+ * 且任何位置都不会被切成块。tilt 的 ±8px 视差偏移一并计入，避免倾斜时越界。 */
+static void drag_clamp(int32_t *px, int32_t *py)
+{
+    int32_t dw, dh;
+    ent_disp_size(&dw, &dh);
+    if (dw <= 0 || dh <= 0) return;              /* 画布未就绪：不限制 */
+    /* 未加 drag 时的基准（与 ent_screen_pos_at 同源，含 tilt 与 base 偏移） */
+    int32_t base_x = g_sw / 2 - g_ent_cx0 * RC_SCALE + RC_ENT_CENTER_OFF_X
+                     + (g_ent_base_wx << RC_SCALE_SHIFT)
+                     + ent_tilt_off_px(g_tilt_mdeg);
+    int32_t base_y = g_sh / 2 - g_ent_cy0 * RC_SCALE + RC_ENT_CENTER_OFF_Y
+                     + (g_ent_base_wy << RC_SCALE_SHIFT);
+    if (px) {
+        int32_t lo = -base_x, hi = g_sw - dw - base_x;
+        if (hi < lo) hi = lo;                    /* 画布比屏还宽：贴左 */
+        if (*px < lo) *px = lo;
+        if (*px > hi) *px = hi;
+    }
+    if (py) {
+        int32_t lo = -base_y, hi = g_sh - dh - base_y;
+        if (hi < lo) hi = lo;
+        if (*py < lo) *py = lo;
+        if (*py > hi) *py = hi;
+    }
+}
+
 void render_set_drag_off(int32_t px)
 {
-    /* 全屏拖动（见 render_set_drag_off_y 注释） */
-    if (px > g_sw) px = g_sw;
-    if (px < -g_sw) px = -g_sw;
+    drag_clamp(&px, NULL);
     g_drag_off_x = px;
 }
 
@@ -451,10 +529,7 @@ int32_t render_get_drag_off(void) { return g_drag_off_x; }
 
 void render_set_drag_off_y(int32_t py)
 {
-    /* 用户要求：**可以全屏拖动**（此前向下只给 +30px，拉不到屏幕下方）。
-     * 放开到 ±(屏高)，即人物可被拖到屏幕上/下任意位置（超出部分自然裁剪）。 */
-    if (py > g_sh) py = g_sh;
-    if (py < -g_sh) py = -g_sh;
+    drag_clamp(NULL, &py);
     g_drag_off_y = py;
 }
 
@@ -534,7 +609,7 @@ static void ent_screen_rect_at(int32_t tilt_mdeg,
     if (*dw <= 0 || *dh <= 0) { *dw = 0; *dh = 0; }
 }
 
-static void mark_rect(int32_t x, int32_t y, int32_t w, int32_t h)
+static void mark_rect_locked(int32_t x, int32_t y, int32_t w, int32_t h)
 {
     if (!g_inited) return;
     int32_t x1 = x + w, y1 = y + h;
@@ -551,6 +626,15 @@ static void mark_rect(int32_t x, int32_t y, int32_t w, int32_t h)
         for (int cx = cx0; cx <= cx1; cx++)
             g_mark[cy * g_gw + cx] = 1;
     g_mark_calls++;          /* 兜底清屏用：见 render_tick 的 1s 全屏重合成 */
+}
+
+/* 跨任务标脏入口（互斥见文件头 s_rlock 说明）：与 flush 的清零/合成互斥，
+ * 否则"标脏→合并 bbox"之间被截断会丢脏区 → 残留像素永不重绘。 */
+static void mark_rect(int32_t x, int32_t y, int32_t w, int32_t h)
+{
+    rc_lock();
+    mark_rect_locked(x, y, w, h);
+    rc_unlock();
 }
 
 static void mark_ent_at(int32_t tilt_mdeg)
@@ -574,7 +658,7 @@ static void mark_ent_at(int32_t tilt_mdeg)
     }
     /* 已 clamp 的屏内矩形（与 compose_region 实体步同一来源）；
      * 完全出屏（dw/dh=0）时 mark_rect 内部越界门同样拦截，双保险 */
-    if (dw > 0 && dh > 0) mark_rect(ex, ey, dw, dh);
+    if (dw > 0 && dh > 0) mark_rect_locked(ex, ey, dw, dh);
 }
 
 static void mark_ent(void)
@@ -653,6 +737,13 @@ static const rc_part_img_t *pc_get(const mpak_part_t *meta)
     }
     e->next = g_pc;
     e->px_hash = rc_bytes_fnv((const uint8_t *)e->px, pb);
+    /* 【取证探针 2026-09-27】掩码指纹 + 非零位数：主机端用同一 mpk 文件解码
+     * 出的同名字段应完全一致。位数为 0 = 该件不出像素；has_alpha=0（mask==NULL）
+     * 时整块位图按不透明贴 = 会把位图里的黑底当内容画上去（真机"头缺一块"嫌疑）。 */
+    e->mask_hash = e->mask ? rc_bytes_fnv(e->mask, mb) : 0u;
+    e->mask_bits = 0;
+    for (uint32_t i = 0; e->mask && i < mb; i++)
+        e->mask_bits += (uint32_t)__builtin_popcount(e->mask[i]);
     g_pc = e;
     g_pc_bytes += pb + mb;
     return e;
@@ -732,6 +823,13 @@ static void ent_canvas_update(void)
     g_ent_cw = cw;
     g_ent_ch = ch;
     g_ent_cbox_ok = true;
+    /* 画布尺寸/原点变了 → 旧 drag 偏移可能已把人物顶出屏（换动作/换装后
+     * 尺寸不同）：按新尺寸重新夹取，保证任何时刻都整只留在屏内。 */
+    {
+        int32_t dx = g_drag_off_x, dy = g_drag_off_y;
+        drag_clamp(&dx, &dy);
+        g_drag_off_x = dx; g_drag_off_y = dy;
+    }
     ESP_LOGD(TAG, "ent canvas union origin(%" PRId32 ",%" PRId32 ") %"
              PRId32 "x%" PRId32, g_ent_cx0, g_ent_cy0, g_ent_cw, g_ent_ch);
 }
@@ -809,7 +907,7 @@ static void blit_ent_2x(const rc_part_img_t *img, bool hflip, int32_t bx, int32_
     }
 }
 
-static void recompose_entity(void)
+static void recompose_entity_locked(void)
 {
     memset(g_ent_px, 0, (size_t)RC_ENT_W * RC_ENT_H * 2u);
     memset(g_ent_cov, 0, RC_ENT_COV_BYTES);
@@ -827,7 +925,7 @@ static void recompose_entity(void)
     {
         static int64_t s_rp_ms;
         int64_t now_ms = esp_timer_get_time() / 1000;
-        if (now_ms - s_rp_ms > 3000) {
+        if (now_ms - s_rp_ms > 30000) {
             s_rp_ms = now_ms;
             int32_t pbx, pby, pex, pey, pdw, pdh;
             ent_screen_rect_at(g_tilt_mdeg, &pbx, &pby, &pex, &pey, &pdw, &pdh);
@@ -865,7 +963,7 @@ static void recompose_entity(void)
     {
         static int64_t s_rp2_ms;
         int64_t now_ms2 = esp_timer_get_time() / 1000;
-        if (now_ms2 - s_rp2_ms > 3000) {
+        if (now_ms2 - s_rp2_ms > 30000) {
             s_rp2_ms = now_ms2;
             ESP_LOGW(TAG, "实体渲染结果：total=%u miss=%u（部件解析失败数）",
                      (unsigned)total, (unsigned)miss);
@@ -882,6 +980,87 @@ static void recompose_entity(void)
             asset_dl_request_sync();
         }
     }
+
+    /* ══ 取证探针（2026-09-27，用户报"头部缺一块 + 一条分割线"）══════════
+     * 目的：把「设备上画出来的到底是什么」变成可对拍的事实——主机端用同一
+     * mpk 文件解码 + 同一 2x/掩码算法合成，逐件/逐像素比对，判定故障在
+     * ①素材（包内容与主机不同）②解码（掩码/像素读错）③合成（画布/坐标）
+     * ④上屏（blit 路径）中的哪一环。默认 DEBUG 级不输出；只有把
+     * RC_FORENSIC 打开（下面宏）才在 8s/24s 各打一次。 */
+#define RC_FORENSIC 0
+#if RC_FORENSIC
+    {
+        static int s_dump_n;
+        static int64_t s_dump_ms;
+        int64_t now_ms = esp_timer_get_time() / 1000;
+        if (s_dump_n < 2 && now_ms > 8000 && now_ms - s_dump_ms > 5000) {
+            s_dump_ms = now_ms;
+            s_dump_n++;
+            s_forensic_chunks = 60;  /* 顺手抓 60 次 flush 的分块指纹（回归：跨帧混合必须为 0） */
+            ESP_LOGW(TAG, "取证#%d：PARTS hash=%016llx LAYOUT hash=%016llx "
+                          "画布=(%d,%d %dx%d) 缓冲=(%d,%d %dx%d) drag=(%d,%d) tilt=%d",
+                     s_dump_n,
+                     (unsigned long long)mpak_content_hash(&g_parts),
+                     (unsigned long long)mpak_content_hash(g_lt_once_ok ? &g_lt_once : &g_lt_loop),
+                     (int)g_ent_cx0, (int)g_ent_cy0, (int)g_ent_cw, (int)g_ent_ch,
+                     (int)g_ent_base_wx, (int)g_ent_base_wy, g_sw, g_sh,
+                     (int)g_drag_off_x, (int)g_drag_off_y, (int)g_tilt_mdeg);
+            for (uint32_t k = 0; k < fr->piece_count; k++) {
+                const mpak_piece_t *piece = &lt->pieces[fr->piece_off + k];
+                const mpak_part_t *raw_meta = mpak_parts_find(&g_parts, piece->part_id);
+                const rc_part_img_t *im = resolve_piece(piece);
+                ESP_LOGW(TAG, "取证件[%u] lay_id=%u expr=%u xy=(%d,%d) flip=%u z=%d "
+                              "| img_id=%u %dx%d alpha=%d maskbits=%u px_hash=%08x mask_hash=%08x",
+                         (unsigned)k, (unsigned)piece->part_id, (unsigned)piece->expr_index,
+                         (int)piece->x, (int)piece->y, (unsigned)(piece->flip & 1u), (int)piece->z,
+                         im ? (unsigned)im->meta->id : 0u,
+                         im ? (int)im->meta->w : 0, im ? (int)im->meta->h : 0,
+                         im ? (int)(im->mask != NULL) : -1,
+                         im ? (unsigned)im->mask_bits : 0u,
+                         im ? (unsigned)im->px_hash : 0u, im ? (unsigned)im->mask_hash : 0u);
+                (void)raw_meta;
+            }
+            /* 实体缓冲 ASCII 图（1 字符 = 画布 1x 像素 = 2x2 屏像素）。
+             * ' ' 透明/未覆盖、'.' 黑、'W' 亮灰(白)、'w' 中灰、'd' 暗灰、
+             * 'R' 红主导、'G' 绿主导、'B' 蓝主导。每行前带画布 y 号。 */
+            for (int32_t cy = 0; cy < g_ent_ch; cy++) {
+                char line[RC_ENT_W / RC_SCALE + 1];
+                int32_t n = 0;
+                for (int32_t cx = 0; cx < g_ent_cw && n < (int32_t)sizeof line - 1; cx++) {
+                    int32_t sx = (int32_t)(cx << RC_SCALE_SHIFT);
+                    int32_t sy = (int32_t)(cy << RC_SCALE_SHIFT);
+                    uint32_t idx = (uint32_t)sy * RC_ENT_W + (uint32_t)sx;
+                    if (!rc_mask_bit(g_ent_cov, idx)) { line[n++] = ' '; continue; }
+                    uint16_t v = g_ent_px[idx];
+                    int32_t r = (int32_t)((v >> 11) & 0x1Fu) << 3;
+                    int32_t g = (int32_t)((v >> 5) & 0x3Fu) << 2;
+                    int32_t b = (int32_t)(v & 0x1Fu) << 3;
+                    int32_t mx = r > g ? (r > b ? r : b) : (g > b ? g : b);
+                    char ch;
+                    if (mx < 40) ch = '.';
+                    else if (mx - r < 24 && mx - g < 24 && mx - b < 24)
+                        ch = mx > 200 ? 'W' : (mx > 120 ? 'w' : '.');
+                    else if (r >= g && r >= b) ch = 'R';
+                    else if (g >= r && g >= b) ch = 'G';
+                    else ch = 'B';
+                    line[n++] = ch;
+                }
+                line[n] = 0;
+                ESP_LOGW(TAG, "取证画布 y=%02d |%s|", (int)cy, line);
+            }
+        }
+    }
+#endif
+}
+
+/* 跨任务入口（render_set_parts/layout/expression 会被输入/状态机任务调用）：
+ * 与 flush 的 ent_compose（读 g_ent_px/g_ent_cov）互斥——否则读到"画了一半"的
+ * 实体缓冲 = 人物某块内容错帧/缺块（用户照片里的"头明显缺一块"）。 */
+static void recompose_entity(void)
+{
+    rc_lock();
+    recompose_entity_locked();
+    rc_unlock();
 }
 
 /* ================= 条带 ================= */
@@ -1176,6 +1355,9 @@ static void compose_region(int32_t x, int32_t y, int32_t w, int32_t h)
  * 先正确后优化）；实体/条带每帧整体重绘各自包围盒由 mark_ent/mark_rect 保证。 */
 static void flush_dirty(void)
 {
+    /* 整笔"标脏清零 → compose_region → 分块 blit"必须原子：真机取证已证
+     * 分块之间被跨任务 full_recompose 截断 → 同屏两帧内容（分割线/错帧块）。 */
+    rc_lock();
     int32_t cx0 = -1, cy0 = -1, cx1 = -1, cy1 = -1;
     int32_t cells = 0;
     for (int32_t cy = 0; cy < g_gh; cy++) {
@@ -1189,7 +1371,7 @@ static void flush_dirty(void)
             if (cy > cy1) cy1 = cy;
         }
     }
-    if (cx0 < 0) return;
+    if (cx0 < 0) { rc_unlock(); return; }
 
     int32_t x = cx0 * RC_CELL, y = cy0 * RC_CELL;
     int32_t w = (cx1 - cx0 + 1) * RC_CELL, h = (cy1 - cy0 + 1) * RC_CELL;
@@ -1206,8 +1388,54 @@ static void flush_dirty(void)
                  PRId32 "x%" PRId32, x, y, w, h);
     }
     (void)cells;
+    if (s_forensic_chunks > 0)
+        ESP_LOGW(TAG, "取证flush rect=(%d,%d %dx%d)", (int)x, (int)y, (int)w, (int)h);
     compose_region(x, y, w, h);
     blit_be(x, y, w, h, g_fb + (size_t)y * g_sw + x, g_sw);
+    if (s_forensic_chunks > 0) s_forensic_chunks--;
+
+    /* ══ 残留自检（2026-09-27，用户报障"错帧块/拖影"的兜底回归）══════════
+     * 无地图（g_static==NULL）时屏幕底色应恒为纯黑：**实体显示矩形之外**出现
+     * 非黑像素 ⇒ 脏区漏标（旧位置没被重铺）或跨任务写入残留。
+     * 真机取证里"头缺一块 + 上下错帧的横条"正是这类残留的典型形态，而它无法从
+     * 分块指纹发现（指纹只覆盖本次 flush 的区域）。这里以 1s 限频统计残留像素数
+     * 与包围盒并打 WARN，把"屏上是否干净"变成可回归的事实。
+     * 排除：当前实体矩形（外扩 16）、顶部横幅带、BGM 半屏条、气泡矩形。 */
+    if (!g_static) {
+        static int64_t s_ghost_ms;
+        int64_t now_ms = esp_timer_get_time() / 1000;
+        if (now_ms - s_ghost_ms > 1000) {
+            s_ghost_ms = now_ms;
+            int32_t ex, ey, dw, dh, ebx, eby;
+            ent_screen_rect_at(g_tilt_mdeg, &ebx, &eby, &ex, &ey, &dw, &dh);
+            int32_t gx0 = 99999, gy0 = 99999, gx1 = -1, gy1 = -1;
+            uint32_t ghost = 0;
+            for (int32_t ry = 0; ry < g_sh; ry++) {
+                if (ry >= RC_BANNER_Y && ry < RC_BANNER_Y + RC_BANNER_H) continue;
+                if (g_banner_on && ry >= RC_BANNER_Y && ry < RC_BANNER_Y + RC_BANNER_H) continue;
+                if (ry >= g_sh - RC_OV_H) continue;              /* BGM 半屏条 */
+                if (g_bub.active && ry >= g_bub.y - 2 && ry < g_bub.y + g_bub.h + 2) continue;
+                if (dw > 0 && ry >= ey - 2 && ry < ey + dh + 2) continue;  /* 实体行 */
+                const uint16_t *row = g_fb + (size_t)ry * g_sw;
+                for (int32_t rx = 0; rx < g_sw; rx++) {
+                    if (row[rx] != 0) {
+                        ghost++;
+                        if (rx < gx0) gx0 = rx;
+                        if (rx > gx1) gx1 = rx;
+                        if (ry < gy0) gy0 = ry;
+                        if (ry > gy1) gy1 = ry;
+                    }
+                }
+            }
+            if (ghost) {
+                ESP_LOGW(TAG, "残留自检：实体矩形外非黑像素 %u 个 bbox=(%d,%d)-(%d,%d) "
+                              "实体=(%d,%d %dx%d)（脏区漏标嫌疑）",
+                         (unsigned)ghost, (int)gx0, (int)gy0, (int)gx1, (int)gy1,
+                         (int)ex, (int)ey, (int)dw, (int)dh);
+            }
+        }
+    }
+    rc_unlock();
 }
 
 /* ================= 上屏边界：LE framebuffer → 驱动大端 RGB565 =================
@@ -1233,7 +1461,7 @@ static void flush_dirty(void)
  * → 心跳停、指令收不到、BGM 不出声。
  * 24KB 取 480×25×2，保证 480 宽下 rows_per=25 → 仍是奇数，故这里**主动取偶数
  * 行数**（见下方 rows_per 计算），让每块恒为整行高，快速通道恒命中、驱动零分配。 */
-static uint8_t s_blit_stage[24576] __attribute__((aligned(64)));
+static uint8_t s_blit_stage[12288] __attribute__((aligned(64)));   /* 回退到已知稳定值：24KB 版本与脸部分割线报障同期 */
 
 static void blit_be(int32_t x, int32_t y, int32_t w, int32_t h,
                     const uint16_t *src, int32_t src_stride)
@@ -1260,15 +1488,31 @@ static void blit_be(int32_t x, int32_t y, int32_t w, int32_t h,
                 *d++ = (uint8_t)v;
             }
         }
-        display_blit((int)x, (int)(y + r0), (int)w, (int)hh, s_blit_stage);
+        if (s_forensic_chunks > 0) {
+            uint32_t fh = 2166136261u;
+            for (int32_t i = 0; i < w * hh * 2; i++) {
+                fh ^= s_blit_stage[i];
+                fh *= 16777619u;
+            }
+            esp_err_t derr = display_blit((int)x, (int)(y + r0), (int)w, (int)hh, s_blit_stage);
+            ESP_LOGW(TAG, "取证blit rect=(%d,%d %dx%d) len=%d ret=%d fnv=%08x",
+                     (int)x, (int)(y + r0), (int)w, (int)hh, (int)(w * hh * 2),
+                     (int)derr, (unsigned)fh);
+        } else {
+            display_blit((int)x, (int)(y + r0), (int)w, (int)hh, s_blit_stage);
+        }
     }
 }
 
 static void full_recompose(void)
 {
+    /* 同 flush_dirty：跨任务（render_set_map/clock/exit_menu/force_redraw）可达，
+     * 必须与渲染任务的增量 flush 串行化，否则整屏 blit 与增量 blit 交错上屏。 */
+    rc_lock();
     compose_region(0, 0, g_sw, g_sh);
     memset(g_mark, 0, (size_t)g_gw * g_gh);
     blit_be(0, 0, g_sw, g_sh, g_fb, g_sw);
+    rc_unlock();
 }
 
 /* ================= 地图装载 ================= */
@@ -1388,10 +1632,97 @@ static int strip_load(rc_strip_t *s, const char *path, const mpak_strip_t *hdr)
 
 /* ================= render.h 公共 API ================= */
 
+/* _nolock 实现的前向声明（定义在文件后段；包装只负责加解锁） */
+static int  render_set_parts_nolock(const char *mpk_path);
+static int  render_set_layout_nolock(const char *mpk_path, bool loop);
+static int  render_set_expression_nolock(const char *name);
+static void render_force_redraw_nolock(void);
+static int  render_enter_menu_nolock(void);
+static int  render_exit_menu_nolock(void);
+static int  render_set_map_nolock(const char *bgmap_path,
+                                 const char *strip_parts_paths[], int strip_count);
+static int  render_set_clock_nolock(const char *fonttime_parts_path,
+                                    int16_t anchor_world_x, int16_t anchor_world_y,
+                                    bool enable);
+
+/* ══ 公共写 API 的加锁包装（2026-09-27 互斥修复，详见文件头 s_rlock 说明）══
+ * 这些入口会改资产句柄/图层指针/实体缓冲/脏区，且**会被渲染任务之外的调用者调用**
+ * （输入任务、状态机、asset_dl）。整段持锁 = 渲染任务的 flush 不会读到
+ * "缓存已释放/图层已换/实体画一半"的中间态。同任务嵌套持锁安全（递归锁）。 */
+int render_set_parts(const char *mpk_path)
+{
+    rc_lock();
+    int r = render_set_parts_nolock(mpk_path);
+    rc_unlock();
+    return r;
+}
+
+int render_set_layout(const char *mpk_path, bool loop)
+{
+    rc_lock();
+    int r = render_set_layout_nolock(mpk_path, loop);
+    rc_unlock();
+    return r;
+}
+
+int render_set_expression(const char *name)
+{
+    rc_lock();
+    int r = render_set_expression_nolock(name);
+    rc_unlock();
+    return r;
+}
+
+void render_force_redraw(void)
+{
+    rc_lock();
+    render_force_redraw_nolock();
+    rc_unlock();
+}
+
+int render_enter_menu(void)
+{
+    rc_lock();
+    int r = render_enter_menu_nolock();
+    rc_unlock();
+    return r;
+}
+
+int render_exit_menu(void)
+{
+    rc_lock();
+    int r = render_exit_menu_nolock();
+    rc_unlock();
+    return r;
+}
+
+int render_set_map(const char *bgmap_path,
+                   const char *strip_parts_paths[], int strip_count)
+{
+    rc_lock();
+    int r = render_set_map_nolock(bgmap_path, strip_parts_paths, strip_count);
+    rc_unlock();
+    return r;
+}
+
+int render_set_clock(const char *fonttime_parts_path,
+                     int16_t anchor_world_x, int16_t anchor_world_y, bool enable)
+{
+    rc_lock();
+    int r = render_set_clock_nolock(fonttime_parts_path, anchor_world_x,
+                                    anchor_world_y, enable);
+    rc_unlock();
+    return r;
+}
+
 int render_init(const minipet_profile_t *profile)
 {
     if (!profile) return RENDER_ERR_ARG;
     if (g_inited) return RENDER_OK;
+    if (!s_rlock) {
+        s_rlock = xSemaphoreCreateRecursiveMutex();
+        if (!s_rlock) return RENDER_ERR_NOMEM;
+    }
 
     g_sw = profile->width;
     g_sh = profile->height;
@@ -1450,11 +1781,15 @@ void render_tick(void)
         int64_t t1 = esp_timer_get_time();
         const uint16_t *mb = bridge_menu_buf();
         if (mb) {
+            /* 菜单整屏拷贝+上屏同样要与跨任务 compose/blit 互斥（否则菜单顶上
+             * 叠一块 POKER 画面；s_blit_stage 亦为共用静态）。 */
+            rc_lock();
             for (int32_t r = 0; r < g_sh; r++)
                 memcpy(g_fb + (size_t)r * g_sw, mb + (size_t)r * g_sw,
                        (size_t)g_sw * 2u);
             int64_t t2 = esp_timer_get_time();
             blit_be(0, 0, g_sw, g_sh, g_fb, g_sw);
+            rc_unlock();
             int64_t t3 = esp_timer_get_time();
             (void)t0; (void)t1; (void)t2; (void)t3;
         } else {
@@ -1610,7 +1945,7 @@ void render_tick(void)
 
 }
 
-int render_set_parts(const char *mpk_path)
+static int render_set_parts_nolock(const char *mpk_path)
 {
     if (!g_inited || !mpk_path) return RENDER_ERR_ARG;
     mpak_t tmp;
@@ -1667,7 +2002,7 @@ static bool layout_matches_current_parts(const mpak_t *lt)
     return ok;
 }
 
-int render_set_layout(const char *mpk_path, bool loop)
+static int render_set_layout_nolock(const char *mpk_path, bool loop)
 {
     if (!g_inited || !mpk_path) return RENDER_ERR_ARG;
     mpak_t tmp;
@@ -1698,7 +2033,7 @@ int render_set_layout(const char *mpk_path, bool loop)
     return RENDER_OK;
 }
 
-int render_set_expression(const char *name)
+static int render_set_expression_nolock(const char *name)
 {
     if (!g_inited || !name) return RENDER_ERR_ARG;
     int rc = rc_anim_set_expression(&g_anim, name);
@@ -1713,14 +2048,14 @@ int render_set_expression(const char *name)
 /* 强制一次全屏重合成 + 全幅上屏（脏区基线同步重建）。
  * 用于外部直写面板（面板自检色块等）或素材全量重绑后清除残留：
  * 无 BGMAP → 全屏填黑；有 BGMAP → static_back+条带+tile 一次铺满。 */
-void render_force_redraw(void)
+static void render_force_redraw_nolock(void)
 {
     if (!g_inited) return;
     full_recompose();
 }
 
-int render_set_map(const char *bgmap_path,
-                   const char *strip_parts_paths[], int strip_count)
+static int render_set_map_nolock(const char *bgmap_path,
+                                const char *strip_parts_paths[], int strip_count)
 {
     if (!g_inited || !bgmap_path) return RENDER_ERR_ARG;
 
@@ -1786,8 +2121,9 @@ void render_set_entity_pos(int16_t world_x, int16_t world_y)
     mark_ent();
 }
 
-int render_set_clock(const char *fonttime_parts_path,
-                     int16_t anchor_world_x, int16_t anchor_world_y, bool enable)
+static int render_set_clock_nolock(const char *fonttime_parts_path,
+                                  int16_t anchor_world_x, int16_t anchor_world_y,
+                                  bool enable)
 {
     if (!g_inited) return RENDER_ERR_ARG;
     int rc = clock_digits_configure(fonttime_parts_path, anchor_world_x,
@@ -1811,7 +2147,7 @@ const lv_font_t *render_get_font(render_font_t id)
     return font_lazy_get((font_id_t)id);
 }
 
-int render_enter_menu(void)
+static int render_enter_menu_nolock(void)
 {
     if (!g_inited) return RENDER_ERR_STATE;
     if (g_menu) return RENDER_OK;
@@ -1821,7 +2157,7 @@ int render_enter_menu(void)
     return RENDER_OK;
 }
 
-int render_exit_menu(void)
+static int render_exit_menu_nolock(void)
 {
     if (!g_inited) return RENDER_ERR_STATE;
     if (!g_menu) return RENDER_OK;
@@ -1976,6 +2312,12 @@ void render_input_tilt(float tilt_deg)
     if (tilt_deg > 8.0f) tilt_deg = 8.0f;
     if (tilt_deg < -8.0f) tilt_deg = -8.0f;
     g_tilt_mdeg = (int32_t)(tilt_deg * 1000.0f);   /* 对齐 32bit 原子写 */
+    /* tilt 视差（±8px）改变实体基准 → 重新夹取拖拽偏移，防倾斜时被边缘裁切 */
+    {
+        int32_t dx = g_drag_off_x, dy = g_drag_off_y;
+        drag_clamp(&dx, &dy);
+        g_drag_off_x = dx; g_drag_off_y = dy;
+    }
 }
 
 /*

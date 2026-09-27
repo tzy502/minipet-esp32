@@ -242,6 +242,28 @@ static void ensure_dirs(void)
 /* ------------------------------------------------------------------ */
 /* 本地清单持久化                                                        */
 /* ------------------------------------------------------------------ */
+static uint8_t read_font_px(const char *path);   /* 定义在下；清单缺 px 时兜底读包内首字节 */
+
+/* 【NAN 陷阱 2026-09-27 真机根因】cJSON_GetNumberValue(NULL/非数字) 返回 **NAN**，
+ * 强转整数是未定义行为：xtensa 上 (uint8_t)NAN == 255。清单里 FONT 条目不带 px 字段
+ * （服务端 ManifestBuilder 只写 hash/kind/bytes/label）→ font_px 被写成 255 →
+ * `asset_dl_font_path(16/24/32)` 永不匹配 → **三档字体从未绑定**（真机日志无 set_font 行，
+ * 汇总日志实证 `FONT 3[px=255,255,255]`）。所有数字字段一律走本函数取默认值。 */
+static double jnum(const cJSON *o, const char *key, double dflt)
+{
+    if (!o) return dflt;
+    const cJSON *v = cJSON_GetObjectItem(o, key);
+    return (v && cJSON_IsNumber(v)) ? cJSON_GetNumberValue(v) : dflt;
+}
+
+/* 数组元素取数（clock_table 的 [x,y]） */
+static double jnum_at(const cJSON *arr, int idx, double dflt)
+{
+    if (!arr) return dflt;
+    const cJSON *v = cJSON_GetArrayItem(arr, idx);
+    return (v && cJSON_IsNumber(v)) ? cJSON_GetNumberValue(v) : dflt;
+}
+
 static void load_local_manifest(void)
 {
     s_file_cnt = 0;
@@ -267,7 +289,7 @@ static void load_local_manifest(void)
     free(buf);
     if (!root) return;
 
-    s_local_rev = (uint32_t)cJSON_GetNumberValue(cJSON_GetObjectItem(root, "rev"));
+    s_local_rev = (uint32_t)jnum(root, "rev", 0);
 
     const char *am = cJSON_GetStringValue(cJSON_GetObjectItem(root, "active_map"));
     if (am) strlcpy(s_active_map, am, sizeof(s_active_map));
@@ -294,12 +316,54 @@ static void load_local_manifest(void)
                 strlcpy(lf->selector, s, sizeof(lf->selector));
             if ((s = cJSON_GetStringValue(cJSON_GetObjectItem(jf, "label"))))
                 strlcpy(lf->label, s, sizeof(lf->label));
-            lf->font_px = (uint8_t)cJSON_GetNumberValue(cJSON_GetObjectItem(jf, "px"));
-            lf->bytes = (uint32_t)cJSON_GetNumberValue(cJSON_GetObjectItem(jf, "bytes"));
+            lf->font_px = (uint8_t)jnum(jf, "px", 0);
+            /* 【字体档位兜底 2026-09-27】服务端清单的 FONT 条目**不带 px** 字段
+             * （只有 hash/kind/bytes/url/label）→ 本地已有素材的 font_px 恒为 0 →
+             * `asset_dl_font_path(16/24/32)` 一个都匹配不上 → 三档字体从未绑定
+             * （真机日志里 "set_font px=… 开始" 一条都没有，气泡/菜单/时钟只能退化）。
+             * 这里在清单没给 px 时直接读本地包内 size_px（payload 首字节）。 */
+            /* 【以包内为准 2026-09-27】清单里的 px 可能是**历史坏值被固件自己持久化**回来的
+             * （旧 read_font_px 读错偏移 + cJSON 缺字段 NAN→255，save_local_manifest 把
+             * 255 写进清单 → 后续每次启动都读到 255，只判 ==0 兜底救不回来）。
+             * FONT 条目的档位一律以本地包内 size_px 为准（包在 → 信包；包不在 → 保留清单值）。 */
+            if (strcasecmp(lf->kind, "FONT") == 0) {
+                const char *fdir = kind_dir("FONT");
+                if (fdir) {
+                    char fp[MP_MPK_PATH_MAX];
+                    snprintf(fp, sizeof(fp), "%s/%s.mpk", fdir, lf->hash);
+                    uint8_t px = read_font_px(fp);
+                    if (px) lf->font_px = px;
+                    ESP_LOGI(TAG, "FONT %s：包内 size_px=%u（清单值 %u）",
+                             lf->hash, (unsigned)px, (unsigned)lf->font_px);
+                }
+            }
+            lf->bytes = (uint32_t)jnum(jf, "bytes", 0);
             lf->fav = cJSON_IsTrue(cJSON_GetObjectItem(jf, "fav"));
-            lf->last_used_ms = (int64_t)cJSON_GetNumberValue(cJSON_GetObjectItem(jf, "ts"));
+            lf->last_used_ms = (int64_t)jnum(jf, "ts", 0);
             s_file_cnt++;
         }
+    }
+
+    /* 【可观测性 2026-09-27】清单载入结果此前完全静默：条目数、FONT 档位识别情况
+     * 都看不见，"字体从未绑定""地图按 id 查不到"这类问题只能靠猜。这里一条汇总。 */
+    {
+        int n_parts = 0, n_layout = 0, n_bgmap = 0, n_font = 0, n_audio = 0;
+        char fx[64] = { 0 };
+        for (int i = 0; i < s_file_cnt; i++) {
+            const char *k = s_files[i].kind;
+            if (!strcasecmp(k, "PARTS")) n_parts++;
+            else if (!strcasecmp(k, "LAYOUT")) n_layout++;
+            else if (!strcasecmp(k, "BGMAP")) n_bgmap++;
+            else if (!strcasecmp(k, "FONT")) {
+                n_font++;
+                char t[16];
+                snprintf(t, sizeof(t), "%s%u", n_font > 1 ? "," : "", (unsigned)s_files[i].font_px);
+                strlcat(fx, t, sizeof(fx));
+            } else if (!strcasecmp(k, "AUDIO_META")) n_audio++;
+        }
+        ESP_LOGW(TAG, "本地清单 rev=%u：%d 条（PARTS %d / LAYOUT %d / BGMAP %d / FONT %d[px=%s] / AUDIO_META %d）",
+                 (unsigned)s_local_rev, s_file_cnt, n_parts, n_layout, n_bgmap, n_font,
+                 n_font ? fx : "-", n_audio);
     }
 
     cJSON *ct = cJSON_GetObjectItem(root, "clock_table");
@@ -312,9 +376,9 @@ static void load_local_manifest(void)
                 strlcpy(s_clock_tab[s_clock_cnt].map_id, jm->string,
                         sizeof(s_clock_tab[0].map_id));
                 s_clock_tab[s_clock_cnt].x =
-                    (int16_t)cJSON_GetNumberValue(cJSON_GetArrayItem(arr, 0));
+                    (int16_t)jnum_at(arr, 0, 0);
                 s_clock_tab[s_clock_cnt].y =
-                    (int16_t)cJSON_GetNumberValue(cJSON_GetArrayItem(arr, 1));
+                    (int16_t)jnum_at(arr, 1, 0);
                 s_clock_cnt++;
             }
         }
@@ -436,13 +500,18 @@ static bool dl_chunk(void *ctx_, const char *data, size_t len)
     return c->head_ok || (c->head_len < sizeof(c->head));
 }
 
-/* FONT 包内 size_px（payload 首字节；文件偏移 = 32 头） */
+/* FONT 包内 size_px（payload 首字节；**文件偏移 = 信封头 40B** + payload 0）。
+ * 【2026-09-27 真机修复】旧代码读文件偏移 32 —— 那是信封里的 payload_len 低字节
+ * （16px 包读到 164、32px 读到 0、24px 读到 84）→ s_files[].font_px 恒为垃圾 →
+ * `asset_dl_font_path(16/24/32)` 全部匹配不上 → **三档字体从未被绑定**
+ * （真机日志里 "set_font px=… 开始" 一条都没有），气泡/列表/时钟只能退化。
+ * 校验（主机端对同一 mpk）：offset40 = 16 / 32 / 24 三个包各自正确。 */
 static uint8_t read_font_px(const char *path)
 {
     FILE *f = fopen(path, "rb");
     if (!f) return 0;
     uint8_t b[2] = { 0, 0 };
-    fseek(f, 32, SEEK_SET);
+    fseek(f, 40, SEEK_SET);               /* 40 字节信封头之后 = payload 首字节 */
     size_t r = fread(b, 1, 2, f);
     fclose(f);
     return (r == 2) ? b[0] : 0;
@@ -686,7 +755,7 @@ static void sync_once(void)
     cJSON *root = cJSON_Parse(resp);
     if (!root) return;
 
-    uint32_t rev = (uint32_t)cJSON_GetNumberValue(cJSON_GetObjectItem(root, "rev"));
+    uint32_t rev = (uint32_t)jnum(root, "rev", 0);
 
     xSemaphoreTake(s_lock, portMAX_DELAY);
 
@@ -708,9 +777,9 @@ static void sync_once(void)
                 strlcpy(s_clock_tab[s_clock_cnt].map_id, jm->string,
                         sizeof(s_clock_tab[0].map_id));
                 s_clock_tab[s_clock_cnt].x =
-                    (int16_t)cJSON_GetNumberValue(cJSON_GetArrayItem(xy, 0));
+                    (int16_t)jnum_at(xy, 0, 0);
                 s_clock_tab[s_clock_cnt].y =
-                    (int16_t)cJSON_GetNumberValue(cJSON_GetArrayItem(xy, 1));
+                    (int16_t)jnum_at(xy, 1, 0);
                 s_clock_cnt++;
             }
         }
@@ -1052,7 +1121,17 @@ bool asset_dl_map_path(const char *hash_or_null, char *path, size_t cap)
     for (int i = 0; i < s_file_cnt; i++) {
         if (strcasecmp(s_files[i].kind, "BGMAP") != 0) continue;
         if (hash_or_null) {
-            if (strcmp(s_files[i].hash, hash_or_null) == 0) { best = i; break; }
+            /* 【按地图 id 也能查到 2026-09-27】调用方有两种口径：
+             *   · state_machine 的 MP_CMD_SET_MAP 下发的是**地图 id**（"000010000"）；
+             *   · 菜单点选下发的是**内容 hash**。
+             * 旧实现只比 hash → 按 id 的查询恒失败（真机：无 TF 卡启动时
+             * "地图 000010000 路径查询失败" → 需求"没有 TF 卡就渲染默认地图"
+             * 静默不落地，屏幕永远纯黑底）。两种键都认。 */
+            if (strcmp(s_files[i].hash, hash_or_null) == 0 ||
+                (s_files[i].map_id[0] && strcmp(s_files[i].map_id, hash_or_null) == 0)) {
+                best = i;
+                break;
+            }
             continue;
         }
         /* NULL = 最近使用的 selector==map 地图（E7 最近+收藏） */
@@ -1078,8 +1157,15 @@ int asset_dl_map_strips(const char *bg_path,
     FILE *f = fopen(bg_path, "rb");
     if (!f) return -1;
 
+    /* 【偏移修正 2026-09-27】BGMAP payload 头 56B：map_id[32] vw/vh[4]
+     * static len/off[8] tile len/off[8] strip_count[4] → strip_count @ payload+52、
+     * strip[14B] @ payload+56。**文件偏移 = 信封头 40B + payload 偏移**
+     * （错算成 payload+52=84 时读到的是 tile_layer_len=489600 → 被 clamp 成
+     * max_strips=8 条，再按错位置解析出 8 个垃圾 part_ref）→ render_set_map 收到
+     * strip_count 不匹配直接返回 RENDER_ERR_ARG，默认地图永远装不上（真机：
+     * "strip count mismatch: bgmap=2 given=8"）。 */
     uint8_t sc[4] = { 0 };
-    fseek(f, 84, SEEK_SET);               /* strip_count @ payload+52 = 文件 84 */
+    fseek(f, 40 + 52, SEEK_SET);          /* strip_count @ payload+52 = 文件 92 */
     if (fread(sc, 1, 4, f) != 4) { fclose(f); return -1; }
     int count = (int)rd_le32(sc);
     if (count <= 0) { fclose(f); return 0; }
@@ -1087,7 +1173,7 @@ int asset_dl_map_strips(const char *bg_path,
 
     uint8_t sh[14];
     int got = 0;
-    fseek(f, 88, SEEK_SET);               /* strip[0] @ payload+56 = 文件 88 */
+    fseek(f, 40 + 56, SEEK_SET);          /* strip[0] @ payload+56 = 文件 96 */
     for (int i = 0; i < count; i++) {
         if (fread(sh, 1, sizeof(sh), f) != sizeof(sh)) break;
         uint64_t part_ref = rd_le64(sh);
@@ -1118,6 +1204,8 @@ int asset_dl_map_strips(const char *bg_path,
         got++;
     }
     fclose(f);
+    if (got != count)
+        ESP_LOGW(TAG, "BGMAP 条带解析：声明 %d 条，解析出 %d 条", count, got);
     return got;
 }
 

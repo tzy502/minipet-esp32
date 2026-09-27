@@ -21,6 +21,15 @@ public sealed class DeviceBgmPrefs
 {
     public string Source { get; set; } = "wz";
     public int Volume { get; set; } = 60;
+    /// <summary>
+    /// 最近一次「点播」的曲目（源内 key，WZ 源 = 库内相对路径）。
+    /// 【Web 点歌 2026-09-27】用户报障「页面 bgm 没有选择歌曲的地方」——曲库页新增点播按钮后，
+    /// 选中曲目落在这里，页面刷新/重进仍能显示「当前曲目」；设备端现场切歌会经
+    /// POST /api/device/bgm/cmd 回写覆盖（该端点已带 trackId）。
+    /// </summary>
+    public string? TrackId { get; set; }
+    /// <summary>点播曲名（展示用；避免页面为一行标题再拉一次全库）。</summary>
+    public string? TrackTitle { get; set; }
 }
 
 public sealed class DeviceRecord

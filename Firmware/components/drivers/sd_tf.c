@@ -24,7 +24,17 @@ static const char *TAG = "sd_tf";
 #define SD_SPI_HOST     SPI3_HOST    /* 显示在 SPI2_HOST，互不干扰 */
 #define SD_SPI_HZ       20000000     /* 20MHz：GPIO 矩阵 + 卡兼容性稳妥档 */
 #define SD_MOUNT_POINT  "/sdcard"
-#define SD_MAX_FILES    4            /* 内部堆紧张：4 足够 manifest+1 包并发 */
+/* 【同时打开文件数 2026-09-27】必须覆盖"常驻打开的素材包"：
+ *   时钟数字 PARTS(1) + 三档 FONT(3) + 纸娃娃 PARTS(1) + LAYOUT 循环/单次(≤2)
+ *   + 清单/下载瞬时(1~2) ≈ 9~10。
+ * 旧值 4 的来源是"manifest+1 包并发"这个早期假设——只对**下载**成立，对**渲染常驻**
+ * 不成立。当时没暴雷是因为字体压根没绑定成功（px 读错）；字体一修好，
+ * 真机立刻变成：`vfs_fat: open: no free file descriptors` →
+ * `mpak: open /sdcard/minipet/parts/… failed` → `本地素材加载失败` → FATAL 态
+ * + 渲染任务 TWDT 连续触发（人物整只消失，实体缓冲全 0）。
+ * 每个打开文件在内部堆上约 0.6~0.7KB（FIL + vfs 包装），12 个 ≈ 8KB；
+ * 每次开机都会打印内部堆水位（provision_dump_internal_heap）便于回归。 */
+#define SD_MAX_FILES    12
 
 /* TF 挂载失败时的兜底：内部 Flash 的 "assets" FAT 分区挂到同一 /sdcard
  * （出厂预置默认素材，无 TF 也能起播——design-review 3.11 出厂保底） */

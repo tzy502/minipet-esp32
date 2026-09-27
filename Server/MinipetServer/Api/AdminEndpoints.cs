@@ -330,10 +330,48 @@ public static class AdminEndpoints
                     return Results.Json(new { ok = true, seq = cmd.Seq, type, value = "source", n = body.N },
                         statusCode: 202);
                 }
+                // ── 点播指定曲目（Web 曲库行内「播放」按钮）─────────────────────
+                // 固件侧新增 v="track"（旧口径 n = 曲目数字 id，u32 位型；bgm.c
+                // MP_AUDIO_PLAY 的 a 即该 id → 走 /api/device/bgm/stream?id=… 取流）。
+                // 数字 id 口径与 AUDIO_META 曲目表一致：XxHash32(源内 key)。
+                if (bgmValue is "track" or "play-track" or "playtrack")
+                {
+                    var key = body?.TrackId?.Trim();
+                    if (string.IsNullOrWhiteSpace(key))
+                        return Results.Json(new
+                        {
+                            error = "bgm=track 需要 trackId（曲目源内 key，取自 GET /music/tracks 的 id 字段）"
+                        }, statusCode: 400);
+                    // 曲目所属音源（可选）：与设备当前音源不同则先补发一条 source 指令，
+                    // 否则点 QQ 曲目会拿 WZ 源的流去查 → 设备侧静默无动作（用户视角"点了没反应"）。
+                    var wantSrc = body?.Source?.Trim().ToLowerInvariant();
+                    var curSrc = reg.Get(id)?.Bgm?.Source ?? "wz";
+                    if (wantSrc is "wz" or "qq" && wantSrc != curSrc)
+                    {
+                        queue.EnqueueLegacy(id, "bgm", "source", wantSrc == "qq" ? 1 : 0);
+                        reg.Update(id, d => d.Bgm.Source = wantSrc);
+                        eventLog.Append(id, $"指令下发：bgm=source n={(wantSrc == "qq" ? 1 : 0)}（点播前切源）");
+                    }
+                    uint numId = unchecked((uint)MiniPet.Export.AudioMetaWriter.TrackIdForKey(key));
+                    var cmd = queue.EnqueueLegacy(id, "bgm", "track", unchecked((int)numId));
+                    reg.Update(id, d =>
+                    {
+                        d.Bgm.TrackId = key;
+                        d.Bgm.TrackTitle = body?.TrackTitle;
+                    });
+                    eventLog.Append(id,
+                        $"指令下发：bgm=track「{body?.TrackTitle ?? key}」trackId={key} 数字id={numId}");
+                    return Results.Json(new
+                    {
+                        ok = true, seq = cmd.Seq, type, value = "track",
+                        trackId = key, id = unchecked((int)numId)
+                    }, statusCode: 202);
+                }
                 return Results.Json(new
                 {
                     error = $"bgm 的 value 非法：{body?.Value}"
-                        + "（可用：play/pause/resume/stop/next/prev；音量 vol + n；音源 source + n）"
+                        + "（可用：play/pause/resume/stop/next/prev；音量 vol + n；音源 source + n；"
+                        + "点播 track + trackId）"
                 }, statusCode: 400);
             }
 
@@ -645,14 +683,23 @@ public static class AdminEndpoints
     /// 设备实时指令（POST /devices/{id}/command）：
     /// type = expression | action | bubble（用 Value）| brightness（用 N）| reboot |
     ///        bgm（Value = play|pause|resume|stop|next|prev；音量 Value=vol + N∈[0,100]；
-    ///             音源 Value=source + N∈{0,1}）。
-    /// 与固件 poller.c 的 payload 约定一一对应（bgm 的 vol/source 走旧口径 {t,v,n}），勿改字段语义。
+    ///             音源 Value=source + N∈{0,1}；点播 Value=track + TrackId（源内 key，
+    ///             服务端按 AUDIO_META 同口径 XxHash32 折算数字 id 下发）。
+    /// 与固件 poller.c 的 payload 约定一一对应（bgm 的 vol/source/track 走旧口径 {t,v,n}），勿改字段语义。
     /// </summary>
     public sealed class DeviceCommandRequest
     {
         public string? Type { get; set; }
         public string? Value { get; set; }
         public int? N { get; set; }
+        /// <summary>
+        /// 点播曲目（bgm + value=track）：源内 key（WZ 源 = /music/tracks 返回的 id 字段）。
+        /// 【Web 点歌 2026-09-27】用户报障「页面 bgm 没有选择歌曲的地方」——曲库行内点播按钮带本字段。
+        /// 服务端折算成 u32（XxHash32(key)，与设备 AUDIO_META 曲目表同口径）后以 JSON 数字发 n。
+        /// </summary>
+        public string? TrackId { get; set; }
+        /// <summary>点播曲名（可选，仅用于事件日志与设备偏好展示）。</summary>
+        public string? TrackTitle { get; set; }
     }
 
     public sealed class PresetUpsertRequest

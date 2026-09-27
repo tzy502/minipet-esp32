@@ -35,8 +35,12 @@ public sealed class DeviceCommand
         public string T { get; set; } = "";
         /// <summary>指令值（固件 v）：固件原样 strcmp——"vol" / "source"。</summary>
         public string? V { get; set; }
-        /// <summary>数值参数（固件 n）。</summary>
-        public int? N { get; set; }
+        /// <summary>
+        /// 数值参数（固件 n）。**long** 而非 int：曲目数字 id 是 u32（XxHash32 结果，
+        /// 近半数 ≥2^31，见 AudioMetaWriter.TrackIdForKey），int 存不下。固件侧
+        /// cJSON 以 double 读，4294967295 内精确；固件按 (int) 位型承载 u32。
+        /// </summary>
+        public long? N { get; set; }
     }
 
     /// <summary>
@@ -125,7 +129,7 @@ public sealed class CommandQueue
     /// 现代 {type,payload} 分支的 bgm 没有 vol/source 实现（详见 DeviceCommand.Legacy）。
     /// Type 仍记 "bgm"（队列持久化/事件日志可读），线上形状由 Legacy 决定。
     /// </summary>
-    public DeviceCommand EnqueueLegacy(string deviceId, string t, string v, int? n)
+    public DeviceCommand EnqueueLegacy(string deviceId, string t, string v, long? n)
     {
         var st = GetState(deviceId);
         lock (st.Gate)
