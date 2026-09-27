@@ -41,6 +41,11 @@ public static class BgmapPackWriter
         public byte RxParallax;
         /// <summary>混合强度（WZ alpha，255=不透明）。</summary>
         public byte Blend;
+        /// <summary>
+        /// 仅供导出端**层序重排**用的标识（不进 wire）：条带 = WZ 资源路径；
+        /// 静态烘焙段 = "seg:{首个 back id}"。设备端不感知（BgmapPackWriter.Build 不写它）。
+        /// </summary>
+        public string Label = "";
     }
 
     public sealed class BgmapInput

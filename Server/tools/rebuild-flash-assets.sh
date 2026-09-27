@@ -91,8 +91,9 @@ for h, v in mf['assets'].items():
 files = []
 for h, v in mf['assets'].items():
     item = {'hash': h, 'kind': v['kind'], 'bytes': int(v.get('bytes') or 0), 'fav': False, 'ts': 0}
+    # origin：LAYOUT 条目的画布内 body 锚点（固件"origin 与屏幕中点重合"摆放用）
     for src, dst in (('label', 'label'), ('action', 'action'), ('entity', 'entity'),
-                     ('map', 'map'), ('selector', 'selector')):
+                     ('map', 'map'), ('selector', 'selector'), ('origin', 'origin')):
         if v.get(src):
             item[dst] = v[src]
     files.append(item)

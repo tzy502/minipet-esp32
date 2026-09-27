@@ -111,6 +111,11 @@ static int32_t   g_ent_base_wx, g_ent_base_wy;   /* 世界 1x 附加偏移（默
  * piece 联合包围盒现算）。绑定 parts+layout 后懒计算一次。 */
 static bool    g_ent_cbox_ok;
 static int32_t g_ent_cx0, g_ent_cy0;       /* 联合包围盒左上（世界 1x） */
+/* 画布内 body 锚点（= 桌面 PaperdollService.RenderFrame 返回的 origin，
+ * manifest LAYOUT 条目 origin=[x,y] 下发；缺省 0,0 = 旧摆放行为）。
+ * 摆放契约：**画布左上角屏幕坐标 = 屏心 - origin×scale** ⇒ origin 恒在屏心，
+ * 换动作/换画布尺寸时人物不跳（桌面侧靠"窗口位置 -= Δorigin"达到同一效果）。 */
+static int32_t g_ent_ox, g_ent_oy;
 static int32_t g_ent_cw,  g_ent_ch;        /* 联合包围盒宽高（世界 1x，已 clamp 到缓冲） */
 
 static mpak_t g_parts;   static bool g_parts_ok;
@@ -138,6 +143,13 @@ static bool g_pc_cap_logged;
  * 全等 ⇒ 交给 panel 的字节完全正确，故障必在面板同步/时序；
  * 不等 ⇒ blit 源行/列错位（"头部缺一块"的候选）。 */
 static int s_forensic_chunks;
+
+/* 拖影自检开关（排障置 1；见 ghost_probe 定义处注释） */
+#define MP_GHOST_PROBE 1
+
+/* 拖拽上下限自检（开机跑一次，打印极限位置；排障用） */
+#define MP_DRAG_LIMIT_SELFTEST 1
+
 
 /* 气泡 */
 static struct { bool active; uint16_t *px; int32_t w, h, x, y; } g_bub;
@@ -240,16 +252,19 @@ static const char *const RC_OV_LABELS[RC_OV_ITEMS] = {
 /* 光标切换（侧键/触摸） */
 void render_bgm_bar_nav(int dir)
 {
-    if (!g_ov_on) return;
+    rc_lock();
+    if (!g_ov_on) { rc_unlock(); return; }
     g_ov_sel = (g_ov_sel + (dir > 0 ? 1 : RC_OV_ITEMS - 1)) % RC_OV_ITEMS;
     g_ov_expire_us = esp_timer_get_time() + (int64_t)RC_OV_AUTO_HIDE_MS * 1000;
     mark_rect(0, g_sh - RC_OV_H, g_sw, RC_OV_H);
+    rc_unlock();
 }
 
 /** 执行第 idx 个控件（触摸点选与顶键确认共用）。 */
 void render_bgm_bar_activate(int idx)
 {
-    if (!g_ov_on || idx < 0 || idx >= RC_OV_ITEMS) return;
+    rc_lock();
+    if (!g_ov_on || idx < 0 || idx >= RC_OV_ITEMS) { rc_unlock(); return; }
     g_ov_sel = idx;
     switch (idx) {
     case 0: {
@@ -282,12 +297,14 @@ void render_bgm_bar_activate(int idx)
     g_ov_cmd_until_us = esp_timer_get_time() + 1200000;   /* 回显 1.2s */
     g_ov_expire_us    = esp_timer_get_time() + (int64_t)RC_OV_AUTO_HIDE_MS * 1000;
     mark_rect(0, g_sh - RC_OV_H, g_sw, RC_OV_H);
+    rc_unlock();
 }
 
 /** 呼出半屏控制条（宠物区长按 / 选择器 BGM 入口）。 */
 void render_bgm_bar_show(void)
 {
-    if (!g_inited) return;
+    rc_lock();
+    if (!g_inited) { rc_unlock(); return; }
     if (!g_ov_on) {
         g_ov_sel = 0;
         ESP_LOGI("bgmbar", "半屏控制条呼出（上半屏仍显示宠物，高 %dpx）", RC_OV_H);
@@ -302,14 +319,17 @@ void render_bgm_bar_show(void)
     strlcpy(g_ov_title, bgm_current_title(), sizeof(g_ov_title));
     g_ov_expire_us = esp_timer_get_time() + (int64_t)RC_OV_AUTO_HIDE_MS * 1000;
     mark_rect(0, g_sh - RC_OV_H, g_sw, RC_OV_H);
+    rc_unlock();
 }
 
 void render_bgm_bar_hide(void)
 {
-    if (!g_ov_on) return;
+    rc_lock();
+    if (!g_ov_on) { rc_unlock(); return; }
     g_ov_on = false;
     ESP_LOGI("bgmbar", "控制条收起");
     mark_rect(0, g_sh - RC_OV_H, g_sw, RC_OV_H);
+    rc_unlock();
 }
 
 bool render_bgm_bar_showing(void) { return g_ov_on; }
@@ -500,10 +520,10 @@ static void drag_clamp(int32_t *px, int32_t *py)
     ent_disp_size(&dw, &dh);
     if (dw <= 0 || dh <= 0) return;              /* 画布未就绪：不限制 */
     /* 未加 drag 时的基准（与 ent_screen_pos_at 同源，含 tilt 与 base 偏移） */
-    int32_t base_x = g_sw / 2 - g_ent_cx0 * RC_SCALE + RC_ENT_CENTER_OFF_X
+    int32_t base_x = g_sw / 2 - (g_ent_ox - g_ent_cx0) * RC_SCALE + RC_ENT_CENTER_OFF_X
                      + (g_ent_base_wx << RC_SCALE_SHIFT)
                      + ent_tilt_off_px(g_tilt_mdeg);
-    int32_t base_y = g_sh / 2 - g_ent_cy0 * RC_SCALE + RC_ENT_CENTER_OFF_Y
+    int32_t base_y = g_sh / 2 - (g_ent_oy - g_ent_cy0) * RC_SCALE + RC_ENT_CENTER_OFF_Y
                      + (g_ent_base_wy << RC_SCALE_SHIFT);
     if (px) {
         int32_t lo = -base_x, hi = g_sw - dw - base_x;
@@ -512,7 +532,17 @@ static void drag_clamp(int32_t *px, int32_t *py)
         if (*px > hi) *px = hi;
     }
     if (py) {
-        int32_t lo = -base_y, hi = g_sh - dh - base_y;
+        /* 【拖动下限 = 屏幕最底 2026-09-27】用户报障"人物没法拖到屏幕最底下"。
+         * 旧口径按**画布矩形**夹取：画布底边贴屏底 ⇒ 脚底仍在屏底之上
+         * （stand1 画布 84 高、脚底约在 73 ⇒ 悬空 ~22px，被武器/法杖的下缘占满）。
+         * 现改为**按 body 锚点(origin)夹取**：
+         *   · 下界 hi：锚点贴屏幕最底（脚底正好踩在屏底，武器若更长则自然裁掉）；
+         *   · 上界 lo：仍让画布顶边不越屏顶（不许把整只宠物拖出画面）。
+         * 锚点的屏幕 y 恒 = 屏心 + drag（见 ent_screen_pos_at）→ 数值上就是
+         * drag_y ∈ [-(base_y), g_sh - anchor_off - base_y]，可被启动自检打印核对。 */
+        int32_t anchor_off = (g_ent_oy - g_ent_cy0) * RC_SCALE;   /* 锚点在显示矩形内的 y */
+        int32_t lo = -base_y;
+        int32_t hi = g_sh - anchor_off - base_y;
         if (hi < lo) hi = lo;
         if (*py < lo) *py = lo;
         if (*py > hi) *py = hi;
@@ -521,16 +551,22 @@ static void drag_clamp(int32_t *px, int32_t *py)
 
 void render_set_drag_off(int32_t px)
 {
+    /* 与 render_tick 的"标脏→合成→上屏"互斥：否则标脏用的是旧位置、合成读到的
+     * 却是新位置 → 差集区域永久残留（真机拖影自检实证：手指一按就开始报残留）。 */
+    rc_lock();
     drag_clamp(&px, NULL);
     g_drag_off_x = px;
+    rc_unlock();
 }
 
 int32_t render_get_drag_off(void) { return g_drag_off_x; }
 
 void render_set_drag_off_y(int32_t py)
 {
+    rc_lock();
     drag_clamp(NULL, &py);
     g_drag_off_y = py;
+    rc_unlock();
 }
 
 int32_t render_get_drag_off_y(void) { return g_drag_off_y; }
@@ -538,9 +574,11 @@ int32_t render_get_drag_off_y(void) { return g_drag_off_y; }
 /* 【校准模式】红线=固件认为的底边(y=440)+竖直中线(x=240)；白点=最近触摸落点 */
 void render_calib_set(bool on, int16_t tx, int16_t ty)
 {
+    rc_lock();
     g_calib_on = on;
     if (tx >= 0) { g_calib_touch_x = tx; g_calib_touch_y = ty; }
     mark_rect(0, 0, g_sw, g_sh);             /* 叠加层变化 → 全屏重绘 */
+    rc_unlock();
 }
 
 /* 实体缓冲 → 屏幕摆放（问题2 修复）：
@@ -571,10 +609,12 @@ static void ent_screen_pos_at(int32_t tilt_mdeg, int32_t *sx, int32_t *sy)
     int32_t drag_x = g_ent_cbox_ok ? g_drag_off_x : 0;
     int32_t drag_y = g_ent_cbox_ok ? g_drag_off_y : 0;
 
-    *sx = g_sw / 2 - g_ent_cx0 * RC_SCALE + RC_ENT_CENTER_OFF_X
+    /* 锚点在缓冲内的位置 = (origin - 画布左上)×scale；把它钉到屏心 ⇒
+     * 缓冲左上角屏幕坐标 = 屏心 - (origin - 画布左上)×scale。 */
+    *sx = g_sw / 2 - (g_ent_ox - g_ent_cx0) * RC_SCALE + RC_ENT_CENTER_OFF_X
           + (g_ent_base_wx << RC_SCALE_SHIFT) + ent_tilt_off_px(tilt_mdeg)
           + drag_x;
-    *sy = g_sh / 2 - g_ent_cy0 * RC_SCALE + RC_ENT_CENTER_OFF_Y
+    *sy = g_sh / 2 - (g_ent_oy - g_ent_cy0) * RC_SCALE + RC_ENT_CENTER_OFF_Y
           + (g_ent_base_wy << RC_SCALE_SHIFT) + drag_y;
 }
 
@@ -823,6 +863,17 @@ static void ent_canvas_update(void)
     g_ent_cw = cw;
     g_ent_ch = ch;
     g_ent_cbox_ok = true;
+    /* 画布内 body 锚点：从清单里按动作名取（桌面 RenderFrame 的 origin 同口径）。
+     * 缺字段（旧清单/未下发）→ 0,0，等价于"画布左上角对齐屏心"的旧行为。 */
+    {
+        extern bool asset_dl_layout_origin(const char *action, int16_t *x, int16_t *y);
+        int16_t ox = 0, oy = 0;
+        if (asset_dl_layout_origin(lt->action, &ox, &oy)) {
+            g_ent_ox = ox; g_ent_oy = oy;
+        } else {
+            g_ent_ox = 0; g_ent_oy = 0;
+        }
+    }
     /* 画布尺寸/原点变了 → 旧 drag 偏移可能已把人物顶出屏（换动作/换装后
      * 尺寸不同）：按新尺寸重新夹取，保证任何时刻都整只留在屏内。 */
     {
@@ -936,6 +987,8 @@ static void recompose_entity_locked(void)
                      (int)g_ent_cx0, (int)g_ent_cy0, (int)g_ent_cw, (int)g_ent_ch,
                      (int)pex, (int)pey, (int)pdw, (int)pdh, (int)g_tilt_mdeg,
                      (int)g_drag_off_x, (int)g_drag_off_y);
+            ESP_LOGW(TAG, "实体锚点：origin=(%d,%d) 屏心=(%d,%d)（画布左上=屏心-origin×2）",
+                     (int)g_ent_ox, (int)g_ent_oy, (int)g_sw / 2, (int)g_sh / 2);
         }
     }
     /* 帧内 piece 列表顺序 = 权威绘制序（导出端按桌面 RenderFrame 底→顶排列：
@@ -1758,9 +1811,110 @@ int render_init(const minipet_profile_t *profile)
 
     g_inited = true;
     full_recompose();   /* 黑底首帧 + hash 基线 + 全幅上屏 */
+    /* 【拖拽极限自检 2026-09-27】用户要求核对"屏幕最底"与"拖动最低点"是否同一高度。
+     * 这里把 drag 分别推到上下极限，打印：显示矩形（画布矩形）屏幕范围 + 锚点屏幕 y
+     * + 屏幕底边，跑完复位。数字对得上就说明脚底正好踩屏底。 */
+
     ESP_LOGI(TAG, "render_init ok %dx%d", (int)g_sw, (int)g_sh);
     return RENDER_OK;
 }
+
+/* ══ 【拖影自检 2026-09-27】══════════════════════════════════════════════════
+ * 用户报障"人物有拖影/双影"。脏区机制只要漏标一次，旧像素就会永久留在 AMOLED 上
+ * ——肉眼极明显、但日志里什么都看不到。这里给出**可回归的硬判据**：
+ *   把整屏重新合成到影子缓冲（g_fb 指针临时切过去），再与"线上"g_fb 逐像素比对：
+ *   差异像素 = 脏区漏标留下的陈旧内容（真实拖影），打 WARN + 包围盒。
+ * 1s 一次；MP_GHOST_PROBE=1 时启用（排障用，常态关）。 */
+#if MP_GHOST_PROBE
+static uint16_t *g_shadow;
+static bool ghost_probe(void)
+{
+    if (!g_shadow) {
+        g_shadow = psram((size_t)g_sw * g_sh * 2u);
+        if (!g_shadow) return true;                 /* 分配失败：跳过检查 */
+    }
+    uint16_t *saved = g_fb;
+    g_fb = g_shadow;
+    compose_region(0, 0, g_sw, g_sh);
+    g_fb = saved;
+    uint32_t diff = 0;
+    int32_t x0 = 99999, y0 = 99999, x1 = -1, y1 = -1;
+    for (int32_t r = 0; r < g_sh; r++) {
+        /* 条带（地图视差）按时间滚动，两次合成之间 offset 可能差 1px —— 那属于
+         * 设计行为不是拖影。整条带行排除（`滚动的条带` 与 `漏标残留` 必须分开）。 */
+        bool in_strip = false;
+        for (int i = 0; i < g_strip_n; i++) {
+            if (!g_strips[i].ok) continue;
+            int32_t y0s = (int32_t)g_strips[i].y << RC_SCALE_SHIFT;
+            int32_t y1s = y0s + ((int32_t)g_strips[i].h << RC_SCALE_SHIFT);
+            if (r >= y0s && r < y1s) { in_strip = true; break; }
+        }
+        if (in_strip) continue;
+        const uint16_t *a = g_fb + (size_t)r * g_sw;
+        const uint16_t *b = g_shadow + (size_t)r * g_sw;
+        for (int32_t c = 0; c < g_sw; c++) {
+            if (a[c] == b[c]) continue;
+            diff++;
+            if (c < x0) x0 = c;
+            if (c > x1) x1 = c;
+            if (r < y0) y0 = r;
+            if (r > y1) y1 = r;
+        }
+    }
+    if (diff) {
+        ESP_LOGW(TAG, "拖影自检：线上帧与重合成基准差 %u px bbox=(%d,%d)-(%d,%d) "
+                      "（脏区漏标残留）", (unsigned)diff, (int)x0, (int)y0, (int)x1, (int)y1);
+        /* 残留形状取证（前 2 次）：8×8 块打点图，'#'=线上≠基准。 */
+        static int s_dump_n;
+        if (s_dump_n < 2) {
+            s_dump_n++;
+            for (int32_t by = (y0 / 8) * 8; by <= y1 && by < g_sh; by += 8) {
+                char line[64];
+                int n = 0;
+                for (int32_t bx = 0; bx < g_sw && n < 60; bx += 8) {
+                    bool any = false;
+                    for (int32_t r = by; r < by + 8 && r < g_sh && !any; r++) {
+                        const uint16_t *a = g_fb + (size_t)r * g_sw;
+                        const uint16_t *b = g_shadow + (size_t)r * g_sw;
+                        for (int32_t c = bx; c < bx + 8 && c < g_sw; c++)
+                            if (a[c] != b[c]) { any = true; break; }
+                    }
+                    line[n++] = any ? '#' : '.';
+                }
+                line[n] = 0;
+                ESP_LOGW(TAG, "拖影形状 y=%03d |%s|", (int)by, line);
+            }
+        }
+        return false;
+    }
+    return true;
+}
+#endif
+
+#if MP_DRAG_LIMIT_SELFTEST
+/* 【拖拽极限自检 2026-09-27】用户要求核对"屏幕最底"与"拖动最低点"是否同一高度。
+ * 把 drag 推到上下极限，打印画布矩形屏幕范围 + 锚点屏幕 y + 屏底，跑完复位。
+ * 必须等画布就绪（g_ent_cbox_ok）——否则 ent_disp_size()=0，夹取会提前返回。 */
+static void drag_limit_selftest(void)
+{
+    int32_t keep_x = g_drag_off_x, keep_y = g_drag_off_y;
+    int32_t bx, by, ex, ey, dw, dh;
+    render_set_drag_off_y(-100000);
+    ent_screen_rect_at(g_tilt_mdeg, &bx, &by, &ex, &ey, &dw, &dh);
+    int32_t anchor_top = by + (g_ent_oy - g_ent_cy0) * RC_SCALE;
+    ESP_LOGW(TAG, "拖拽极限自检 上界：drag_y=%d 画布 y=%d..%d 锚点屏 y=%d（屏顶=0）",
+             (int)g_drag_off_y, (int)by, (int)(by + dh * 0 + (dh ? dh : 0)), (int)anchor_top);
+    render_set_drag_off_y(100000);
+    ent_screen_rect_at(g_tilt_mdeg, &bx, &by, &ex, &ey, &dw, &dh);
+    int32_t anchor_bot = by + (g_ent_oy - g_ent_cy0) * RC_SCALE;
+    ESP_LOGW(TAG, "拖拽极限自检 下界：drag_y=%d 画布 y=%d..%d 锚点屏 y=%d（屏底=%d）→ %s",
+             (int)g_drag_off_y, (int)by, (int)(by + (g_ent_cy0 ? 0 : 0) + (dh ? dh : 0)),
+             (int)anchor_bot, (int)g_sh,
+             anchor_bot == g_sh ? "锚点/脚底正好踩在屏幕最底 ✓" : "与屏底不一致 ✗");
+    g_drag_off_x = keep_x;
+    g_drag_off_y = keep_y;
+}
+#endif
 
 void render_tick(void)
 {
@@ -1802,6 +1956,16 @@ void render_tick(void)
         }
         return;
     }
+
+#if MP_DRAG_LIMIT_SELFTEST
+    {
+        static bool s_drag_selftest_done;
+        if (!s_drag_selftest_done && g_ent_cbox_ok) {
+            s_drag_selftest_done = true;
+            drag_limit_selftest();
+        }
+    }
+#endif
 
     bool any = false;
 
@@ -1940,6 +2104,18 @@ void render_tick(void)
      * 无感）。有脏区的帧不受影响，动画流畅度不变。 */
 
     if (any) flush_dirty();
+
+#if MP_GHOST_PROBE
+    /* 拖影自检：1s 一次（重合成整屏有成本，别每帧做） */
+    {
+        static int64_t s_gp_ms;
+        int64_t now_ms = esp_timer_get_time() / 1000;
+        if (now_ms - s_gp_ms > 1000) {
+            s_gp_ms = now_ms;
+            ghost_probe();
+        }
+    }
+#endif
 
     /* ENTPOS 探针已移除（诊断期结束） */
 
@@ -2115,10 +2291,12 @@ static int render_set_map_nolock(const char *bgmap_path,
 void render_set_entity_pos(int16_t world_x, int16_t world_y)
 {
     if (!g_inited) return;
+    rc_lock();
     mark_ent();
     g_ent_base_wx = world_x;
     g_ent_base_wy = world_y;
     mark_ent();
+    rc_unlock();
 }
 
 static int render_set_clock_nolock(const char *fonttime_parts_path,
@@ -2220,11 +2398,12 @@ static int bubble_render_fallback(const char *text, uint16_t *buf,
 int render_bubble_show(const char *text, render_font_t font)
 {
     if (!g_inited) return RENDER_ERR_STATE;
-    if (g_menu) return RENDER_ERR_STATE;
-    if (!text || !text[0]) { render_bubble_hide(); return RENDER_OK; }
+    rc_lock();
+    if (g_menu) { rc_unlock(); return RENDER_ERR_STATE; }
+    if (!text || !text[0]) { render_bubble_hide(); rc_unlock(); return RENDER_OK; }
 
     uint16_t *buf = psram((size_t)RC_BUBBLE_MAX_W * RC_BUBBLE_MAX_H * 2u);
-    if (!buf) return RENDER_ERR_NOMEM;
+    if (!buf) { rc_unlock(); return RENDER_ERR_NOMEM; }
 
     int32_t bw = 0, bh = 0;
     int rc = bridge_bubble_render(text, (int)font, buf, RC_BUBBLE_MAX_W,
@@ -2233,6 +2412,7 @@ int render_bubble_show(const char *text, render_font_t font)
         rc = bubble_render_fallback(text, buf, RC_BUBBLE_MAX_W, RC_BUBBLE_MAX_H, &bw, &bh);
         if (rc != RENDER_OK) {
             heap_caps_free(buf);
+            rc_unlock();
             return rc;
         }
         ESP_LOGW(TAG, "气泡走内置 5x7 兜底（桥接字体缺失）");
@@ -2260,16 +2440,19 @@ int render_bubble_show(const char *text, render_font_t font)
     g_bub.y = by;
 
     mark_rect(bx, by, bw, bh);
+    rc_unlock();
     return RENDER_OK;
 }
 
 void render_bubble_hide(void)
 {
     if (!g_inited || !g_bub.active) return;
+    rc_lock();
     mark_rect(g_bub.x, g_bub.y, g_bub.w, g_bub.h);
     heap_caps_free(g_bub.px);
     g_bub.px = NULL;
     g_bub.active = false;
+    rc_unlock();
 }
 
 /* ---------------- 未配网常驻横幅（问题4） ----------------
@@ -2278,22 +2461,26 @@ void render_bubble_hide(void)
 
 int render_banner_show(const char *text)
 {
-    if (!g_inited) return RENDER_ERR_STATE;
+    rc_lock();
+    if (!g_inited) { rc_unlock(); return RENDER_ERR_STATE; }
     if (g_banner_on) mark_rect(0, RC_BANNER_Y, g_sw, RC_BANNER_H);
     g_banner_on = true;
     g_banner_expire_us = 0;    /* 常驻：清定时横幅计时，防 show_for 残留到期误隐藏配网横幅 */
     g_banner_text[0] = 0;
     if (text) strlcpy(g_banner_text, text, sizeof(g_banner_text));
     mark_rect(0, RC_BANNER_Y, g_sw, RC_BANNER_H);
+    rc_unlock();
     return RENDER_OK;
 }
 
 void render_banner_hide(void)
 {
     if (!g_inited || !g_banner_on) return;
+    rc_lock();
     g_banner_on = false;
     g_banner_expire_us = 0;
     mark_rect(0, RC_BANNER_Y, g_sw, RC_BANNER_H);
+    rc_unlock();
 }
 
 /* 定时横幅（输入层 VOL± 反馈）：显示 text 并在 duration_ms 后由 render_tick
@@ -2301,9 +2488,11 @@ void render_banner_hide(void)
  * 常驻横幅（配网）仍走 render_banner_show（内部清到期时刻，不受定时影响）。 */
 int render_banner_show_for(const char *text, uint32_t duration_ms)
 {
-    int rc = render_banner_show(text);
-    if (rc != RENDER_OK) return rc;
+    rc_lock();
+    int rc = render_banner_show(text);      /* 递归锁：同任务嵌套安全 */
+    if (rc != RENDER_OK) { rc_unlock(); return rc; }
     g_banner_expire_us = esp_timer_get_time() + (int64_t)duration_ms * 1000;
+    rc_unlock();
     return rc;
 }
 
@@ -2311,6 +2500,7 @@ void render_input_tilt(float tilt_deg)
 {
     if (tilt_deg > 8.0f) tilt_deg = 8.0f;
     if (tilt_deg < -8.0f) tilt_deg = -8.0f;
+    rc_lock();
     g_tilt_mdeg = (int32_t)(tilt_deg * 1000.0f);   /* 对齐 32bit 原子写 */
     /* tilt 视差（±8px）改变实体基准 → 重新夹取拖拽偏移，防倾斜时被边缘裁切 */
     {
@@ -2318,6 +2508,7 @@ void render_input_tilt(float tilt_deg)
         drag_clamp(&dx, &dy);
         g_drag_off_x = dx; g_drag_off_y = dy;
     }
+    rc_unlock();
 }
 
 /*

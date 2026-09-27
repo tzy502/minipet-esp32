@@ -55,6 +55,11 @@ bool asset_dl_parts_path(const char *entity_or_null, char *path, size_t cap);
 /* FONT：size_px = 16/24/32（包内首字节识别，下载时登记） */
 bool asset_dl_font_path(int size_px, char *path, size_t cap);
 
+/* LAYOUT 条目的画布内 body 锚点（origin，桌面 RenderFrame 同口径）：
+ * 摆放 = 画布左上角对齐「屏心 - origin×scale」⇒ origin 恒在屏心。
+ * 返回 false = 清单里没有该动作/没有 origin 字段（调用方回退 0,0）。 */
+bool asset_dl_layout_origin(const char *action, int16_t *out_x, int16_t *out_y);
+
 /* fontTime 时钟数字 PARTS（selector == "clock"，E9/七.5） */
 bool asset_dl_fonttime_path(char *path, size_t cap);
 

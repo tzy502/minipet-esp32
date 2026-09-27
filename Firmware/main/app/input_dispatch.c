@@ -707,10 +707,14 @@ static void touch_tick(void)
             return;
         }
         int dx = (int)f.x - (int)down_x;
-        /* 问题6：按住并水平拖动（≥TAP_MOVE_PX）→ 倾斜视差同款效果：
-         * dx ±60px 线性映射 ±8°（render_input_tilt 内部再 clamp），
-         * 条带视差 + 实体 ±8px 偏移与 IMU 倾斜共用一条通路 */
-        if (!drag_active && !longpress_fired && abs(dx) >= TAP_MOVE_PX) {
+        int dy = (int)f.y - (int)down_y;
+        /* 【拖拽判定补垂直方向 2026-09-27】用户报障「人物没法拖到屏幕最底下」：
+         * 此前起拖判据只看**水平**位移（`abs(dx) >= TAP_MOVE_PX`）——竖直向下拖
+         * （dx≈0、|dy| 很大）永远进不了 drag_active，手势被当成轻点/长按，
+         * 于是"往下拖不动"。现改为任一轴超阈值即起拖；
+         * 跟手定位本来就是二维绝对定位（f.x/f.y - 屏心），无需额外改动。 */
+        if (!drag_active && !longpress_fired &&
+            (abs(dx) >= TAP_MOVE_PX || abs(dy) >= TAP_MOVE_PX)) {
             drag_active = true;
         }
         if (drag_active) {

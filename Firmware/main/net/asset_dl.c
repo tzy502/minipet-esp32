@@ -50,6 +50,7 @@ typedef struct {
     char     entity[40];      /* LAYOUT/PARTS：如 "paperdoll:default" */
     char     map_id[32];      /* BGMAP：地图 id */
     char     selector[12];    /* map/paperdoll/npc/clock（无则空） */
+    int16_t  origin_x, origin_y; /* LAYOUT：画布内 body 锚点（桌面 RenderFrame 同口径，1x） */
     uint8_t  font_px;         /* FONT：16/24/32 */
     char     label[32];       /* 服务端 manifest label（选择器显示名） */
     uint32_t bytes;
@@ -316,6 +317,17 @@ static void load_local_manifest(void)
                 strlcpy(lf->selector, s, sizeof(lf->selector));
             if ((s = cJSON_GetStringValue(cJSON_GetObjectItem(jf, "label"))))
                 strlcpy(lf->label, s, sizeof(lf->label));
+            /* 【锚点 2026-09-27】LAYOUT 条目的 origin=[x,y]（画布内 body 锚点）。
+             * 旧固件只拿到 bounds（画布尺寸），摆放只能退化成"画布左上角对齐屏心"，
+             * 与"origin 与屏幕中点重合"差 origin×2 px，且换动作时锚点漂移 → 人物跳。
+             * 缺字段/旧清单 → 0,0（= 旧行为，不会崩）。 */
+            {
+                const cJSON *jo = cJSON_GetObjectItem(jf, "origin");
+                if (jo && cJSON_IsArray(jo)) {
+                    lf->origin_x = (int16_t)jnum_at(jo, 0, 0);
+                    lf->origin_y = (int16_t)jnum_at(jo, 1, 0);
+                }
+            }
             lf->font_px = (uint8_t)jnum(jf, "px", 0);
             /* 【字体档位兜底 2026-09-27】服务端清单的 FONT 条目**不带 px** 字段
              * （只有 hash/kind/bytes/url/label）→ 本地已有素材的 font_px 恒为 0 →
@@ -405,6 +417,15 @@ static void save_local_manifest_locked(void)
         if (s_files[i].map_id[0])   cJSON_AddStringToObject(jf, "map", s_files[i].map_id);
         if (s_files[i].selector[0]) cJSON_AddStringToObject(jf, "selector", s_files[i].selector);
         if (s_files[i].font_px)     cJSON_AddNumberToObject(jf, "px", s_files[i].font_px);
+        /* 【origin 必须回写 2026-09-27】LAYOUT 的 origin（画布内 body 锚点）由清单下发；
+         * 固件在同步后会**重写本地清单**，此前不写 origin ⇒ 字段被抹掉、下次开机
+         * 摆放退回"画布左上角对齐屏心"（真机实测：锚点探针打印 origin=(0,0)）。
+         * 只在非零时写（(0,0) 即默认值，写了也不影响，但少一个字段更干净）。 */
+        if (s_files[i].origin_x || s_files[i].origin_y) {
+            cJSON *jo = cJSON_AddArrayToObject(jf, "origin");
+            cJSON_AddItemToArray(jo, cJSON_CreateNumber(s_files[i].origin_x));
+            cJSON_AddItemToArray(jo, cJSON_CreateNumber(s_files[i].origin_y));
+        }
         cJSON_AddNumberToObject(jf, "bytes", s_files[i].bytes);
         cJSON_AddBoolToObject(jf, "fav", s_files[i].fav);
         cJSON_AddNumberToObject(jf, "ts", (double)s_files[i].last_used_ms);
@@ -1076,6 +1097,26 @@ bool asset_dl_parts_path(const char *entity_or_null, char *path, size_t cap)
         const char *dir = kind_dir("PARTS");
         snprintf(path, cap, "%s/%s.mpk", dir, s_files[fallback].hash);
         ok = true;
+    }
+    xSemaphoreGive(s_lock);
+    return ok;
+}
+
+/* LAYOUT 条目的画布内 body 锚点（origin）：按动作名查询。
+ * 供合成器摆放用（画布左上角 = 屏心 - origin×scale ⇒ origin 恒在屏心）。
+ * 返回 false = 清单无该动作/无 origin 字段（回退 0,0 = 旧摆放行为）。 */
+bool asset_dl_layout_origin(const char *action, int16_t *out_x, int16_t *out_y)
+{
+    if (!action || !action[0]) return false;
+    bool ok = false;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    for (int i = 0; i < s_file_cnt; i++) {
+        if (strcasecmp(s_files[i].kind, "LAYOUT") != 0) continue;
+        if (strcmp(s_files[i].action, action) != 0) continue;
+        if (out_x) *out_x = s_files[i].origin_x;
+        if (out_y) *out_y = s_files[i].origin_y;
+        ok = true;
+        break;
     }
     xSemaphoreGive(s_lock);
     return ok;

@@ -267,6 +267,15 @@ public sealed class AssetExporter
         public Dictionary<string, byte[]> Layouts = new(StringComparer.Ordinal);
         /// <summary>动作 → 画布联合包围盒 [w,h]（1x 像素；manifest LAYOUT 条目 "bounds"，契约见类头注释）。</summary>
         public Dictionary<string, int[]> LayoutBounds = new(StringComparer.Ordinal);
+        /// <summary>
+        /// 动作 → 画布内 body 锚点（origin）坐标 [x,y]（1x 像素）。
+        /// 与桌面 `PaperdollService.RenderFrame` 的返回值**同口径**：
+        /// `origin = (Flip ? W + bounds.Left : -bounds.Left, -bounds.Top)`（未翻转时）。
+        /// 设备端摆放契约（对齐桌面"锚点不动、窗口跟着 origin 补偿"）：
+        /// **画布左上角屏幕坐标 = 屏心 - origin × scale**，于是 origin 恒在屏心，
+        /// 换动作/换画布尺寸时人物不会跳。
+        /// </summary>
+        public Dictionary<string, int[]> LayoutOrigins = new(StringComparer.Ordinal);
         public string AppearanceHash = "";
         public List<string> SkippedActions = new();
     }
@@ -294,6 +303,14 @@ public sealed class AssetExporter
             };
             if (core.LayoutBounds.TryGetValue(action, out var bounds))
                 extra["bounds"] = bounds; // [w,h] 画布联合包围盒（1x 像素，契约见类头注释）
+            /* 【锚点下发 2026-09-27】origin = 画布内 body 锚点（桌面 RenderFrame 同口径）。
+             * 设备端只靠 bounds 无法还原锚点位置，于是"origin 与屏幕中点重合"这条需求
+             * 只能退化成"画布左上角对齐屏心"（差 origin×2 px，人物整体偏右下）。
+             * 这里把 origin 随 LAYOUT 条目一起下发；固件读不到时回退 (0,0) 即旧行为。 */
+            if (core.LayoutOrigins.TryGetValue(action, out var origin))
+                extra["origin"] = origin;
+            Console.WriteLine($"[AssetExporter]   LAYOUT {action}: bounds={string.Join('x', bounds ?? new[] { 0, 0 })} "
+                              + $"origin={string.Join(',', origin ?? new[] { 0, 0 })}（画布内 body 锚点，1x）");
             /* 【E1 缺口补齐 2026-09-27】需求原文：「480 屏部件 1x + scale 2x nearest
              * 由导出器标注」。此前该标注只存在于 PlacementMath 的编译期常量里，
              * manifest 不含任何缩放信息 —— 缺口核对记为"E1 未实现项"。
@@ -467,6 +484,10 @@ public sealed class AssetExporter
             });
             // 画布联合包围盒（RunPipeline 的 bounds = GetBounds(hash, a, action)，跨帧共用同一张画布）
             result.LayoutBounds[action] = new[] { boundsLast.W, boundsLast.H };
+            /* origin = 画布内 body 锚点：GetBounds 的 minX/minY 以 0 起算（minX≤0），
+             * 画布坐标 = 锚点相对坐标 - bounds.Left/Top ⇒ 锚点在画布内位于
+             * (-bounds.Left, -bounds.Top)（与桌面 RenderFrame 返回的 origin 一致）。 */
+            result.LayoutOrigins[action] = new[] { -boundsLast.Left, -boundsLast.Top };
         }
 
         // 补齐表情家族 25 槽位的 part 登记（缺帧槽回退 default / 首个可用槽，ShareDataOf 去重数据）
@@ -584,7 +605,17 @@ public sealed class AssetExporter
         var map = _map.LoadMap(mapId);
         if (map == null) { summary.Warnings.Add($"地图 {mapId} 加载失败"); return; }
 
-        int vw = profile.ViewportW, vh = profile.ViewportH;
+        /* ══ 【地图世界视口 2026-09-27：用户报障"最下面重复/背景 back 不对"的根因】══
+         * 契约：**全部世界内容 1x 出图 + 设备 2x nearest 展开**（E1：480 屏部件 1x + scale 2x）。
+         * 人物部件（1x）与地图条带（1x，固件 <<1）都遵守；唯独 static_back / tile_layer
+         * 此前按 **480×480 屏幕口径**渲，固件按"世界→屏幕 2x"装载 ⇒ 这两层被**又放大一次**
+         * 或错位：树（条带）跑到下半屏、静态地面与 tile 地面各画一遍（"最下面重复"）。
+         * 现改为按 **世界视口 = 屏宽/scale = 240×240** 出图；固件侧
+         * layer_rgb_load / tile_mask_load 已有 2x 展开分支（vw*RC_SCALE==屏宽）。
+         * 与桌面同口径：等于 mapleStoryMiniPet 的 RenderViewport(zoom=2)。 */
+        int vwScale = Math.Max(1, PlacementMath.Scale);
+        int vw = Math.Max(1, profile.ViewportW / vwScale);
+        int vh = Math.Max(1, profile.ViewportH / vwScale);
         // 相机中心：含 clock 配置的图以 clock 锚点为优先（2026-09-26 定稿）——480 视口下地图中心
         // 相机多看不到 clock 面板（实测 18/26 出界）；这 26 张"售票处/码头"图的存在意义就是
         // 显示时钟，以锚点为中心烘焙 → 面板入镜 + 时钟落面板（与桌面版 1080 视口验收一致）。
@@ -600,9 +631,51 @@ public sealed class AssetExporter
 
         // 条带 = ScrollH/V 项（profile 关条带时置空 → strip_count=0）
         var stripBacks = profile.Strips ? map.Backs.Where(IsStripBack).ToList() : new List<MapBack>();
+        /* 【back 层序取证 2026-09-27】用户报障"背景 back 不对/重复"：把地图 back 的
+         * **真实顺序 + 每条属性 + 是否被当条带**打出来，用于核对设备端三层
+         * （static → 条带 → tile/obj）与桌面"全部 back（按序）→ obj/tile → front back"
+         * 的顺序差异到底出在哪几条。 */
+        for (int bi = 0; bi < map.Backs.Count; bi++)
+        {
+            var b = map.Backs[bi];
+            int tm = BackTileMode(b.Type);
+            Console.WriteLine($"[AssetExporter]   BACK[{bi}] id={b.Id} type={b.Type} tm={tm} "
+                              + $"x={b.X} y={b.Y} rx={b.Rx} ry={b.Ry} cx={b.Cx} cy={b.Cy} "
+                              + $"alpha={b.Alpha} ani={b.Ani} screenMode={b.ScreenMode} front={b.Front} "
+                              + $"strip={IsStripBack(b)}");
+        }
 
-        // 1. static_back：全 back 快照（剔除条带项，避免动画层残影；front back 一并烘入）
-        var staticMap = CloneMap(map, map.Backs.Where(b => !stripBacks.Contains(b)).ToList());
+        /* ══ 【back 层序修正 2026-09-27：用户报障"背景 back 不对 / 最下面重复"根因】══
+         * 桌面 MapService 的层序是「**全部非 front back（按 map.Backs 原序，滚动层也在其中）
+         * → 各层 obj/tile → front back**」；设备只有三层（static → 条带 → tile）。
+         * 旧导出把**所有非滚动 back 合成一张 static**，于是"夹在两条带之间的 back"
+         * 被画到了条带**下面**：真机 000010000 的实测层序
+         *   BACK[0] 天空 → BACK[1] 枫树(条带) → BACK[2..5] 丘陵 → BACK[6] 白云(条带) → BACK[7..13] 远景
+         * ⇒ 白云(条带)盖住了本该在它上面的 BACK[7..13]（整屏白块）、枫树盖住了丘陵。
+         * 修法（不改 BGMAP wire 格式）：把 back 按条带**切成若干段**，每段单独渲一张透明底
+         * 图，作为 **speed=0 的"条带"**下发（条带槽位本就是"按序叠加的整层"，y=0、h=视口高）；
+         * 设备按 payload 顺序绘制 ⇒ 与桌面同序。第一段仍作 static_back（在最底层）。
+         * front back 仍烘进最后一段（设备无"人物之后"的层，符合 E5 现状）。 */
+        var segs = new List<(bool isStrip, List<MapBack> backs, MapBack? strip)>();
+        {
+            var cur = new List<MapBack>();
+            foreach (var b in map.Backs)
+            {
+                if (stripBacks.Contains(b))
+                {
+                    segs.Add((false, cur, null));
+                    cur = new List<MapBack>();
+                    segs.Add((true, new List<MapBack>(), b));
+                }
+                else cur.Add(b);
+            }
+            segs.Add((false, cur, null));
+        }
+        int firstSegIdx = segs.FindIndex(x => !x.isStrip);
+        var firstSeg = firstSegIdx >= 0 ? segs[firstSegIdx].backs : new List<MapBack>();
+
+        // 1. static_back：第一段（条带之前的所有 back）快照
+        var staticMap = CloneMap(map, firstSeg);
         _map.MapShowBack = true;
         _map.MapShowTile = false;
         _map.MapShowObj = false;
@@ -611,6 +684,32 @@ public sealed class AssetExporter
         _map.MapShowFoothold = false;
         var staticBmp = _map.RenderViewport(staticMap, camX, camY, 1f, 0, vw, vh);
         if (staticBmp == null) { summary.Warnings.Add($"地图 {mapId} static_back 渲染失败"); return; }
+
+        /* 【back 层对照诊断 2026-09-27（用户报障"地图背景 back 漏了"）】
+         * 设备把地图拆成 static_back（非滚动 back）+ 条带（滚动 back）+ tile（tile/obj）
+         * 三层；而桌面 MapService 是"全部 back + tile/obj"一次渲。这里额外渲一张
+         * **完整参考图**（MapShowBack/Tile/Obj 全开，与桌面同口径）并落盘到导出目录，
+         * 用于与设备三层合成结果逐像素对照，定位到底哪一层 back 没画上。
+         * 仅诊断产物，不进 manifest。 */
+        _map.MapShowBack = true;
+        _map.MapShowTile = true;
+        _map.MapShowObj = true;
+        _map.MapShowLife = false;
+        _map.MapShowPortal = false;
+        try
+        {
+            var refBmp = _map.RenderViewport(map, camX, camY, 1f, 0, vw, vh);
+            if (refBmp != null)
+            {
+                string rp = Path.Combine(summary.DeviceDir, $"_ref_{mapId}.png");
+                using var img = SKImage.FromBitmap(refBmp);
+                using var dat = img.Encode(SKEncodedImageFormat.Png, 90);
+                using var fs = File.Create(rp);
+                dat.SaveTo(fs);
+                Console.WriteLine($"[AssetExporter]   参考图（back+tile+obj 全开）→ {rp}");
+            }
+        }
+        catch (Exception ex) { summary.Warnings.Add($"参考图渲染失败: {ex.Message}"); }
 
         // 2. tile_layer：关 back 只渲 tile/obj（透明底，RGBA5650）
         _map.MapShowBack = false;
@@ -622,6 +721,38 @@ public sealed class AssetExporter
 
         // 3. 条带：图按 cx 周期预平铺 → 独立小 PARTS 包（part_id=1，group=0）
         var strips = new List<BgmapPackWriter.BgmapStrip>();
+        /* 3a. 严格按 segs（= map.Backs 原序切段）输出层：
+         *     条带段 → 滚动条带；非条带段（除第一段已作 static_back）→ speed=0 整层。
+         * 顺序必须与桌面一致，否则又会出现"白云盖住远景"这类错层。 */
+        foreach (var (isStripSeg, segBacks, stripB) in segs)
+        {
+            if (isStripSeg) continue;                      /* 条带在本函数后半段输出（保持原逻辑） */
+            if (segBacks.Count == 0 || ReferenceEquals(segBacks, firstSeg)) continue;
+            try
+            {
+                var segMap = CloneMap(map, segBacks);
+                _map.MapShowBack = true; _map.MapShowTile = false; _map.MapShowObj = false;
+                _map.MapShowLife = false; _map.MapShowPortal = false; _map.MapShowFoothold = false;
+                var segBmp = _map.RenderViewport(segMap, camX, camY, 1f, 0, vw, vh);
+                if (segBmp == null) continue;
+                var segPayload = PartPackWriter.Build(new[]
+                {
+                    new PartPackWriter.PartEntry { PartId = 1, ExprGroup = 0, Bitmap = segBmp, OriginX = 0, OriginY = 0 },
+                });
+                var segAsset = AddAsset(summary, MpakKind.Parts, segPayload,
+                                        $"背景层 {mapId}#{segBacks[0].Id}", selector: null);
+                strips.Add(new BgmapPackWriter.BgmapStrip
+                {
+                    PartRef = segAsset.Hash,
+                    Y = 0,                       /* 世界 0 → 屏幕 0（整视口层） */
+                    SpeedX = 0,                  /* 不滚动：静态烘焙段 */
+                    RxParallax = 0,
+                    Blend = 255,                 /* bit0=1：带 1bit alpha 掩码（透明处露出下层） */
+                    Label = $"seg:{segBacks[0].Id}",
+                });
+            }
+            catch (Exception ex) { summary.Warnings.Add($"地图 {mapId} 背景段渲染失败: {ex.Message}"); }
+        }
         foreach (var b in stripBacks)
         {
             try
@@ -651,6 +782,7 @@ public sealed class AssetExporter
 
                 strips.Add(new BgmapPackWriter.BgmapStrip
                 {
+                    Label = b.Resource.ResourceUrl,
                     PartRef = stripAsset.Hash,
                     Y = (short)Math.Clamp((int)Math.Round(screenY), short.MinValue, short.MaxValue),
                     SpeedX = (short)Math.Clamp(scrollH ? b.Rx * 5 : 0, short.MinValue, short.MaxValue),
@@ -662,6 +794,24 @@ public sealed class AssetExporter
             {
                 summary.Warnings.Add($"地图 {mapId} 条带 {b.Id} 失败: {ex.Message}");
             }
+        }
+
+        /* 3b. 层序重排：strips 列表当前是"段在前、条带在后"，需按 segs 原序排。
+         * 做法：给每条产出一个稳定 key（段的哈希 / 条带的 Resource），再按 segs 顺序挑。 */
+        {
+            var ordered = new List<BgmapPackWriter.BgmapStrip>();
+            var pool = new List<BgmapPackWriter.BgmapStrip>(strips);
+            foreach (var (isStripSeg, segBacks, stripB) in segs)
+            {
+                string want = isStripSeg
+                    ? (stripB != null ? stripB.Resource.ResourceUrl : "")
+                    : (segBacks.Count > 0 ? $"seg:{segBacks[0].Id}" : "");
+                if (want.Length == 0) continue;
+                int hit = pool.FindIndex(x => x.Label == want);
+                if (hit >= 0) { ordered.Add(pool[hit]); pool.RemoveAt(hit); }
+            }
+            ordered.AddRange(pool);      /* 兜底：没匹配上的（理论不该有）追加在尾部 */
+            strips = ordered;
         }
 
         // 4. BGMAP 主包
