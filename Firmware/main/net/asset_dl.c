@@ -643,8 +643,30 @@ static bool manifest_collect(void *ctx_, const char *data, size_t len)
     return false;
 }
 
+/* 【出厂素材模式（TF 卡缺失）下不下载 2026-09-27】真机根因：TF 卡损坏时
+ * 每次 sync_once 都会把服务端 manifest 与本地对表 → 发现缺包 → 逐个下载 →
+ * 每次都因无卡写盘失败 → 60s 周期 + poll 触发反复重试。每次失败都占用
+ * socket 与 HTTP 内部缓冲，而本板运行期内部堆只剩 ~2.5KB →
+ * `probe: socket 失败 errno=105 (No ENOBUFS)` → 心跳/指令/播放全部断续。
+ * 出厂素材模式下的正确语义是：**只用内部 Flash 出厂快照，不尝试写盘**。 */
+static bool asset_dl_download_allowed(void)
+{
+    extern bool sd_tf_is_flash_fallback(void);
+    if (sd_tf_is_flash_fallback()) return false;
+    return true;
+}
+
 static void sync_once(void)
 {
+    if (!asset_dl_download_allowed()) {
+        static int64_t s_last_log_ms;
+        int64_t now = esp_timer_get_time() / 1000;
+        if (now - s_last_log_ms > 60000) {      /* 60s 限频，避免刷屏 */
+            s_last_log_ms = now;
+            ESP_LOGW(TAG, "出厂素材模式（无 TF 卡）：跳过清单同步与下载，只用内部 Flash 快照");
+        }
+        return;
+    }
     static char *resp = NULL;
     if (!resp) {
         resp = malloc(MANIFEST_RESP_CAP);       /* 常驻复用（任务栈外） */
@@ -791,6 +813,7 @@ bool asset_dl_request_one(const char *hash)
 /* 单包下载执行体（资产任务上下文）：查 kind → 水位检查 → download_one → 登记 */
 static void one_request_run(const char *hash)
 {
+    if (!asset_dl_download_allowed()) return;   /* 出厂素材模式：不写盘 */
     char kind[12] = { 0 };
     xSemaphoreTake(s_lock, portMAX_DELAY);
     for (int i = 0; i < s_file_cnt; i++) {
