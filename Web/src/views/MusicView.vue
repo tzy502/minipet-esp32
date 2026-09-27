@@ -1,17 +1,28 @@
 <script setup>
 /**
- * 曲库管理（E4/E8）：WZ 曲库浏览 + QQ 音源卡片。
+ * 曲库管理（E4/E8）：WZ 曲库浏览 + QQ 音源卡片 + 设备播放控制卡片。
  * - NDataTable：source 切换 wz/qq（GET /admin/music/tracks?source=），搜索 + 前端分页；
  * - QQ 卡：cookie 导入（POST .../sources/qq/cookie）、健康 NTag、启停 NSwitch
  *   （PUT .../sources/{name}；wz 为默认源不可停）。
- * Web 只管曲库/cookie/启停 —— 点歌控制权在设备（E8 定稿），本页无播放按钮。
+ * - 设备播放控制卡（本页顶部）：E8 定稿「控制入口在设备触摸屏，Web 只管曲库/歌单/cookie」，
+ *   本卡是用户实测反馈「服务器页面也没有播放 bgm 的按钮」后的**超出需求的附加能力**，
+ *   因此按「只读展示 + 探测到才启用的可选远程下发」做：
+ *     · 只读：设备在线态 / BGM 偏好（source·volume）/ 设备事件日志（GET /admin/logs/{id}）；
+ *     · 下发：POST /admin/devices/{id}/command {type:"bgm", value:"play|pause|resume|stop|next|prev"}
+ *       与 {type:"bgm", value:"vol", n} —— 开卡先探测（哨兵值 __probe__ 对设备零副作用），
+ *       端点未放行 bgm → 按钮全禁用 + 卡内贴出接口需求（与 DeviceDetailView 表情卡同一套模式）。
+ *     · 音量另有已在位通道：PUT /admin/devices/{id} {bgm:{volume}}（服务端偏好，非即时下发）。
  */
-import { computed, h, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, h, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import {
-  NCard, NDataTable, NInput, NRadioGroup, NRadioButton, NSpace, NTag, NSwitch,
-  NButton, NSpin, NResult, NAlert, NTooltip, useMessage,
+  NCard, NDataTable, NInput, NInputNumber, NRadioGroup, NRadioButton, NSpace, NTag, NSwitch,
+  NButton, NSpin, NResult, NAlert, NTooltip, NSelect, NSlider, NDivider, useMessage,
 } from 'naive-ui'
-import { musicTracks, listMusicSources, setMusicSourceEnabled, setQqCookie, getSettings } from '../api/client'
+import {
+  musicTracks, listMusicSources, setMusicSourceEnabled, setQqCookie, getSettings,
+  listDevices, getDevice, getDeviceLogs, sendBgmCommand, probeBgmCommand, setDeviceBgmPrefs,
+  BGM_COMMAND, errText,
+} from '../api/client'
 import { fmtBytes } from '../utils/format'
 
 const message = useMessage()
@@ -127,12 +138,191 @@ async function probeCookie() {
   } catch { /* 忽略：仅提示用 */ }
 }
 
+// ── 设备播放控制（E8 附加：只读展示 + 探测到才启用的远程下发）─────────────
+const DEVICE_KEY = 'minipet.music.deviceId'
+const devices = ref([])
+const deviceId = ref('')
+const deviceInfo = ref(null) // GET /admin/devices/{id} 的 device（含 bgm / online）
+const devLogs = ref([])
+const devLoadError = ref('')
+
+const bgmSupport = ref('unknown') // unknown | ok | missing | mismatch
+const bgmProbeNote = ref('')
+const bgmProbeBusy = ref(false)
+const bgmBusy = ref('') // 正在下发的 bgm 值 / 'vol' / 'pref'
+const volume = ref(50)
+const lastResult = ref(null) // { type: 'success'|'error', text }
+
+const deviceOptions = computed(() =>
+  devices.value.map((d) => ({
+    label: `${d.name || '未命名'} [${d.deviceId}]${d.online ? ' · 在线' : ' · 离线'}`,
+    value: d.deviceId,
+  })),
+)
+const selectedDevice = computed(() => devices.value.find((d) => d.deviceId === deviceId.value) ?? null)
+const deviceOnline = computed(() => !!selectedDevice.value?.online)
+const bgmDisabled = computed(() => bgmSupport.value === 'missing' || !deviceId.value)
+const bgmPref = computed(() => deviceInfo.value?.bgm ?? null)
+
+const SUPPORT_TAG = {
+  ok: { type: 'success', label: '端点在位' },
+  missing: { type: 'error', label: '端点不支持 bgm' },
+  mismatch: { type: 'warning', label: '端点入参不符' },
+  unknown: { type: 'default', label: '未探测到' },
+}
+const supportTag = computed(() => SUPPORT_TAG[bgmSupport.value] ?? SUPPORT_TAG.unknown)
+
+/** 命令端点路径（提示文案与真实请求同源）。 */
+const cmdPath = computed(() => `/api/admin/devices/${deviceId.value || '{id}'}/command`)
+
+async function loadDevices() {
+  try {
+    const data = await listDevices()
+    devices.value = data?.devices ?? []
+    const known = devices.value.some((d) => d.deviceId === deviceId.value)
+    if (!known) {
+      let stored = ''
+      try { stored = localStorage.getItem(DEVICE_KEY) || '' } catch { /* 无 localStorage 权限时忽略 */ }
+      const pick =
+        devices.value.find((d) => d.deviceId === stored) ||
+        devices.value.find((d) => d.online) ||
+        devices.value[0]
+      deviceId.value = pick?.deviceId ?? ''
+    }
+  } catch (e) {
+    devLoadError.value = errText(e, '设备列表加载失败')
+  }
+}
+
+async function loadDeviceInfo() {
+  if (!deviceId.value) return
+  devLoadError.value = ''
+  try {
+    const data = await getDevice(deviceId.value)
+    deviceInfo.value = data?.device ?? null
+    const v = deviceInfo.value?.bgm?.volume
+    if (v != null) volume.value = v
+  } catch (e) {
+    deviceInfo.value = null
+    devLoadError.value = errText(e, '设备详情加载失败')
+  }
+  loadDeviceLogs()
+}
+
+async function loadDeviceLogs() {
+  if (!deviceId.value) return
+  try {
+    const data = await getDeviceLogs(deviceId.value)
+    devLogs.value = (data?.lines ?? []).slice(0, 5)
+  } catch { devLogs.value = [] }
+}
+
+/** 开卡探测（哨兵值 __probe__：固件不认它 → 设备零副作用，见 client.js 注释）。 */
+async function probeBgm() {
+  if (!deviceId.value) return
+  bgmProbeBusy.value = true
+  bgmSupport.value = 'unknown'
+  bgmProbeNote.value = ''
+  try {
+    const r = await probeBgmCommand(deviceId.value)
+    if (r.supported === false) {
+      bgmSupport.value = 'missing'
+      bgmProbeNote.value = `HTTP ${r.status}${r.error ? `：${r.error}` : ''}`
+    } else if (r.supported === true && r.status >= 400) {
+      bgmSupport.value = 'mismatch'
+      bgmProbeNote.value = `HTTP ${r.status}：${r.error || ''}`
+    } else if (r.supported === true) {
+      bgmSupport.value = 'ok'
+    } else {
+      bgmSupport.value = 'unknown'
+      bgmProbeNote.value = r.error || '无法判定（网络不可达？）'
+    }
+  } finally {
+    bgmProbeBusy.value = false
+  }
+}
+
+function onDeviceChange(v) {
+  deviceId.value = v
+  try { localStorage.setItem(DEVICE_KEY, v) } catch { /* 忽略 */ }
+}
+
+/** 真发一条 bgm 指令；按真实响应落状态（400「type 非法：bgm」→ 判定端点未放行）。 */
+async function sendBgm(value, label, opts = {}) {
+  if (!deviceId.value) return
+  bgmBusy.value = opts.busyKey || value
+  lastResult.value = null
+  const bodyText = opts.n != null
+    ? `{"type":"bgm","value":"${value}","n":${opts.n}}`
+    : `{"type":"bgm","value":"${value}"}`
+  try {
+    const r = await sendBgmCommand(deviceId.value, value, opts)
+    bgmSupport.value = 'ok'
+    const http = r?.seq != null ? 202 : 200
+    lastResult.value = {
+      type: 'success',
+      text: `HTTP ${http} · POST ${cmdPath.value} body ${bodyText} → ${r?.seq != null ? `seq ${r.seq}（已入队，设备下次 poll 取走）` : JSON.stringify(r)}`,
+    }
+    message.success(`${label}已下发${r?.seq != null ? `（seq ${r.seq}）` : ''}`)
+    loadDeviceLogs()
+  } catch (e) {
+    const status = e?.response?.status
+    const text = errText(e)
+    if (status === 404 || status === 405 || status === 501) bgmSupport.value = 'missing'
+    else if (status === 400 && /bgm/i.test(text) && /type[\s=:：]*[^，,。;\s]{0,12}?(非法|不支持|未知|无效)/i.test(text)) bgmSupport.value = 'missing'
+    else if (status === 400) bgmSupport.value = 'mismatch'
+    bgmProbeNote.value = `HTTP ${status ?? '—'}：${text}`
+    lastResult.value = { type: 'error', text: `HTTP ${status ?? '—'} · POST ${cmdPath.value} body ${bodyText} → ${text}` }
+    message.error(text)
+  } finally {
+    bgmBusy.value = ''
+  }
+}
+
+const playBgm = (v, label) => sendBgm(v, label)
+
+/** 音量下发（需服务端放行 + 固件支持数值型 payload；202 只代表入队）。 */
+function sendVolume() {
+  return sendBgm(BGM_COMMAND.VOLUME, '音量下发', { n: Number(volume.value), busyKey: 'vol' })
+}
+
+/** 音量写入服务端设备偏好（PUT /admin/devices/{id}，服务端已支持；非即时下发）。 */
+async function saveVolumePref() {
+  bgmBusy.value = 'pref'
+  lastResult.value = null
+  const bodyText = `{"bgm":{"volume":${Number(volume.value)}}}`
+  try {
+    await setDeviceBgmPrefs(deviceId.value, { volume: Number(volume.value) })
+    lastResult.value = { type: 'success', text: `HTTP 200 · PUT /api/admin/devices/${deviceId.value} body ${bodyText} → 设备偏好已保存` }
+    message.success('音量已写入设备偏好')
+    loadDeviceInfo()
+  } catch (e) {
+    const text = errText(e)
+    lastResult.value = { type: 'error', text: `HTTP ${e?.response?.status ?? '—'} · PUT /api/admin/devices/${deviceId.value} body ${bodyText} → ${text}` }
+    message.error(text)
+  } finally {
+    bgmBusy.value = ''
+  }
+}
+
+watch(deviceId, () => {
+  deviceInfo.value = null
+  devLogs.value = []
+  loadDeviceInfo()
+  probeBgm()
+})
+
 let refreshTimer = null
-onMounted(() => {
+onMounted(async () => {
   loadSources()
   probeCookie()
   loadTracks()
-  refreshTimer = setInterval(loadSources, 30000) // 健康态 30s 静默刷新
+  // deviceId 由 loadDevices 选定 → watch(deviceId) 负责首次 loadDeviceInfo + probeBgm
+  await loadDevices()
+  refreshTimer = setInterval(() => {
+    loadSources() // 健康态 30s 静默刷新
+    loadDevices().then(() => loadDeviceInfo())
+  }, 30000)
 })
 onBeforeUnmount(() => clearInterval(refreshTimer))
 </script>
@@ -140,6 +330,104 @@ onBeforeUnmount(() => clearInterval(refreshTimer))
 <template>
   <div>
     <n-alert v-if="sourcesError" type="warning" closable class="mb12">{{ sourcesError }}</n-alert>
+
+    <!-- 设备播放控制（E8 附加：控制入口本在设备触摸屏，这里是超出需求的 Web 远程通道） -->
+    <n-card size="small" class="mb12" title="设备播放控制（E8 附加：只读展示 + 可选远程下发）">
+      <template #header-extra>
+        <n-space align="center">
+          <n-select
+            :value="deviceId"
+            :options="deviceOptions"
+            size="small"
+            style="width: 240px"
+            :disabled="!devices.length"
+            placeholder="选择设备"
+            @update:value="onDeviceChange"
+          />
+          <n-tag size="small" :bordered="false" :type="supportTag.type">{{ supportTag.label }}</n-tag>
+          <n-button size="tiny" secondary :loading="bgmProbeBusy" :disabled="!deviceId" @click="probeBgm">重新检测</n-button>
+        </n-space>
+      </template>
+
+      <n-space vertical :size="10">
+        <n-alert v-if="devLoadError" type="warning" :show-icon="false" size="small">{{ devLoadError }}</n-alert>
+
+        <!-- 只读展示：设备与 BGM 偏好来自 GET /admin/devices/{id}，事件来自 GET /admin/logs/{id} -->
+        <n-space align="center" :size="8" wrap class="ro-line">
+          <n-tag size="small" :bordered="false" :type="deviceOnline ? 'success' : 'default'">
+            {{ deviceOnline ? '设备在线' : '设备离线' }}
+          </n-tag>
+          <span class="hint">
+            BGM 偏好：源 <b>{{ bgmPref?.source ?? '—' }}</b> · 音量 <b>{{ bgmPref?.volume ?? '—' }}</b>
+            （GET /api/admin/devices/{{ deviceId || '{id}' }} · 只读，设备端现场控制会回写此处）
+          </span>
+        </n-space>
+
+        <n-space v-if="devLogs.length" vertical size="2">
+          <span class="hint">设备事件（GET /api/admin/logs/{{ deviceId }} 最近 5 条）：</span>
+          <div v-for="(l, i) in devLogs" :key="i" class="log-line">{{ l }}</div>
+        </n-space>
+
+        <n-divider style="margin: 2px 0" />
+
+        <n-space align="center" :size="8" wrap>
+          <n-button size="small" type="primary" class="bgm-btn" data-bgm="play" :disabled="bgmDisabled" :loading="bgmBusy === 'play'" @click="playBgm(BGM_COMMAND.PLAY, '播放')">▶ 播放</n-button>
+          <n-button size="small" class="bgm-btn" data-bgm="pause" :disabled="bgmDisabled" :loading="bgmBusy === 'pause'" @click="playBgm(BGM_COMMAND.PAUSE, '暂停')">⏸ 暂停</n-button>
+          <n-button size="small" class="bgm-btn" data-bgm="resume" :disabled="bgmDisabled" :loading="bgmBusy === 'resume'" @click="playBgm(BGM_COMMAND.RESUME, '续播')">⏯ 续播</n-button>
+          <n-button size="small" class="bgm-btn" data-bgm="stop" :disabled="bgmDisabled" :loading="bgmBusy === 'stop'" @click="playBgm(BGM_COMMAND.STOP, '停止')">⏹ 停止</n-button>
+          <n-divider vertical />
+          <n-button size="small" class="bgm-btn" data-bgm="prev" :disabled="bgmDisabled" :loading="bgmBusy === 'prev'" @click="playBgm(BGM_COMMAND.PREV, '上一首')">⏮ 上一首</n-button>
+          <n-button size="small" class="bgm-btn" data-bgm="next" :disabled="bgmDisabled" :loading="bgmBusy === 'next'" @click="playBgm(BGM_COMMAND.NEXT, '下一首')">⏭ 下一首</n-button>
+        </n-space>
+
+        <n-space align="center" :size="8" wrap>
+          <span class="vol-label">音量</span>
+          <n-slider v-model:value="volume" :min="0" :max="100" :step="1" style="width: 220px" />
+          <n-input-number v-model:value="volume" size="small" :min="0" :max="100" style="width: 92px" />
+          <n-button size="small" class="bgm-btn" data-bgm="vol" :disabled="bgmDisabled" :loading="bgmBusy === 'vol'" @click="sendVolume">下发音量</n-button>
+          <n-button size="small" secondary class="bgm-btn" data-bgm="pref" :disabled="!deviceId" :loading="bgmBusy === 'pref'" @click="saveVolumePref">存为设备偏好</n-button>
+        </n-space>
+
+        <n-alert
+          v-if="lastResult"
+          :type="lastResult.type === 'success' ? 'success' : 'error'"
+          :show-icon="false"
+          size="small"
+        >{{ lastResult.text }}</n-alert>
+
+        <n-alert v-if="bgmSupport === 'missing'" type="warning" :show-icon="false" size="small">
+          <b>服务端未放行 bgm 指令，播放/暂停/切歌按钮已禁用。</b>
+          （探测结果：{{ bgmProbeNote || 'HTTP 400' }}）需要服务端在设备指令端点白名单里加 <code>bgm</code>：
+          <div class="req">
+            <div><code>POST {{ cmdPath }}</code></div>
+            <div>播放控制 body <code>{ "type": "bgm", "value": "play" | "pause" | "resume" | "stop" | "next" | "prev" }</code></div>
+            <div>音量 body <code>{ "type": "bgm", "value": "vol", "n": 0-100 }</code></div>
+            <div>期望 <code>202 { "ok": true, "seq": &lt;n&gt;, "type": "bgm", "value": "..." }</code></div>
+            <div>
+              实现要点：入队 payload 必须是<b>裸 JSON 字符串</b>（<code>queue.Enqueue(id, "bgm", "play")</code>）——
+              固件 <code>Firmware/main/net/poller.c:208-217</code> 的 bgm 分支要求 <code>payload</code> 是字符串；
+              数值型音量 <code>{"n":50}</code> 会被固件静默忽略（<code>poller.c:171-173</code> 折算成 vitem=NULL），
+              需固件同补 <code>pn</code> 分支（<code>MP_AUDIO_VOL</code>）。
+            </div>
+            <div>完整清单：<code>Web/docs/interfaces-needed-from-server.md</code> §T6</div>
+          </div>
+        </n-alert>
+        <n-alert v-else-if="bgmSupport === 'mismatch'" type="warning" :show-icon="false" size="small">
+          端点已认 <code>bgm</code> 但拒绝了本次入参（{{ bgmProbeNote }}）—— 请对照
+          <code>Web/docs/interfaces-needed-from-server.md</code> §T6 核对 value 白名单 / n 范围。
+        </n-alert>
+        <n-alert v-else-if="bgmSupport === 'unknown'" type="info" :show-icon="false" size="small">
+          未能判定端点是否放行 bgm（{{ bgmProbeNote || '网络不可达' }}）：按钮未禁用，点击后按真实响应提示。
+        </n-alert>
+
+        <div class="hint">
+          E8 定稿：控制入口在<b>设备触摸屏</b>（菜单内 BGM 入口 → 半屏控制条），Web 的职责是曲库/歌单/cookie；
+          本卡为超出需求的<b>只读展示 + 可选远程下发</b>。设置音量后不会自动同步设备实际音量
+          （设备端现场控制会回传 <code>POST /api/device/bgm/cmd</code>）；「存为设备偏好」只改服务端偏好
+          （设备下次 hello 才可能消费，固件当前只读阈值四件套）。
+        </div>
+      </n-space>
+    </n-card>
 
     <n-card size="small" class="mb12" title="QQ 音源">
       <template #header-extra>
@@ -225,7 +513,8 @@ onBeforeUnmount(() => clearInterval(refreshTimer))
         :max-height="480"
       />
       <div class="hint" style="margin-top: 8px">
-        共 {{ trackCount }} 首{{ query ? ` · 过滤后 ${filteredTracks.length} 首` : '' }}；播放控制在设备端（E8）
+        共 {{ trackCount }} 首{{ query ? ` · 过滤后 ${filteredTracks.length} 首` : '' }}；
+        播放控制在设备触摸屏（E8），上方控制卡为附加的 Web 远程通道
       </div>
     </n-card>
   </div>
@@ -235,4 +524,9 @@ onBeforeUnmount(() => clearInterval(refreshTimer))
 .mb12 { margin-bottom: 12px; }
 .hint { font-size: 12px; opacity: 0.6; }
 .block-center { display: flex; justify-content: center; padding: 40px 0; }
+.ro-line { width: 100%; }
+.log-line { font-size: 12px; opacity: 0.65; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.vol-label { font-size: 12px; opacity: 0.75; }
+.req { margin-top: 6px; line-height: 1.8; }
+.req code { background: rgba(128, 128, 140, 0.15); padding: 0 3px; border-radius: 3px; }
 </style>

@@ -99,10 +99,12 @@ export function deviceCommandPath(deviceId) {
   return `/api/admin/devices/${encodeURIComponent(deviceId)}/command`
 }
 
-/** 下发设备指令（动作/表情/气泡）。服务端未上线该端点时 reject（404/405）。 */
+/** 下发设备指令（动作/表情/气泡/bgm）。服务端未上线该端点或未放行该 type 时 reject（404/405/400）。 */
 export function sendDeviceCommand(deviceId, type, value, opts = {}) {
   const body = { type: String(type), value: String(value) }
   if (opts.durationMs != null) body.durationMs = Number(opts.durationMs)
+  // 数值通道：服务端 DeviceCommandRequest.N → JSON `n`（固件 poller.c 的 pn 通道）
+  if (opts.n != null) body.n = Number(opts.n)
   return http.post(`/admin/devices/${encodeURIComponent(deviceId)}/command`, body).then((r) => r.data)
 }
 
@@ -125,6 +127,76 @@ export async function probeDeviceCommand(deviceId) {
     if (status) return { supported: true, status, error: errText(e) }
     return { supported: null, error: errText(e) }
   }
+}
+
+// ── BGM 播放控制（E8 附加：Web 只读展示 + 可选远程下发）───────────────────
+// E8 定稿「控制入口在设备触摸屏，Web 只管曲库/歌单/cookie」——本组函数是用户
+// 实测反馈后加的「超出需求」的远程控制通道，UI 侧一律「探测到才启用」。
+//
+// 固件实证（Firmware/main/net/poller.c:208-217，type+payload 通道）：
+//   bgm 分支要求 payload 是【字符串】（cJSON_IsString(vitem)），且只认
+//   play / pause / resume / stop / next / prev → MP_AUDIO_*；
+//   ⚠ vol / source 只在 poller.c:77-88 的旧扁平通道（{t,v,n}）有分支，而
+//     CommandQueue 只会产出 {seq,type,payload} 形态 → 数值型音量（{"n":50}）
+//     在 poller.c:171-173 被折算成 vitem=NULL → bgm 分支不匹配 → 静默丢弃。
+//     故「音量下发」需服务端放行 + 固件补 pn 分支（见 docs/interfaces-needed-from-server.md §T6）。
+export const DEVICE_COMMAND_BGM = 'bgm'
+
+/** 固件认的 bgm 值（poller.c:211-216 字符串分支）。 */
+export const BGM_COMMAND = Object.freeze({
+  PLAY: 'play', PAUSE: 'pause', RESUME: 'resume', STOP: 'stop', NEXT: 'next', PREV: 'prev', VOLUME: 'vol',
+})
+
+/**
+ * 探测哨兵值：固件字符串分支不认它（m.type 保持 MP_AUDIO_NONE → 不 mp_post_audio），
+ * 所以用它探测「服务端是否放行 bgm」对设备零副作用（不会出声、不改音量）。
+ */
+export const BGM_PROBE_VALUE = '__probe__'
+
+/** 下发一条 bgm 指令：value 取 BGM_COMMAND；音量（VOLUME）需带 opts.n。 */
+export function sendBgmCommand(deviceId, value, opts = {}) {
+  return sendDeviceCommand(deviceId, DEVICE_COMMAND_BGM, value, opts)
+}
+
+/**
+ * 探测 admin 指令端点是否放行 type=bgm（曲库页播放控制卡开卡/「重新检测」用）。
+ * 语义：POST {"type":"bgm","value":"__probe__"}（哨兵值，设备零副作用）。
+ * 返回 { supported: true | false | null, status?, error? }
+ *   true  = 放行（2xx；或 400 但拒绝理由不是「type 非法：bgm」——例如 value 白名单不符，
+ *           说明 bgm 这个 type 已认，只是拒绝了哨兵值）
+ *   false = 404/405/501 路由不存在；或 400 且错误文案明确说「type 非法/不支持：bgm」
+ *           （服务端 AdminEndpoints.cs:281-284 白名单当前就是这一形态）
+ *   null  = 网络不可达等无法判定
+ */
+export async function probeBgmCommand(deviceId) {
+  try {
+    const res = await sendBgmCommand(deviceId, BGM_PROBE_VALUE)
+    return { supported: true, status: res?.seq != null ? 202 : 200, data: res }
+  } catch (e) {
+    const status = e?.response?.status
+    const msg = errText(e)
+    if (status === 404 || status === 405 || status === 501) return { supported: false, status, error: msg }
+    // 只在「错误文案把 bgm 判为非法 type」时判定不支持；避免把「bgm 的 value 必须是 …」
+    // 这类「已认 type、拒了 value」的 400 误判成不支持
+    const typeRejected =
+      /bgm/i.test(msg) && /type[\s=:：]*[^，,。;\s]{0,12}?(非法|不支持|未知|无效)/i.test(msg)
+    if (status === 400 && typeRejected) return { supported: false, status, error: msg }
+    if (status) return { supported: true, status, error: msg }
+    return { supported: null, error: msg }
+  }
+}
+
+/** 设备 BGM 偏好（服务端已支持：PUT /admin/devices/{id} body { bgm: { source?, volume? } }）。 */
+export function setDeviceBgmPrefs(deviceId, { source, volume } = {}) {
+  const bgm = {}
+  if (source != null) bgm.source = String(source)
+  if (volume != null) bgm.volume = Number(volume)
+  return updateDevice(deviceId, { bgm })
+}
+
+/** 设备事件环形日志（GET /admin/logs/{id} → { deviceId, online, note, lines: [...], events: [...] }）。 */
+export function getDeviceLogs(deviceId) {
+  return http.get(`/admin/logs/${encodeURIComponent(deviceId)}`).then((r) => r.data)
 }
 
 // ── 纸娃娃预设（E4 编辑器 → E7 设备选择器「纸娃娃 tab」）──────────────────

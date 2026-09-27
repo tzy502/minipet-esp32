@@ -55,6 +55,9 @@ void provision_rtc_resync_start(void);
  * WiFi 永不初始化 → 设备永不 poll。幂等，后续 provision_* 复用同一实例。 */
 void provision_wifi_preinit(void);
 
+/* 校时任务是否已成功创建（供失败重试判定）。 */
+bool provision_rtc_task_running(void);
+
 #ifdef __cplusplus
 }
 #endif

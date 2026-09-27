@@ -998,10 +998,7 @@ static void menu_apply_selection(void)
         lv_obj_invalidate(btn);
     }
     /* 【取证探针 2026-09-27】把"贴到第几行"变成日志事实，便于与用户观察对照 */
-    ESP_LOGI("menu", "高亮已贴：sel=%d/%d styled=%d rows=%d childs=%u",
-             s_menu.sel, s_menu.row_cnt, styled,
-             (s_menu.rows[s_menu.sel] != NULL) ? 1 : 0,
-             (unsigned)lv_obj_get_child_count(lv_screen_active()));
+    (void)styled;   /* 诊断探针已移除（内部堆/串口带宽优先） */
 }
 
 /* 菜单态 100ms 节拍（渲染任务）：排空侧键/触摸/换页请求 → 贴高亮 → 轮询下载

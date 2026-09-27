@@ -509,6 +509,11 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
         ip_event_got_ip_t *e = (ip_event_got_ip_t *)data;
         ESP_LOGI(TAG, "WiFi GOT_IP: " IPSTR, IP2STR(&e->ip_info.ip));
         s_sta_connected = true;
+        /* 【真机连不通修复 2026-09-27】拿到 IP 后再关省电（放在 connect 之前
+         * 改 PS 策略会干扰认证/关联，实测出现 reason=2 认证失败）。
+         * 默认 WIFI_PS_MIN_MODEM 会让 TCP 建连偶发 select() timeout。 */
+        esp_wifi_set_ps(WIFI_PS_NONE);
+        xEventGroupClearBits(s_wifi_events, WIFI_FAIL_BIT);
         xEventGroupSetBits(s_wifi_events, WIFI_GOT_IP_BIT);
     }
 }
@@ -712,14 +717,23 @@ void provision_wifi_preinit(void)
     wifi_init_once();   /* 幂等：只建 esp_netif + esp_wifi_init，不连接 */
 }
 
+static volatile bool s_rtc_started;
+bool provision_rtc_task_running(void) { return s_rtc_started; }
+
 void provision_rtc_resync_start(void)
 {
     static bool started;
     if (started) return;
-    started = true;
-    if (xTaskCreatePinnedToCore(rtc_resync_task, "rtcsync", 4096, NULL,
-                                tskIDLE_PRIORITY + 1, NULL, 0 /* PRO */) != pdPASS) {
-        ESP_LOGW(TAG, "rtcsync 任务创建失败（内部堆挤压）——待机时钟可能显示 --:--");
+    /* 【真机修复 2026-09-27】原来失败即放弃 → 内部堆挤压时校时任务永远起不来，
+     * 待机时钟恒 --:--。现改为：失败不置 started，由调用方（状态机/慢速巡检）
+     * 后续重试；同时把栈从 4096 降到 3072（该任务只跑 SNTP 往返与 RTC 写，
+     * 不需要 4K，内部堆紧张时更容易分配成功）。 */
+    if (xTaskCreatePinnedToCore(rtc_resync_task, "rtcsync", 3072, NULL,
+                                tskIDLE_PRIORITY + 1, NULL, 0 /* PRO */) == pdPASS) {
+        started = true;
+        s_rtc_started = true;
+    } else {
+        ESP_LOGW(TAG, "rtcsync 任务创建失败（内部堆挤压）→ 稍后重试");
     }
 }
 
@@ -773,11 +787,6 @@ static void portal_task(void *arg)
 
     xEventGroupClearBits(s_wifi_events, WIFI_GOT_IP_BIT | WIFI_FAIL_BIT);
     ESP_ERROR_CHECK(esp_wifi_start());
-    /* 【真机连不通修复 2026-09-27】关闭 WiFi 省电（WIFI_PS_NONE）：
-     * 默认 WIFI_PS_MIN_MODEM 会让 TCP 建连/长轮询偶发 `select() timeout` 与
-     * `wifi:m f null`（真机实证：socket 建得出但 connect 超时 → hello 失败 →
-     * 设备长期不在线）。本设备常插电使用，省电收益远小于连通性。 */
-    esp_wifi_set_ps(WIFI_PS_NONE);
     esp_wifi_connect();
 
     EventBits_t bits = xEventGroupWaitBits(

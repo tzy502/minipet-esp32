@@ -826,15 +826,7 @@ static void flush_dirty(void)
         ESP_LOGD(TAG, "first dirty flush rect (%" PRId32 ",%" PRId32 ") %"
                  PRId32 "x%" PRId32, x, y, w, h);
     }
-    /* 真机诊断期探针：本帧标脏包围盒 + 标脏块数（500ms 限频，INFO 级；
-     * 验收后主线程降级） */
-    static int64_t s_flush_probe_us;
-    int64_t probe_now = esp_timer_get_time();
-    if (probe_now - s_flush_probe_us > 500000) {
-        s_flush_probe_us = probe_now;
-        ESP_LOGI("probe", "flush (%" PRId32 ",%" PRId32 ") %" PRId32
-                 "x%" PRId32 " cells=%" PRId32, x, y, w, h, cells);
-    }
+    (void)cells;
     compose_region(x, y, w, h);
     blit_be(x, y, w, h, g_fb + (size_t)y * g_sw + x, g_sw);
 }
@@ -1075,13 +1067,7 @@ void render_tick(void)
             int64_t t2 = esp_timer_get_time();
             blit_be(0, 0, g_sw, g_sh, g_fb, g_sw);
             int64_t t3 = esp_timer_get_time();
-            static int64_t s_menu_probe_us;
-            if (t3 - s_menu_probe_us > 2000000) {
-                s_menu_probe_us = t3;
-                ESP_LOGW("menu", "菜单帧耗时 lvgl=%lldms memcpy=%lldms blit=%lldms",
-                         (long long)((t1 - t0) / 1000), (long long)((t2 - t1) / 1000),
-                         (long long)((t3 - t2) / 1000));
-            }
+            (void)t0; (void)t1; (void)t2; (void)t3;
         } else {
             static int64_t s_mb_null_us;
             if (t1 - s_mb_null_us > 2000000) {
@@ -1221,22 +1207,8 @@ void render_tick(void)
 
     if (any) flush_dirty();
 
-    /* 【ENTPOS 探针】「人物不居中」真机读数（1s 限频，一行可 grep，前缀
-     * ENTPOS；诊断期 INFO 级，验收后主线程降级）：
-     * sx/sy=实体锚点 ent_screen_pos；cx0/cy0=联合画布原点（世界 1x）；
-     * base=世界附加偏移 render_set_entity_pos；drag=拖拽跟手偏移 */
-    static int64_t s_entpos_probe_us;
-    if (now_us - s_entpos_probe_us > 1000000) {
-        s_entpos_probe_us = now_us;
-        int32_t sx, sy;
-        ent_screen_pos(&sx, &sy);
-        ESP_LOGI("probe", "ENTPOS sx=%" PRId32 " sy=%" PRId32
-                 " cx0=%" PRId32 " cy0=%" PRId32
-                 " base=(%" PRId32 ",%" PRId32 ")"
-                 " drag=(%" PRId32 ",%" PRId32 ")",
-                 sx, sy, g_ent_cx0, g_ent_cy0,
-                 g_ent_base_wx, g_ent_base_wy, g_drag_off_x, g_drag_off_y);
-    }
+    /* ENTPOS 探针已移除（诊断期结束） */
+
 }
 
 int render_set_parts(const char *mpk_path)

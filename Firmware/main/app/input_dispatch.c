@@ -29,6 +29,7 @@
 #include "nvs.h"
 
 #include "app_core.h"
+#include "provision.h"
 #include "hal_contract.h"
 #include "state_machine.h"
 
@@ -668,8 +669,14 @@ static void touch_tick(void)
                  touch_quadrant_name(f.x, f.y), f.x, f.y);
         extern void mp_orient_calib_tap(void);   /* main.c（MP_ORIENT_CALIB 期切换方向组合） */
         mp_orient_calib_tap();
-        tmap_tap_advance(&f);                /* 【拖动方向自校准】点屏切换映射候选 */
-        render_calib_set(true, f.x, f.y);    /* 【校准】落点回显到屏（白点=当前候选落点） */
+        /* 【用户定稿 2026-09-27】辅助线默认【不再出现】：此前每次触摸都调
+         * render_calib_set(true,...) 且全工程无关闭路径 → 红线/蓝线/三角/白点
+         * 一旦首触就永久常驻盖住画面（用户口径"辅助线删了"）。
+         * 现仅保留编译期标定开关 MP_TOUCH_CALIB=1 时的回显；正常固件完全不碰校准层。 */
+#if MP_TOUCH_CALIB
+        tmap_tap_advance(&f);                /* 标定期：点屏切换映射候选 */
+        render_calib_set(true, f.x, f.y);    /* 标定期：落点回显（白点=当前候选落点） */
+#endif
     } else if (f.touched && down) {
         int dx = (int)f.x - (int)down_x;
         /* 问题6：按住并水平拖动（≥TAP_MOVE_PX）→ 倾斜视差同款效果：
@@ -1074,11 +1081,23 @@ static void pwron_tick(void)
 
 /* ================================================================== */
 /* 慢速巡检：电池 / 温度（E10/E11）                                     */
+static bool    s_rtc_retry_done;
+static int64_t s_rtc_retry_s;
+
 static void slow_tick(int64_t idle_ms)
 {
     int64_t now_s = mp_now_ms() / 1000;
 
     pwron_tick();                 /* 底键（PWRON 短按）慢速巡检（内部 100ms 节流） */
+
+    /* 【真机修复 2026-09-27】校时任务创建失败时重试（内部堆挤压是启动期常见，
+     * 几秒后往往就能分配）；幂等：已成功启动则内部直接返回。 */
+    if (!s_rtc_retry_done && now_s - s_rtc_retry_s >= 5) {
+        s_rtc_retry_s = now_s;
+        provision_rtc_resync_start();
+        extern bool provision_rtc_task_running(void);
+        if (provision_rtc_task_running()) s_rtc_retry_done = true;
+    }
 
     if (now_s - s_last_battery_s >= BATTERY_CHK_S) {
         s_last_battery_s = now_s;
