@@ -563,6 +563,21 @@ static void poller_task(void *arg)
         }
 
         int64_t poll_t0 = mp_now_ms();
+        /* 【poll 心跳探针 2026-09-27】真机出现"hello ok 之后完全没有 poll 日志、
+         * 服务端长期 offline、指令取不走"的现象，但看不到卡在哪一步。这里每 15s
+         * 打一条带内部堆余量的心跳，把"循环是否在转 / 是否在等 portal"变成事实。 */
+        {
+            static int64_t s_hb_ms;
+            int64_t now_ms = esp_timer_get_time() / 1000;
+            if (now_ms - s_hb_ms > 15000) {
+                s_hb_ms = now_ms;
+                ESP_LOGW(TAG, "poll 心跳：since=%lu deviceId=%s 内部堆空闲=%u 最大块=%u portal=%d",
+                         (unsigned long)s_since, mp_http_device_id(),
+                         (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                         (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+                         (int)provision_portal_active());
+            }
+        }
         bool ok = do_poll_once();
         int64_t poll_dt_ms = mp_now_ms() - poll_t0;
 
