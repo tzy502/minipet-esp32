@@ -279,13 +279,22 @@ static void app_main_task(void *arg)
      * 本板内部动态堆仅 ~143KB 且碎片化，真机实证 bgm 24K 先分配后
      * render 12K 连续块即失败（internal=9115 最大块=3060，整屏黑）。
      * render 再配有界重试兜底（碎片随时序漂移，boot 间随机）。 */
+    /* 【内部堆腾挪 2026-09-27】12K → 10K：真机启动末期内部堆只剩 2.3KB 空闲、
+     * 最大连续块 2036B，lwIP 连 TCP PCB/发送缓冲都分不到（连自己的网关都
+     * connect 失败 errno=113），而 Mac 侧同一 URL curl 200。渲染任务只做
+     * compose+blit，菜单构建期的深栈需求已由 lvgl_bridge 内部收敛；
+     * 保留 10K 余量并保留下方有界重试。 */
     bool render_ok = false;
+    static const uint32_t render_stacks[] = { 10240, 8192 };
     for (int t = 0; t < 10 && !render_ok; t++) {
-        if (xTaskCreatePinnedToCore(render_task, "render", 12288, NULL, 5, NULL, 1) == pdPASS) {
+        uint32_t stk = render_stacks[t < 6 ? 0 : 1];   /* 前 6 次 10K，之后降 8K */
+        if (xTaskCreatePinnedToCore(render_task, "render", stk, NULL, 5, NULL, 1) == pdPASS) {
             render_ok = true;
+            ESP_LOGW(TAG, "render 任务已创建（栈 %u）", (unsigned)stk);
             break;
         }
-        ESP_LOGE(TAG, "render 任务创建失败(第%d次) internal=%u 最大块=%u", t + 1,
+        ESP_LOGE(TAG, "render 任务创建失败(第%d次, 栈%u) internal=%u 最大块=%u", t + 1,
+                 (unsigned)stk,
                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
         vTaskDelay(pdMS_TO_TICKS(200));

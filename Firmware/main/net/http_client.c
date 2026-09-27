@@ -171,11 +171,18 @@ static void raw_tcp_probe_once(const char *url)
             a2.sin_family = AF_INET;
             a2.sin_port = htons((uint16_t)tgts[i].port);
             inet_aton(tgts[i].ip, &a2.sin_addr);
-            int rc = connect(s2, (struct sockaddr *)&a2, sizeof a2);
+            int rc = -1, last_errno = 0;
+            /* 连两次（间隔 2s）：区分"首次包丢/ARP 未就绪"与"稳定不通" */
+            for (int attempt = 0; attempt < 2; attempt++) {
+                rc = connect(s2, (struct sockaddr *)&a2, sizeof a2);
+                last_errno = (rc == 0) ? 0 : errno;
+                if (rc == 0) break;
+                vTaskDelay(pdMS_TO_TICKS(2000));
+            }
             ESP_LOGW("probe", "[%s] %s:%d connect=%d errno=%d (%s)",
                      tgts[i].name, tgts[i].ip, tgts[i].port, rc,
-                     rc == 0 ? 0 : errno, rc == 0 ? "OK" : strerror(errno));
-            if (rc == 0) close(s2); else close(s2);
+                     last_errno, rc == 0 ? "OK" : strerror(last_errno));
+            close(s2);
         }
     }
 

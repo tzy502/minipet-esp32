@@ -358,3 +358,61 @@ E (2707) bridge: font 1 not loaded (render_set_font first)
    代码路径自检 + 主机 harness 逻辑验证；真机验证受网络环境阻塞）。真机首验
    建议看两条证据：① 串口/环日志出现 `I (xxx) mdns: 发现服务端: http://...`；
    ② 服务端出现 `POST /api/device/log` 且 200。
+
+---
+
+## 8. 设备联网卡点交接（2026-09-27 真机实测，未闭环）
+
+### 8.1 已经修好并有证据的部分
+
+| 项 | 证据 |
+|---|---|
+| Reset WiFi 后无限重启（`rst:0xc` / LoadProhibited `EXCVADDR=0x2c`） | 修复后连续多轮启动 `crashes: 0` |
+| 配网页 192.168.4.1 打不开 | `curl http://192.168.4.1/` → 200 / 5276B / `<title>MiniPet 配网</title>` |
+| 热点连上但拿不到 IP（只剩 169.254） | Mac 连上 3s 内拿到 `192.168.4.2` |
+| 配网页只有响应头没 body | 由 15s 超时 size=0 → 1.7s / 5276B |
+| 配网提交 | `POST /save` → 200 → 重启后 `WiFi GOT_IP: <PET_IP>` |
+| 时钟 6h 漂移校时从未执行 | 已改为到点真校一次并回写 RTC |
+
+关键改动：httpd 改到开机最早窗口启动且必须确认 80 端口真在监听（listen 失败是任务内
+异步发生，只看 ESP32_OK 会得到"哑巴 httpd"）；dns53 bind 失败改重试（原来直接自杀
+且句柄残留 → 手机不弹配网页）；mp_main/bgm/render/httpd 栈下调；HTTP 上报缓冲挪 PSRAM；
+WiFi **RX** 缓冲回默认（缩容会引发 `reason=2` 认证失败，**不要再动 RX**），仅 TX 16→8。
+
+### 8.2 未闭环：设备拿到 IP 后 TCP 一律失败
+
+真机现状（本文件写作时）：
+
+```
+I (2749) provision: WiFi GOT_IP: <PET_IP>          ← 关联 + DHCP 正常
+W (2751) http: hello 目标 http=http://<NAS_IP>:38090 deviceId=44BD8D60DAC0
+W (10758) http: mp_http_tx_fail ret=0x7002 (ESP_ERR_HTTP_CONNECT) errno=0 phase=open
+W (33004) probe: [网关] <LAN_IP>:80 connect=-1 errno=128 (Socket is not connected)
+```
+
+同时刻对照事实：
+- Mac 侧 `curl http://<NAS_IP>:38090/api/health` → **200**；`nc -z <NAS_IP> 38090` 通
+- Mac 侧 `ping <PET_IP>` → **0% 丢包 6~30ms**（设备整机在线、链路层活着）
+- 设备侧连**自己的默认网关**的 TCP 都不通（errno 113 → 128 两次不同）
+- 内部堆诊断：总 196363B / 空闲 2344B / **最大连续块 2036B**（100KB 段 0 空闲、179 个分配块）
+- 设备侧同时出现 `W:m f null`（WiFi 管理帧分配失败）
+
+已排除：NAS 防火墙/端口（Mac 同 URL 200）、路由（网关 ping 通）、DNS（用的是点分 IP）、
+凭据（NVS 里 ssid/srv_url 正确）、RX 缓冲缩容（已回退）。
+
+**下一步方向（按优先级）**：
+1. 内部堆碎片是唯一还站得住的嫌疑：`connect()` 需要 lwIP 从内部堆取 TCP PCB/发送缓冲。
+   建议做一次**启动期内部堆分配清单**（heap_caps 分段 + 各任务栈 + 组件 .bss 排序），
+   找出 100KB 段被 179 个小块吃光的具体来源，而不是继续零敲碎打地调栈。
+2. 若确认是 WiFi 驱动收包路径（`m f null` + TCP 全灭但 ICMP 通），可在拿到 IP 后
+   增加 `esp_wifi_stop()+start()` 的"重启净空"实验（本板内存紧张，需实测）。
+3. 验证手段：`Firmware/main/net/http_client.c` 的 `raw_tcp_probe_once()` 已内置
+   网关+服务端双点裸 socket 探针（含 2 次重试），下次直接看它打印的 errno 即可。
+
+### 8.3 服务端/Web 本轮补齐（E14 日志链路，已自测）
+
+- `POST /api/device/log` + `GET /api/admin/device-logs/{id}`|`/by-uuid/{uuid}`：
+  见 §7.2 契约；实现含 **幂等**（重传同批 `accepted=0`）与会话判定（用设备上报的
+  `t` 开机毫秒判断重启，**不能只看 seq 回退**——否则重传被误判成重启并重建库）。
+- Web 设备详情页新增「设备日志」卡（级别/TAG 过滤、5s 自动刷新、E/W 着色、
+  端点缺失时给可读提示）。CI smoke 增加 GET/PUT 与本次幂等的断言。
