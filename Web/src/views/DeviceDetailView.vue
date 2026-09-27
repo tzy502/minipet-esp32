@@ -4,8 +4,10 @@
  * + 素材推送（T3/E7）+ 动作/表情/气泡调试（T2/E4，25 表情手动指定）。
  * 换装 = PUT devices/{id} 显式传 petConfig（按设备隔离，manifest rev+1）；
  * 阈值覆盖 = 传 thresholds 对象；显式传 petConfig:null = 清空回默认宠物。
- * T2 指令端点服务端尚未提供（见 Web/docs/interfaces-needed-from-server.md）：开卡先探测，
- * 缺失 → 25 个表情按钮全部禁用 + 卡片内给出接口需求；端点上线后无需改前端（探测转 ok）。
+ * T2 指令端点服务端**已上线**（实测 202 {"ok":true,"seq":47,...}）：仍保留开卡探测，
+ * 老部署实例上端点缺失 → 25 个表情按钮禁用 + 卡片内给出接口需求（见
+ * Web/docs/interfaces-needed-from-server.md）；端点在线时探测转 ok，无需改前端。
+ * 素材选择器按 E4 分组「★收藏 / 🕘最近 / 全部目录」（读 utils/favorites.js）。
  */
 import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
@@ -25,6 +27,7 @@ import {
   CATEGORIES, GENDERS, newDraft, appearanceToDraft, draftToAppearance, buildPaperdollId,
 } from '../utils/appearance'
 import { EXPRESSIONS, BUBBLE_MAX_BYTES, bubbleByteLength } from '../utils/expressions'
+import { favoriteIds, recentIds, recordRecent } from '../utils/favorites'
 import { fmtTime, fmtAgo } from '../utils/format'
 
 const props = defineProps({ id: { type: String, required: true } })
@@ -205,14 +208,49 @@ async function doOta() {
 }
 
 // ── 素材推送到设备（T3/E7：地图/NPC 资产登记进该设备 manifest）─────────────
+// E4「地图选择含收藏（喂给设备选择器的「最近+收藏」）」：选项按 ★收藏 / 🕘最近 / 全部目录 分组，
+// 收藏与「最近」读自 utils/favorites.js（与素材页星标同一份 localStorage 单例；服务端收藏端点缺失时
+// 仍照常工作，端点上线后素材页会把它同步上去）。成功推送即记一次「最近使用」。
 const pushKind = ref('map')
 const pushId = ref('')
 const pushSwitch = ref(true)
 const pushBusy = ref(false)
 const pushResult = ref(null) // { type, text }
-const matOptions = ref([])
+const matAll = ref([]) // 当前 kind 的目录全量 [{ id, name }]
 const matLoading = ref(false)
 const matLoaded = reactive({}) // kind → 已加载过
+
+function matLabel(id) {
+  const hit = matAll.value.find((it) => it.id === id)
+  return hit ? `${hit.name || '—'} [${id}]` : `[${id}]`
+}
+
+/**
+ * 设备选择器选项（分组）：★ 收藏 → 🕘 最近 → 全部目录。
+ * 同一 id 只出现一次（上面出现过的从「全部目录」里剔除）；收藏/最近里的 id 即使不在目录中
+ * （手工输入过 / 目录未加载完）也保留，值仍是可下发的编号字符串。
+ */
+const matOptions = computed(() => {
+  const shown = new Set()
+  const take = (ids) => {
+    const out = []
+    for (const raw of ids) {
+      const id = String(raw)
+      if (shown.has(id)) continue
+      shown.add(id)
+      out.push({ label: matLabel(id), value: id })
+    }
+    return out
+  }
+  const groups = []
+  const favs = take(favoriteIds(pushKind.value))
+  if (favs.length) groups.push({ type: 'group', label: '★ 收藏', key: 'g-fav', children: favs })
+  const rec = take(recentIds(pushKind.value))
+  if (rec.length) groups.push({ type: 'group', label: '🕘 最近使用', key: 'g-recent', children: rec })
+  const rest = take(matAll.value.map((it) => it.id))
+  if (rest.length) groups.push({ type: 'group', label: '全部目录', key: 'g-all', children: rest })
+  return groups
+})
 
 async function loadMatOptions() {
   const k = pushKind.value
@@ -220,13 +258,10 @@ async function loadMatOptions() {
   matLoading.value = true
   try {
     const data = await getMaterials(k)
-    matOptions.value = (data?.items ?? []).map((it) => ({
-      label: `${it.name || '—'} [${it.id}]`,
-      value: String(it.id),
-    }))
+    matAll.value = (data?.items ?? []).map((it) => ({ id: String(it.id), name: it.name ?? '' }))
     matLoaded[k] = true
   } catch (e) {
-    matOptions.value = []
+    matAll.value = []
     pushResult.value = { type: 'error', text: `素材目录加载失败：${errText(e)}（仍可直接输入编号）` }
   } finally {
     matLoading.value = false
@@ -234,7 +269,7 @@ async function loadMatOptions() {
 }
 watch(pushKind, () => {
   pushId.value = ''
-  matOptions.value = []
+  matAll.value = []
   loadMatOptions()
 })
 
@@ -260,6 +295,7 @@ async function doPushMaterial() {
     const r = await pushMaterial(props.id, pushKind.value, id, pushSwitch.value)
     const text = `已受理（HTTP 202）：${r?.note || '后台打包中'}`
     pushResult.value = { type: 'success', text }
+    recordRecent(pushKind.value, id) // E4「最近」：成功推送即记一次（设备选择器分组置顶）
     message.success(text)
   } catch (e) {
     const status = e?.response?.status
@@ -540,7 +576,7 @@ async function sendBubble() {
         </n-space>
       </n-card>
 
-      <!-- 素材推送（T3/E7）：收藏只在本机，这里是真正让素材上机的动作 -->
+      <!-- 素材推送（T3/E7）：选择器 = E4「最近+收藏」，推送是真正让素材上机的动作 -->
       <n-card title="素材推送（地图 / NPC 上机，E7）" size="small">
         <n-space vertical :size="10">
           <n-space align="center" :size="8" style="width: 100%">
@@ -576,7 +612,10 @@ async function sendBubble() {
             {{ pushResult.text }}
           </n-alert>
           <div class="hint">
-            端点：<code>POST /api/admin/devices/{{ device.deviceId }}/push</code> body
+            选择器分组：<b>★ 收藏</b> / <b>🕘 最近使用</b>（E4「地图选择含收藏」，读素材页星标同一份
+            本机存储 <code>minipet.materials.favorites</code> / <code>.recent</code>；服务端收藏端点缺失时
+            仍照常工作）/ <b>全部目录</b>。端点：
+            <code>POST /api/admin/devices/{{ device.deviceId }}/push</code> body
             <code>{ kind: "map"|"npc", id, switch }</code> → 202 受理（后台打包，数秒）；
             失败分支：400 参数非法 / 404 设备不存在 / 503 WZ 未加载 / 500 打包异常。
           </div>

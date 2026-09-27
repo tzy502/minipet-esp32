@@ -7,7 +7,11 @@
  * - 「加载更多」每次追加 100 条；缩略图 n-image 懒加载，失败回退 emoji
  * - 收藏星标（localStorage minipet.materials.favorites：map/mob/npc 桶 + 纸娃娃按类目 pd_{part}
  *   分桶；旧 paperdoll 桶为占位时代数据，弃用不迁移）；点击 id 复制
- * - 「推送到设备」（T3/E4/E7）：⭐ 收藏只在本机浏览器，📤 推送才是真正上机动作 ——
+ * - 收藏的服务端同步（T3/E4）：服务端暂无收藏端点 → 运行时探测
+ *   （GET /api/admin/materials/favorites，404/405/501 = 缺失）→ 命中才拉取合并 + 回推；
+ *   缺失/不可达时**完全退回本机 localStorage**（离线兜底，能力不减），UI 如实标注同步态。
+ *   状态与读写共享 Web/src/utils/favorites.js（设备选择器的「最近+收藏」分组读同一份）。
+ * - 「推送到设备」（T3/E4/E7）：📤 推送是真正上机动作 ——
  *   选目标设备 → POST /admin/devices/{id}/push {kind,id,switch} → 202 后台打包，
  *   完成后服务端 bump manifest rev + 自动下发切图指令（设备自动切换）。服务端 push 仅
  *   支持 kind=map|npc（AdminEndpoints.cs:254-329），故 mob/纸娃娃 tab 只给禁用态说明。
@@ -18,6 +22,7 @@ import {
   NSpin, NTabPane, NTabs, NTag, NTooltip, useMessage,
 } from 'naive-ui'
 import { errText, getCatalog, getMaterials, pushMaterial, thumbUrl } from '../api/client'
+import * as favoritesApi from '../utils/favorites'
 import { CATEGORIES, numericId } from '../utils/appearance'
 import { useDevicesStore } from '../stores/devices'
 
@@ -34,30 +39,51 @@ const PAGE_SIZE = 100
 /** 缩略图加载失败/缺失时的回退 emoji（纸娃娃 tab 用类目 icon）。 */
 const FALLBACK_EMOJI = { map: '🗺️', mob: '👾', npc: '🧑' }
 
-// ── 收藏（localStorage 持久化，按桶分桶）──────────────────────────────────
-// 桶名：map / mob / npc（素材 tab key）+ 纸娃娃 pd_{part}；旧 paperdoll 桶为占位时代数据，弃用不迁移
-const FAV_KEY = 'minipet.materials.favorites'
-const favorites = ref(loadFavs())
+// ── 收藏（localStorage 真源 + 探测到才启用的服务端同步）───────────────────
+// 桶名：map / mob / npc（素材 tab key）+ 纸娃娃 pd_{part}；旧 paperdoll 桶为占位时代数据，弃用不迁移。
+// 状态与读写全部收敛到 utils/favorites.js（与 DeviceDetailView 的设备选择器共享同一份单例）。
+const {
+  isFavorite: isFav, toggleFavorite: toggleFav,
+  syncState, syncNote, lastSyncText, probeSync, pullAndMerge, pushFavorites,
+} = favoritesApi
+const syncing = ref(false)
 
-function loadFavs() {
-  try {
-    return { map: [], mob: [], npc: [], ...JSON.parse(localStorage.getItem(FAV_KEY) || '{}') }
-  } catch {
-    return { map: [], mob: [], npc: [] }
+/** 收藏同步态标签（探针结果 → UI 文案）。 */
+const SYNC_TAG = {
+  syncing: { type: 'info', label: '同步中…' },
+  ok: { type: 'success', label: '收藏已同步服务端' },
+  missing: { type: 'default', label: '收藏仅本机（端点缺失）' },
+  error: { type: 'warning', label: '收藏仅本机（同步不可用）' },
+  unknown: { type: 'default', label: '收藏仅本机' },
+}
+const syncTag = computed(() => SYNC_TAG[syncState.value] ?? SYNC_TAG.unknown)
+
+/** 开卡：探测服务端收藏端点；命中（且形态正确）才拉取合并，缺失/不可达一律退回本机模式。 */
+async function initFavoritesSync() {
+  const r = await probeSync()
+  if (r.supported === true && r.shapeOk !== false) {
+    try {
+      await pullAndMerge()
+    } catch (e) {
+      syncState.value = 'error'
+      syncNote.value = errText(e, '同步失败')
+    }
   }
 }
-function persistFavs() {
-  localStorage.setItem(FAV_KEY, JSON.stringify(favorites.value))
-}
-function isFav(bucket, id) {
-  return favorites.value[bucket]?.includes(id)
-}
-function toggleFav(bucket, id) {
-  const arr = favorites.value[bucket] ?? (favorites.value[bucket] = [])
-  const i = arr.indexOf(id)
-  if (i >= 0) arr.splice(i, 1)
-  else arr.push(id)
-  persistFavs()
+
+/** 手动同步（按钮仅在端点命中时出现）：拉取合并（并集，本地不丢）+ 回推。 */
+async function syncNow() {
+  syncing.value = true
+  try {
+    await pullAndMerge()
+    message.success(lastSyncText.value || '收藏已与服务端合并')
+  } catch (e) {
+    syncState.value = 'error'
+    syncNote.value = errText(e, '同步失败')
+    message.error(syncNote.value)
+  } finally {
+    syncing.value = false
+  }
 }
 
 // ── 当前上下文（tab + 纸娃娃类目）─────────────────────────────────────────
@@ -270,7 +296,10 @@ watch(searchText, (v) => {
 watch([query, onlyFav], () => {
   visibleCount.value = PAGE_SIZE
 })
-onMounted(loadList)
+onMounted(() => {
+  loadList()
+  initFavoritesSync()
+})
 onBeforeUnmount(() => clearTimeout(searchTimer))
 </script>
 
@@ -281,7 +310,24 @@ onBeforeUnmount(() => clearTimeout(searchTimer))
         <n-space align="center">
           <n-tag :bordered="false" type="info">服务端渲染缩略图</n-tag>
           <span class="hint">素材目录实时读自 WZ（Map/Mob/Npc/Character）</span>
-          <span class="hint">★ 收藏只存本机浏览器；📤 推送到设备才是上机动作（服务端 push 支持地图/NPC）</span>
+        </n-space>
+        <n-space align="center" :size="8">
+          <n-tooltip trigger="hover">
+            <template #trigger>
+              <n-tag :bordered="false" size="small" :type="syncTag.type">{{ syncTag.label }}</n-tag>
+            </template>
+            <div style="max-width: 380px; line-height: 1.7">
+              <div>收藏以本机 localStorage（<code>minipet.materials.favorites</code>）为真源 —— 离线/端点缺失时能力不减。</div>
+              <div v-if="syncState === 'ok'">服务端端点 <code>GET/PUT /api/admin/materials/favorites</code> 在位：进入本页自动拉取合并（并集，本地不丢）。{{ lastSyncText }}</div>
+              <div v-else-if="syncState === 'missing'">
+                服务端暂无收藏端点（探测 HTTP {{ syncNote || '404' }}）→ 同步未启用，收藏只在本机浏览器。
+                接口需求已写入 <code>Web/docs/interfaces-needed-from-server.md</code> §T7。
+              </div>
+              <div v-else>探测未完成或不可达{{ syncNote ? `（${syncNote}）` : '' }}。</div>
+            </div>
+          </n-tooltip>
+          <n-button v-if="syncState === 'ok'" size="tiny" secondary :loading="syncing" @click="syncNow">同步到服务端</n-button>
+          <span class="hint">★ 收藏已喂给设备选择器（「最近+收藏」）；📤 推送才是上机动作（服务端 push 支持地图/NPC）</span>
         </n-space>
         <n-checkbox v-model:checked="onlyFav">只看收藏（{{ favCount }}）</n-checkbox>
       </n-space>
@@ -412,7 +458,9 @@ onBeforeUnmount(() => clearTimeout(searchTimer))
 
         <div class="hint">
           推送 = 服务端把该素材打包进此设备 manifest（数秒，HTTP 202 受理）→ 设备轮询到 rev
-          变化后自动拉包 → 完成后自动切换。收藏（★）仍只在本机浏览器。
+          变化后自动拉包 → 完成后自动切换。收藏（★）以本机 localStorage 为真源
+          <template v-if="syncState === 'ok'">，并已同步到服务端</template>
+          <template v-else>（服务端收藏端点缺失 → 仅本机）</template>，且已喂给设备详情页的地图选择器。
         </div>
 
         <n-result

@@ -39,6 +39,17 @@ public sealed class HealthReport
     private static readonly HashSet<string> ErrorTypes = new(StringComparer.Ordinal)
     {
         "error", "fatal", "asset_fail", "asset_corrupt", "watchdog_fuse",
+        /* 【E11 Web 可见性修复 2026-09-27】固件实际发的错误类事件名：
+         * events.c 的 event_name() 产出 asset_error / bgm_failover，此前不在白名单
+         * → 素材损坏与 BGM failover 永不进"最近异常"，Web 健康页看不到降级。 */
+        "asset_error", "bgm_failover",
+    };
+
+    /* 非错误事件名：即使走 MP_EVT_ERROR 通道（如回网 net_online）也不该污染"最近异常"。
+     * 固件 state_machine.c 的 net_offline/net_online 都用 type=error + data.s 区分。 */
+    private static readonly HashSet<string> NonErrorSubtypes = new(StringComparer.Ordinal)
+    {
+        "net_online",
     };
 
     private sealed class State
@@ -69,14 +80,19 @@ public sealed class HealthReport
             st.Ring.Enqueue(new DeviceEventRecord { TsUtc = now, Type = type, Data = data });
             while (st.Ring.Count > RingCapacity) st.Ring.Dequeue();
 
-            if (isError)
+            if (isError && !NonErrorSubtypes.Contains(ExtractString(data, "s") ?? ""))
             {
-                st.LastError = ExtractString(data, "message") ?? type;
+                st.LastError = ExtractString(data, "message")
+                               ?? ExtractString(data, "s")      /* 固件用 data.s 带子类（net_offline/asset hash…） */
+                               ?? type;                          /* 兜底：至少不是裸 "error" */
                 st.LastErrorUtc = now;
             }
             if (type is "battery" or "battery_low" or "low_battery")
             {
-                var pct = ExtractInt(data, "percent") ?? ExtractInt(data, "battery");
+                /* 固件事件载荷把参数平铺为 data.a（events.c 的 a/b/s 平铺）；
+                 * 此前只读 percent/battery → BatteryPercent 恒 null、Web 电量永不渲染。 */
+                var pct = ExtractInt(data, "percent") ?? ExtractInt(data, "battery")
+                          ?? ExtractInt(data, "a");
                 if (pct.HasValue) st.BatteryPercent = pct;
             }
         }

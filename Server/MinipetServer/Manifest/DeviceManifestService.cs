@@ -186,6 +186,50 @@ public sealed class DeviceManifestService
         }
         catch { /* latest.json 损坏 → 无 firmware 项 */ }
 
+        /* 【E2 修复 2026-09-27】entities[] 数组结构（需求原文：协议里 entities[]
+         * 数组结构，首版 N=1，未来同屏多宠不改协议）。
+         * 此前全仓只有一行注释、无实际数组；实体身份散落在 assets 的 entity 字段
+         * 与 LAYOUT 的 entity_id 里。现从 assets 聚合出 entities[]：
+         *   { id, kind: "paperdoll"|"npc", partsHash, layoutHashes[], appearanceHash?, defaultAction? }
+         * 固件侧忽略未知顶层字段（cJSON 只取 rev/files/clock_table/active_map），
+         * 因此对现有设备零影响；未来多宠只需往数组里加项。 */
+        var entitiesById = new Dictionary<string, JsonObject>(StringComparer.Ordinal);
+        foreach (var (hash, node) in assets ?? new JsonObject())
+        {
+            if (node is not JsonObject e) continue;
+            var kind = e["kind"]?.GetValue<string>() ?? "";
+            var ent = e["entity"]?.GetValue<string>();
+            if (string.IsNullOrEmpty(ent)) continue;
+            if (!entitiesById.TryGetValue(ent, out var obj))
+            {
+                var isNpc = kind.Equals("PARTS", StringComparison.OrdinalIgnoreCase)
+                            && ent.StartsWith("npc:", StringComparison.Ordinal);
+                if (!(isNpc || (kind.Equals("PARTS", StringComparison.OrdinalIgnoreCase)
+                                && ent.StartsWith("paperdoll", StringComparison.Ordinal))))
+                    continue;   /* 条带/时钟等非实体包不入 entities */
+                obj = new JsonObject
+                {
+                    ["id"] = ent,
+                    ["kind"] = isNpc ? "npc" : "paperdoll",
+                    ["layouts"] = new JsonArray(),
+                };
+                entitiesById[ent] = obj;
+            }
+            if (kind.Equals("PARTS", StringComparison.OrdinalIgnoreCase))
+            {
+                obj["partsHash"] = hash;
+                if (e["appearanceHash"] is { } ah) obj["appearanceHash"] = ah.DeepClone();
+                if (e["defaultAction"] is { } da) obj["defaultAction"] = da.DeepClone();
+            }
+            else if (kind.Equals("LAYOUT", StringComparison.OrdinalIgnoreCase))
+            {
+                if (obj["layouts"] is JsonArray arr) arr.Add(hash);
+            }
+        }
+        var entities = new JsonArray();
+        foreach (var kv in entitiesById) entities.Add(kv.Value);
+        root["entities"] = entities;
+
         // clock_table：E9 魔法值表（Web 可改 → rev+1）
         var clock = new JsonObject();
         foreach (var (mapId, xy) in _cfg.Current.Clock.MapOffsets)

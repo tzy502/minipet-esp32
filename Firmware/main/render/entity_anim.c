@@ -96,9 +96,14 @@ int rc_anim_set_expression(rc_anim_t *st, const char *name)
     snprintf(st->expr_want, sizeof st->expr_want, "%s", name);
     int want = expr_lookup(st->layout, name);
     if (want < 0) {
-        ESP_LOGW(TAG, "expression '%s' not in action '%s'", name,
-                 st->layout ? st->layout->action : "(none)");
-        st->expr_cur = 0;
+        /* 【E10 修复 2026-09-27】需求：「某表情素材缺失 → 回退 default」。
+         * 此前直接 expr_cur=0，而导出表 index 0 实际是 blink（不是 default）
+         * → 缺素材时错回退成眨眼。现显式查 "default" 并回退到它；连 default
+         * 都缺才退回 index 0（保留"绝不空脸"的原兜底）。 */
+        ESP_LOGW(TAG, "expression '%s' not in action '%s' → 回退 default",
+                 name, st->layout ? st->layout->action : "(none)");
+        int dflt = expr_lookup(st->layout, "default");
+        st->expr_cur = (dflt >= 0) ? dflt : 0;
         return -1;
     }
     st->expr_cur = want;

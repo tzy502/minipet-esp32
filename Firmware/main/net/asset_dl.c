@@ -608,6 +608,11 @@ static void evict_if_needed(void)
             char path[96];
             snprintf(path, sizeof(path), "%s/%s.mpk", dir, s_files[victim].hash);
             ESP_LOGI(TAG, "evict LRU %s", path);
+            /* 【E11 修复 2026-09-27】需求「TF 卡满：按淘汰策略清」+「所有降级事件
+             * 上报服务端（Web 可见设备健康状态）」——此前淘汰只打串口日志，
+             * 服务端/Web 完全看不到。现上报一条事件（type=error, data.s=tf_evict,
+             * data.a=被淘汰文件的 kind 名哈希长度无关，借 a 传剩余空间水位）。 */
+            mp_post_event_simple(MP_EVT_ERROR, (int32_t)s_file_cnt, 0, "tf_evict");
             unlink(path);
         }
         s_files[victim] = s_files[s_file_cnt - 1];

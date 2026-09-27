@@ -71,6 +71,18 @@ extern "C" {
 #define MP_EXPR_WINK         "wink"
 #define MP_EXPR_CHU          "chu"
 #define MP_EXPR_QBLUE        "qBlue"
+/* 【E10 补齐 2026-09-27】需求要求 25 个实证表情全量（Face_000.wz）：
+ * 导出器已全量下发（AssetExporter 25 表情维度），但固件此前只具名 18 个，
+ * 缺的 8 个无法本地触发（只能等服务端下发 expression 名字）。
+ * 现补齐宏，使固件侧可引用/触发全部 25 个。 */
+#define MP_EXPR_CRY          "cry"
+#define MP_EXPR_ANGRY        "angry"
+#define MP_EXPR_VOMIT        "vomit"
+#define MP_EXPR_PAIN         "pain"
+#define MP_EXPR_GLITTER      "glitter"
+#define MP_EXPR_SHINE        "shine"
+#define MP_EXPR_BLAZE        "blaze"
+#define MP_EXPR_BOWING       "bowing"
 
 /* 动作名（WZ 真实 action，仅引用不自创——E5 动画铁律） */
 #define MP_ACTION_STAND      "stand1"

@@ -83,15 +83,15 @@ export function pushMaterial(deviceId, kind, id, switchAfter = true) {
 }
 
 // ── 设备指令（动作 / 表情 / 气泡，E4/E12）────────────────────────────────
-// ⚠ 服务端端点【尚未提供】：AdminEndpoints.cs 目前只有 manifest/ota/map/push 四类入队，
-//   没有任何 admin 端点能调 CommandQueue.Enqueue 下发 action/expression/bubble。
-//   需求清单（方法/路径/请求体/期望响应/固件侧实证）见 Web/docs/interfaces-needed-from-server.md。
-//   本函数按需求清单的约定形态预留：一旦服务端上线，UI 无需改动即可生效。
+// ✅ 服务端端点【已上线】（AdminEndpoints.cs「设备实时指令下发」段）：实测
+//   POST {"type":"expression","value":"default"} → 202 {"ok":true,"seq":47,...}（见下方 probeDeviceCommand）。
+//   白名单 type：expression / action / bubble / brightness / reboot（+ 工作区已加 bgm）；bubble ≤95 字节。
+//   固件侧已支持（Firmware/main/net/poller.c:141-210 摊平 commands[].type + payload：
+//   payload 须是裸字符串或 {"id":"..."}，形如 {"value":"..."} 会被固件静默忽略）。
+//   本函数仍保留「探测到才启用」语义：老版本部署实例上端点缺失时 UI 自动退回禁用态。
 //   期望：POST /api/admin/devices/{id}/command
 //         body { type: "expression"|"action"|"bubble", value: "<名字/文本>", durationMs?: number }
 //         → 202 { ok: true, seq: <n>, type, value }
-//   固件侧已支持（Firmware/main/net/poller.c:141-210 摊平 commands[].type + payload：
-//   payload 须是裸字符串或 {"id":"..."}，形如 {"value":"..."} 会被固件静默忽略）。
 export const DEVICE_COMMAND_TYPE = Object.freeze({ EXPRESSION: 'expression', ACTION: 'action', BUBBLE: 'bubble' })
 
 /** 设备指令端点的完整路径（UI 展示「需要服务端提供什么」时用同一份字符串）。 */
@@ -229,7 +229,62 @@ export function getMaterials(kind) {
   return http.get('/admin/materials', { params: { kind } }).then((r) => r.data)
 }
 
+// ── 素材收藏（E4「地图选择含收藏」）────────────────────────────────────────
+// ⚠ 服务端**当前没有**收藏存储/端点（AdminEndpoints.cs 无 /materials/favorites 路由）→
+//   Web 侧按「探测到才启用」做：404/405/501 判「端点缺失」，收藏退回 localStorage 单机模式；
+//   端点一旦按 Web/docs/interfaces-needed-from-server.md §T7 上线，UI 无需改动即启用同步。
+// 约定契约（探测命中时的期望形态）：
+//   GET /api/admin/materials/favorites → 200 { favorites: { "map": ["200000100", …], "npc": […] } }
+//   PUT /api/admin/materials/favorites  body { favorites: {…} } → 200 { ok: true, favorites: {…} }
+export const FAVORITES_PATH = '/api/admin/materials/favorites'
+
+/** 收藏桶（与 Web 侧 localStorage 桶名一致）。 */
+export const FAVORITE_BUCKETS = Object.freeze(['map', 'mob', 'npc'])
+
+export function getMaterialFavorites() {
+  return http.get('/admin/materials/favorites').then((r) => r.data)
+}
+
+export function putMaterialFavorites(favorites) {
+  return http.put('/admin/materials/favorites', { favorites }).then((r) => r.data)
+}
+
+/**
+ * 探测服务端收藏端点是否在位（T3）。
+ * 返回 { supported: true|false|null, status?, shapeOk?, data?, error? }
+ *   true  = 路由在位且响应含 favorites 对象（shapeOk=true）；路由在位但形态不符 → shapeOk=false
+ *   false = 404/405/501 路由不存在 → UI 退回「收藏仅本机 localStorage」
+ *   null  = 网络不可达等无法判定
+ */
+export async function probeMaterialFavorites() {
+  try {
+    const data = await getMaterialFavorites()
+    const favs = data?.favorites
+    const shapeOk = !!favs && typeof favs === 'object' && !Array.isArray(favs)
+    return { supported: true, shapeOk, status: 200, data }
+  } catch (e) {
+    const status = e?.response?.status
+    if (status === 404 || status === 405 || status === 501) return { supported: false, status }
+    if (status) return { supported: true, shapeOk: false, status, error: errText(e) }
+    return { supported: null, error: errText(e) }
+  }
+}
+
 // ── 曲库与音源（E8：Web 只管曲库/cookie/启停，不做点歌）───────────────────
+/**
+ * 音源健康态枚举（服务端 MusicSourceState，Server/MinipetServer/Music/IMusicSource.cs:3-9）。
+ * ⚠ 实测口径（2026-09-27，`GET /api/admin/music/sources`）：System.Text.Json **按数字**序列化
+ *   → `health.state` 是 number（wz=0、qq 未启用=3），**不是**字符串；UI 必须先过 musicStateKey()
+ *   再查表，禁止直接对 state 调字符串方法（旧实现 `s.toLowerCase()` 会 TypeError → 整页渲染失败）。
+ */
+export const MUSIC_SOURCE_STATE = Object.freeze({ OK: 0, DEGRADED: 1, DOWN: 2, DISABLED: 3 })
+
+/** health.state → 'ok'|'degraded'|'down'|'disabled'（兼容服务端将来改字符串枚举的形态）。 */
+export function musicStateKey(state) {
+  if (typeof state === 'number') return Object.keys(MUSIC_SOURCE_STATE).find((k) => MUSIC_SOURCE_STATE[k] === state)?.toLowerCase() ?? ''
+  return String(state ?? '').toLowerCase()
+}
+
 // GET /admin/music/tracks?source=wz|qq → { source, count, tracks: [{id,title,category,bytes}] }
 export function musicTracks(source) {
   return http.get('/admin/music/tracks', { params: { source } }).then((r) => r.data)
@@ -249,6 +304,65 @@ export function setMusicSourceEnabled(name, enabled) {
 // QQ cookie 导入（任务口径 source/cookie 的实际后端路由为 POST .../cookie）
 export function setQqCookie(cookie) {
   return http.post('/admin/music/sources/qq/cookie', { cookie }).then((r) => r.data)
+}
+
+/**
+ * 从 `GET /admin/music/sources` 的 qq 条目里解析 cookie 新鲜度（E4「cookie 超过 7 天告警」）。
+ *
+ * ⚠ 字段实测口径（2026-09-27 真实实例，AdminEndpoints.cs:146-165 + QqMusicSource.CookieFreshness）：
+ *   · `cookieStale`  **恒存在**（所有源都有；非 qq 源恒 false）——服务端算好的判定结果；
+ *   · `cookieSavedAtUtc` / `cookieAgeDays` 为 **null 时被 JSON 序列化省略**（WhenWritingNull）
+ *     → 前端必须按 undefined 处理，不能假定字段存在；
+ *   · 有 cookie 但无导入时间（老配置/手改 JSON）→ stale=true 且 ageDays 缺省（保守告警）。
+ *
+ * 返回 `{ imported, stale, ageDays, savedAtUtc, unknownAge }`（全为纯派生，不发请求）。
+ */
+export function qqCookieInfo(src) {
+  const ageDays = src?.cookieAgeDays ?? null
+  const savedAtUtc = src?.cookieSavedAtUtc ?? null
+  const stale = src?.cookieStale === true
+  return {
+    imported: stale || ageDays != null || savedAtUtc != null,
+    stale,
+    ageDays, // number | null（null = 未导入 / 老配置无导入时间）
+    savedAtUtc,
+    unknownAge: stale && ageDays == null, // 老配置：有 cookie 但没记导入时间
+  }
+}
+
+/**
+ * 从 qq 条目的 `gateway` 对象解析网关降级原因（E4/E8）。
+ *
+ * ⚠ 实测口径：`gateway` 是**对象**（`QqGatewayStatus`，QqGatewayProcess.cs:365-378 的 camelCase 投影：
+ *   enabled / scriptFound / running / healthy / cookieLoaded / pid / restarts / lastProbeUtc
+ *   + 可选 scriptPath / startedAtUtc / lastError），**不是** "Ok/Degraded" 这种字符串枚举；
+ *   整体是否可用由服务端聚合在 `health.state` + `health.detail`。
+ *   非 qq 源该字段缺省（省略）→ present=false。
+ *
+ * 返回 `{ present, level, label, reason }`（level: ok | off | degraded | unknown）。
+ */
+export function qqGatewayInfo(src) {
+  const g = src?.gateway
+  if (!g || typeof g !== 'object') return { present: false, level: 'unknown', label: '网关状态未返回', reason: '' }
+  if (!g.enabled) {
+    return { present: true, level: 'off', label: '网关未启用', reason: g.lastError || '配置 QqMusic.Enabled=false（卡片开关可启用）' }
+  }
+  if (!g.scriptFound) {
+    return {
+      present: true, level: 'degraded', label: '未找到网关脚本',
+      reason: g.lastError || '网关本体（Rain120/qq-music-api + 适配层）不在本仓库/镜像内，需服务端配好网关',
+    }
+  }
+  if (!g.running) {
+    return { present: true, level: 'degraded', label: '网关进程未运行', reason: g.lastError || `脚本 ${g.scriptPath ?? '(未知)'} 未能拉起` }
+  }
+  if (!g.healthy) {
+    return { present: true, level: 'degraded', label: '网关健康检查失败', reason: g.lastError || `pid ${g.pid ?? '—'} 无响应` }
+  }
+  if (!g.cookieLoaded) {
+    return { present: true, level: 'degraded', label: '网关卡在 cookie 未加载', reason: g.lastError || '导入 cookie 后服务端会推送网关' }
+  }
+  return { present: true, level: 'ok', label: '网关正常', reason: '' }
 }
 
 // ── 设置（E3 双通道之 Web 通道，写同一份 data/config/appsettings.json）────

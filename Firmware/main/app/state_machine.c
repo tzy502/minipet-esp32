@@ -592,6 +592,15 @@ void app_cmd_dispatch(const mp_cmd_t *cmd)
         render_set_expression(cmd->s);
         break;
     case MP_CMD_BUBBLE:
+        /* 【E9/E12 互斥 2026-09-27】待机时钟态（CLOCK_DOZE）是纯黑只数字全屏，
+         * 合成器在时钟激活时提前 return（不画气泡层）→ 此态收到气泡（E12 静置
+         * 台词默认 300s 与 E9 待机时钟默认 5min 同刻触发）会静默丢失。
+         * 按 E9 定稿「交互（触摸/按键/IMU）→ 立即唤醒回桌宠态」的口径，
+         * 先唤醒再显示：气泡可见，且用户看到台词时不会停在黑屏时钟态。 */
+        if (state_machine_current() == MP_ST_CLOCK_DOZE) {
+            state_machine_notify_activity();
+            ESP_LOGI(TAG, "气泡指令到达：先从待机时钟唤醒回桌宠态");
+        }
         render_bubble_show(cmd->s, RENDER_FONT_24);   /* 协议传 UTF-8（E12） */
         break;
     case MP_CMD_SET_MAP:
