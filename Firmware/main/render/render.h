@@ -54,6 +54,10 @@ int  render_init(const minipet_profile_t *profile);
 /* 帧节拍（30fps 定时器驱动；内部完成合成/脏区/display_blit/LVGL） */
 void render_tick(void);
 
+/* 交互活动通知（触摸/按键/IMU）：交互期内冻结地图视差条带刷新，
+ * 把渲染预算让给拖拽跟手；1.5s 无交互自动恢复。 */
+void render_note_activity(void);
+
 /* ---------------- 素材绑定（TF 路径；失败保留旧画面） ---------------- */
 
 /* 换装：PARTS 包（一整套装扮） */

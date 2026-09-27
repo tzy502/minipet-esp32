@@ -123,6 +123,8 @@ static void post_expression(const char *expr)
 /* 交互记账：本地闲置计时（随机表情用）+ 状态机唤醒/闲置刷新 */
 static void note_interaction(void)
 {
+    extern void render_note_activity(void);
+    render_note_activity();      /* 交互期冻结地图视差刷新（拖拽手感优先） */
     s_last_interaction_ms = mp_now_ms();
     state_machine_notify_activity();
 }

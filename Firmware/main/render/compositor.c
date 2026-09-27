@@ -116,6 +116,11 @@ static int32_t g_ent_cx0, g_ent_cy0;       /* 联合包围盒左上（世界 1x�
  * 摆放契约：**画布左上角屏幕坐标 = 屏心 - origin×scale** ⇒ origin 恒在屏心，
  * 换动作/换画布尺寸时人物不跳（桌面侧靠"窗口位置 -= Δorigin"达到同一效果）。 */
 static int32_t g_ent_ox, g_ent_oy;
+/* 【交互期冻结视差 2026-09-27】用户在摸/拖时（触摸、按键、IMU 晃动）把地图条带的
+ * 滚动刷新让出去：条带整幅重合成 ~70ms/笔，与拖拽抢同一份渲染预算就是"拖动卡顿"。
+ * 交互结束后 1.5s 自动恢复滚动（观感上只是"手一碰，背景先停一下"）。 */
+static volatile int64_t g_ui_active_until_ms;
+void render_note_activity(void) { g_ui_active_until_ms = esp_timer_get_time() / 1000 + 1500; }
 static int32_t g_ent_cw,  g_ent_ch;        /* 联合包围盒宽高（世界 1x，已 clamp 到缓冲） */
 
 static mpak_t g_parts;   static bool g_parts_ok;
@@ -1146,17 +1151,51 @@ static void strip_blit(const rc_strip_t *s, int32_t rx0, int32_t ry0,
     int32_t off2 = s->last_off << RC_SCALE_SHIFT;
     const uint32_t stride_el = s->stride_b / 2u;
 
+    /* 【合成提速】先算一行"源列 → 掩码位"的可见性；按源 8 列一组的掩码字节
+     * 走快速通道（0x00 跳过 / 0xFF 直拷），避免每像素一次位运算 + 取模。
+     * 目标 x 与源 x 是 2:1 固定映射（period = 源宽×2），故可整组推进。 */
     for (int32_t sy = y0; sy < y1; sy++) {
         int32_t src_y = (sy - band_y) >> RC_SCALE_SHIFT;
         const uint16_t *srow = s->px + (size_t)src_y * stride_el;
         uint16_t *drow = g_fb + (size_t)sy * g_sw;
-        for (int32_t sx = rx0; sx < rx0 + rw; sx++) {
+        if (!s->mask) {
+            for (int32_t sx = rx0; sx < rx0 + rw; sx++) {
+                int32_t m = (sx + off2) % period;
+                if (m < 0) m += period;
+                drow[sx] = srow[m >> RC_SCALE_SHIFT];
+            }
+            continue;
+        }
+        const uint8_t *mbase = s->mask + (size_t)src_y * ((s->w + 7) / 8);
+        int32_t sx = rx0;
+        while (sx < rx0 + rw) {
             int32_t m = (sx + off2) % period;
             if (m < 0) m += period;
             int32_t src_x = m >> RC_SCALE_SHIFT;
-            if (s->mask && !rc_mask_bit(s->mask, (uint32_t)src_y * s->w + (uint32_t)src_x))
-                continue;
-            drow[sx] = srow[src_x];
+            int32_t src_bit = src_x & 7;
+            int32_t run = 8 - src_bit;                       /* 到掩码字节边界 */
+            int32_t max_dst = (rx0 + rw - sx + 1) >> 1;      /* 2 目标像素/源列 */
+            if (run > max_dst) run = max_dst;
+            if (run <= 0) run = 1;
+            uint8_t mb = (src_bit == 0) ? mbase[src_x >> 3]
+                                        : (uint8_t)((mbase[src_x >> 3] << src_bit) |
+                                                    (mbase[(src_x >> 3) + 1] >> (8 - src_bit)));
+            /* 仅当整字节且源列不跨周期回绕时走整组路径 */
+            if (run == 8 && src_bit == 0 && src_x + 8 <= (int32_t)s->w) {
+                if (mb == 0x00) { sx += 16; continue; }
+                if (mb == 0xFF) {
+                    memcpy(drow + sx, srow + src_x, 16u);
+                    sx += 16;
+                    continue;
+                }
+            }
+            for (int32_t k = 0; k < run; k++) {
+                if ((mb >> (7 - ((src_bit + k) & 7))) & 1u) {
+                    drow[sx] = srow[src_x + k];
+                    if (sx + 1 < rx0 + rw) drow[sx + 1] = srow[src_x + k];
+                }
+                sx += 2;
+            }
         }
     }
 }
@@ -1261,10 +1300,24 @@ static void compose_region(int32_t x, int32_t y, int32_t w, int32_t h)
             if (!mrow) {
                 memcpy(drow + x, srow + x, (size_t)w * 2u);
             } else {
-                const uint8_t *mseg = mrow + (x / 8);   /* mask 位索引已按绝对像素 x+c 起算 */
-                for (int32_t c = 0; c < w; c++) {
-                    if (rc_mask_bit(mseg, (uint32_t)(x + c) - (x & ~7)))
-                        drow[x + c] = srow[x + c];
+                /* 【合成提速 2026-09-27】逐像素读掩码位 → 改按 8 像素组：
+                 * 掩码字节 0x00 整组跳过、0xFF 整组 memcpy、混合才逐像素。
+                 * 真机实测 flush compose=157ms（4 层整屏重算）拖垮拖拽手感，
+                 * 掩码组快速通道是其中最大头（tile/段/条带三层都吃这个）。 */
+                int32_t c = 0;
+                while (c < w) {
+                    int32_t px = x + c;
+                    uint32_t bit = (uint32_t)px;
+                    int32_t grp = (int32_t)(8 - (bit & 7));       /* 到字节边界 */
+                    if (grp > w - c) grp = w - c;
+                    uint8_t mb = mrow[bit >> 3];
+                    if (grp == 8 && mb == 0x00) { c += 8; continue; }
+                    if (grp == 8 && mb == 0xFF) { memcpy(drow + px, srow + px, 16u); c += 8; continue; }
+                    for (int32_t k = 0; k < grp; k++) {
+                        uint32_t b = bit + (uint32_t)k;
+                        if ((mrow[b >> 3] >> (7 - (b & 7))) & 1u) drow[px + k] = srow[px + k];
+                    }
+                    c += grp;
                 }
             }
         }
@@ -1443,9 +1496,32 @@ static void flush_dirty(void)
     (void)cells;
     if (s_forensic_chunks > 0)
         ESP_LOGW(TAG, "取证flush rect=(%d,%d %dx%d)", (int)x, (int)y, (int)w, (int)h);
+    /* 【卡顿量化探针 2026-09-27】用户报障"拖动久了卡顿"。flush 分两段计时：
+     * compose（各图层重算）与 blit（字节序转换 + SPI 分块上屏）各占多少 ms，
+     * 每 2s 汇总一条（均/最大）。据此决定优化哪一段，而不是猜。 */
+    int64_t t_c0 = esp_timer_get_time();
     compose_region(x, y, w, h);
+    int64_t t_c1 = esp_timer_get_time();
     blit_be(x, y, w, h, g_fb + (size_t)y * g_sw + x, g_sw);
+    int64_t t_c2 = esp_timer_get_time();
     if (s_forensic_chunks > 0) s_forensic_chunks--;
+    {
+        static int64_t s_perf_ms;
+        static uint32_t n, csum, bsum, cmax, bmax;
+        n++;
+        uint32_t cd = (uint32_t)((t_c1 - t_c0) / 1000), bd = (uint32_t)((t_c2 - t_c1) / 1000);
+        csum += cd; bsum += bd;
+        if (cd > cmax) cmax = cd;
+        if (bd > bmax) bmax = bd;
+        int64_t now_ms = t_c2 / 1000;
+        if (now_ms - s_perf_ms > 2000) {
+            s_perf_ms = now_ms;
+            ESP_LOGW(TAG, "flush 性能（%u 笔/2s）：compose 均 %u 最大 %u ms | blit 均 %u 最大 %u ms | 末笔区域 %dx%d",
+                     (unsigned)n, (unsigned)(csum / (n ? n : 1)), (unsigned)cmax,
+                     (unsigned)(bsum / (n ? n : 1)), (unsigned)bmax, (int)w, (int)h);
+            n = 0; csum = bsum = cmax = bmax = 0;
+        }
+    }
 
     /* ══ 残留自检（2026-09-27，用户报障"错帧块/拖影"的兜底回归）══════════
      * 无地图（g_static==NULL）时屏幕底色应恒为纯黑：**实体显示矩形之外**出现
@@ -2030,14 +2106,24 @@ void render_tick(void)
     }
 
     /* 2) 条带偏移（时间驱动 + IMU 视差；offset 不变则零成本） */
-    for (int i = 0; i < g_strip_n; i++) {
-        if (!g_strips[i].ok) continue;
-        int32_t off = strip_offset(&g_strips[i], now_us);
-        if (off != g_strips[i].last_off) {
-            g_strips[i].last_off = off;
-            mark_rect(0, (int32_t)g_strips[i].y << RC_SCALE_SHIFT,
-                      g_sw, (int32_t)g_strips[i].h << RC_SCALE_SHIFT);
-            any = true;
+    /* 【刷新限频 2026-09-27】条带整幅 480×444 重合成实测 compose 157ms/笔：
+     * 5~10px/s 的滚动若每变化 1px 就刷一次，等于每秒 5~10 笔整屏 → 拖拽必卡。
+     * 这里限到最多 8Hz（每笔 ≥125ms），观感上仍是连续滚动（滚动速度未变，
+     * 只是位移以更少的大步长呈现），但整屏重合成笔数下降数倍。 */
+    {
+        static int64_t s_strip_ms;
+        bool strip_window = (now_us / 1000 - s_strip_ms) > 125;
+        if (g_ui_active_until_ms > now_us / 1000) strip_window = false;   /* 交互期冻结 */
+        if (strip_window) s_strip_ms = now_us / 1000;
+        for (int i = 0; i < g_strip_n; i++) {
+            if (!g_strips[i].ok) continue;
+            int32_t off = strip_offset(&g_strips[i], now_us);
+            if (off != g_strips[i].last_off && strip_window) {
+                g_strips[i].last_off = off;
+                mark_rect(0, (int32_t)g_strips[i].y << RC_SCALE_SHIFT,
+                          g_sw, (int32_t)g_strips[i].h << RC_SCALE_SHIFT);
+                any = true;
+            }
         }
     }
 
