@@ -39,6 +39,15 @@ docker compose up -d
 #   首页会出现设备卡片；设备首次开机 hello 入册后，屏显 6 位配对码 → 在此输入完成绑定
 ```
 
+> **升级已部署的实例（重要）**：服务端代码变更（新增端点/修正行为）**必须重新构建镜像**才生效——
+> 只更新 compose 里的镜像标签或重启容器都不会带上新代码。本地开发机执行：
+> ```bash
+> docker build -t <你的镜像名>:latest .        # 或 docker compose build
+> docker push <你的镜像名>:latest               # 推到你 compose 里用的仓库
+> ```
+> NAS 上再 `docker compose pull && docker compose up -d`。验证：`curl http://<服务器IP>:38090/api/admin/device-logs/<deviceId>`
+> 应返回 JSON（若返回 HTML 说明还是旧镜像，SPA fallback 把它接走了）。
+
 固件烧录（开发者）：
 
 ```bash
