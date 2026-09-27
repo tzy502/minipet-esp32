@@ -1210,6 +1210,21 @@ bool provision_has_config(void)
            mp_nvs_get_str("srv_url", server, sizeof(server)) && server[0] != 0;
 }
 
+/** 【僵局打破】强制断开并重新关联（不等下次 poll 循环）。
+ *  使用场景：设备已有 IP 但到服务端的 TCP 一直不通 —— 说明当前关联质量差
+ *  （路由器 reason=2 拒连/信号边缘），换一次关联（含 BSSID 重选）比原地重试有效。 */
+void provision_wifi_force_reconnect(void)
+{
+    ESP_LOGW(TAG, "强制重新关联（断开→等 500ms→重连）");
+    s_sta_connected = false;
+    s_conn_busy = false;
+    esp_wifi_disconnect();
+    vTaskDelay(pdMS_TO_TICKS(500));
+    /* 直接发起 connect（配置仍是 NVS 里的凭据），不等 connect_sta 的超时窗口 */
+    esp_err_t e = esp_wifi_connect();
+    ESP_LOGW(TAG, "重新关联请求：%s", esp_err_to_name(e));
+}
+
 esp_err_t provision_wifi_connect_sta(uint32_t timeout_ms)
 {
     char ssid[33] = { 0 }, pass[65] = { 0 };

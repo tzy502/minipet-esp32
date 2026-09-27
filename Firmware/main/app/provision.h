@@ -80,6 +80,10 @@ void provision_ap_early_start_if_needed(void);
  * 有配网凭据时空转。幂等（httpd/dns 各自查重）。 */
 void provision_portal_early_start_if_needed(void);
 
+/* 【僵局打破】强制断开并重新关联：用于"有 IP 但 TCP 一直不通"的场景
+ *（当前关联质量差 / 路由器认证风暴保护），换一次关联比原地重试有效。 */
+void provision_wifi_force_reconnect(void);
+
 /* E14：恢复出厂配网（清 WiFi/服务器地址/轮询游标后重启 → 进 SoftAP portal）。 */
 void provision_factory_reset(void);
 

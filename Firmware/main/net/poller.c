@@ -39,6 +39,7 @@ static bool     s_reported_online;
 static int      s_last_poll_status;   /* 最近一次 poll 的 HTTP 状态（-1=超时） */
 static int      s_poll_fail_streak;   /* 连续真失败次数（达到阈值重新 hello） */
 #define POL_REHELLO_FAILS 3           /* 掉线自愈：连续真失败达此次数 → 重新 hello */
+static int      s_hello_fail_streak;  /* hello 连续失败（达 3 次强制重新关联） */
 
 /* ------------------------------------------------------------------ */
 /* 单条指令落地                                                          */
@@ -306,7 +307,20 @@ static void poller_task(void *arg)
                 ESP_LOGW("poller", "hello 补发成功 → 立即请求素材同步并回到在线");
                 asset_dl_request_sync();
                 backoff_ms = BACKOFF_MIN_MS;
+                s_hello_fail_streak = 0;
             } else {
+                /* 【僵局打破 2026-09-27】"有 IP 但 TCP 连不通"时 connect_sta 会
+                 * 立刻返回 OK（它只看 netif 有没有地址），于是我们一直在同一个
+                 * 坏关联上重试 hello —— 真机上可以卡很久。
+                 * 连续失败 3 次后强制断开重连（换一次关联/BSSID），并给路由器
+                 * 留 3s 冷却：本板在 reason=2 时 2.6s 就重试一次，过密的认证
+                 * 重试本身就可能被 AP 的认证风暴保护继续拒绝。 */
+                if (++s_hello_fail_streak >= 3) {
+                    s_hello_fail_streak = 0;
+                    ESP_LOGW("poller", "hello 连续失败 3 次（有 IP 但 TCP 不通）→ 强制重新关联");
+                    provision_wifi_force_reconnect();
+                    vTaskDelay(pdMS_TO_TICKS(3000));
+                }
                 ESP_LOGW("poller", "hello 补发仍失败 → 退避重试");
                 vTaskDelay(pdMS_TO_TICKS(backoff_ms));
                 if (backoff_ms < BACKOFF_MAX_MS) backoff_ms *= 2;
