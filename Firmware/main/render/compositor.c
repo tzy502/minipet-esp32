@@ -1060,13 +1060,35 @@ void render_tick(void)
          * 问题4 加固：每帧全屏重绘。DIRECT 模式下 LVGL 只重绘失效区，
          * menu_buf 常驻持有完整画面；若按脏 bbox 增量上屏，LVGL「本帧无
          * 失效区」时无 flush → 不 blit，未刷新区域与残留叠加会闪烁。 */
+        /* 【卡死取证探针 2026-09-27】用户报"菜单里按键全不动、选中不变"，
+         * 且采样见 uptime 停滞 → 渲染任务疑似卡在菜单路径。此处分三段计时，
+         * 卡死时日志停在哪个字（lvgl/memcpy/blit）即可定位。每 2s 一条，
+         * 修复后降级为 DEBUG。 */
+        int64_t t0 = esp_timer_get_time();
         lv_timer_handler();
+        int64_t t1 = esp_timer_get_time();
         const uint16_t *mb = bridge_menu_buf();
         if (mb) {
             for (int32_t r = 0; r < g_sh; r++)
                 memcpy(g_fb + (size_t)r * g_sw, mb + (size_t)r * g_sw,
                        (size_t)g_sw * 2u);
+            int64_t t2 = esp_timer_get_time();
             blit_be(0, 0, g_sw, g_sh, g_fb, g_sw);
+            int64_t t3 = esp_timer_get_time();
+            static int64_t s_menu_probe_us;
+            if (t3 - s_menu_probe_us > 2000000) {
+                s_menu_probe_us = t3;
+                ESP_LOGW("menu", "菜单帧耗时 lvgl=%lldms memcpy=%lldms blit=%lldms",
+                         (long long)((t1 - t0) / 1000), (long long)((t2 - t1) / 1000),
+                         (long long)((t3 - t2) / 1000));
+            }
+        } else {
+            static int64_t s_mb_null_us;
+            if (t1 - s_mb_null_us > 2000000) {
+                s_mb_null_us = t1;
+                ESP_LOGE("menu", "bridge_menu_buf() 为 NULL：菜单缓冲缺失（lvgl=%lldms）",
+                         (long long)((t1 - t0) / 1000));
+            }
         }
         return;
     }

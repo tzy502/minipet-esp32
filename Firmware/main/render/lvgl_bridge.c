@@ -382,25 +382,14 @@ void render_menu_nav(int dir)
         return;
     }
     int old = s_menu.sel;
-    /* 【2026-09-27 真机】原为回绕（wrap）：根页在第 0 行按"上移"会跳到最后一
-     * 行，用户观感是"上移无效/光标乱跳"。改为【到边界停住】——首行上移、
-     * 末行下移都不再动作；且仅在真正移动时打日志（限位时打一条 WARN 便于取证）。 */
-    if (dir) {
-        if (s_menu.sel + 1 >= s_menu.row_cnt) {
-            ESP_LOGW("menu", "nav(%d) 已到末行 %d/%d：停住（不回绕）",
-                     dir, s_menu.sel, s_menu.row_cnt);
-            return;
-        }
-        s_menu.sel += 1;
-    } else {
-        if (s_menu.sel <= 0) {
-            ESP_LOGW("menu", "nav(%d) 已到首行 0/%d：停住（不回绕）",
-                     dir, s_menu.row_cnt);
-            return;
-        }
-        s_menu.sel -= 1;
-    }
-    ESP_LOGI("menu", "nav(%d) sel %d→%d/%d（100ms 内贴高亮）", dir, old, s_menu.sel, s_menu.row_cnt);
+    /* 【2026-09-27 真机定稿：恢复回绕】此前一版改成"到边界停住"，真机日志
+     * 实证反而把用户焊死：中键=光标上移、初始 sel=0 → 每次都命中
+     * `nav(0) 已到首行 0/6：停住`，用户观感就是"上下键全不能用了"。
+     * 回绕语义下：首行再上移 → 走到末行（Exit），有明确可见反馈；
+     * 末行再下移 → 回首行。这是循环列表的标准手感，保留回绕。 */
+    if (dir) s_menu.sel = (s_menu.sel + 1) % s_menu.row_cnt;
+    else      s_menu.sel = (s_menu.sel + s_menu.row_cnt - 1) % s_menu.row_cnt;
+    ESP_LOGI("menu", "nav(%d) sel %d→%d/%d", dir, old, s_menu.sel, s_menu.row_cnt);
 }
 
 /* 顶键短按=确认/进入：置请求旗标，菜单 tick 在渲染任务排空
