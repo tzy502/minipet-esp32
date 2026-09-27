@@ -37,6 +37,8 @@ static uint32_t s_since;         /* 指令游标（服务端 rev 序列；NVS �
 static uint32_t s_local_rev;     /* 已见 manifest rev（asset_dl 维护本地副本） */
 static bool     s_reported_online;
 static int      s_last_poll_status;   /* 最近一次 poll 的 HTTP 状态（-1=超时） */
+static int      s_poll_fail_streak;   /* 连续真失败次数（达到阈值重新 hello） */
+#define POL_REHELLO_FAILS 3           /* 掉线自愈：连续真失败达此次数 → 重新 hello */
 
 /* ------------------------------------------------------------------ */
 /* 单条指令落地                                                          */
@@ -338,6 +340,7 @@ static void poller_task(void *arg)
 
         if (ok) {
             s_last_poll_status = 200;
+            s_poll_fail_streak = 0;
             backoff_ms = BACKOFF_MIN_MS;          /* 成功复位退避 */
             if (!s_reported_online) {
                 s_reported_online = true;
@@ -351,6 +354,21 @@ static void poller_task(void *arg)
                 vTaskDelay(pdMS_TO_TICKS(POLL_TIMEOUT_RETRY_MS));
                 backoff_ms = BACKOFF_MIN_MS;      /* 超时不累积退避 */
                 continue;                          /* 仍在线：不报 NET_OFFLINE */
+            }
+            /* 【掉线自愈 2026-09-27】连续真失败 ≥ POL_REHELLO_FAILS 次 → 重新 hello。
+             * 场景：路由器把设备踢掉（真机 reason=2/8 每 2~4 分钟一次）后，设备的
+             * deviceId/服务端侧注册可能已过期或路由器换了网关，只重试 poll 会一直
+             * 404/连接失败；重新 hello 可重建注册并把地址探测再走一遍。
+             * 限频：成功后清零，避免把 hello 变成每轮都发的负担。 */
+            if (++s_poll_fail_streak >= POL_REHELLO_FAILS) {
+                s_poll_fail_streak = 0;
+                ESP_LOGW(TAG, "poll 连续失败 %d 次 → 重新 hello 重建注册", POL_REHELLO_FAILS);
+                if (mp_http_hello() == 0) {
+                    ESP_LOGW(TAG, "重新 hello 成功 → 请求素材同步");
+                    asset_dl_request_sync();
+                } else {
+                    ESP_LOGW(TAG, "重新 hello 仍失败 → 继续退避重连");
+                }
             }
             vTaskDelay(pdMS_TO_TICKS(backoff_ms));
             if (backoff_ms < BACKOFF_MAX_MS) backoff_ms *= 2;
