@@ -215,6 +215,10 @@ static bool mdns_try_discover(void)
 /* ------------------------------------------------------------------ */
 static bool mdns_try_discover(void);   /* E14：定义在同文件下方（mDNS 兜底） */
 
+/* 【掉线自愈】provision.c 提供（本地 extern 声明，不动 provision.h）：
+ * STA 是否已拿到 IP —— 用来判断"是网络断了"还是"只是服务端不可达" */
+extern bool provision_wifi_is_connected(void);
+
 static void self_test(bool sd_ok, bool psram_ok)
 {
     s_state = MP_ST_SELF_TEST;
@@ -307,10 +311,22 @@ offline_check_cache:
      * 因此：只有"连续多次仍然连不上"才拉 portal，给 STA 留稳定窗口。 */
     {
         static int s_boot_hello_fails;
-        if (++s_boot_hello_fails >= 3) {
-            ESP_LOGW(TAG, "服务端连续 %d 次不可达 → 并行拉起配网 portal"
+        /* 【自愈优先 2026-09-27】拉 portal 前先看 STA 链路：已经有 IP（只是服务端
+         * TCP 不可达，典型是 NAS 重启/换 IP）时**不要**拉 portal ——
+         * provision_start_portal() 会把 WiFi 切成 APSTA 并起 SoftAP，真机实测紧随
+         * 其后 `WiFi 断开 reason=8`（STA 被模式切换打断），而且 poller 在 portal
+         * 活动期间是停摆的（poller.c 的 portal 等待循环）→ 反而把"分钟级自愈"
+         * 变成"一直离线"。只有连 WiFi 都连不上（凭据/信号问题）才值得开配网入口。
+         * 注：本分支只在自检里自增一次（self_test 每次开机只调用一次），阈值 3
+         * 实际不可达 —— 这里顺手写成正确语义，避免以后有人挪动调用点踩坑。 */
+        if (++s_boot_hello_fails >= 3 && !provision_wifi_is_connected()) {
+            ESP_LOGW(TAG, "服务端连续 %d 次不可达且 STA 未连上 → 并行拉起配网 portal"
                           "（凭据保留，poller 继续回网）", s_boot_hello_fails);
             provision_start_portal();
+        } else if (s_boot_hello_fails >= 3) {
+            ESP_LOGW(TAG, "服务端连续 %d 次不可达但 STA 已拿到 IP → 不拉 portal"
+                          "（APSTA 切换会打断 STA 且 poller 停摆），交给 poller 自愈",
+                     s_boot_hello_fails);
         } else {
             ESP_LOGW(TAG, "服务端不可达（第 %d 次）→ 先交给 poller 补发 hello，"
                           "暂不拉 portal（避免 APSTA 切换打断 STA）", s_boot_hello_fails);

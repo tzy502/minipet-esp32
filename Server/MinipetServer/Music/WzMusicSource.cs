@@ -95,10 +95,18 @@ public sealed class WzMusicSource : IMusicSource
         if (rel.Contains("..")) throw new FileNotFoundException($"非法曲目 id：{trackId}");
 
         // 0) 纯数字 = 设备侧 AUDIO_META 的 u32 id → 反查 trackKey（E8 出声主路径）
-        if (rel.Length > 0 && rel.All(char.IsAsciiDigit))
+        //    兼容固件 int32 口径：id ≥ 2^31 的曲目（本机 1167 曲中 580 首）会被未修固件
+        //    以负数发出（3036740071 → -1258227225），按位型还原 u32 再反查——否则设备
+        //    以负号串落进「字符串 key」分支 → FileNotFoundException → 503（本机实测复现）。
+        var unsignedNum = rel.Length > 0 && rel.All(char.IsAsciiDigit);
+        var signedNum = !unsignedNum && rel.Length > 1 && rel[0] == '-' && rel[1..].All(char.IsAsciiDigit);
+        if (unsignedNum || signedNum)
         {
             var map = IdToKey(ct);
-            if (map != null && uint.TryParse(rel, out var num) && map.TryGetValue(num, out var key))
+            var num = unsignedNum
+                ? (uint.TryParse(rel, out var u) ? u : 0u)
+                : (int.TryParse(rel, out var s) ? unchecked((uint)s) : 0u);
+            if (map != null && num != 0 && map.TryGetValue(num, out var key))
                 rel = key;
             else
                 throw new FileNotFoundException($"曲目 id 无法反查（AUDIO_META 未导出或曲库变更）：{trackId}");

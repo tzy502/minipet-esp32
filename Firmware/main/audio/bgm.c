@@ -188,11 +188,16 @@ static void tbl_ensure_locked(void)
     tbl_load_locked();
 }
 
-/* idx 处曲目 id（越界/空表=-1）。短临界区，不触发构建。 */
-static int tbl_id_at(int idx)
+/* idx 处曲目 id（越界/空表=0）。短临界区，不触发构建。
+ * 【E8 无声根因修复】按 u32 原值返回：AUDIO_META 的 id 是 uint32，>2^31 的曲目
+ * 占 49.7%（本机实测 1167 曲中 580 首；且设备曲目表**首条** SleepyWood=3036740071）。
+ * 此前返回 int → 高位 id 变负数 → bgm_play_session 的 by_table 判 false 且 fb_id=0
+ * → 会话开头直接 return：不发 HTTP、不报错、状态仍停在 PLAYING（界面像在播），
+ * 且 s_tcur 锚点不前移 → 每次「下一首」都重挑同一首，表现为永久无声。 */
+static uint32_t tbl_id_at(int idx)
 {
     xSemaphoreTake(s_tbl_lock, portMAX_DELAY);
-    int id = (idx >= 0 && idx < s_tcount) ? (int)s_tids[idx] : -1;
+    uint32_t id = (idx >= 0 && idx < s_tcount) ? s_tids[idx] : 0;
     xSemaphoreGive(s_tbl_lock);
     return id;
 }
@@ -355,13 +360,16 @@ static bool stream_chunk(void *ctx, const char *data, size_t len)
 }
 
 /* 播放一首：返回 true=自然播完（可续下一首），false=失败/中止 */
-static bool play_track(int track_id)
+static bool play_track(uint32_t track_id)
 {
     char url[160];
     /* bgm/stream 端点服务端必填 deviceId（DeviceEndpoints.cs HandleBgmStream
-     * 签名 string deviceId）——不带参实测 400，带参后实测 200 + audio/mpeg。 */
-    snprintf(url, sizeof(url), "/api/device/bgm/stream?deviceId=%s&id=%d&source=%s",
-             mp_http_device_id(), track_id, source_str((mp_bgm_source_t)s_source));
+     * 签名 string deviceId）——不带参实测 400，带参后实测 200 + audio/mpeg。
+     * 【E8 无声根因修复】id 必须按 u32（%u）发出：服务端 WzMusicSource 只认
+     * 「纯 ASCII 数字」做 u32→trackKey 反查，用 %d 发高位 id（3036740071 →
+     * -1258227225）会带上负号 → 服务端当字符串 key → 503「曲目不存在」（实测）。 */
+    snprintf(url, sizeof(url), "/api/device/bgm/stream?deviceId=%s&id=%u&source=%s",
+             mp_http_device_id(), (unsigned)track_id, source_str((mp_bgm_source_t)s_source));
 
     memset(&s_sc, 0, sizeof(s_sc));
     mp3dec_init(s_dec);                         /* 每曲复位解码器（清 bit reservoir/合成
@@ -412,10 +420,10 @@ static void source_failover(void)
  * s_tcur 只在真正起播前提交：暂停/流中止退出时不前移，恢复续播仍在当前曲。 */
 static void bgm_play_session(int start_idx, int fb_id)
 {
-    bool by_table = (tbl_id_at(start_idx) > 0);
-    int track = by_table ? 0 : fb_id;            /* 服务端模式：track=当前曲 id */
+    bool by_table = (tbl_id_at(start_idx) != 0);         /* u32 判 0（见 tbl_id_at 注释） */
+    uint32_t track = by_table ? 0 : (uint32_t)fb_id;     /* 服务端模式：int32 位型即 u32 id */
     int idx = by_table ? start_idx : -1;
-    if (!by_table && fb_id <= 0) return;
+    if (!by_table && fb_id == 0) return;
 
     int track_fails = 0;
 
@@ -424,10 +432,10 @@ static void bgm_play_session(int start_idx, int fb_id)
         if (!s_playing || s_offline) return;            /* 中止（锚点不前移） */
         if (s_greyed[s_source]) return;
 
-        int id;
+        uint32_t id;
         if (by_table) {
             id = tbl_id_at(idx);
-            if (id <= 0) {
+            if (id == 0) {
                 /* 表中途失效（重建为空/缩水）：走循环尾统一收尾
                  * （s_state=PLAYING 时回 IDLE），不可裸 return 漏状态 */
                 break;
@@ -436,7 +444,7 @@ static void bgm_play_session(int start_idx, int fb_id)
         } else {
             id = track;
         }
-        s_cur_id = (uint32_t)id;                        /* 恢复续播/上报用 */
+        s_cur_id = id;                                  /* 恢复续播/上报用 */
 
         int retries = 0;
         bool ok = false;
@@ -447,7 +455,7 @@ static void bgm_play_session(int start_idx, int fb_id)
         }
         if (!ok) {
             track_fails++;
-            ESP_LOGW(TAG, "track %d failed (streak %d), skip", id, track_fails);
+            ESP_LOGW(TAG, "track %u failed (streak %d), skip", (unsigned)id, track_fails);
             /* 同曲重试耗尽 → 跳下一首（仍同源——E8 禁跨源自动换歌） */
             if (by_table) {
                 xSemaphoreTake(s_tbl_lock, portMAX_DELAY);
@@ -456,11 +464,11 @@ static void bgm_play_session(int start_idx, int fb_id)
                 if (idx < 0) break;                     /* 空表（异常）：会话结束 */
             } else {
                 int next = 0;
-                if (bgm_cmd("next", 0, &next) != 0 || next <= 0) {
+                if (bgm_cmd("next", 0, &next) != 0 || next == 0) {
                     track_fails++;                      /* 取下一首也失败：加速三振 */
-                    break;
+                    break;                              /* id 判 0：int32 位型可为负 */
                 }
-                track = next;
+                track = (uint32_t)next;
             }
             continue;
         }
@@ -477,11 +485,11 @@ static void bgm_play_session(int start_idx, int fb_id)
             if (idx < 0) break;
         } else {
             int next = 0;
-            if (bgm_cmd("next", 0, &next) != 0 || next <= 0) {
+            if (bgm_cmd("next", 0, &next) != 0 || next == 0) {
                 track_fails = 1;
                 break;                               /* 拿不到下一首：会话结束 */
             }
-            track = next;
+            track = (uint32_t)next;
         }
     }
 
@@ -576,9 +584,9 @@ static void handle_audio_msg(const mp_audio_msg_t *m)
     switch (m->type) {
     case MP_AUDIO_PLAY: {
         if (s_greyed[s_source]) return;                 /* 置灰源禁播（E8） */
-        int id = m->a;
-        if (id <= 0) {
-            if (bgm_cmd("play", 0, &id) != 0 || id <= 0) return;
+        int id = m->a;                              /* 0=服务端决定；负数=高位 u32 id 的位型 */
+        if (id == 0) {
+            if (bgm_cmd("play", 0, &id) != 0 || id == 0) return;
         }
         s_pending_op = 0;
         s_pending_play = false;                     /* 本次 PLAY 直接落地，清延后记账 */
@@ -647,7 +655,7 @@ static void handle_audio_msg(const mp_audio_msg_t *m)
         } else {
             /* 兜底：表不可用（audio/ 无包）→ 服务端 next/prev */
             int sid = 0;
-            if (bgm_cmd(m->type == MP_AUDIO_NEXT ? "next" : "prev", 0, &sid) == 0 && sid > 0) {
+            if (bgm_cmd(m->type == MP_AUDIO_NEXT ? "next" : "prev", 0, &sid) == 0 && sid != 0) {
                 s_state = MP_BGM_PLAYING;
                 s_playing = true;
                 mp_codec_start(s_rate ? s_rate : 44100);

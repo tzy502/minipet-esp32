@@ -290,6 +290,25 @@ static void app_main_task(void *arg)
     static const uint32_t render_stacks[] = { 8192, 6144 };
     for (int t = 0; t < 10 && !render_ok; t++) {
         uint32_t stk = render_stacks[t < 6 ? 0 : 1];   /* 前 6 次 8K，之后降 6K */
+        /* 【内部 DRAM 腾挪 2026-09-27】渲染任务栈改从 PSRAM 分配：
+         * 真机实测内部堆运行期只剩 空闲 3356B / 最大连续块 2036B，lwIP 连
+         * socket 都开不出来（`out of memory` → ESP_ERR_HTTP_CONNECT errno=105），
+         * 设备"永远不上线"。渲染任务是纯内存拷贝/合成，栈放 PSRAM 只需一次
+         * xTaskCreateStatic 前置分配，换来 8KB 内部 DRAM 给网络栈。
+         * 失败（PSRAM 不足）则回落原有内部栈路径。 */
+        TaskHandle_t rh = NULL;
+        StackType_t *rstack = heap_caps_malloc(stk * sizeof(StackType_t),
+                                              MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        StaticTask_t *rtcb = rstack ? heap_caps_malloc(sizeof(StaticTask_t),
+                                                       MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) : NULL;
+        if (rstack && rtcb) {
+            rh = xTaskCreateStaticPinnedToCore(render_task, "render", stk, NULL, 5, rstack, rtcb, 1);
+        }
+        if (rh) {
+            render_ok = true;
+            ESP_LOGW(TAG, "render 任务已创建（栈 %u @PSRAM）", (unsigned)stk);
+            break;
+        }
         if (xTaskCreatePinnedToCore(render_task, "render", stk, NULL, 5, NULL, 1) == pdPASS) {
             render_ok = true;
             ESP_LOGW(TAG, "render 任务已创建（栈 %u）", (unsigned)stk);

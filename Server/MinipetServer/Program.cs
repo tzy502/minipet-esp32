@@ -42,6 +42,7 @@ builder.Services.AddSingleton<DeviceLogStore>();         // 设备端环形日�
 builder.Services.AddSingleton<PaperdollPackService>();   // petConfig → 设备装扮资产包（换装下发链路）
 builder.Services.AddSingleton<FontPackService>();       // 16/24/32 三档 FONT 包（E12 字体链，hello 自动补）
 builder.Services.AddSingleton<DeviceAssetService>();     // 地图/NPC → 设备资产登记（E7 选择器/推送）
+builder.Services.AddSingleton<MdnsAdvertiser>();         // mDNS 服务广告（E14：设备自动发现服务端；IDisposable）
 
 builder.Services.ConfigureHttpJsonOptions(o =>
 {
@@ -59,6 +60,13 @@ _ = app.Services.GetRequiredService<DeviceManifestService>();
 _ = app.Services.GetRequiredService<QqGatewayProcess>();
 // E12 随机台词气泡调度：早绑定单例 → 构造即起定时器（同上；配置/设备表都按拍读快照，无热重载耦合）
 _ = app.Services.GetRequiredService<SpeechScheduler>();
+// E14 mDNS 服务广告：设备「配网页服务器地址留空」时靠它自动发现服务端（固件侧
+// mdns_discover.c 查 _minipet._tcp + 按 hostname 补查 A）。两处刻意的取舍：
+//   ① 早绑定单例（DI 容器退出时调 Dispose → 发 goodbye 停播），但**不在构造里开播**；
+//   ② 开播挂在 ApplicationStarted：那时监听端口才确定（广告端口要的是真实/对外端口），
+//      且广告失败（端口占用/无网卡/权限）只 warning，绝不阻塞或拖垮 HTTP 启动。
+var mdns = app.Services.GetRequiredService<MdnsAdvertiser>();
+app.Lifetime.ApplicationStarted.Register(() => mdns.Start());
 cfgSvc.Changed += e =>
     app.Logger.LogInformation("[Config] 已热重载（external={External}，WZ={Wz}）", e.External, e.New.Wz.DataPath);
 router.Failover += e =>
@@ -150,6 +158,7 @@ app.MapGet("/api/health", (ConfigService c, DeviceRegistry reg) => Results.Json(
     wzDataPath = c.Current.Wz.DataPath,
     devices = reg.List().Count,
     qqEnabled = c.Current.QqMusic.Enabled,
+    mdns = mdns.StatusText,                                   // E14：advertising … / disabled / degraded: 原因
 }));
 
 DeviceEndpoints.Map(app);

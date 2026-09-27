@@ -98,6 +98,26 @@ public sealed class ClockConfig
     public int Calib { get; set; }
 }
 
+/// <summary>
+/// mDNS 服务广告（E14「设备可发现服务端」）：设备在配网页服务器地址留空时，
+/// 靠 _minipet._tcp 组播发现本服务端。实现见 Services/MdnsAdvertiser.cs。
+/// 缺字段即默认（Enabled=true / Port=0 自动 / Interface 空=自动），老配置文件无需迁移。
+/// </summary>
+public sealed class MdnsConfig
+{
+    [JsonPropertyName("_comment")]
+    public string Comment { get; set; } = "mDNS 服务广告（E14）：Enabled=总开关（缺字段=开，配网页留空的设备靠它自动发现）；Port=广告端口（0=自动：MINIPET_PORT 环境变量 → 实际监听端口 → 38090；容器内监听 8080、对外 38090 时应显式填对外端口或给容器传 MINIPET_PORT）；Interface=只在该本机 IPv4 所在网卡上广告（空=自动：优先有默认网关的网卡）";
+
+    /// <summary>总开关；默认开（老配置文件无该字段时为 true）。</summary>
+    public bool Enabled { get; set; } = true;
+
+    /// <summary>广告端口；0 = 自动（MINIPET_PORT → 实际监听端口 → 38090）。</summary>
+    public int Port { get; set; }
+
+    /// <summary>指定网卡（本机 IPv4 字符串）；空 = 自动选择。</summary>
+    public string Interface { get; set; } = "";
+}
+
 public sealed class MinipetConfig
 {
     public WzConfig Wz { get; set; } = new();
@@ -107,6 +127,8 @@ public sealed class MinipetConfig
     public ClockConfig Clock { get; set; } = new();
     /// <summary>随机台词气泡（E12）；Web 设置页按此段是否存在启用对应卡片。</summary>
     public SpeechConfig Speech { get; set; } = new();
+    /// <summary>mDNS 服务广告（E14，默认开）。</summary>
+    public MdnsConfig Mdns { get; set; } = new();
 }
 
 public sealed class ConfigChangedEventArgs : EventArgs
@@ -251,6 +273,9 @@ public sealed class ConfigService : IDisposable
             // 台词气泡必须在 Replace 里显式搬运：Web 全量回传若被丢弃，设置页
             // 存了也读不回来（Web 侧按 config.speech 是否存在判断是否启用该卡片）。
             c.Speech = incoming.Speech ?? new SpeechConfig();
+            // mDNS 段：Web 全量回传没带（老前端）就保留现行值，带了才覆盖——
+            // 否则一次「保存设置」会把 mDNS 开关/端口重置成默认。
+            if (incoming.Mdns is not null) c.Mdns = incoming.Mdns;
         }, validateWzPath);
 
     private void ScheduleReload()
@@ -316,6 +341,10 @@ public sealed class ConfigService : IDisposable
         c.Clock ??= new ClockConfig();
         c.Speech ??= new SpeechConfig();
         c.Speech.Lines ??= new List<string>();
+        c.Mdns ??= new MdnsConfig();                       // 老配置文件缺该段 → 默认（Enabled=true）
+        c.Mdns.Interface ??= "";
+        /* 端口夹取到合法区间；越界/负数一律回 0=自动（不让一个手滑的值把广告指到无效端口） */
+        if (c.Mdns.Port is < 0 or > 65535) c.Mdns.Port = 0;
         /* 灵敏度夹取到合理区间（0.2–3.0）：0/负数会让有效阈值发散，过大等于关闭判定 */
         if (c.Device.ImuSensitivity < 0.2) c.Device.ImuSensitivity = 0.2;
         if (c.Device.ImuSensitivity > 3.0) c.Device.ImuSensitivity = 3.0;

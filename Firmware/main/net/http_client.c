@@ -401,7 +401,11 @@ int mp_http_hello(void)
     if (!body) return -1;
 
     char resp[1024] = { 0 };
-    int status = mp_http_post_json("/api/device/hello", body, resp, sizeof(resp), 8000);
+    /* 【超时收紧 2026-09-27】8s → 4s：hello 是局域网内的小 POST（Mac curl 同 URL
+     * 毫秒级返回）。真机失败形态是 `ESP_ERR_HTTP_CONNECT phase=open` 一直挂到
+     * 超时（AP 半死/SYN 黑洞），8s 只是把"卡住"拉长一倍。缩短后失败更快暴露，
+     * 由 poller 的退避/重连逻辑接手（每轮代价从 8s 降到 4s）。 */
+    int status = mp_http_post_json("/api/device/hello", body, resp, sizeof(resp), 4000);
     free(body);
     if (status != 200) return status ? status : -1;
 

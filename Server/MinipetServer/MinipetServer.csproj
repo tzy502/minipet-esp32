@@ -12,6 +12,7 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <PackageReference Include="Makaretu.Dns" Version="2.0.1" />
     <PackageReference Include="SkiaSharp" Version="3.119.0" />
     <PackageReference Include="SkiaSharp.NativeAssets.Linux" Version="3.119.0" />
     <PackageReference Include="System.IO.Hashing" Version="9.0.0" />
@@ -28,10 +29,7 @@
          容器 ContentRoot=/app 下没有 Server/seed → Link 到输出根的 seed/，
          DeviceProfile.FindSeedRoot 的第二候选布局即此。字体三档 JSON ~4.2MB 是主要体积；
          默认装扮（新设备 provisioning）+ profile（导出视口）同源。 -->
-    <Content Include="../seed/**/*"
-             Link="seed/%(RecursiveDir)%(Filename)%(Extension)"
-             CopyToOutputDirectory="PreserveNewest"
-             CopyToPublishDirectory="PreserveNewest" />
+    <Content Include="../seed/**/*" Link="seed/%(RecursiveDir)%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
   </ItemGroup>
 
 </Project>

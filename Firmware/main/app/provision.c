@@ -68,6 +68,43 @@ static bool s_sta_connected;        /* STA 已拿到 IP：GOT_IP 置位 / DISCON
 #define WIFI_FAIL_BIT     BIT1
 
 /* ================================================================== */
+/* 【掉线自愈 2026-09-27】断线→恢复的实测账本 + 事件驱动快速重连          */
+/* ================================================================== */
+/* 真机现象：路由器以 reason=2/8 每 2~4 分钟踢一次；旧实现断线事件只清状态、
+ * 置 FAIL_BIT，**不主动重连** —— 只能等 poller 下一轮 connect_sta(15000)，
+ * 而 poller 可能正卡在 65s 长轮询里，于是"掉线到回网"经常超过 1 分钟。
+ * 现在：事件到达即（节流 3s）主动 esp_wifi_connect()，poller 那边再快也快不过事件。
+ *  - s_disc_count：断线次数累计（poller 用它判断"链路掉过线 → 回网立刻补 hello"）
+ *  - s_disc_ms  ：最近一次断线时刻（0 = 当前没有待恢复的断线）
+ *  - s_recover_ms：最近一次"断线→GOT_IP"耗时（验收口径，串口直接可读） */
+static volatile uint32_t s_disc_count;
+static volatile int64_t  s_disc_ms;
+static int64_t           s_recover_ms;
+
+/* 【防打架】主动 disconnect/set_config/停 WiFi 期间禁止事件驱动自动重连：
+ * 那些窗口里配置是半成品，旧配置盲重连会与 set_config 抢（真机 abort 成因之一）。
+ * 事件是异步投递的，故关闭后再留 800ms 余量。 */
+static volatile bool    s_auto_conn_off;
+static volatile int64_t s_auto_conn_block_until_ms;
+static int64_t          s_last_auto_conn_ms;
+#define AUTO_CONN_MIN_GAP_MS 3000    /* 自动重连最小间隔：本板 reason=2 与重试密度正相关 */
+
+static bool auto_connect_allowed(void)
+{
+    int64_t now_ms = mp_now_ms();
+    if (s_auto_conn_off || s_portal_active) return false;
+    if (now_ms < s_auto_conn_block_until_ms) return false;
+    return (now_ms - s_last_auto_conn_ms) >= AUTO_CONN_MIN_GAP_MS;
+}
+
+/* 主动改配置/停 WiFi 的前后包夹（见 s_auto_conn_off 说明） */
+static void wifi_auto_conn_hold(bool on)
+{
+    s_auto_conn_off = on;
+    if (!on) s_auto_conn_block_until_ms = mp_now_ms() + 800;
+}
+
+/* ================================================================== */
 /* 配置页（内嵌；UTF-8；三步向导；HEAD/BODY 分段以便注入失败横幅）        */
 /* ================================================================== */
 static const char PAGE_PORTAL_HEAD[] =
@@ -599,12 +636,33 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
             reason = d->reason;
         }
         s_sta_connected = false;
+        s_disc_count++;
+        if (s_disc_ms == 0) s_disc_ms = mp_now_ms();   /* 断线起点（GOT_IP 时结算耗时） */
         ESP_LOGW(TAG, "WiFi 断开 reason=%d（205=握手失败 201=无AP 8=离开 15=4路超时 202=认证失败）", reason);
         xEventGroupSetBits(s_wifi_events, WIFI_FAIL_BIT);
+
+        /* 【掉线自愈 · 新增】断线即重连，不等 poller 的 15s 超时窗口。
+         * 节流 3s：过密的认证重试会被 AP 的认证风暴保护继续拒（本板实测
+         * reason=2 时 2.6s 就重试过一次）。s_auto_conn_off/s_portal_active
+         * 期间不抢（那是我们在主动改配置或配网页在用射频）。 */
+        if (auto_connect_allowed()) {
+            s_last_auto_conn_ms = mp_now_ms();
+            esp_err_t ce = esp_wifi_connect();
+            ESP_LOGW(TAG, "断线自愈：立即发起重连（不等 poll 超时）→ %s", esp_err_to_name(ce));
+        } else {
+            ESP_LOGW(TAG, "断线自愈：本轮不自动重连（主动改配置/portal 中/节流窗内）");
+        }
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *e = (ip_event_got_ip_t *)data;
         ESP_LOGI(TAG, "WiFi GOT_IP: " IPSTR, IP2STR(&e->ip_info.ip));
         s_sta_connected = true;
+        /* 【断线→恢复耗时】验收口径：被踢到重新拿回 IP 的实测间隔 */
+        if (s_disc_ms != 0) {
+            s_recover_ms = mp_now_ms() - s_disc_ms;
+            ESP_LOGW(TAG, "断线→恢复耗时 %lld ms（本次开机累计断线 %u 次）",
+                     (long long)s_recover_ms, (unsigned)s_disc_count);
+            s_disc_ms = 0;
+        }
         /* 【真机连不通修复 2026-09-27】拿到 IP 后再关省电（放在 connect 之前
          * 改 PS 策略会干扰认证/关联，实测出现 reason=2 认证失败）。
          * 默认 WIFI_PS_MIN_MODEM 会让 TCP 建连偶发 select() timeout。 */
@@ -740,6 +798,7 @@ static esp_err_t wifi_start_ap(const char *ssid_in)
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
 
     esp_wifi_stop();    /* 失败重开路径下 WiFi 可能仍以 STA 模式在跑，先停干净 */
+    wifi_auto_conn_hold(true);   /* 停/起 WiFi 期间禁止事件驱动自动重连 */
     /* APSTA：STA 口保持 up 才能扫周围 WiFi（GET /scan）。
      * 扫描逐信道跳转时 SoftAP 客户端短暂卡顿 —— 页面已提示「正在扫描…」 */
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
@@ -752,6 +811,7 @@ static esp_err_t wifi_start_ap(const char *ssid_in)
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap));
     ESP_ERROR_CHECK(esp_wifi_start());
     s_ap_up = true;
+    wifi_auto_conn_hold(false);   /* AP 已起来：STA 侧自动重连恢复（portal 期间由 s_portal_active 兜住） */
     ESP_LOGW(TAG, "SoftAP 已启动：起后内部堆 空闲=%u 最大块=%u",
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
@@ -1120,6 +1180,7 @@ static void portal_task(void *arg)
     s_portal_active = false;                      /* DNS 循环退出 */
     stop_httpd();
     vTaskDelay(pdMS_TO_TICKS(300));               /* 等 DNS 任务自删 */
+    wifi_auto_conn_hold(true);   /* 拆 AP + 下发新凭据期间：禁止自动重连（旧凭据盲重连会拆台） */
     ESP_ERROR_CHECK(esp_wifi_stop());
     vTaskDelay(pdMS_TO_TICKS(200));
 
@@ -1140,6 +1201,7 @@ static void portal_task(void *arg)
     xEventGroupClearBits(s_wifi_events, WIFI_GOT_IP_BIT | WIFI_FAIL_BIT);
     ESP_ERROR_CHECK(esp_wifi_start());
     esp_wifi_connect();
+    wifi_auto_conn_hold(false);   /* 新凭据已下发：放开自动重连（下面 15s 等待窗内它才有用） */
 
     EventBits_t bits = xEventGroupWaitBits(
         s_wifi_events, WIFI_GOT_IP_BIT | WIFI_FAIL_BIT,
@@ -1215,14 +1277,89 @@ bool provision_has_config(void)
  *  （路由器 reason=2 拒连/信号边缘），换一次关联（含 BSSID 重选）比原地重试有效。 */
 void provision_wifi_force_reconnect(void)
 {
+    /* 【节流 2026-09-27】服务端整机不可达（NAS 重启）时 poller 会反复走到这里：
+     * 10s 内只做一次。重连风暴比原地重试更伤 —— 本板 reason=2 与认证重试密度
+     * 直接相关，密度高了会被 AP 的认证风暴保护继续拒。 */
+    static int64_t s_last_ms;
+    int64_t now_ms = mp_now_ms();
+    if (s_last_ms != 0 && now_ms - s_last_ms < 10000) {
+        ESP_LOGW(TAG, "强制重新关联节流中（距上次 %lld ms）→ 跳过",
+                 (long long)(now_ms - s_last_ms));
+        return;
+    }
+    s_last_ms = now_ms;
+
     ESP_LOGW(TAG, "强制重新关联（断开→等 500ms→重连）");
     s_sta_connected = false;
     s_conn_busy = false;
+    wifi_auto_conn_hold(true);      /* 本函数自己管重连：禁止事件驱动的并发重连 */
     esp_wifi_disconnect();
     vTaskDelay(pdMS_TO_TICKS(500));
     /* 直接发起 connect（配置仍是 NVS 里的凭据），不等 connect_sta 的超时窗口 */
     esp_err_t e = esp_wifi_connect();
+    wifi_auto_conn_hold(false);
     ESP_LOGW(TAG, "重新关联请求：%s", esp_err_to_name(e));
+}
+
+/* 【掉线自愈 · 供 poller 判断】断线次数累计：变化 = 链路掉过线 → 回网后立刻补 hello
+ * （服务端 lastSeen 立即刷新，不必等下一轮 55s 长轮询结束）。
+ * 声明放调用方（poller.c 内 extern），避免为两个取值函数改 provision.h。 */
+uint32_t provision_wifi_disconnect_count(void) { return s_disc_count; }
+/* STA 当前是否已拿到 IP（state_machine 用它决定"要不要拉 portal 兜底"：
+ * 有 IP 说明只是服务端不可达，拉 portal 反而会打断 STA 且 poller 停摆） */
+bool provision_wifi_is_connected(void) { return s_sta_connected; }
+/* 最近一次断线→恢复耗时（0 = 本次开机还没恢复过；诊断/验收用） */
+int64_t provision_wifi_last_recover_ms(void) { return s_recover_ms; }
+
+/* 【真机联网质量 2026-09-27】同名 SSID 多 AP（mesh/多路由）时，驱动默认可能关联到
+ * 信号很弱的那个：本板实测 RSSI 常年在 -74~-81dBm，导致 hello 的 TCP 建连频繁超时
+ * （服务端侧表现为"设备时上时下"）。这里先扫一遍，挑该 SSID 下 RSSI 最强的 BSSID
+ * 并 pin 住再连——比让驱动自己挑稳定得多。
+ * 失败/扫不到该 SSID → 不 pin（回落驱动默认行为），绝不影响原有连接能力。 */
+static bool sta_pick_strongest_bssid(const char *ssid, uint8_t out_bssid[6], int *out_rssi)
+{
+    wifi_scan_config_t scfg = {
+        .ssid = NULL, .bssid = NULL, .channel = 0, .show_hidden = false,
+        .scan_type = WIFI_SCAN_TYPE_ACTIVE,
+        .scan_time.active = { .min = 0, .max = 120 },
+    };
+    /* STA 刚 set_mode、还没 start 时扫描会返回 ESP_ERR_WIFI_STATE —— 重试几次 */
+    esp_err_t se = ESP_FAIL;
+    for (int i = 0; i < 5; i++) {
+        se = esp_wifi_scan_start(&scfg, true);
+        if (se == ESP_OK) break;
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
+    if (se != ESP_OK) {
+        ESP_LOGW(TAG, "挑最佳 AP：扫描失败 %s → 不 pin BSSID（回落驱动默认）",
+                 esp_err_to_name(se));
+        return false;
+    }
+    uint16_t num = 32;
+    wifi_ap_record_t *recs = calloc(num, sizeof(wifi_ap_record_t));
+    if (!recs) return false;
+    esp_err_t e = esp_wifi_scan_get_ap_records(&num, recs);
+    int best = -128, idx = -1;
+    if (e == ESP_OK) {
+        for (uint16_t i = 0; i < num; i++) {
+            if (strcmp((const char *)recs[i].ssid, ssid) != 0) continue;
+            if (recs[i].rssi > best) { best = recs[i].rssi; idx = (int)i; }
+        }
+    }
+    bool ok = false;
+    if (idx >= 0) {
+        memcpy(out_bssid, recs[idx].bssid, 6);
+        *out_rssi = best;
+        ok = true;
+    }
+    free(recs);
+    if (ok) {
+        ESP_LOGW(TAG, "挑最佳 AP：SSID=%s 命中 %02X:%02X:%02X:%02X:%02X:%02X rssi=%d → pin BSSID 关联",
+                 ssid, out_bssid[0], out_bssid[1], out_bssid[2], out_bssid[3], out_bssid[4], out_bssid[5], *out_rssi);
+    } else {
+        ESP_LOGW(TAG, "挑最佳 AP：扫描结果里没有 %s → 不 pin BSSID", ssid);
+    }
+    return ok;
 }
 
 esp_err_t provision_wifi_connect_sta(uint32_t timeout_ms)
@@ -1248,6 +1385,24 @@ esp_err_t provision_wifi_connect_sta(uint32_t timeout_ms)
     esp_err_t e = esp_wifi_set_mode(WIFI_MODE_STA);
     ESP_LOGI(TAG, "wifi: set_mode=%s", esp_err_to_name(e));
     if (e != ESP_OK) { s_conn_busy = false; return e; }
+    /* 【同名 SSID 多 AP】set_mode(STA) 之后、set_config 之前挑最强 BSSID。
+     * 每次开机只挑一次（s_bssid_picked）：扫描耗时 1~2s，放进每次重连会拖慢回网。 */
+    static bool s_bssid_picked;
+    uint8_t pinned_mac[6] = { 0 };
+    bool have_pinned = false;
+    /* 【真机回退 2026-09-27】"挑最强 BSSID 并 pin"实测在本板不成立：
+     * 真机日志 `挑最佳 AP：扫描失败 ESP_ERR_WIFI_NOT_STARTED`（STA 尚未 start），
+     * 后续每次关联都以 reason=2/205 断开。驱动自带的
+     * WIFI_ALL_CHANNEL_SCAN + WIFI_CONNECT_AP_BY_SIGNAL 已经会选最佳 AP，
+     * 因此这里关闭手动 pin（代码保留备查，置 1 可重新启用）。 */
+#if MP_BSSID_PIN
+    if (!s_bssid_picked) {
+        int best_rssi = 0;
+        s_bssid_picked = true;
+        have_pinned = sta_pick_strongest_bssid(ssid, pinned_mac, &best_rssi);
+    }
+#endif
+    wifi_auto_conn_hold(true);   /* 改配置窗口：禁止事件驱动自动重连（旧配置盲重连会抢） */
     esp_wifi_disconnect();                       /* 清掉进行中/已存的自动连接，安全幂等 */
     {   /* 掩码回显：核对配网时存的密码是否正确（前2+后2可见） */
         char masked[16] = { 0 };
@@ -1265,19 +1420,45 @@ esp_err_t provision_wifi_connect_sta(uint32_t timeout_ms)
     /* WPA2/WPA3 混合路由器：声明 PMF 能力（required=false），否则 4 握手超时 reason=15 */
     sta.sta.pmf_cfg.capable = true;
     sta.sta.pmf_cfg.required = false;
+    /* BSSID pin 挪到 set_mode(STA) 之后（那里扫描才可能成功），见下方调用 */
+    if (have_pinned) {
+        memcpy(sta.sta.bssid, pinned_mac, 6);
+        sta.sta.bssid_set = true;
+        ESP_LOGW(TAG, "STA 关联 pin 到最强 BSSID %02X:%02X:%02X:%02X:%02X:%02X",
+                 pinned_mac[0], pinned_mac[1], pinned_mac[2],
+                 pinned_mac[3], pinned_mac[4], pinned_mac[5]);
+    } else {
+        /* 【同名多 AP 选优 2026-09-27】不 pin 时（= 后续每次重连）让驱动自己按信号挑：
+         * 默认 WIFI_FAST_SCAN 扫到第一个同名 AP 就停 —— 家里同名多 AP 时可能正是
+         * 那个 -80dBm 的弱 AP（真机 TCP 建连频繁超时的根因）。
+         * ALL_CHANNEL_SCAN + BY_SIGNAL 才真的选最强；failure_retry_cnt=3 让驱动
+         * 在认证失败时自己重试 3 次再放弃（旧实现一次失败就回到应用层慢退避）。 */
+        sta.sta.scan_method = WIFI_ALL_CHANNEL_SCAN;
+        sta.sta.sort_method = WIFI_CONNECT_AP_BY_SIGNAL;
+        sta.sta.failure_retry_cnt = 3;
+        ESP_LOGW(TAG, "不 pin BSSID → 驱动按信号选 AP（全信道扫描 + 失败重试 3 次）");
+    }
     e = esp_wifi_set_config(WIFI_IF_STA, &sta);
     if (e != ESP_OK) {
         ESP_LOGE(TAG, "set_config 失败: %s", esp_err_to_name(e));
         s_conn_busy = false;   /* 门闩复位：否则本函数永远走「共享等待」死路（再无人推进连接） */
+        wifi_auto_conn_hold(false);
         return e;
     }
 
     xEventGroupClearBits(s_wifi_events, WIFI_GOT_IP_BIT | WIFI_FAIL_BIT);
     e = esp_wifi_start();
     ESP_LOGI(TAG, "wifi: start=%s", esp_err_to_name(e));
-    if (e != ESP_OK && e != ESP_ERR_INVALID_STATE) { s_conn_busy = false; return e; }
+    if (e != ESP_OK && e != ESP_ERR_INVALID_STATE) {
+        s_conn_busy = false;
+        wifi_auto_conn_hold(false);
+        return e;
+    }
     e = esp_wifi_connect();
     ESP_LOGI(TAG, "wifi: connect=%s（等待 IP，最长 %u ms）", esp_err_to_name(e), (unsigned)timeout_ms);
+    /* 配置已下发：放开自动重连 —— 接下来的等待窗口里，断线事件驱动的快速重连
+     * 与本次 connect 用的是同一份配置，不会打架（真机 reason=2 场景靠它抢时间） */
+    wifi_auto_conn_hold(false);
 
     EventBits_t bits = xEventGroupWaitBits(
         s_wifi_events, WIFI_GOT_IP_BIT | WIFI_FAIL_BIT,
@@ -1390,7 +1571,10 @@ void provision_stop(void)
         vTaskDelete(s_portal_task);               /* 状态机切换钩子：中止配网 */
         s_portal_task = NULL;
     }
+    wifi_auto_conn_hold(true);                    /* 停 WiFi 的收尾窗：不让自动重连抢进来 */
     esp_wifi_stop();
+    s_auto_conn_block_until_ms = mp_now_ms() + 1500;
+    s_auto_conn_off = false;                      /* 之后由 poller 的 connect_sta 重新接管 */
 }
 
 bool provision_is_active(void)

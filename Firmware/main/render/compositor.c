@@ -800,10 +800,12 @@ static void recompose_entity(void)
     const mpak_frame_t *fr = &lt->frames[g_anim.frame_idx];
     /* 帧内 piece 列表顺序 = 权威绘制序（导出端按桌面 RenderFrame 底→顶排列：
      * OrderByDescending(ZIndex)，z 字段仅诊断参考）→ 顺序画，不再排序 */
+    uint32_t miss = 0, total = 0;
     for (uint32_t k = 0; k < fr->piece_count; k++) {
         const mpak_piece_t *piece = &lt->pieces[fr->piece_off + k];
         const rc_part_img_t *img = resolve_piece(piece);
-        if (!img) continue;
+        total++;
+        if (!img) { miss++; continue; }
         /* 导出 x/y = 位图左上角相对 body 锚点坐标（FinalX 已含 part origin，
          * 不再减 origin）；+帧位移 move（桌面同轴：画布内绝对位移，非累计），
          * -联合画布原点 → 实体缓冲内位置（世界 1x → 2x 移位展开） */
@@ -811,6 +813,23 @@ static void recompose_entity(void)
         int32_t bx = ((int32_t)piece->x - g_ent_cx0) << RC_SCALE_SHIFT;
         int32_t by = ((int32_t)piece->y - g_ent_cy0) << RC_SCALE_SHIFT;
         blit_ent_2x(img, piece->flip & 1u, bx, by);
+    }
+
+    /* 【人物消失自愈 2026-09-27】LAYOUT 与 PARTS 是两份独立资产、分开下载：
+     * 真机实测会出现"LAYOUT 换新了、配套 PARTS 还在路上"的窗口——此时整帧
+     * piece 全部解析失败，画出来就是"人物没了"（用户报障）。这里在渲染期兜底：
+     * 单帧命中率过低即判定错配，立刻请求一次素材全量同步（带节流），
+     * 让设备几秒内自己把配套 PARTS 拉回来，不需要用户做任何事。 */
+    if (total > 0 && miss * 2 > total) {
+        static int64_t s_mismatch_last_ms;
+        int64_t now_ms = esp_timer_get_time() / 1000;
+        if (now_ms - s_mismatch_last_ms > 15000) {   /* 15s 节流，防刷请求 */
+            s_mismatch_last_ms = now_ms;
+            ESP_LOGE(TAG, "实体帧部件错配（%u/%u 解析失败）→ 请求素材全量同步"
+                          "（LAYOUT 与 PARTS 版本不一致）", (unsigned)miss, (unsigned)total);
+            extern void asset_dl_request_sync(void);
+            asset_dl_request_sync();
+        }
     }
 }
 
@@ -1540,12 +1559,60 @@ int render_set_parts(const char *mpk_path)
     return RENDER_OK;
 }
 
+/* 【换装错配保护 2026-09-27】新 LAYOUT 与当前 PARTS 包必须成对：服务端按外观
+ * hash 同时产出两者，但设备可能只拉到 LAYOUT（TF 挂载失败走 Flash 出厂素材、
+ * 或 PARTS 下载失败）→ 帧里引用的 part_id 在 PARTS 里一个都找不到，
+ * 渲染出来就是"人物整个消失"（真机实证：piece part 1106/821/1755… not in PARTS pkg，
+ * 用户症状"人物也没了"）。
+ *
+ * 这里在**换绑之前**校验：新 LAYOUT 的部件命中率过低就拒绝切换（保留原画面），
+ * 同时请素材任务做一次全量同步（拿回与之配套的 PARTS）。宁可暂时显示旧形象，
+ * 也不给用户一片空白。 */
+static bool layout_matches_current_parts(const mpak_t *lt)
+{
+    const mpak_layout_t *l = lt->u.layout;   /* mpak_t.u.layout 本就是指针 */
+    if (!g_parts_ok) return true;            /* PARTS 未加载：交给原有降级路径 */
+    if (!l->frames || l->frame_count == 0 || !l->pieces) return true;
+    uint32_t total = 0, hit = 0;
+    uint32_t shown = 0;
+    for (uint32_t f = 0; f < l->frame_count && f < 4; f++) {   /* 抽样前 4 帧足够判配 */
+        const mpak_frame_t *fr = &l->frames[f];
+        for (uint32_t k = 0; k < fr->piece_count; k++) {
+            const mpak_piece_t *pc = &l->pieces[fr->piece_off + k];
+            total++;
+            if (mpak_parts_find(&g_parts, pc->part_id)) hit++;
+            else if (shown < 4) {
+                shown++;
+                ESP_LOGW(TAG, "  [错配] 帧%u piece[%u] part=%u 不在当前 PARTS 包",
+                         (unsigned)f, (unsigned)k, (unsigned)pc->part_id);
+            }
+        }
+    }
+    if (total == 0) return true;
+    /* 命中率 < 50% 判为错配（正常换装应接近 100%；表情变体缺失不算错配，
+     * 因为 part_id 本身仍在包里） */
+    bool ok = (hit * 2 >= total);
+    if (!ok) {
+        ESP_LOGE(TAG, "LAYOUT 与 PARTS 不匹配（命中 %u/%u）→ 拒绝换绑，保留当前形象",
+                 (unsigned)hit, (unsigned)total);
+    }
+    return ok;
+}
+
 int render_set_layout(const char *mpk_path, bool loop)
 {
     if (!g_inited || !mpk_path) return RENDER_ERR_ARG;
     mpak_t tmp;
     int rc = mpak_open(&tmp, mpk_path, 0, MPAK_KIND_LAYOUT);
     if (rc != MPAK_OK) return rc;
+
+    /* 换绑前先校验与当前 PARTS 的配套性（不匹配则不切、并请求全量同步） */
+    if (!layout_matches_current_parts(&tmp)) {
+        mpak_close(&tmp);
+        extern void asset_dl_request_sync(void);
+        asset_dl_request_sync();      /* 拉回配套 PARTS，下次 SET_ACTION/SET_MAP 会重试 */
+        return RENDER_ERR_STATE;
+    }
 
     mark_ent();
     if (loop) {

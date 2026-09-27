@@ -81,3 +81,14 @@ CONFIG_MDNS_ENABLE_DEBUG_PRINTS=n
 CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=6
 CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=16
 CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=8
+
+# 【联网根因修复 2026-09-27】WiFi/lwIP 允许从 PSRAM 分配
+# 真机实测硬证据：启动末期内部 DRAM 只剩 空闲 2231B / 最大连续块 2036B →
+#   E lwip_arch: thread_sem_init: out of memory
+#   E esp-tls: getaddrinfo() returns 202
+#   W http: mp_http_tx_fail ESP_ERR_HTTP_CONNECT errno=105 phase=open（立刻失败，不是超时）
+#   W wifi:m f auth → 1.0s 后 auth -> init (0x200) = reason=2
+# 即：设备"连不上/被踢"的真因是**自己的内部堆分配不出 WiFi 认证帧与 socket**，
+# 不是路由器。本板有 8MB PSRAM（几乎全空），让 lwIP/WiFi 的收发缓冲与 socket
+# 结构去 PSRAM 取，内部 DRAM 只留必须的部分。
+CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y

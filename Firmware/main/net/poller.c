@@ -9,12 +9,18 @@
 
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <errno.h>
+#include <unistd.h>
+#include <fcntl.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "cJSON.h"
 #include "esp_system.h"
+#include "lwip/sockets.h"
+#include "lwip/inet.h"
 
 #include "app_core.h"
 #include "hal_contract.h"
@@ -36,10 +42,109 @@ static const char *TAG = "poller";
 static uint32_t s_since;         /* 指令游标（服务端 rev 序列；NVS 持久化） */
 static uint32_t s_local_rev;     /* 已见 manifest rev（asset_dl 维护本地副本） */
 static bool     s_reported_online;
-static int      s_last_poll_status;   /* 最近一次 poll 的 HTTP 状态（-1=超时） */
+static int      s_last_poll_status;   /* 最近一次 poll 的 HTTP 状态（-1=超时或建连失败） */
 static int      s_poll_fail_streak;   /* 连续真失败次数（达到阈值重新 hello） */
 #define POL_REHELLO_FAILS 3           /* 掉线自愈：连续真失败达此次数 → 重新 hello */
 static int      s_hello_fail_streak;  /* hello 连续失败（达 3 次强制重新关联） */
+
+/* ------------------------------------------------------------------ */
+/* 【回网自愈 2026-09-27】可达性门 + 回网补 hello                          */
+/* ------------------------------------------------------------------ */
+/* 真机死结：http_txn 在 open（TCP 建连）失败时也返回 -1，与"长轮询读超时"同码；
+ * 而 poll 的 timeout=65s 是"建连+读"的总预算 —— AP 半死（有 IP 但 SYN 进黑洞）
+ * 时一次 poll 要阻塞 65s，调用方还把它当"心跳抖动"再等 5s，于是既不重连也不补
+ * hello，服务端 lastSeen 空窗轻松超过 2 分钟（设备在网、ping 得通，服务端 offline）。
+ * 现在每轮 poll 前用 1.5s 裸 socket 探针先判定：探不通 = 真断线（立刻退避/重连，
+ * 不浪费 65s）；探得通 = 上一轮 -1 只是长轮询抖动（保持 5s 快速重试、不误报离线）。 */
+#define POLL_PROBE_MS      1500   /* 探针建连上限（局域网正常 <20ms） */
+#define POL_UNREACH_RECONN 2      /* 连续不可达达此次数 → 强制重新关联 */
+#define POL_UNREACH_RECONN_MAX 3  /* 一次"不可达事件"内最多重连 3 次：服务端整机不可达
+                                   * （NAS 重启）时不该反复折腾 WiFi（本板 reason=2 与
+                                   * 重连密度正相关）；探针恢复即复位 */
+#define BACKOFF_UNREACH_MAX_MS 5000   /* 不可达分支退避封顶 5s（探针很轻，不必退到 60s） */
+#define POLL_JITTER_MIN_MS 5000   /* -1 且耗时 ≥ 此值才算"真跑满 hold 的超时"（服务端 hold 55s） */
+static bool     s_link_up = true;         /* 最近一次探针结论 */
+static bool     s_link_was_down;          /* 探针曾判定不可达（恢复时补 hello 用） */
+static bool     s_need_hello;             /* 回网后立即补 hello（掉线/强制重连后置位） */
+static int      s_unreach_streak;
+static int      s_reconn_tries;           /* 本轮"不可达事件"里已强制重连次数 */
+static uint32_t s_seen_disconnects;       /* 已见过的 WiFi 断线次数（provision 侧计数） */
+static int64_t  s_offline_since_ms;       /* 本设备进入"服务端不可达"的时刻（回网时算耗时） */
+
+/* 【掉线自愈】provision.c 提供（声明与 poller.c:284 的 provision_portal_active 同法，
+ * 不动公共头文件）：断线次数累计 + STA 是否已拿 IP */
+extern uint32_t provision_wifi_disconnect_count(void);
+extern bool     provision_wifi_is_connected(void);
+
+/**
+ * 1.5s 上限的裸 TCP 可达性探针（不建 HTTP、不发请求：只回答"到服务端能不能建连"）。
+ * 三态返回（真机实测必须区分后两者 —— 见下）：
+ *   PROBE_UP      建连成功
+ *   PROBE_DOWN    建连失败/超时（真不可达：该重连）
+ *   PROBE_NO_MEM  本地内存不足（socket()/内核缓冲分配失败 errno=105 ENOBUFS）
+ * 【为什么区分】真机 `internal heap 空闲 2231 最大块 2036` 时，lwIP 直接
+ * `thread_sem_init: out of memory` + `socket 失败 errno=105`，此时**换关联毫无用处**
+ * （是内部 RAM 不够，不是 Wi-Fi 链路问题），盲目强制重连只会把认证风暴叠上去。
+ * 只探点分 IP；非点分 IP（域名）直接算通，交给 http 层判断，避免误判。
+ */
+#define PROBE_UP      1
+#define PROBE_DOWN    0
+#define PROBE_NO_MEM (-1)
+
+static int server_tcp_probe(uint32_t timeout_ms)
+{
+    const char *url = mp_http_server_url();
+    if (!url || !url[0]) return PROBE_DOWN;
+
+    const char *p = strstr(url, "//");
+    p = p ? p + 2 : url;
+    const char *slash = strchr(p, '/');
+    const char *colon = strchr(p, ':');
+    char host[64] = { 0 };
+    size_t hl = (colon && (!slash || colon < slash)) ? (size_t)(colon - p)
+              : (slash ? (size_t)(slash - p) : strlen(p));
+    if (hl == 0 || hl >= sizeof(host)) return PROBE_UP;
+    memcpy(host, p, hl);
+    int port = (colon && (!slash || colon < slash)) ? atoi(colon + 1) : 80;
+
+    struct sockaddr_in sa = { 0 };
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons((uint16_t)port);
+    if (inet_aton(host, &sa.sin_addr) != 1) return PROBE_UP;
+
+    int fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (fd < 0) {
+        ESP_LOGW(TAG, "探针：socket() 失败 errno=%d (%s) → 本地内部堆/缓冲不足",
+                 errno, strerror(errno));
+        return PROBE_NO_MEM;                  /* 不是网络问题：别去动 WiFi */
+    }
+    int fl = fcntl(fd, F_GETFL, 0);
+    if (fl >= 0) fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+
+    int rc = PROBE_DOWN;
+    if (connect(fd, (struct sockaddr *)&sa, sizeof(sa)) == 0) {
+        rc = PROBE_UP;                        /* 立即成功（本机/回环路径） */
+    } else if (errno == ENOMEM || errno == ENOBUFS) {
+        rc = PROBE_NO_MEM;
+    } else if (errno == EINPROGRESS || errno == EALREADY) {
+        fd_set wf, ef;
+        FD_ZERO(&wf); FD_ZERO(&ef);
+        FD_SET(fd, &wf); FD_SET(fd, &ef);
+        struct timeval tv = { .tv_sec = 0, .tv_usec = (suseconds_t)(timeout_ms * 1000) };
+        int r = select(fd + 1, NULL, &wf, &ef, &tv);
+        if (r > 0 && FD_ISSET(fd, &wf)) {
+            int soerr = 0;
+            socklen_t sl = sizeof(soerr);
+            if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr, &sl) == 0 && soerr == 0) {
+                rc = PROBE_UP;
+            } else if (soerr == ENOMEM || soerr == ENOBUFS) {
+                rc = PROBE_NO_MEM;
+            }
+        }
+    }
+    close(fd);
+    return rc;
+}
 
 /* ------------------------------------------------------------------ */
 /* 单条指令落地                                                          */
@@ -315,6 +420,19 @@ static void poller_task(void *arg)
                  * 连续失败 3 次后强制断开重连（换一次关联/BSSID），并给路由器
                  * 留 3s 冷却：本板在 reason=2 时 2.6s 就重试一次，过密的认证
                  * 重试本身就可能被 AP 的认证风暴保护继续拒绝。 */
+                /* 【内存不足时不折腾 WiFi · 2026-09-27 真机取证】内部堆只剩
+                 * 2.2KB/最大块 2.0KB 时，hello 的失败原因是
+                 * `lwip_arch: thread_sem_init: out of memory` + socket ENOBUFS
+                 * —— 换关联完全无效，反复 force_reconnect 反而把 reason=2 认证
+                 * 风暴叠上去（真机 320s 内 13 次 reason=2 断线、6 次强制重连）。
+                 * 探针报 PROBE_NO_MEM → 只退避，等内存回收。 */
+                if (server_tcp_probe(POLL_PROBE_MS) == PROBE_NO_MEM) {
+                    ESP_LOGW(TAG, "hello 失败原因是本地内存不足（socket 分配失败）→ "
+                                  "跳过强制重连，仅退避重试");
+                    vTaskDelay(pdMS_TO_TICKS(backoff_ms));
+                    if (backoff_ms < BACKOFF_MAX_MS) backoff_ms *= 2;
+                    continue;
+                }
                 if (++s_hello_fail_streak >= 3) {
                     s_hello_fail_streak = 0;
                     ESP_LOGW("poller", "hello 连续失败 3 次（有 IP 但 TCP 不通）→ 强制重新关联");
@@ -335,9 +453,23 @@ static void poller_task(void *arg)
             if (backoff_ms < BACKOFF_MAX_MS) backoff_ms *= 2;
             if (s_reported_online) {
                 s_reported_online = false;
+                s_offline_since_ms = mp_now_ms();
                 state_machine_handle(MP_SM_EV_NET_OFFLINE);
             }
             continue;
+        }
+
+        /* 【掉线自愈 · 新增】WiFi 侧掉过线（provision 的断线计数自增）→ 回网立刻补 hello：
+         * 服务端 lastSeen 马上刷新，不必等下一轮 55s 长轮询结束。
+         * 计数只在 DISCONNECTED 事件里自增，天然限频（不会变成每轮都发）。 */
+        {
+            uint32_t dn = provision_wifi_disconnect_count();
+            if (dn != s_seen_disconnects) {
+                ESP_LOGW(TAG, "检测到 WiFi 断线（累计 %u 次）→ 回网立即补 hello",
+                         (unsigned)dn);
+                s_seen_disconnects = dn;
+                s_need_hello = true;
+            }
         }
 
         /* E9 常态化校时：借本任务执行（不新建 rtcsync 任务，绕开内部堆碎片） */
@@ -347,7 +479,67 @@ static void poller_task(void *arg)
          * 内部自带 20s 心跳/失败退避，poll 长轮询期间不会叠加请求。 */
         mp_http_device_log_step();
 
+        /* 【可达性门 · 新增】1.5s 裸 TCP 探针：分辨"真断线"与"长轮询抖动"。
+         * 探不通就跳过本轮 poll（省下 65s 的建连黑洞），直接走重连/退避；
+         * 探得通则说明链路在，上一轮 -1 只是长轮询抖动，保持 5s 快速重试。 */
+        int probe = server_tcp_probe(POLL_PROBE_MS);
+        if (probe != PROBE_UP) {
+            int streak = ++s_unreach_streak;
+            s_link_up = false;
+            if (probe == PROBE_DOWN) s_link_was_down = true;
+            ESP_LOGW(TAG, "服务端 TCP 探针=%s（连续第 %d 次，上限 %ums，STA 已连=%d）→ 跳过本轮 poll",
+                     probe == PROBE_NO_MEM ? "本地内存不足" : "不可达",
+                     streak, (unsigned)POLL_PROBE_MS, (int)provision_wifi_is_connected());
+            if (probe == PROBE_NO_MEM) {
+                /* 本地内部堆耗尽（真机实测：空闲 2.2KB/最大块 2.0KB 时 lwIP
+                 * `thread_sem_init: out of memory` + socket errno=105）——
+                 * 换关联解决不了它，只会把认证风暴叠上去；只退避等内存回收。 */
+                ESP_LOGW(TAG, "本轮不强制重连（非链路问题，是本地内存不足）");
+            } else if (streak >= POL_UNREACH_RECONN && s_reconn_tries < POL_UNREACH_RECONN_MAX) {
+                s_reconn_tries++;
+                ESP_LOGW(TAG, "连续不可达 → 第 %d 次强制重新关联（换关联/BSSID）",
+                         s_reconn_tries);
+                provision_wifi_force_reconnect();
+                s_need_hello = true;
+                vTaskDelay(pdMS_TO_TICKS(3000));   /* 给路由器留冷却（认证风暴保护） */
+            }
+            if (streak >= POL_UNREACH_RECONN && s_reported_online) {
+                s_reported_online = false;
+                s_offline_since_ms = mp_now_ms();
+                state_machine_handle(MP_SM_EV_NET_OFFLINE);
+                ESP_LOGW(TAG, "上报 NET_OFFLINE（服务端 TCP 不可达）");
+            }
+            /* 探针很轻（一次 SYN），退避封顶 5s：路由器刚恢复/服务端刚重启时
+             * 要在 1 分钟内回来，不能退到 60s */
+            vTaskDelay(pdMS_TO_TICKS(backoff_ms));
+            backoff_ms = (backoff_ms < BACKOFF_UNREACH_MAX_MS) ? backoff_ms * 2
+                                                              : BACKOFF_UNREACH_MAX_MS;
+            continue;
+        }
+        s_unreach_streak = 0;
+        if (!s_link_up) {
+            s_link_up = true;
+            if (s_link_was_down) {
+                s_link_was_down = false;
+                s_reconn_tries = 0;
+                s_need_hello = true;
+                ESP_LOGW(TAG, "链路恢复（探针已通）→ 立即补 hello 刷新服务端 lastSeen");
+            }
+        }
+        if (s_need_hello) {
+            s_need_hello = false;
+            if (mp_http_hello() == 0) {
+                s_hello_fail_streak = 0;
+                asset_dl_request_sync();
+                ESP_LOGW(TAG, "回网补 hello 成功（掉线/重连后立即执行，不等 poll 轮次）");
+            } else {
+                ESP_LOGW(TAG, "回网补 hello 失败 → 继续走 poll（poll 成功同样刷新 lastSeen）");
+            }
+        }
+
+        int64_t poll_t0 = mp_now_ms();
         bool ok = do_poll_once();
+        int64_t poll_dt_ms = mp_now_ms() - poll_t0;
 
         /* 长轮询可能 hold 50s：再补一次日志上报机会（内部节流，不会连发） */
         mp_http_device_log_step();
@@ -355,19 +547,35 @@ static void poller_task(void *arg)
         if (ok) {
             s_last_poll_status = 200;
             s_poll_fail_streak = 0;
+            s_reconn_tries = 0;
             backoff_ms = BACKOFF_MIN_MS;          /* 成功复位退避 */
             if (!s_reported_online) {
                 s_reported_online = true;
+                int64_t gap_ms = s_offline_since_ms ? (mp_now_ms() - s_offline_since_ms) : 0;
+                s_offline_since_ms = 0;
                 state_machine_handle(MP_SM_EV_NET_ONLINE);
+                ESP_LOGW(TAG, "poll 成功 → 回到 online（离线时长 %lld ms）", (long long)gap_ms);
             }
         } else {
-            /* 【心跳新鲜度】超时（-1）≠ 网络故障：只等 5s 就重试，避免 60s 退避
-             * 把 lastSeen 空窗拖过服务端 90s 在线窗口（真机"状态忽上忽下"根因）。
-             * 真失败（连接被拒/无路由等）仍走指数退避，保护 lwip 缓冲。 */
-            if (s_last_poll_status == -1) {
+            /* 本轮 poll 前探针是通过的 → -1 只可能是长轮询读超时/响应丢失（设备仍在线）。
+             * 置 s_link_up=false 让下一轮先探针复检：若 hold 期间掉了线，下一轮就会
+             * 走"不可达"分支快速重连，而不是再等一个 65s。 */
+            s_link_up = false;
+            /* 【-1 的第二种含义 2026-09-27】服务端 hold 最长 55s，真"长轮询超时"必然
+             * 跑满 poll_dt≈65s；若 -1 却在几秒内返回，那是 open/写阶段就失败
+             * （真机形态：lwIP ENOBUFS、连接被拒、socket 分配失败），属于真失败 ——
+             * 旧实现一律当抖动 5s 重试，于是"内存不够导致的连不上"被无限空转，
+             * 既不退避也不重新 hello、更不报离线。现按耗时区分。 */
+            if (s_last_poll_status == -1 && poll_dt_ms >= POLL_JITTER_MIN_MS) {
+                ESP_LOGW(TAG, "poll 超时（%lld ms，跑满 hold）→ 判为心跳抖动，5s 快速重试",
+                         (long long)poll_dt_ms);
                 vTaskDelay(pdMS_TO_TICKS(POLL_TIMEOUT_RETRY_MS));
                 backoff_ms = BACKOFF_MIN_MS;      /* 超时不累积退避 */
                 continue;                          /* 仍在线：不报 NET_OFFLINE */
+            }
+            if (s_last_poll_status == -1) {
+                ESP_LOGW(TAG, "poll 快速失败（%lld ms < %d ms）→ 判为真失败，走退避/补 hello",
+                         (long long)poll_dt_ms, POLL_JITTER_MIN_MS);
             }
             /* 【掉线自愈 2026-09-27】连续真失败 ≥ POL_REHELLO_FAILS 次 → 重新 hello。
              * 场景：路由器把设备踢掉（真机 reason=2/8 每 2~4 分钟一次）后，设备的
@@ -388,7 +596,9 @@ static void poller_task(void *arg)
             if (backoff_ms < BACKOFF_MAX_MS) backoff_ms *= 2;
             if (s_reported_online) {
                 s_reported_online = false;
+                s_offline_since_ms = mp_now_ms();
                 state_machine_handle(MP_SM_EV_NET_OFFLINE);
+                ESP_LOGW(TAG, "上报 NET_OFFLINE（poll 真失败 %d）", s_last_poll_status);
             }
         }
     }

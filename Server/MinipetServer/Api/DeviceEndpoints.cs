@@ -332,7 +332,14 @@ public static class DeviceEndpoints
             $"BGM：{cmd}（设备现场控制）· source={source} · volume={volume}"
             + (string.IsNullOrWhiteSpace(trackId) ? "" : $" · 曲目 {trackId}"));
 
-        return Results.Json(new { ok = true, cmd, source, trackId, volume });
+        // 固件 bgm_cmd() 取的数字字段名是 "id"（cJSON_GetObjectItem(r,"id")），此前本端点只回
+        // trackId 字符串 → 设备兜底取曲路径（本地无 AUDIO_META 包时走这里）永远拿不到 id，
+        // next/prev/play 全部静默无动作。补回数字 id：按 AUDIO_META 同口径 XxHash32(trackKey)，
+        // 以 int32 位型承载 u32（固件按 (int) 读，负数即高位 id 的位型）。
+        int? trackNumId = string.IsNullOrWhiteSpace(trackId)
+            ? null
+            : unchecked((int)MiniPet.Export.AudioMetaWriter.TrackIdForKey(trackId));
+        return Results.Json(new { ok = true, cmd, source, trackId, id = trackNumId, volume });
     }
 
     /// <summary>OTA 固件包：data/firmware/{ver}.bin（E11：设备直接 WiFi OTA，双分区回滚）。</summary>
