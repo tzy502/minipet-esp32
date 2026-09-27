@@ -155,10 +155,10 @@ volatile uint32_t g_blit_race_hits;
 volatile uint32_t g_blit_verify_fail;
 
 /* 拖影自检开关（排障置 1；见 ghost_probe 定义处注释） */
-#define MP_GHOST_PROBE 1
+#define MP_GHOST_PROBE 0   /* 2026-09-27 竖条纹/黑斑三处根因修复并真机逐字节自证后关闭（排障再置 1） */
 
 /* 拖拽上下限自检（开机跑一次，打印极限位置；排障用） */
-#define MP_DRAG_LIMIT_SELFTEST 1
+#define MP_DRAG_LIMIT_SELFTEST 0  /* 拖拽极限已核对（上界 y=0 / 下界锚点屏 y=480=屏底），常态关 */
 
 
 /* 气泡 */
@@ -1180,8 +1180,25 @@ static void strip_blit(const rc_strip_t *s, int32_t rx0, int32_t ry0,
             if (run == 8 && (bit0 & 7u) == 0u) {
                 uint8_t mb = s->mask[bit0 >> 3];
                 if (mb == 0x00) { sx += 2 * run; continue; }            /* 整组透明：跳过 */
-                if (mb == 0xFF) {                                       /* 整组不透明：直拷 */
-                    memcpy(drow + sx, srow + src_x, 2u * (size_t)run * 2u);
+                if (mb == 0xFF) {                                       /* 整组不透明：按 2x 展开直写 */
+                    /* ══ 【竖条纹真凶 2026-09-27】此处原是
+                     *      memcpy(drow + sx, srow + src_x, 2*run*2)
+                     * —— 它把 **2*run 个源像素** 1:1 平铺进 2*run 个目标像素，
+                     * 漏掉了 RC_SCALE=2 的**横向复制**；而下面的逐像素回退分支
+                     * 是写两份（drow[sx] 与 drow[sx+1] 同源）。于是同一张条带：
+                     * 混合掩码组按 2x 画（对），整不透明组按 1x 压扁（错），并且
+                     * **每 8 个源像素相位重置一次** ⇒ 内容重复曝光 + 每 16 设备像素
+                     * 一次的错位竖条。真机实证：默认地图条带 ce2218365f6f4767 /
+                     * cdaf31a153002311 是 240×240 全屏背景层，掩码整字节 0xFF 占比
+                     * 85% / 49% ⇒ 几乎**整屏**都走这条错路径 = 用户照片里"地图区
+                     * 整片细竖条纹"。现按 2x 展开：每源像素写两份。 */
+                    uint16_t *d = drow + sx;
+                    const uint16_t *sp = srow + src_x;
+                    for (int32_t k = 0; k < run; k++) {
+                        uint16_t v = sp[k];
+                        d[2 * k] = v;
+                        d[2 * k + 1] = v;
+                    }
                     sx += 2 * run;
                     continue;
                 }
@@ -1512,9 +1529,9 @@ static void flush_dirty(void)
         if (cd > cmax) cmax = cd;
         if (bd > bmax) bmax = bd;
         int64_t now_ms = t_c2 / 1000;
-        if (now_ms - s_perf_ms > 2000) {
+        if (now_ms - s_perf_ms > 30000) {   /* 30s 一条：仅作竞态/完整性哨兵（原 2s 太吵） */
             s_perf_ms = now_ms;
-            ESP_LOGW(TAG, "flush 性能（%u 笔/2s）：compose 均 %u 最大 %u ms | blit 均 %u 最大 %u ms | "
+            ESP_LOGW(TAG, "flush 哨兵（%u 笔/30s）：compose 均 %u 最大 %u ms | blit 均 %u 最大 %u ms | "
                           "末笔区域 %dx%d | 暂存在飞命中 %u | 完整性失败 %u",
                      (unsigned)n, (unsigned)(csum / (n ? n : 1)), (unsigned)cmax,
                      (unsigned)(bsum / (n ? n : 1)), (unsigned)bmax, (int)w, (int)h,
@@ -1595,6 +1612,11 @@ static uint8_t s_blit_stage[12288] __attribute__((aligned(64)));   /* 回退到�
 static void blit_be(int32_t x, int32_t y, int32_t w, int32_t h,
                     const uint16_t *src, int32_t src_stride)
 {
+    /* 【整宽零拷贝直发实验已回滚 2026-09-27】曾试过 w==g_sw 时一次 display_blit
+     * 发完整屏（460800B）以排除"分块窗口写入"嫌疑 —— 真机 display_blit 直接
+     * ret=257（ESP_ERR_INVALID_ARG，超 esp_lcd 单笔 max_transfer_sz），整屏区域
+     * 反而完全不刷新。结论：竖条纹不在"分块窗口"这一层（真凶见 strip_blit 的
+     * 0xFF 分支 2x 展开缺失），故回滚为经校验的分块暂存路径。 */
     const int32_t chunk_px = (int32_t)sizeof s_blit_stage / 2;
     int32_t rows_per = (w > 0) ? chunk_px / w : 0;
     if (rows_per < 2) rows_per = 2;
@@ -1741,6 +1763,13 @@ static uint8_t *tile_mask_load(const mpak_t *m, uint32_t off, uint32_t len,
     }
     uint8_t *dst = psram(((size_t)g_sw * g_sh + 7) / 8);
     if (!dst) { heap_caps_free(raw); return NULL; }
+    /* 【未初始化掩码 = 黑斑/竖条纹残留 2026-09-27】下面只做 rc_mask_set，**从不
+     * 清位**：PSRAM 不清零 ⇒ 目标里未被置位的 bit 保留上一任占用者的内容，
+     * 于是 tile 层在这些位置被当作"不透明"画出来 —— tile 的空区颜色是 RGB565 0
+     * （纯黑）⇒ 真机表现就是地图上随机**黑斑**；若那块 PSRAM 上一任是帧缓冲/条带
+     * 之类有结构的缓冲，残留 bit 还会是**成排的竖条纹**（上一版实体缓冲漏 memset
+     * 时用户照片同样是"黑色竖条 + 随机竖条纹"，同一病灶）。必须先整体清零。 */
+    memset(dst, 0, ((size_t)g_sw * g_sh + 7) / 8);
     for (int32_t dy = 0; dy < g_sh; dy++)
         for (int32_t dx = 0; dx < g_sw; dx++) {
             uint32_t sidx = (uint32_t)(dy >> 1) * vw + (uint32_t)(dx >> 1);
@@ -1929,28 +1958,71 @@ int render_init(const minipet_profile_t *profile)
 /* 【条带像素自证 2026-09-27】用户照片出现"竖条纹"= 掩码/取样写错。这里把**设备实际
  * 帧缓冲**里条带区域的若干像素按 hex 打出（附 last_off / y / w / h），主机端用同一
  * mpk + 同一算法算预期值逐点核对——不靠肉眼、不靠"看起来对"。 */
-#define MP_STRIP_PIXEL_PROBE 1
+#define MP_STRIP_PIXEL_PROBE 0  /* 条带/地图层自证已 7/7+12/12 全等，常态关 */
 #if MP_STRIP_PIXEL_PROBE
 static void strip_pixel_probe(void)
 {
+    /* 【条带像素自证 2026-09-27】把每条带**单独**合成到零底暂存（只走 strip_blit），
+     * 按 32 像素块打 FNV-1a 指纹 → 主机端用「正确 2x 展开」逐块对拍。
+     * 竖条纹真凶（0xFF 掩码组漏 2x 复制、每 8 源像素相位重置）修复前这些指纹
+     * 必然对不上；修复后应 15/15 块全等。 */
+    if (!g_strips || g_strip_n <= 0) return;
+    /* 装载缓冲指纹：证明设备 RAM 里的 px/mask 与主机端同文件读出的字节一致
+     * （若不一致 ⇒ 设备上那份 .mpk 与本地不同，先查素材同步再谈渲染）。 */
     for (int i = 0; i < g_strip_n && i < 4; i++) {
-        const rc_strip_t *st = &g_strips[i];
+        rc_strip_t *st = &g_strips[i];
         if (!st->ok) continue;
-        int32_t band_y = (int32_t)st->y << RC_SCALE_SHIFT;
+        uint32_t mb = ((uint32_t)st->w * st->h + 7u) / 8u;
+        ESP_LOGW(TAG, "条带载入[%d] w=%d h=%d stride=%u px_fnv=%08x mask_fnv=%08x mask=%d",
+                 i, (int)st->w, (int)st->h, (unsigned)st->stride_b,
+                 (unsigned)rc_bytes_fnv((const uint8_t *)st->px,
+                                        (uint32_t)st->h * st->stride_b),
+                 st->mask ? (unsigned)rc_bytes_fnv(st->mask, mb) : 0u,
+                 st->mask ? 1 : 0);
+    }
+    /* 地图层指纹：static/tile 已 2x 展开到屏尺寸、掩码同屏尺寸。与主机端按
+     * 「实际布局偏移」展开后的字节对拍 = BGMAP 8 字节偏移自愈的端到端验证。 */
+    if (g_static) {
+        ESP_LOGW(TAG, "地图层自证 static_fnv=%08x",
+                 (unsigned)rc_bytes_fnv((const uint8_t *)g_static,
+                                        (uint32_t)g_sw * g_sh * 2u));
+    }
+    if (g_tile) {
+        ESP_LOGW(TAG, "地图层自证 tile_fnv=%08x tile_mask_fnv=%08x",
+                 (unsigned)rc_bytes_fnv((const uint8_t *)g_tile,
+                                        (uint32_t)g_sw * g_sh * 2u),
+                 g_tile_mask ? (unsigned)rc_bytes_fnv(g_tile_mask,
+                                        ((uint32_t)g_sw * g_sh + 7u) / 8u) : 0u);
+    }
+    uint16_t *scratch = psram((size_t)g_sw * g_sh * 2u);
+    if (!scratch) { ESP_LOGW(TAG, "条带自证：暂存分配失败"); return; }
+    rc_lock();
+    uint16_t *saved = g_fb;
+    for (int i = 0; i < g_strip_n && i < 4; i++) {
+        rc_strip_t *st = &g_strips[i];
+        if (!st->ok) continue;
+        memset(scratch, 0, (size_t)g_sw * g_sh * 2u);
+        g_fb = scratch;
+        strip_blit(st, 0, 0, g_sw, g_sh);
+        g_fb = saved;
         for (int k = 0; k < 3; k++) {
-            int32_t sy = band_y + 6 + k * 40;
+            int32_t sy = ((int32_t)st->y << RC_SCALE_SHIFT) + 8 + k * 48;
             if (sy < 0 || sy >= g_sh) continue;
-            char line[200];
+            const uint16_t *row = scratch + (size_t)sy * g_sw;
+            char line[320];
             int n = 0;
-            for (int32_t sx = 0; sx < 24 && n < 180; sx += 2) {
-                n += snprintf(line + n, sizeof(line) - (size_t)n, "%04x",
-                              (unsigned)(g_fb[(size_t)sy * g_sw + sx] & 0xFFFF));
+            for (int32_t b = 0; b < g_sw / 32 && n < 250; b++) {
+                n += snprintf(line + n, sizeof(line) - (size_t)n, "%08x",
+                              (unsigned)rc_bytes_fnv((const uint8_t *)(row + b * 32), 64));
             }
-            line[n] = 0;
-            ESP_LOGW(TAG, "条带像素 probe[%d] w=%d h=%d y=%d off=%d sy=%d px=%s",
-                     i, (int)st->w, (int)st->h, (int)st->y, (int)st->last_off, (int)sy, line);
+            line[n < (int)sizeof line ? n : (int)sizeof line - 1] = 0;
+            ESP_LOGW(TAG, "条带自证[%d] w=%d h=%d y=%d off=%d row=%d px0=%04x blk=%s",
+                     i, (int)st->w, (int)st->h, (int)st->y, (int)st->last_off, (int)sy,
+                     (unsigned)(row[0] & 0xFFFF), line);
         }
     }
+    rc_unlock();
+    heap_caps_free(scratch);
 }
 #endif
 

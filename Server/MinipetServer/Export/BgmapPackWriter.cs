@@ -74,7 +74,15 @@ public static class BgmapPackWriter
             ? PartPackWriter.EncodeRgb565WithMask(input.TileLayer)
             : Array.Empty<byte>();
 
-        int headerLen = MapIdSize + 2 + 2 + 4 + 4 + 4 + 4 + 4 + input.Strips.Count * 16;
+        // 【布局修正 2026-09-27】每条条带实际序列化 14B（part_ref u64 + y i16 +
+        // speed_x i16 + rx u8 + blend u8，见 mpak_wire_strip_t/_Static_assert），
+        // 旧代码按 16B/条 估 headerLen ⇒ static_back_off/tile_layer_off 比真实位置
+        // 大 8B：地图两层整体左移 4 像素、tile 掩码错位 64 像素（真机：对象错位 +
+        // 块状黑斑 + 竖缝）。这里按实际字节数算，并把头部补到 4B 对齐。
+        int stripsLen = input.Strips.Count * 14;
+        int headerLen = MapIdSize + 2 + 2 + 4 + 4 + 4 + 4 + 4 + stripsLen;
+        int headerPad = (4 - (headerLen & 3)) & 3;
+        headerLen += headerPad;
         int staticOff = headerLen;
         int tileOff = staticOff + staticData.Length;
 
@@ -97,6 +105,7 @@ public static class BgmapPackWriter
                 w.Write(s.RxParallax);
                 w.Write(s.Blend);
             }
+            for (int i = 0; i < headerPad; i++) w.Write((byte)0);
             w.Write(staticData);
             w.Write(tileData);
         }

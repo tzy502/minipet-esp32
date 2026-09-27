@@ -624,6 +624,30 @@ static int parse_bgmap(mpak_t *m)
         return MPAK_ERR_FMT;
     }
 
+    /* 【BGMAP 层偏移自愈 2026-09-27】真凶级布局 bug：BgmapPackWriter 估 headerLen 时
+     * 按 **16B/条** 计（`input.Strips.Count * 16`），但每条实际只写 14B
+     * （part_ref u64 + y i16 + speed i16 + rx u8 + blend u8）。于是声明的
+     * static_back_off/tile_layer_off 比真实数据位置大 8B：
+     *   · static_back 整体左移 4 源像素（每行首 4 像素来自下一行行尾）；
+     *   · tile_layer 颜色同样移 4 像素，而**掩码**是从 tile_off+px 读的 —— 掩码是
+     *     tight 位打包、行距 240 bit，8B = 64 bit ⇒ 掩码整体错位 64 像素（含跨行
+     *     回卷）⇒ 掩码与颜色完全对不上：真机表现为地图对象错位、块状黑斑、边缘
+     *     锯齿状竖缝（用户"地图没渲染好"照片）。
+     * 判据：真实布局必然是「56B 头 + 14B×条数（补 4B 对齐）+ static + tile」，
+     * 声明值与之不符即自愈（对已修好的新包是 no-op）。 */
+    uint32_t strips_end = (56u + (uint32_t)bg->strip_count * 14u + 3u) & ~3u;
+    if (bg->static_back_off != strips_end ||
+        bg->tile_layer_off != strips_end + bg->static_back_len ||
+        strips_end + bg->static_back_len + bg->tile_layer_len > m->payload_len) {
+        ESP_LOGW(TAG, "BGMAP %s 层偏移不符实际布局（声明 static_off=%u tile_off=%u，"
+                      "实际 %u/%u，payload=%u）→ 已按实际布局校正",
+                 bg->map_id, (unsigned)bg->static_back_off, (unsigned)bg->tile_layer_off,
+                 (unsigned)strips_end, (unsigned)(strips_end + bg->static_back_len),
+                 (unsigned)m->payload_len);
+        bg->static_back_off = strips_end;
+        bg->tile_layer_off   = strips_end + bg->static_back_len;
+    }
+
     if (bg->strip_count) {
         bg->strips = psram_alloc(bg->strip_count * sizeof(mpak_strip_t));
         if (!bg->strips) { heap_caps_free(bg); return MPAK_ERR_NOMEM; }
