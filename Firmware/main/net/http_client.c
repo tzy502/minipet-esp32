@@ -114,27 +114,6 @@ static void raw_tcp_probe_once(const char *url)
     if (done) return;
     done = true;
 
-    /* 【真机网络定位 2026-09-27】依次对服务端做多端口 TCP 握手：
-     *   22(SSH)/80(HTTP)/5000/38090(MinipetServer)
-     * 目的：区分「所有 TCP 都不通（链路/WiFi 省电/路由器隔离）」与
-     * 「只有 38090 不通（服务端/防火墙按源拦截）」。 */
-    {
-        static const int ports[] = { 22, 80, 5000, 38090 };
-        for (size_t i = 0; i < sizeof(ports) / sizeof(ports[0]); i++) {
-            struct sockaddr_in t = { 0 };
-            t.sin_family = AF_INET;
-            t.sin_port = htons((uint16_t)ports[i]);
-            inet_aton("<NAS_IP>", &t.sin_addr);
-            int sk = socket(AF_INET, SOCK_STREAM, 0);
-            if (sk < 0) { ESP_LOGW("nprobe", "port %d socket 失败 errno=%d", ports[i], errno); continue; }
-            struct timeval tv = { .tv_sec = 3, .tv_usec = 0 };
-            setsockopt(sk, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
-            int rc = connect(sk, (struct sockaddr *)&t, sizeof t);
-            ESP_LOGW("nprobe", "port %d connect=%d errno=%d", ports[i], rc, rc ? errno : 0);
-            close(sk);
-        }
-    }
-
     const char *p = strstr(url, "//");
     if (!p) return;
     p += 2;

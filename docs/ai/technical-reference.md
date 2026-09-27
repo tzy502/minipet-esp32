@@ -81,14 +81,14 @@ s.setDTR(False); s.setRTS(True); time.sleep(0.1); s.setRTS(False)   # RTS 脉冲
 | `idf.py` 报 CMakeLists not found | 当前目录不对，cd 进 Firmware |
 | 端口打不开/烧录失败 | 残留 monitor 占口：`lsof | grep usbmodem` 找 PID kill，或 pkill -f idf_monitor |
 | ModuleNotFoundError: serial | 用 IDF 环境的 python（见 2.1） |
-| 恢复出厂（重配网） | esptool `erase_region 0x9000 0xF000`（只擦 NVS 不动 assets）；配网页 WiFi 密码 12 位 <WIFI_PASS> |
+| 恢复出厂（重配网） | esptool `erase_region 0x9000 0xF000`（只擦 NVS 不动 assets）；配网页 WiFi 密码 12 位 <WIFI_PASSWORD> |
 | 烧录后行为诡异 | 先确认 flash 真的成功（完整输出见 "Done"）；再排除脏日志误判 |
 | **黑屏 + 串口刷 `boot: No bootable app partitions`（复位循环）** | 烧录中途被取消 → app 分区残缺镜像（`invalid segment length 0xffffffff`），ota_1 又为空 → 处置=重烧完整镜像即愈，与代码无关。**烧录一旦开始不要中断** |
 
 ### 2.5 服务端/网络环境
 - 本地服务端（Mac）：`dotnet run`=5059；用户常驻实例抢 5000 勿动；测试显式 `ASPNETCORE_URLS=5059`。dotnet/WZ 数据在 `/Volumes/SSD`（见记忆 dev-env-ssd）。
-- 生产服务端：NAS `http://<NAS_IP>:38090`（**禁改后端**；Mac IP=<DEV_PC_IP>，板子 DHCP≈<PET_IP>）。
-- 家 WiFi：<WIFI_SSID> / <WIFI_PASS>（12 位，别输成 13 位）。SoftAP 配网：`<AP_SSID>` → portal 192.168.4.1。
+- 生产服务端：NAS `http://<NAS_IP>:38090`（**禁改后端**；Mac IP=<MAC_IP>，板子 DHCP≈<DEVICE_IP>）。
+- 家 WiFi：<SSID> / <WIFI_PASSWORD>（12 位，别输成 13 位）。SoftAP 配网：`<AP_SSID>` → portal 192.168.4.1。
 - 服务端健康自检：`curl -m 5 http://<NAS_IP>:38090/api/device/hello`（GET 应 200）。
 
 ---
