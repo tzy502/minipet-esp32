@@ -95,7 +95,18 @@
   （`a` = 曲目 id，`bgm.c` 原本就按 u32 位型处理）；顺带把 `n` 的读取从
   `(int32_t)double` 改成**先在 double 域判范围再折算**，避免 u32 越界时的未定义行为。
 
-## 7. 仍需人眼确认的一点
+## 7. 修复过程中连带挖出的三处「静默失败」（都在同一类：读错偏移/资源上限）
+
+| # | 现象 | 根因 | 真机证据（修前 → 修后） |
+|---|------|------|------------------------|
+| 1 | 三档字体从未绑定 → 气泡/菜单/曲库文本全退化 | `read_font_px()` 读**文件偏移 32**（信封里 payload_len 的低字节），而 payload 首字节在 **40**；且服务端清单 FONT 条目**不带 px** → `font_px` 恒为垃圾 | 修前日志无 `set_font` 行；修后 `set_font px=16/24/32 开始/完成` 六行齐 |
+| 2 | `font_px` 一旦修好反而整机 FATAL：`vfs_fat: open: no free file descriptors` → `mpak: open /sdcard/minipet/parts/… failed` → `本地素材加载失败` → 人物整只消失 + 渲染任务 TWDT 每 5s 连发 | `SD_MAX_FILES = 4`（早期"manifest+1 包并发"假设，只对下载成立）；实际常驻打开 = 时钟 PARTS(1)+三档 FONT(3)+纸娃娃 PARTS(1)+LAYOUT(≤2)+瞬时(1~2) | 修前 TWDT 触发 37 次、`miss=15`；`max_files 4→12` 后 TWDT **0 次**、`miss=0`、内部堆 @素材全绑后 空闲=18107/最大块=8180 |
+| 3 | `cJSON_GetNumberValue(NULL)` 返回 **NAN**，`(uint8_t)NAN == 255` → 坏值被 `save_local_manifest()` 持久化回清单，只判 `==0` 的兜底救不回来 | 缺字段没先判 `cJSON_IsNumber` | 统一 `jnum()/jnum_at()`；FONT 档位**以包内 size_px 为准**（清单值只作参考） |
+
+> 顺带把常态日志收敛：`RC_FORENSIC` 默认 0（需要时改 1 复跑取证），周期探针 3s → 30s，
+> flush 日志仅在取证窗口打印。最终固件 60s 只输出 **307 行**日志、**0 次 TWDT**、0 条 ERROR。
+
+## 8. 仍需人眼确认的一点
 
 面板侧没有 TE（撕裂同步）引脚（BSP 里 `BSP_LCD_*` 无 TE、`tear_avoid_mode = NONE`），
 所以"写入 GRAM 时面板正在扫描"这件事在硬件上无法消除；本次修复把**内容错帧/残影/越界裁切**
