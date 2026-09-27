@@ -405,7 +405,19 @@ static void poller_task(void *arg)
 
     for (;;) {
         extern bool provision_portal_active(void);   /* portal 期间停轮询：无配置时对不可达服务端的重试会耗尽 lwip 缓冲（listen ENOBUFS 根因） */
-        while (provision_portal_active()) vTaskDelay(pdMS_TO_TICKS(1000));
+        /* 【取证 2026-09-27】hello_done 已确认正常置位（追踪日志 0→1 后不再被清），
+         * 但 poll 心跳仍不出现 → 怀疑卡在这个 portal 等待里（s_portal_active 被
+         * provision_start_portal() 置位后若任务创建失败/未拆栈，就永远为 true）。
+         * 这里进入等待时打一条（30s 限频），把"是否卡在这"变成事实。 */
+        if (provision_portal_active()) {
+            static int64_t s_pw_log_ms;
+            int64_t now_ms = esp_timer_get_time() / 1000;
+            if (now_ms - s_pw_log_ms > 30000) {
+                s_pw_log_ms = now_ms;
+                ESP_LOGW(TAG, "poll 被 portal 阻塞中（portal_active=1）→ 等待配网完成");
+            }
+            while (provision_portal_active()) vTaskDelay(pdMS_TO_TICKS(1000));
+        }
 
         /* 【真机根因 2026-09-27】本任务在 app_main 里先于 state_machine_boot()
          * 启动，而 deviceId 是 hello 从服务端取回的。此前会在 hello 之前就用

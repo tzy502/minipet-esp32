@@ -44,6 +44,18 @@ static char s_server_url[128];      /* 无结尾斜杠 */
 static char s_uuid[13];             /* 12 hex + NUL */
 static char s_device_id[40];        /* hello 返回；未注册时 = s_uuid */
 static volatile bool s_hello_done;
+/* 【取证 2026-09-27】hello_done 被反复清导致 poller 永不 poll。加统一写入口，
+ * 记录每次写入的来源与序号，一次看清是谁在清。 */
+static void hello_done_set(bool v, const char *who)
+{
+    static int seq;
+    bool old = s_hello_done;
+    s_hello_done = v;
+    if (old != v) {
+        ESP_LOGW("hello", "hello_done %d→%d @%s (#%d, t=%lldms)",
+                 (int)old, (int)v, who, ++seq, (long long)(esp_timer_get_time() / 1000));
+    }
+}
 static char s_pairing_code[8];      /* hello 下发的 6 位配对码（暂存，字体绑定后重显） */
 
 /* 设备日志上报游标（已成功送达服务端的最大序号） */
@@ -85,6 +97,18 @@ void mp_http_init(void)
                  mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
         strlcpy(s_device_id, s_uuid, sizeof(s_device_id));   /* 匿名兜底（E13） */
     }
+    /* 【自清自毁死循环修复 2026-09-27】mp_http_hello() 入口会调本函数，
+     * 而本函数末尾要通过"换地址"接口重装 s_server_url —— 那个接口会清
+     * s_hello_done。结果：hello 成功置位 → 下一轮 poller 调 hello 时
+     * 又被本函数清掉 → poller 永远看到 hello_done=false → 反复 hello、
+     * 永不 poll（真机铁证：`hello ok` 每 ~5s 重复、`poll 心跳` 从未出现、
+     * 服务端长期 offline、指令取不走）。
+     * 修法：装载地址前记下旧值，装载后若地址**没变**就把 hello_done 恢复，
+     * 只有地址真正变化时才要求重新 hello。 */
+    char before[sizeof(s_server_url)];
+    strlcpy(before, s_server_url, sizeof(before));
+    bool hello_done_before = s_hello_done;
+
     char raw[128] = { 0 };
     if (!mp_nvs_get_str("srv_url", raw, sizeof(raw)) || raw[0] == 0) {
         /* 【编译期兜底 2026-09-27】NVS 里的 srv_url 为空（首次上电/被清）时，
@@ -95,12 +119,16 @@ void mp_http_init(void)
         if (MP_DEFAULT_SRV_URL[0]) {
             ESP_LOGW(TAG, "NVS 无 srv_url → 使用编译期默认服务器地址 %s", MP_DEFAULT_SRV_URL);
             url_apply(s_server_url, sizeof(s_server_url), MP_DEFAULT_SRV_URL);
+            /* 地址未变则不打断已完成的 hello（见函数入口注释） */
+            if (hello_done_before && strcmp(before, s_server_url) == 0) hello_done_set(true, "init_restore");
             return;
         }
         s_server_url[0] = 0;
+        if (hello_done_before && before[0] == 0) hello_done_set(true, "init_restore_empty");
         return;
     }
     url_apply(s_server_url, sizeof(s_server_url), raw);
+    if (hello_done_before && strcmp(before, s_server_url) == 0) hello_done_set(true, "init_restore2");
 }
 
 const char *mp_http_server_url(void) { return s_server_url[0] ? s_server_url : NULL; }
@@ -113,13 +141,18 @@ const char *mp_http_pairing_code(void)    { return s_pairing_code; }
  * url 为 NULL 或空串 = 清空（地址不可达时清掉，避免对已知坏地址反复发请求）。 */
 void mp_http_set_server_url(const char *url)
 {
-    if (!url || url[0] == 0) {
-        s_server_url[0] = 0;
-        s_hello_done = false;      /* 地址换了：hello 需要重新做 */
-        return;
-    }
-    url_apply(s_server_url, sizeof(s_server_url), url);
-    s_hello_done = false;
+    /* 【只在地址真变时要求重新 hello 2026-09-27】原实现无条件清 s_hello_done，
+     * 而启动路径里 mp_http_init()（被 mp_http_hello() 入口调用）与状态机的
+     * "还原手输地址"都会走这里 → hello 刚成功就被清 → poller 永远看到
+     * hello_done=false → 反复 hello、永不 poll（真机铁证：hello ok 每 ~5s 重复、
+     * poll 心跳从未出现、服务端长期 offline、指令/BGM 全部取不走）。
+     * 现在：把地址写进临时缓冲，**只有解析结果与当前地址不同**才清标记。 */
+    char tmp[sizeof(s_server_url)];
+    tmp[0] = 0;
+    if (url && url[0]) url_apply(tmp, sizeof(tmp), url);
+    if (strcmp(tmp, s_server_url) == 0) return;      /* 地址没变：保持 hello 状态 */
+    strlcpy(s_server_url, tmp, sizeof(s_server_url));
+    hello_done_set(false, "set_server_url_changed");   /* 地址换了：hello 需要重新做 */
 }
 
 /* ------------------------------------------------------------------ */
@@ -380,6 +413,8 @@ static bool json_num2(const cJSON *obj, const char *primary,
 
 int mp_http_hello(void)
 {
+    ESP_LOGW("hello", "→ mp_http_hello() 被调用（done=%d, t=%lldms）",
+             (int)s_hello_done, (long long)(esp_timer_get_time() / 1000));
     /* 【真机连不通取证 2026-09-27】把"设备到底在连哪个 URL、用什么 deviceId"
      * 打成事实：若与 Mac 侧 curl 的地址不一致（NVS 旧值），一切"连不通"都由此解释。 */
     mp_http_init();
@@ -463,7 +498,7 @@ int mp_http_hello(void)
     }
 
     cJSON_Delete(r);
-    s_hello_done = true;
+    hello_done_set(true, "hello_ok");
     ESP_LOGI(TAG, "hello ok, deviceId=%s", s_device_id);
     return 0;
 }
