@@ -298,13 +298,24 @@ offline_check_cache:
         watchdog_text_persist("MINIPET NO ASSETS", "CHECK WIFI/SERVER");
         return;
     }
-    /* 【真机恢复能力 2026-09-27】有凭据但服务端连不上 → 同时拉起配网 portal：
+    /* 【真机恢复能力 2026-09-27】有凭据但服务端连不上 → 拉起配网 portal：
      *   - 排障不用插线：手机连 MiniPet-XXXX 即可核对/改服务器地址、重选 WiFi
-     *   - 真机场景：家宽换了网段/服务端换了 IP 时，设备不再只能干等 poller
-     * 与"无凭据"分支的区别：这里**不清凭据**，STA 连接（若已连上）保持，
-     * poller 仍在后台重连；portal 只是并行提供一个人工入口。 */
-    ESP_LOGW(TAG, "服务端不可达 → 并行拉起配网 portal（凭据保留，poller 继续回网）");
-    provision_start_portal();
+     *   - 换网/服务端换 IP 时有人工入口，不必连电脑擦 NVS
+     * 但要**延后**：provision_start_portal() 会把 WiFi 切成 APSTA 并起 SoftAP，
+     * 真机实测紧随其后出现 `WiFi 断开 reason=8`（STA 被模式切换打断）——
+     * 而 poller 的 hello 补发本来很可能在几秒后成功（已验证可上线）。
+     * 因此：只有"连续多次仍然连不上"才拉 portal，给 STA 留稳定窗口。 */
+    {
+        static int s_boot_hello_fails;
+        if (++s_boot_hello_fails >= 3) {
+            ESP_LOGW(TAG, "服务端连续 %d 次不可达 → 并行拉起配网 portal"
+                          "（凭据保留，poller 继续回网）", s_boot_hello_fails);
+            provision_start_portal();
+        } else {
+            ESP_LOGW(TAG, "服务端不可达（第 %d 次）→ 先交给 poller 补发 hello，"
+                          "暂不拉 portal（避免 APSTA 切换打断 STA）", s_boot_hello_fails);
+        }
+    }
     transition(MP_ST_OFFLINE);
 }
 
