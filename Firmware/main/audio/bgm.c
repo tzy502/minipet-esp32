@@ -162,6 +162,11 @@ static void tbl_load_locked(void)
         closedir(d);
     }
 
+    /* 【可观测性 2026-09-27】此前构建结果完全静默：包不存在/坏包/source 过滤不匹配
+     * （AUDIO_META 里 tracks[].source 与当前音源不符）都会得到空表，用户侧只看到
+     * "设了 BGM 没声音"，无从判断卡在哪一步。这里把关键计数打出来。 */
+    ESP_LOGW(TAG, "曲目表构建：src=%d 命中 %d 首（audio 目录%s）",
+             (int)src, cnt, d ? "存在" : "不存在");
     if (oom) {
         ESP_LOGE(TAG, "track table build OOM @%d", cnt);
         heap_caps_free(ids);

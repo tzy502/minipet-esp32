@@ -258,9 +258,20 @@ static bool do_poll_once(void)
      * handle_cmd 期望的 {t,v,n,u} 视图后复用既有语义映射 */
     cJSON *cmds = cJSON_GetObjectItem(root, "commands");
     if (!cJSON_IsArray(cmds)) cmds = cJSON_GetObjectItem(root, "cmds");  /* 兼容旧口径 */
+    /* 【指令丢失根因修复 2026-09-27】游标必须只推进到"**实际收到**的最大 seq"，
+     * 不能用响应里的 lastSeq：lastSeq 是本轮取走之后的队列尾，若在"服务端组装
+     * 响应"与"读 lastSeq"之间又有新指令入队（真机就是 Web 点击的瞬间），
+     * 设备会把游标推过这条指令 → 它永远不会被取走（用户症状：设了 BGM/表情
+     * 没反应，服务端显示已入队）。 */
+    uint32_t max_rx_seq = 0;
     if (cJSON_IsArray(cmds)) {
         cJSON *jc;
         cJSON_ArrayForEach(jc, cmds) {
+            cJSON *jseq = cJSON_GetObjectItem(jc, "seq");
+            if (jseq) {
+                uint32_t sq = (uint32_t)cJSON_GetNumberValue(jseq);
+                if (sq > max_rx_seq) max_rx_seq = sq;
+            }
             cJSON *t = cJSON_GetObjectItem(jc, "type");
             cJSON *payload = cJSON_GetObjectItem(jc, "payload");
             if (!t) { handle_cmd(jc); continue; }   /* 旧口径直通 */
@@ -347,10 +358,17 @@ static bool do_poll_once(void)
     }
 
     cJSON *jls = cJSON_GetObjectItem(root, "lastSeq");
-    if (jls) rev = (uint32_t)cJSON_GetNumberValue(jls);
-    if (rev > s_since) {
-        s_since = rev;
+    uint32_t last_seq = jls ? (uint32_t)cJSON_GetNumberValue(jls) : 0;
+    /* 收到指令：只推到实际收到的最大 seq（可能落后于 lastSeq，下轮再取后续的）；
+     * 没收到指令：说明本轮到 lastSeq 为止都取空了，可以安全推进到 lastSeq。 */
+    uint32_t adv = (max_rx_seq > 0) ? max_rx_seq : last_seq;
+    if (adv > s_since) {
+        s_since = adv;
         mp_nvs_set_u32("poll_since", s_since);   /* 断电续读（尽力而为） */
+        if (max_rx_seq > 0 && last_seq > max_rx_seq) {
+            ESP_LOGW(TAG, "游标推进到实收 seq=%lu（服务端 lastSeq=%lu，差值留到下轮取）",
+                     (unsigned long)max_rx_seq, (unsigned long)last_seq);
+        }
     }
 
     /* manifest rev 前进 → 触发素材 diff（E11 回网补拉；E13 按设备隔离下发） */

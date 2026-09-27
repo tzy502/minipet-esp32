@@ -340,6 +340,13 @@ static void app_main_task(void *arg)
      * → 无渲染降级黑屏）。这里把渲染放在网络任务之后、OTA/BGM 之前，
      * 实测能拿到最大连续块并成功建栈。 */
 
+    /* 【BGM 任务必须早于渲染 2026-09-27】bgm 任务栈 6K、渲染栈 8K，两者在内部
+     * DRAM 里只能先到先得：实测先起渲染后，bgm 任务连 6K 都拿不到（
+     * `bgm 任务首建失败（内部堆挤压）` 每 10s 重试、永不成功）→ 用户"设了 BGM
+     * 没声音"。BGM 是用户直接可感知的功能，优先级高于渲染任务，故先起 bgm。 */
+    bgm_start();           /* BGM 解码+feeder+环形缓冲（codec_init 在内） */
+    provision_dump_internal_heap("bgm 任务后（渲染任务未创建）");
+
     bool render_ok = false;
     /* 【无凭据时不起渲染 2026-09-27】设备在配网态（无凭据 → SoftAP + portal）
      * 时，屏上要显示的是配网引导而不是宠物，而 portal 任务 + httpd + SoftAP 已
@@ -414,9 +421,8 @@ static void app_main_task(void *arg)
                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
     }
 
-    /* 后台任务：OTA / BGM（网络任务已在渲染任务之前启动，见上） */
+    /* 后台任务：OTA（BGM 已提到渲染任务之前，见上） */
     ota_start();           /* 双分区升级 */
-    bgm_start();           /* BGM 解码+feeder+环形缓冲（codec_init 在内） */
     provision_dump_internal_heap("全部任务创建后");
 
     /* E9 常态化校时：自检后启动（内部等 STA 连上才动作；时间已有效则转 6h 周期）。
