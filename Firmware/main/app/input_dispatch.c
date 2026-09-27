@@ -770,8 +770,12 @@ static void touch_tick(void)
             return;
         }
         if (drag_active) {
-            /* 拖动结束 → 人物保持原地（跟手语义） */
+            /* 【松手落回地面线 2026-09-27】原为"保持原地（跟手语义）"——用户实测
+             * 拖过之后人物会永久留在半空（"目前是站在空中"）。现改为松手即落到
+             * 该 x 处的地面线（本图内置地面表 / 无表回落"屏底-20"），保证任何时刻
+             * 都像站在地上；"全屏拖动"只在按住期间有效（跟手不变）。 */
             drag_active = false;
+            render_settle_on_ground();
             note_interaction();
         } else if (!longpress_fired && dur < TAP_MAX_MS && dx < TAP_MOVE_PX && dy < TAP_MOVE_PX) {
             /* 轻点 = 抚摸：smile/love 随机 + 短气泡可见反馈（问题6）。

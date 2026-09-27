@@ -158,7 +158,7 @@ volatile uint32_t g_blit_verify_fail;
 #define MP_GHOST_PROBE 0   /* 2026-09-27 竖条纹/黑斑三处根因修复并真机逐字节自证后关闭（排障再置 1） */
 
 /* 拖拽上下限自检（开机跑一次，打印极限位置；排障用） */
-#define MP_DRAG_LIMIT_SELFTEST 0  /* 下界=地面 tile 线（屏底-20）已于真机自检 ✓（脚底 y=460），常态关 */
+#define MP_DRAG_LIMIT_SELFTEST 0  /* 地面表下界已于真机自检 ✓（脚底 y=408=表中地面线），常态关 */
 
 
 /* 气泡 */
@@ -514,9 +514,52 @@ static int32_t ent_tilt_off_px(int32_t tilt_mdeg)
     return px;
 }
 
+static int32_t ground_line_y_at(int32_t dev_x);   /* 前向声明：拖拽下界用（定义见下） */
+
 /* 【站立线常量】地面 tile 表面 = 屏底往上 20px（用户口径 2026-09-27，详见
  * ent_stand_on_ground_locked 处的说明）。drag_clamp 与站立归位共用。 */
 #define RC_GROUND_UP_PX 20
+
+/* ══ 地面线（降级方案：把"这张地图的地面"直接写进板子）════════════════════════
+ * 用户口径：「纸娃娃要站在 foothold 上 / 初始化时像站在地上，现在悬在空中；
+ *           降级方案能不能直接写进板子，就这张地图的」。
+ *
+ * 取证（本地 Exporter `--dump-footholds 000010000`，与导出设备地图同一相机口径）：
+ *   视口 240x240（1x，设备 2x）、相机中心 = 地图中心 (-175, 11.5)；
+ *   foothold 共 111 段，地面组 y ∈ [-532, 750]（世界），**可见视口内一段都没有** ——
+ *   真正可行走的地面在 world y≈245.5 = 视口 y 354 = 设备 y 708，比屏幕下沿还低 228px
+ *   （因为导出相机取的是"地图中心"，而这张图的地面远在其下方）。所以「踩在真 foothold
+ *   上」在当前导出素材下无法可见地成立，除非把导出相机下移（= 服务端重导，用户已指示
+ *   先放弃）。画面底部那片草地是 back 美术（烘焙进 240x240 背景层包），不是 foothold。
+ *
+ * 降级实现：主机端从**设备实际显示的那张合成图**里提取"可见地面线"（前景亮草的上沿：
+ * 逐列找"下面连续 25px 都是亮草"的顶边 → 中值+滑动平均平滑 → 每列 1 个 1x y 值），
+ * 直接烘成下面这张表（240 列 = 240 设备列的一半，固件 ×2）。仅对这张图生效
+ * （map_id 匹配才启用），其余地图回落到「屏底往上 20px」的通用线。
+ *
+ * 语义：脚底(body 锚点 origin)恒落在地面线上：初始化/换图站上去；拖拽下界=地面线
+ * （脚不会沉进地面）；**松手后落回地面线**（不会留在半空）——"永远像站在地上"。 */
+#define RC_GROUND_FALLBACK_UP_PX 20        /* 无地面表时的通用线：屏底往上 20px */
+static const char kGroundMapId[] = "000010000";
+/* 地图 000010000 可见地面线（1x 视口 y，共 240 列；设备 y = 表值 × RC_SCALE） */
+static const uint8_t kGroundY000010000[240] = {
+    203, 203, 203, 203, 203, 202, 201, 200, 199, 198, 196, 195, 194, 193, 191, 190,
+    189, 188, 188, 187, 187, 187, 187, 187, 187, 187, 188, 188, 189, 190, 190, 191,
+    192, 193, 194, 194, 195, 196, 196, 197, 197, 196, 196, 196, 196, 196, 195, 195,
+    195, 195, 194, 194, 194, 194, 194, 194, 195, 195, 195, 195, 195, 195, 196, 196,
+    196, 196, 196, 196, 196, 195, 195, 195, 195, 195, 195, 194, 194, 194, 194, 194,
+    194, 194, 194, 194, 194, 194, 195, 195, 195, 195, 195, 195, 195, 195, 195, 195,
+    194, 192, 190, 187, 185, 182, 180, 177, 175, 172, 170, 169, 170, 171, 173, 176,
+    180, 183, 186, 189, 193, 196, 199, 202, 204, 204, 204, 204, 204, 204, 204, 204,
+    203, 202, 201, 201, 200, 199, 199, 198, 197, 197, 196, 196, 195, 196, 196, 196,
+    196, 197, 197, 197, 198, 198, 199, 199, 200, 200, 201, 202, 202, 203, 204, 204,
+    205, 205, 206, 207, 207, 208, 208, 208, 209, 209, 209, 210, 210, 210, 210, 210,
+    211, 211, 211, 211, 211, 211, 211, 211, 211, 211, 211, 210, 210, 210, 210, 210,
+    210, 210, 210, 210, 210, 210, 210, 210, 210, 210, 210, 210, 210, 210, 210, 210,
+    210, 210, 210, 210, 210, 210, 210, 210, 210, 210, 210, 210, 210, 210, 210, 210,
+    210, 210, 210, 210, 210, 210, 210, 210, 210, 210, 210, 210, 210, 210, 210, 210,
+};
+static bool g_ground_tbl_on;               /* 当前地图是否命中地面表 */
 
 /* ══ 拖拽范围：**整只宠物必须留在屏内** ═══════════════════════════════════
  * 【2026-09-27 用户报障"头明显锁了一块 + 一条明显的分割线"的第二个真凶】
@@ -550,14 +593,14 @@ static void drag_clamp(int32_t *px, int32_t *py)
         /* 【拖动下限 = 地面 tile 表面线 2026-09-27】口径演进：
          *   ① 最初按**画布矩形**夹取（脚底悬空 ~22px）；
          *   ② 后改为按 body 锚点夹到**屏幕最底**（脚底踩屏底 480）；
-         *   ③ 现按用户新要求「站在地图的 tile 上、该 tile 在屏幕底边往上 20px」
-         *      → 下界 = 地面线 460（= 屏底 - RC_GROUND_UP_PX）：脚底不会沉进地面，
-         *      人物下沿与屏底之间留出 20px 的"地面砖"厚度，视觉上就是站在那块
-         *      tile 上（上电/换图时也直接站在这条线上，见 ent_stand_on_ground_locked）。
+         *   ③ 再按「站在 foothold / 像站在地上」→ 下界 = **地面线**（ground_line_y_at）：
+         *      命中本图地面表时按下界=该 x 的可见地面（0.5px 精度）；无表回落「屏底-20」。
          * 上界 lo 仍让画布顶边不越屏顶（不许把整只宠物拖出画面）。 */
         int32_t anchor_off = (g_ent_oy - g_ent_cy0) * RC_SCALE;   /* 锚点在显示矩形内的 y */
         int32_t lo = -base_y;
-        int32_t hi = (g_sh - RC_GROUND_UP_PX) - anchor_off - base_y;
+        int32_t anchor_x = g_sw / 2 + RC_ENT_CENTER_OFF_X + (g_ent_base_wx << RC_SCALE_SHIFT)
+                           + ent_tilt_off_px(g_tilt_mdeg) + g_drag_off_x;
+        int32_t hi = ground_line_y_at(anchor_x) - anchor_off - base_y;
         if (hi < lo) hi = lo;
         if (*py < lo) *py = lo;
         if (*py > hi) *py = hi;
@@ -586,34 +629,60 @@ void render_set_drag_off_y(int32_t py)
 
 int32_t render_get_drag_off_y(void) { return g_drag_off_y; }
 
-/* ══ 站立线：地面 tile 表面 = 屏底往上 20px（用户口径 2026-09-27）═══════════════
- * 用户要求原文：「纸娃娃需要站在地图的某个 tile 上（tile 你自己定义选哪个），同时
- * 这个 tile 在屏幕底边往上 20px」。设备端地图是 1bit 掩码位图（没有桌面版的
- * foothold 折线可查），所以**选定**地面 tile 的行为一条水平站立线：y = 屏底 - 20。
- * 人物 body 锚点 origin（= 脚底基准，与桌面版 RenderFrame 同一契约）恒落在这条线上：
- *   · 初始上电 / 换地图 → 直接站到线上（不再悬在屏幕正中）；
- *   · 拖拽 → 下界就是这条线（脚底不会沉进地面），上界仍到屏顶（"全屏拖动"保持）。
- * 数值自证：drag_y_stand = 屏心 - 20 - CENTER_OFF_Y - base_wy*2（baset 默认 0 → 220），
- * 锚点屏幕 y = 460 = 480 - 20 ✓ 见 ent_stand_on_ground_locked 的日志
- * （常量 RC_GROUND_UP_PX 定义在 drag_clamp 之前，两处共用）。 */
+/* ══ 站立线 / 地面线（详见上方 kGroundY000010000 的降级说明）═════════════════
+ * 人物 body 锚点 origin（= 脚底基准，与桌面版 RenderFrame 同一契约）恒落在地面线上：
+ *   · 初始上电 / 换地图 → 站到地面线；
+ *   · 拖拽下界 = 地面线（脚底不会沉进地面），上界仍到屏顶（"全屏拖动"保持）；
+ *   · **松手落回地面线**（render_settle_on_ground）→ 任何时候都像站在地上。 */
 
-static int32_t ground_line_y(void) { return g_sh - RC_GROUND_UP_PX; }
+/* 锚点(脚底)屏幕 x = 屏心 + CENTER_OFF_X + base_wx×2 + tilt + drag_x
+ * （与 ent_screen_pos_at 同源：画布原点项在锚点上相互抵消） */
+static int32_t ent_anchor_screen_x(int32_t drag_x)
+{
+    return g_sw / 2 + RC_ENT_CENTER_OFF_X + (g_ent_base_wx << RC_SCALE_SHIFT)
+           + ent_tilt_off_px(g_tilt_mdeg) + drag_x;
+}
+
+/* 该 x 处的地面线（设备像素 y）。命中地面表 → 表值×2；否则通用线 = 屏底往上 20px */
+static int32_t ground_line_y_at(int32_t dev_x)
+{
+    if (g_ground_tbl_on) {
+        int32_t i = dev_x >> RC_SCALE_SHIFT;         /* 表是 1x，每列覆盖 2 设备列 */
+        if (i < 0) i = 0;
+        if (i > 239) i = 239;
+        int32_t y = (int32_t)kGroundY000010000[i] << RC_SCALE_SHIFT;
+        if (y < 0) y = 0;
+        if (y > g_sh - 1) y = g_sh - 1;
+        return y;
+    }
+    return g_sh - RC_GROUND_FALLBACK_UP_PX;
+}
+
+static int32_t ground_line_y(void) { return ground_line_y_at(ent_anchor_screen_x(g_drag_off_x)); }
 
 /* 站到地面线上（需持锁）。返回是否真的改了位置。 */
 static bool ent_stand_on_ground_locked(void)
 {
     if (!g_inited || !g_ent_cbox_ok) return false;
-    /* 锚点屏幕 y = 屏心 + CENTER_OFF_Y + base_wy×2 + drag_y（与 ent_screen_pos_at
-     * 同源：画布原点项在锚点上相互抵消）⇒ 令其等于地面线即得 drag_y */
-    int32_t dy = ground_line_y()
-                 - (g_sh / 2 + RC_ENT_CENTER_OFF_Y + (g_ent_base_wy << RC_SCALE_SHIFT));
-    drag_clamp(NULL, &dy);            /* 下界=地面线，理论上刚好取到 */
+    /* 锚点屏幕 y = 屏心 + CENTER_OFF_Y + base_wy×2 + drag_y ⇒ 令其等于地面线即得 drag_y */
+    int32_t line = ground_line_y();
+    int32_t dy = line - (g_sh / 2 + RC_ENT_CENTER_OFF_Y + (g_ent_base_wy << RC_SCALE_SHIFT));
+    drag_clamp(NULL, &dy);            /* 兜底夹取（下界=同一地面线） */
     if (dy == g_drag_off_y) return false;
     g_drag_off_y = dy;
     mark_rect(0, 0, g_sw, g_sh);      /* 位置变了：整屏重合成（罕见事件） */
-    ESP_LOGI(TAG, "站位：脚底 y=%d（= 屏底 %d 往上 %dpx 的 tile 表面线）drag_y=%d",
-             (int)ground_line_y(), (int)g_sh, (int)RC_GROUND_UP_PX, (int)dy);
+    ESP_LOGI(TAG, "站位：脚底 y=%d（地面线来源=%s，锚点 x=%d）drag_y=%d",
+             (int)line, g_ground_tbl_on ? "本图地面表" : "通用线(屏底-20)",
+             (int)ent_anchor_screen_x(g_drag_off_x), (int)dy);
     return true;
+}
+
+/* 松手落回地面线（input 任务调用）：脚底回到该 x 处的地面线上，绝不留半空 */
+void render_settle_on_ground(void)
+{
+    rc_lock();
+    if (ent_stand_on_ground_locked()) { /* 内部已标脏 */ }
+    rc_unlock();
 }
 
 /* 【校准模式】红线=固件认为的底边(y=440)+竖直中线(x=240)；白点=最近触摸落点 */
@@ -2148,10 +2217,11 @@ static void drag_limit_selftest(void)
     render_set_drag_off_y(100000);
     ent_screen_rect_at(g_tilt_mdeg, &bx, &by, &ex, &ey, &dw, &dh);
     int32_t anchor_bot = by + (g_ent_oy - g_ent_cy0) * RC_SCALE;
-    ESP_LOGW(TAG, "拖拽极限自检 下界：drag_y=%d 画布 y=%d..%d 锚点屏 y=%d（地面 tile 线=%d=屏底%d-%d）→ %s",
-             (int)g_drag_off_y, (int)by, (int)(by + (g_ent_cy0 ? 0 : 0) + (dh ? dh : 0)),
-             (int)anchor_bot, (int)ground_line_y(), (int)g_sh, (int)RC_GROUND_UP_PX,
-             anchor_bot == ground_line_y() ? "脚底正好踩在地面 tile 线上 ✓" : "与地面线不一致 ✗");
+    ESP_LOGW(TAG, "拖拽极限自检 下界：drag_y=%d 画布 y=%d..%d 锚点屏 y=%d（地面线=%d，来源=%s）→ %s",
+             (int)g_drag_off_y, (int)by, (int)(by + (dh ? dh : 0)),
+             (int)anchor_bot, (int)ground_line_y(),
+             g_ground_tbl_on ? "本图地面表" : "通用线(屏底-20)",
+             anchor_bot == ground_line_y() ? "脚底正好踩在地面线上 ✓" : "与地面线不一致 ✗");
     g_drag_off_x = keep_x;
     g_drag_off_y = keep_y;
 }
@@ -2541,6 +2611,13 @@ static int render_set_map_nolock(const char *bgmap_path,
             }
         }
     }
+
+    /* 【地面表选择：必须在 mpak_close 之前！】bg 指向 bm.u.bgmap，close 会 free 掉它，
+     * 之后再读 bg->map_id 就是 use-after-free（真机首版实测：打印出成串乱码、
+     * strcmp 命中失败 → 地面表没启用、站位仍是通用线 460）。 */
+    g_ground_tbl_on = (strcmp(bg->map_id, kGroundMapId) == 0);
+    ESP_LOGI(TAG, "地面线来源：%s（map_id=%s）",
+             g_ground_tbl_on ? "本图内置地面表" : "通用线(屏底-20)", bg->map_id);
 
     g_map_epoch_us = esp_timer_get_time();
     g_map_ok = true;

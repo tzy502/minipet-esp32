@@ -38,6 +38,7 @@ var options = new ExportOptions
 };
 
 string? wzDataPath = Environment.GetEnvironmentVariable("MINIPET_WZ_DATA");
+string? dumpFootholds = null;   // --dump-footholds <mapId>：只打印地面层折线（固件降级表用，不导出资产）
 
 for (int i = 0; i < args.Length; i++)
 {
@@ -61,13 +62,17 @@ for (int i = 0; i < args.Length; i++)
         case "--firmware": options.FirmwareVer = Next(); break;
         case "--charset": options.CharsetFile = Next(); break;
         case "--font-family": options.FontFamily = Next(); break;
+        case "--dump-footholds": dumpFootholds = Next(); break;
         case "--help" or "-h":
             Console.WriteLine("""
                 用法: Exporter [--appearance <json>] [--profile <名|路径>] [--maps <id,...>] [--out <dir>]
                        [--device-id <id>] [--wz <WZ数据目录>] [--fonts 16,24,32|--no-fonts]
                        [--no-audio] [--no-fonttime] [--firmware <ver>] [--charset <file>] [--font-family <名>]
+                       [--dump-footholds <mapId>]
                 默认: profile=amoled216  out=data/cache/export  fonts=16  audio=on  fontTime=on
                 WZ 目录: --wz 或环境变量 MINIPET_WZ_DATA
+                --dump-footholds: 只打印该图 foothold 第 0 层（地面层）+ 设备视口相机换算，
+                                  并输出可直接粘进固件的 C 数组（不导出任何资产）
                 """);
             return 0;
         default:
@@ -98,6 +103,64 @@ if (!ok)
     return 3;
 }
 Console.WriteLine($"[Exporter] WZ 加载完成（warning: {wz.LastWzLibWarning ?? "无"}）");
+
+// ── --dump-footholds <mapId>：固件「降级地面表」生成（只读 WZ，不导出资产、不动服务端）──
+if (!string.IsNullOrEmpty(dumpFootholds))
+{
+    var mapSvc = new MapService(wz, new CacheManager());
+    var mi = mapSvc.LoadMap(dumpFootholds);
+    if (mi == null) { Console.Error.WriteLine($"[dump] 地图加载失败: {dumpFootholds}"); return 5; }
+
+    var prof = DeviceProfile.Load("amoled216");
+    int vw = Math.Max(1, prof.ViewportW / Math.Max(1, PlacementMath.Scale));
+    int vh = Math.Max(1, prof.ViewportH / Math.Max(1, PlacementMath.Scale));
+    var (ccx, ccy) = MapService.GetMapCenter(mi);
+    var (camX, camY) = MapService.ClampCamera(mi, ccx, ccy, 1f, vw, vh);
+    float ox = camX - vw / 2f, oy = camY - vh / 2f;      // 视口左上角世界坐标（1x）
+
+    Console.WriteLine($"[dump] map={mi.Id} 视口 {vw}x{vh} 相机中心=({camX:0.##},{camY:0.##}) 视口原点世界=({ox:0.##},{oy:0.##})");
+    Console.WriteLine($"[dump] foothold 总数={mi.Footholds.Count} 第0层(地面)={mi.Footholds.Count(f => f.Layer == 0)}");
+    Console.WriteLine($"[dump] 地图包围盒 X[{mi.MinX},{mi.MaxX}] Y[{mi.MinY},{mi.MaxY}] "
+                    + $"VR X[{mi.VRLeft},{mi.VRRight}] Y[{mi.VRTop},{mi.VRBottom}]");
+    Console.WriteLine($"[dump] GetMapCenter=({ccx:0.##},{ccy:0.##}) 未夹取；夹取后=({camX:0.##},{camY:0.##})");
+    var g0 = mi.Footholds.Where(f => f.Layer == 0).ToList();
+    if (g0.Count > 0)
+        Console.WriteLine($"[dump] 地面层 y 范围 [{g0.Min(f => Math.Min(f.Y1, f.Y2))},{g0.Max(f => Math.Max(f.Y1, f.Y2))}] "
+                        + $"x 范围 [{g0.Min(f => Math.Min(f.X1, f.X2))},{g0.Max(f => Math.Max(f.X1, f.X2))}]");
+    Console.WriteLine("[dump] 各层分布: " + string.Join(" ", mi.Footholds.GroupBy(f => f.Layer)
+        .OrderBy(g => g.Key).Select(g => $"L{g.Key}={g.Count()}")));
+
+    var ground = mi.Footholds.Where(f => f.Layer == 0).ToList();
+    if (ground.Count == 0) ground = mi.Footholds;
+    var rows = new List<(int x1, int y1, int x2, int y2)>();
+    foreach (var f in ground)
+    {
+        int x1 = Math.Min(f.X1, f.X2), x2 = Math.Max(f.X1, f.X2);
+        if (x2 < ox - vw || x1 > ox + 2 * vw) continue;   // 视口两侧各留一屏，便于拖动
+        int y1 = (f.X1 <= f.X2) ? f.Y1 : f.Y2;
+        int y2 = (f.X1 <= f.X2) ? f.Y2 : f.Y1;
+        rows.Add(((int)Math.Round(x1 - ox), (int)Math.Round(y1 - oy),
+                  (int)Math.Round(x2 - ox), (int)Math.Round(y2 - oy)));
+    }
+    Console.WriteLine($"[dump] 视口内地面段 {rows.Count} 条（视口 1x 屏幕坐标，固件 ×2）:");
+    foreach (var r in rows) Console.WriteLine($"[dump]   {{{r.x1}, {r.y1}, {r.x2}, {r.y2}}},");
+    int? gyWorld = MapService.GetGroundY(mi, (int)Math.Round(camX));
+    Console.WriteLine("[dump] 中列地面 y(1x 视口) = " + (gyWorld is int gy ? (gy - oy).ToString("0.##") : "null"));
+    // 把 foothold 画在视口渲染图上（红线），用于肉眼核对"真地面 vs 画面里的草地"对不对
+    mapSvc.MapShowFoothold = true;
+    var ov = mapSvc.RenderViewport(mi, camX, camY, 1f, 0, vw, vh);
+    if (ov != null)
+    {
+        using var fs = File.Create("/tmp/fh_overlay.png");
+        ov.Encode(fs, SkiaSharp.SKEncodedImageFormat.Png, 100);
+    }
+    Console.WriteLine("[dump] foothold 叠加图 → /tmp/fh_overlay.png");
+    mapSvc.MapShowFoothold = false;
+    Console.WriteLine("static const MpFoothold kFh[] = {");
+    foreach (var r in rows) Console.WriteLine($"    {{ {r.x1}, {r.y1}, {r.x2}, {r.y2} }},");
+    Console.WriteLine("};");
+    return 0;
+}
 
 try
 {
