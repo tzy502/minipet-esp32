@@ -285,10 +285,31 @@ static void poller_task(void *arg)
          * 启动，而 deviceId 是 hello 从服务端取回的。此前会在 hello 之前就用
          * UUID 匿名回退值发 poll → 服务端 404「未注册设备」→ 设备永远回不到
          * 在线（真机日志：poll?deviceId=44BD8D60DAC0&since=0 + HTTP_CONNECT 失败）。
-         * 现等 hello 完成再轮询；hello 未完成时不做请求、只低频等待。 */
+         * 现等 hello 完成再轮询。
+         *
+         * 【死锁修复 2026-09-27（二）】原实现是 `if (!hello_done) { delay; continue; }`
+         * —— 只等待、**不去连网**。而 hello 又必须在拿到 IP 之后才能发，于是
+         * "开机首次 hello 失败"（服务端不可达 / 路由器暂时拒连）之后设备永久卡死：
+         * poller 既不连网也不补 hello，自检阶段给的那次 20s 窗口成了唯一机会
+         * （真机现象：设备在网、ping 得通，但服务端永远 offline）。
+         * 现在改为：先确保连上家网，再补发 hello；补上后才进入正常轮询。 */
         if (!mp_http_hello_done()) {
-            vTaskDelay(pdMS_TO_TICKS(500));
-            continue;
+            ESP_LOGW("poller", "hello 未完成 → 先确保联网再补发（自检阶段失败后的唯一补救路径）");
+            if (!provision_wifi_connect_sta(15000)) {
+                vTaskDelay(pdMS_TO_TICKS(backoff_ms));
+                if (backoff_ms < BACKOFF_MAX_MS) backoff_ms *= 2;
+                continue;
+            }
+            if (mp_http_hello() == 0) {
+                ESP_LOGW("poller", "hello 补发成功 → 立即请求素材同步并回到在线");
+                asset_dl_request_sync();
+                backoff_ms = BACKOFF_MIN_MS;
+            } else {
+                ESP_LOGW("poller", "hello 补发仍失败 → 退避重试");
+                vTaskDelay(pdMS_TO_TICKS(backoff_ms));
+                if (backoff_ms < BACKOFF_MAX_MS) backoff_ms *= 2;
+                continue;
+            }
         }
 
         /* WiFi 掉线先重连（OFFLINE 期间唯一回网驱动，E11） */

@@ -1340,6 +1340,10 @@ void provision_start_portal(void)
 {
     if (s_portal_task) return;
     s_portal_active = true;
+    /* STA 连上后我们把 SoftAP 关了（s_ap_up=false）以省内部堆；此时若因服务端
+     * 不可达要重开 portal，必须让 wifi_start_ap 走"重新 set_mode(APSTA)+start"
+     * 的完整路径 —— 显式清标记，避免它以为 AP 还在跑而只 set_config。 */
+    s_ap_up = false;
     if (portal_task_try()) return;
 
     /* 首次失败：转为周期重试（等待该窗口的临时分配释放） */

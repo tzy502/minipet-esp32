@@ -298,6 +298,13 @@ offline_check_cache:
         watchdog_text_persist("MINIPET NO ASSETS", "CHECK WIFI/SERVER");
         return;
     }
+    /* 【真机恢复能力 2026-09-27】有凭据但服务端连不上 → 同时拉起配网 portal：
+     *   - 排障不用插线：手机连 MiniPet-XXXX 即可核对/改服务器地址、重选 WiFi
+     *   - 真机场景：家宽换了网段/服务端换了 IP 时，设备不再只能干等 poller
+     * 与"无凭据"分支的区别：这里**不清凭据**，STA 连接（若已连上）保持，
+     * poller 仍在后台重连；portal 只是并行提供一个人工入口。 */
+    ESP_LOGW(TAG, "服务端不可达 → 并行拉起配网 portal（凭据保留，poller 继续回网）");
+    provision_start_portal();
     transition(MP_ST_OFFLINE);
 }
 
