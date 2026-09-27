@@ -87,69 +87,80 @@ static void events_task(void *arg)
             n++;
         }
 
-        /* 【契约对齐】服务端 DeviceEventRequest（DeviceEndpoints.cs:54-62）是
-         * 【单事件】形状：{deviceId, type, tsUtc, data, hashes}。此前固件发
-         * {events:[...], cache:[...]} 数组 → 服务端 body.Type 为空 → 400，
-         * 真机实证事件表恒空（E11 健康上报全丢、E7 cached 永不写入）。
-         * 现改为：批内逐条按服务端 DTO 形状发送，hashes 随首条捎带（cached
-         * 标记只需写一次）；批量语义不变，仅换报文形状。 */
+        /* 【契约对齐 + 网络风暴修复 2026-09-27】
+         * 服务端 DeviceEventRequest（DeviceEndpoints.cs:54-62）是【单事件】形状
+         * {deviceId,type,tsUtc,data,hashes}，旧的 {events:[...],cache:[...]} 数组
+         * 会被 400 拒收（真机实证事件表恒空）。
+         * 但"每条一个 POST"同样不可取：真机实证事件突发时会把 lwip/WiFi 缓冲打爆
+         * （`Failed to create socket errno=105 No buffer space available` +
+         * `wifi:m f null` 数百条）→ 网络栈瘫痪、连带输入/菜单卡死。
+         * 折中：一次 POST 带整批——顶层 type 取首条（满足 DTO 必填校验，事件成功
+         * 落库并点亮 hashes/cached 标记），完整批次放 data.batch[]（服务端 data 是
+         * 任意 JsonElement，原样存，不丢信息）。HTTP 请求数从 N 降到 1。 */
         size_t hlen = asset_dl_collect_hashes(hashes, sizeof(hashes));
 
-        for (int i = 0; i < n; i++) {
-            const mp_event_t *e = &batch[i];
-            cJSON *root = cJSON_CreateObject();
-            if (!root) break;
-            cJSON_AddNumberToObject(root, "proto", MP_PROTO_VER);
-            cJSON_AddStringToObject(root, "deviceId", mp_http_device_id());
-            cJSON_AddStringToObject(root, "type", event_name(e->type));
-            /* tsUtc：DateTime 解析 ISO8601；ts_ms 为设备开机毫秒（非 epoch），
-             * 换算成“现在 - (开机时长 - 事件时刻)”的近似 UTC 时间戳。
-             * 时钟未校准（1970）时服务端拿到的也是 1970，属可接受的降级。 */
-            {
-                time_t now_s = time(NULL);
-                int64_t age_ms = (int64_t)mp_now_ms() - (int64_t)e->ts_ms;
-                if (age_ms < 0) age_ms = 0;
-                time_t ev_s = now_s - (time_t)(age_ms / 1000);
-                struct tm tmv;
-                gmtime_r(&ev_s, &tmv);
-                char iso[32];
-                /* tm_year 是 int（理论 16 位宽），GCC 的 format-truncation 会
-                 * 假定极端值判超限；实际年份恒为 4 位，故局部关掉该告警。 */
+        cJSON *root = cJSON_CreateObject();
+        if (!root) continue;
+        cJSON_AddNumberToObject(root, "proto", MP_PROTO_VER);
+        cJSON_AddStringToObject(root, "deviceId", mp_http_device_id());
+        cJSON_AddStringToObject(root, "type", event_name(batch[0].type));
+        {
+            /* tsUtc：以首条事件时刻换算（ts_ms 为开机毫秒，非 epoch） */
+            time_t now_s = time(NULL);
+            int64_t age_ms = (int64_t)mp_now_ms() - (int64_t)batch[0].ts_ms;
+            if (age_ms < 0) age_ms = 0;
+            time_t ev_s = now_s - (time_t)(age_ms / 1000);
+            struct tm tmv;
+            gmtime_r(&ev_s, &tmv);
+            char iso[32];
+            /* tm_year 是 int（理论 16 位宽），GCC 的 format-truncation 会假定
+             * 极端值判超限；实际年份恒为 4 位，故局部关掉该告警。 */
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wformat-truncation"
-                snprintf(iso, sizeof(iso), "%04d-%02d-%02dT%02d:%02d:%02dZ",
-                         tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,
-                         tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
+            snprintf(iso, sizeof(iso), "%04d-%02d-%02dT%02d:%02d:%02dZ",
+                     tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,
+                     tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
 #pragma GCC diagnostic pop
-                cJSON_AddStringToObject(root, "tsUtc", iso);
-            }
-            /* 事件载荷：a/b/s 折进 data（服务端 data 为 JsonElement，任意对象） */
-            if (e->a || e->b || e->s[0]) {
-                cJSON *d = cJSON_AddObjectToObject(root, "data");
-                if (d) {
-                    if (e->a) cJSON_AddNumberToObject(d, "a", e->a);
-                    if (e->b) cJSON_AddNumberToObject(d, "b", e->b);
-                    if (e->s[0]) cJSON_AddStringToObject(d, "s", e->s);
+            cJSON_AddStringToObject(root, "tsUtc", iso);
+        }
+        cJSON *d = cJSON_AddObjectToObject(root, "data");
+        if (d) {
+            /* 首条事件的 a/b/s 平铺在 data 顶层（兼容既有消费口径），
+             * 整批再以 batch[] 数组携带 */
+            if (batch[0].a) cJSON_AddNumberToObject(d, "a", batch[0].a);
+            if (batch[0].b) cJSON_AddNumberToObject(d, "b", batch[0].b);
+            if (batch[0].s[0]) cJSON_AddStringToObject(d, "s", batch[0].s);
+            if (n > 1) {
+                cJSON *arr = cJSON_AddArrayToObject(d, "batch");
+                if (arr) {
+                    for (int i = 1; i < n; i++) {
+                        cJSON *je = cJSON_CreateObject();
+                        if (!je) continue;
+                        cJSON_AddStringToObject(je, "type", event_name(batch[i].type));
+                        cJSON_AddNumberToObject(je, "ts", (double)batch[i].ts_ms);
+                        if (batch[i].a) cJSON_AddNumberToObject(je, "a", batch[i].a);
+                        if (batch[i].b) cJSON_AddNumberToObject(je, "b", batch[i].b);
+                        if (batch[i].s[0]) cJSON_AddStringToObject(je, "s", batch[i].s);
+                        cJSON_AddItemToArray(arr, je);
+                    }
                 }
             }
-            /* E7/R7：首条捎带本地缓存 hash 集（服务端据此算选择器 cached 标记） */
-            if (i == 0 && hlen > 0) {
-                add_hashes_array(root, hashes);
-            }
+        }
+        /* E7/R7：捎带本地缓存 hash 集（服务端据此算选择器 cached 标记） */
+        if (hlen > 0) add_hashes_array(root, hashes);
 
-            char *body = cJSON_PrintUnformatted(root);
-            cJSON_Delete(root);
-            if (!body) continue;
+        char *body = cJSON_PrintUnformatted(root);
+        cJSON_Delete(root);
+        if (!body) continue;
 
-            char resp[RESP_CAP];
-            int status = mp_http_post_json("/api/device/event", body,
-                                           resp, sizeof(resp), POST_TIMEOUT_MS);
-            free(body);
-            if (status != 200) {
-                /* 有界损失：失败即丢，不重放（队列不积压，事件价值随时间衰减） */
-                ESP_LOGD(TAG, "event post dropped (type=%s status=%d)",
-                         event_name(e->type), status);
-            }
+        char resp[RESP_CAP];
+        int status = mp_http_post_json("/api/device/event", body,
+                                       resp, sizeof(resp), POST_TIMEOUT_MS);
+        free(body);
+        if (status != 200) {
+            /* 有界损失：失败即丢，不重放（队列不积压，事件价值随时间衰减） */
+            ESP_LOGD(TAG, "event post dropped (n=%d type=%s status=%d)",
+                     n, event_name(batch[0].type), status);
         }
     }
 }

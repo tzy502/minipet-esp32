@@ -171,7 +171,12 @@ static int http_txn(const char *url, const char *path, bool is_post, const char 
         .url = url,
         .timeout_ms = timeout_ms,
         .buffer_size = 2048,
-        .keep_alive_enable = true,
+        /* 【socket 耗尽修复 2026-09-27】POST 关闭 keep-alive：
+         * 真机实证事件上报突发时 `Failed to create socket errno=105
+         * (No buffer space available)` + `wifi:m f null` 数百条 → 网络栈瘫痪、
+         * 输入/菜单连带卡死。事件/心跳这类低频请求保持长连接只会积压 socket，
+         * 每次走短连接更稳。GET（长轮询/素材流）仍保留 keep-alive 复用。 */
+        .keep_alive_enable = !is_post,
         .disable_auto_redirect = false,
     };
     esp_http_client_handle_t h = esp_http_client_init(&cfg);
