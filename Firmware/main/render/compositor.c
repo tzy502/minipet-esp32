@@ -158,7 +158,7 @@ volatile uint32_t g_blit_verify_fail;
 #define MP_GHOST_PROBE 0   /* 2026-09-27 竖条纹/黑斑三处根因修复并真机逐字节自证后关闭（排障再置 1） */
 
 /* 拖拽上下限自检（开机跑一次，打印极限位置；排障用） */
-#define MP_DRAG_LIMIT_SELFTEST 0  /* 拖拽极限已核对（上界 y=0 / 下界锚点屏 y=480=屏底），常态关 */
+#define MP_DRAG_LIMIT_SELFTEST 0  /* 下界=地面 tile 线（屏底-20）已于真机自检 ✓（脚底 y=460），常态关 */
 
 
 /* 气泡 */
@@ -470,6 +470,7 @@ static bool     g_calib_on;                 /* 【校准模式】红线坐标系
 static int16_t  g_calib_touch_x = -1;       /* 最近一次触摸落点（-1=无） */
 static int16_t  g_calib_touch_y = -1;       /* 最近一次触摸落点 y（-1=无） */
 static volatile int32_t g_drag_off_y;   /* 拖拽：人物屏幕 y 偏移 */
+static bool     g_stand_done;              /* 首次画布就绪是否已"站到地面 tile 线上" */
 static int32_t s_last_ent_tilt;            /* 实体已按此 tilt 值摆放（问题7 跟随标脏） */
 
 /* 脏区网格（16×16 标记；问题1：合帧后合并为单一包围盒上屏） */
@@ -513,6 +514,10 @@ static int32_t ent_tilt_off_px(int32_t tilt_mdeg)
     return px;
 }
 
+/* 【站立线常量】地面 tile 表面 = 屏底往上 20px（用户口径 2026-09-27，详见
+ * ent_stand_on_ground_locked 处的说明）。drag_clamp 与站立归位共用。 */
+#define RC_GROUND_UP_PX 20
+
 /* ══ 拖拽范围：**整只宠物必须留在屏内** ═══════════════════════════════════
  * 【2026-09-27 用户报障"头明显锁了一块 + 一条明显的分割线"的第二个真凶】
  * 取证（真机串口探针）：故障时刻 `drag=(61,172)`、`落点=(301,412 179x68)`——
@@ -542,17 +547,17 @@ static void drag_clamp(int32_t *px, int32_t *py)
         if (*px > hi) *px = hi;
     }
     if (py) {
-        /* 【拖动下限 = 屏幕最底 2026-09-27】用户报障"人物没法拖到屏幕最底下"。
-         * 旧口径按**画布矩形**夹取：画布底边贴屏底 ⇒ 脚底仍在屏底之上
-         * （stand1 画布 84 高、脚底约在 73 ⇒ 悬空 ~22px，被武器/法杖的下缘占满）。
-         * 现改为**按 body 锚点(origin)夹取**：
-         *   · 下界 hi：锚点贴屏幕最底（脚底正好踩在屏底，武器若更长则自然裁掉）；
-         *   · 上界 lo：仍让画布顶边不越屏顶（不许把整只宠物拖出画面）。
-         * 锚点的屏幕 y 恒 = 屏心 + drag（见 ent_screen_pos_at）→ 数值上就是
-         * drag_y ∈ [-(base_y), g_sh - anchor_off - base_y]，可被启动自检打印核对。 */
+        /* 【拖动下限 = 地面 tile 表面线 2026-09-27】口径演进：
+         *   ① 最初按**画布矩形**夹取（脚底悬空 ~22px）；
+         *   ② 后改为按 body 锚点夹到**屏幕最底**（脚底踩屏底 480）；
+         *   ③ 现按用户新要求「站在地图的 tile 上、该 tile 在屏幕底边往上 20px」
+         *      → 下界 = 地面线 460（= 屏底 - RC_GROUND_UP_PX）：脚底不会沉进地面，
+         *      人物下沿与屏底之间留出 20px 的"地面砖"厚度，视觉上就是站在那块
+         *      tile 上（上电/换图时也直接站在这条线上，见 ent_stand_on_ground_locked）。
+         * 上界 lo 仍让画布顶边不越屏顶（不许把整只宠物拖出画面）。 */
         int32_t anchor_off = (g_ent_oy - g_ent_cy0) * RC_SCALE;   /* 锚点在显示矩形内的 y */
         int32_t lo = -base_y;
-        int32_t hi = g_sh - anchor_off - base_y;
+        int32_t hi = (g_sh - RC_GROUND_UP_PX) - anchor_off - base_y;
         if (hi < lo) hi = lo;
         if (*py < lo) *py = lo;
         if (*py > hi) *py = hi;
@@ -580,6 +585,36 @@ void render_set_drag_off_y(int32_t py)
 }
 
 int32_t render_get_drag_off_y(void) { return g_drag_off_y; }
+
+/* ══ 站立线：地面 tile 表面 = 屏底往上 20px（用户口径 2026-09-27）═══════════════
+ * 用户要求原文：「纸娃娃需要站在地图的某个 tile 上（tile 你自己定义选哪个），同时
+ * 这个 tile 在屏幕底边往上 20px」。设备端地图是 1bit 掩码位图（没有桌面版的
+ * foothold 折线可查），所以**选定**地面 tile 的行为一条水平站立线：y = 屏底 - 20。
+ * 人物 body 锚点 origin（= 脚底基准，与桌面版 RenderFrame 同一契约）恒落在这条线上：
+ *   · 初始上电 / 换地图 → 直接站到线上（不再悬在屏幕正中）；
+ *   · 拖拽 → 下界就是这条线（脚底不会沉进地面），上界仍到屏顶（"全屏拖动"保持）。
+ * 数值自证：drag_y_stand = 屏心 - 20 - CENTER_OFF_Y - base_wy*2（baset 默认 0 → 220），
+ * 锚点屏幕 y = 460 = 480 - 20 ✓ 见 ent_stand_on_ground_locked 的日志
+ * （常量 RC_GROUND_UP_PX 定义在 drag_clamp 之前，两处共用）。 */
+
+static int32_t ground_line_y(void) { return g_sh - RC_GROUND_UP_PX; }
+
+/* 站到地面线上（需持锁）。返回是否真的改了位置。 */
+static bool ent_stand_on_ground_locked(void)
+{
+    if (!g_inited || !g_ent_cbox_ok) return false;
+    /* 锚点屏幕 y = 屏心 + CENTER_OFF_Y + base_wy×2 + drag_y（与 ent_screen_pos_at
+     * 同源：画布原点项在锚点上相互抵消）⇒ 令其等于地面线即得 drag_y */
+    int32_t dy = ground_line_y()
+                 - (g_sh / 2 + RC_ENT_CENTER_OFF_Y + (g_ent_base_wy << RC_SCALE_SHIFT));
+    drag_clamp(NULL, &dy);            /* 下界=地面线，理论上刚好取到 */
+    if (dy == g_drag_off_y) return false;
+    g_drag_off_y = dy;
+    mark_rect(0, 0, g_sw, g_sh);      /* 位置变了：整屏重合成（罕见事件） */
+    ESP_LOGI(TAG, "站位：脚底 y=%d（= 屏底 %d 往上 %dpx 的 tile 表面线）drag_y=%d",
+             (int)ground_line_y(), (int)g_sh, (int)RC_GROUND_UP_PX, (int)dy);
+    return true;
+}
 
 /* 【校准模式】红线=固件认为的底边(y=440)+竖直中线(x=240)；白点=最近触摸落点 */
 void render_calib_set(bool on, int16_t tx, int16_t ty)
@@ -885,11 +920,16 @@ static void ent_canvas_update(void)
         }
     }
     /* 画布尺寸/原点变了 → 旧 drag 偏移可能已把人物顶出屏（换动作/换装后
-     * 尺寸不同）：按新尺寸重新夹取，保证任何时刻都整只留在屏内。 */
+     * 尺寸不同）：按新尺寸重新夹取，保证任何时刻都整只留在屏内。
+     * 【首次就绪 = 站到地面线上 2026-09-27】上电后画布第一次算出来时，人物应
+     * 直接站在地面 tile 表面线上（而不是悬在屏心）；此后只有在换地图时才再次
+     * 归位（见 render_set_map_nolock），用户拖过的位置不会被动作切换重置。 */
     {
+        bool first_ready = !g_stand_done;
         int32_t dx = g_drag_off_x, dy = g_drag_off_y;
         drag_clamp(&dx, &dy);
         g_drag_off_x = dx; g_drag_off_y = dy;
+        if (first_ready) { g_stand_done = true; ent_stand_on_ground_locked(); }
     }
     ESP_LOGD(TAG, "ent canvas union origin(%" PRId32 ",%" PRId32 ") %"
              PRId32 "x%" PRId32, g_ent_cx0, g_ent_cy0, g_ent_cw, g_ent_ch);
@@ -2108,10 +2148,10 @@ static void drag_limit_selftest(void)
     render_set_drag_off_y(100000);
     ent_screen_rect_at(g_tilt_mdeg, &bx, &by, &ex, &ey, &dw, &dh);
     int32_t anchor_bot = by + (g_ent_oy - g_ent_cy0) * RC_SCALE;
-    ESP_LOGW(TAG, "拖拽极限自检 下界：drag_y=%d 画布 y=%d..%d 锚点屏 y=%d（屏底=%d）→ %s",
+    ESP_LOGW(TAG, "拖拽极限自检 下界：drag_y=%d 画布 y=%d..%d 锚点屏 y=%d（地面 tile 线=%d=屏底%d-%d）→ %s",
              (int)g_drag_off_y, (int)by, (int)(by + (g_ent_cy0 ? 0 : 0) + (dh ? dh : 0)),
-             (int)anchor_bot, (int)g_sh,
-             anchor_bot == g_sh ? "锚点/脚底正好踩在屏幕最底 ✓" : "与屏底不一致 ✗");
+             (int)anchor_bot, (int)ground_line_y(), (int)g_sh, (int)RC_GROUND_UP_PX,
+             anchor_bot == ground_line_y() ? "脚底正好踩在地面 tile 线上 ✓" : "与地面线不一致 ✗");
     g_drag_off_x = keep_x;
     g_drag_off_y = keep_y;
 }
@@ -2505,6 +2545,12 @@ static int render_set_map_nolock(const char *bgmap_path,
     g_map_epoch_us = esp_timer_get_time();
     g_map_ok = true;
     mpak_close(&bm);           /* 场景已全量入 PSRAM */
+
+    /* 【换地图 → 人物归位到地面 tile 线上 2026-09-27】新地图的地面/视口不同，
+     * 人物应重新站在"屏底往上 20px"的地面线上（与上电首次就绪同一条线）。
+     * 画布还没就绪（开机时地图先于 LAYOUT 绑定）就留给 ent_canvas_update 的
+     * 首次就绪路径，不要在这里把 g_stand_done 提前置位。 */
+    if (g_ent_cbox_ok) { g_stand_done = true; ent_stand_on_ground_locked(); }
 
     full_recompose();
     return RENDER_OK;

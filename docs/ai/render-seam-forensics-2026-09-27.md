@@ -292,3 +292,32 @@ if (mb == 0xFF) { memcpy(drow + sx, srow + src_x, 2u * run * 2u); sx += 2 * run;
 * 探针按约定全部置 0（`MP_GHOST_PROBE` / `MP_DRAG_LIMIT_SELFTEST` / `MP_STRIP_PIXEL_PROBE`），
   `flush` 性能汇总降为 30s 一条（仅作竞态/完整性哨兵）。
 * 仍未处理（非阻塞）：1bit alpha 软边点阵（§11.5）；Web 点歌需 NAS 侧重建镜像。
+
+---
+
+## 13. 站立线：纸娃娃站在地面 tile 上（2026-09-27 追加需求）
+
+用户口径原文：「纸娃娃需要站在地图的任意一个 tile 上（tile 你自己定义选哪个），同时这个 tile
+在屏幕底边往上 20px」「站在 tile 上的算法桌宠已经实现」。
+
+桌面版口径（`mapleStoryMiniPet`）：`MapService.GetGroundY(map, worldX)` 取 **foothold 第 0 层（地面层）**
+覆盖该 x 的最高折线 y，脚底贴该线（`PlacePetOnMapGround`：`Position.Y = groundScreenY - fh`）；
+地面缺失时回退 `背景窗口底 - 24px`。设备端地图是 1bit 掩码位图、没有 foothold 折线可查，
+因此按用户授权**选定**地面 tile 行为一条水平站立线：
+
+* `RC_GROUND_UP_PX = 20` → 站立线 `y = g_sh - 20 = 460`（= 屏底往上 20px 的那块"地面砖"表面）；
+* 人物 **body 锚点 origin**（= 脚底基准，与桌面版 RenderFrame 同一契约）恒落在这条线上：
+  * 上电首次画布就绪 / 换地图 → 直接站上去（不再悬在屏心）；
+  * 拖拽下界 = 站立线（脚底不沉进地面），上界仍到屏顶 → "全屏拖动"保持。
+* 数值：`drag_y_stand = 屏心 - 20 - CENTER_OFF_Y - base_wy×2`（默认 0 → **220**），
+  锚点屏幕 y = 220 + 240 = **460** = 480 - 20 ✓
+
+真机自证（串口）：
+```
+rc: 站位：脚底 y=460（= 屏底 480 往上 20px 的 tile 表面线）drag_y=220
+rc: 拖拽极限自检 上界：drag_y=-96 画布 y=0..168 锚点屏 y=144（屏顶=0）
+rc: 拖拽极限自检 下界：drag_y=220 画布 y=316..480 锚点屏 y=460（地面 tile 线=460=屏底480-20）
+    → 脚底正好踩在地面 tile 线上 ✓
+```
+（`MP_DRAG_LIMIT_SELFTEST` 核完即置 0；下界由 480 变为 460，即"站在 tile 上"与之前
+"脚底踩屏底"的差别。）
