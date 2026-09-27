@@ -150,6 +150,35 @@ static void raw_tcp_probe_once(const char *url)
     if (done) return;
     done = true;
 
+    /* 【真机取证 2026-09-27】设备关联+DHCP+ICMP 全通，但 TCP 一律打不开
+     * （ESP_ERR_HTTP_CONNECT / 8s 超时），而 Mac 对同一 URL curl 得 200。
+     * 这里先把两个"一定在线"的目标各连一次（网关 + 服务端），把 errno 打出来：
+     * 若连网关也失败 → 设备侧 socket/TCP 分配问题（内部堆最大连续块仅 2KB）；
+     * 若网关通、服务端不通 → 路径/防火墙按源拦截。 */
+    {
+        static const struct { const char *ip; int port; const char *name; } tgts[] = {
+            { "<LAN_IP>",    80,    "网关" },
+            { "<NAS_IP>",   38090, "服务端" },
+        };
+        for (size_t i = 0; i < sizeof(tgts) / sizeof(tgts[0]); i++) {
+            int s2 = socket(AF_INET, SOCK_STREAM, 0);
+            if (s2 < 0) {
+                ESP_LOGE("probe", "[%s] socket 失败 errno=%d (%s) → socket 池/内部堆不足",
+                         tgts[i].name, errno, strerror(errno));
+                continue;
+            }
+            struct sockaddr_in a2 = { 0 };
+            a2.sin_family = AF_INET;
+            a2.sin_port = htons((uint16_t)tgts[i].port);
+            inet_aton(tgts[i].ip, &a2.sin_addr);
+            int rc = connect(s2, (struct sockaddr *)&a2, sizeof a2);
+            ESP_LOGW("probe", "[%s] %s:%d connect=%d errno=%d (%s)",
+                     tgts[i].name, tgts[i].ip, tgts[i].port, rc,
+                     rc == 0 ? 0 : errno, rc == 0 ? "OK" : strerror(errno));
+            if (rc == 0) close(s2); else close(s2);
+        }
+    }
+
     const char *p = strstr(url, "//");
     if (!p) return;
     p += 2;
