@@ -1099,6 +1099,17 @@ static void menu_tick_cb(lv_timer_t *t)
     }
     menu_dl_poll();                         /* T4：下载落盘轮询 → post 切换指令 */
     menu_apply_selection();
+    /* 【重影修复 2026-09-27】DIRECT 模式下 LVGL 只重绘"失效区"，而菜单里
+     * 行内文字/高亮底/提示行的失效矩形由 LVGL 自行推导——真机截图可见文字
+     * 叠影（旧像素没被覆盖）。合成器每帧 memcpy 整个 menu_buf 上屏，
+     * 因此只要 menu_buf 里留了脏像素就会**稳定复现**。这里在 100ms 节拍上
+     * 强制整屏失效一次：LVGL 会重绘全屏进 menu_buf，脏像素每 100ms 清一遍。
+     * 代价：菜单态 10fps 全屏重绘（LVGL 官方在 DIRECT 模式下的推荐做法），
+     * 菜单是静态界面，实测无卡顿。 */
+    {
+        lv_obj_t *scr = lv_screen_active();
+        if (scr) lv_obj_invalidate(scr);
+    }
     if (++s_menu.bgm_refr_div >= 5) {   /* 100ms×5 = 500ms */
         s_menu.bgm_refr_div = 0;
         menu_bgm_status_refresh();
