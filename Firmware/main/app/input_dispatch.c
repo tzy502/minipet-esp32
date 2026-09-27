@@ -823,7 +823,29 @@ static void key_tick(void)
 
 static void key0_tick(void)
 {
+    /* 【中键取证 2026-09-27】用户实测"中键理论向上但没反应"。为区分
+     * 「按键根本没接到 GPIO0」与「接到了但被消抖/分支吃掉」：
+     * 每 2s 打印 GPIO0 原始电平 + 按下沿累计数；电平变化即时打印。
+     * 探针纯只读，不改变下面任何行为。 */
+    static int64_t s_probe_ms;
+    static uint32_t s_edge_cnt;
+    static int s_last_lvl = -1;          /* -1=未采样 */
+
+    int lvl = key_gpio0_pressed() ? 0 : 1;
+    if (s_last_lvl < 0) {
+        s_last_lvl = lvl;
+        ESP_LOGW(TAG, "中键 GPIO0 初值=%d（0=低/按下，1=高/松开）", lvl);
+    } else if (lvl != s_last_lvl) {
+        s_last_lvl = lvl;
+        ESP_LOGW(TAG, "中键 GPIO0 跳变 → %d", lvl);
+    }
+    if (mp_now_ms() - s_probe_ms >= 3000) {
+        s_probe_ms = mp_now_ms();
+        ESP_LOGI("key0", "取证 GPIO0=%d 按下沿累计=%u", lvl, (unsigned)s_edge_cnt);
+    }
+
     if (!key_gpio0_tick()) return;       /* 消抖后的按下沿事件（一次/按压） */
+    s_edge_cnt++;
     ESP_LOGI(TAG, "中键（GPIO0）按下沿");
     {
         /* 【中键取证】NVS 累计计数 + 按下时状态机状态：计数证明通路，
@@ -878,6 +900,14 @@ static void key0_tick(void)
 #if MP_KEY_SCAN_PROBE
 #include "driver/gpio.h"
 
+/* 【2026-09-27 扩表】中键实测不在 GPIO0（GPIO0 恒 1、按下沿恒 0）→ 扩到
+ * ESP32-S3 上所有"可能空闲"的脚，逐一上拉监听跳变，用户按一下即可定位。
+ * 排除项（踩过的坑必须写清）：
+ *   - 板上外设：SD 1/2/3/41、LCD 4/5/6/7/12/38/39、音频 8/9/10/42/45/46、
+ *     触摸 11/40、RTC 13、I2C 14/15、IMU 17/21、菜单键 18；
+ *   - 系统：26-32 Flash、**33/34 也是 Octal PSRAM 数据脚**（本板 8MB Octal
+ *     PSRAM；配成 GPIO 输入会打断 PSRAM 总线 → 立刻 WDT 复位，实测踩过）、
+ *     35-37 PSRAM、19/20 USB、43/44 UART0。 */
 static const int s_keyscan_pins[] = { 0, 16, 47, 48 };
 #define KEYSCAN_PIN_N       (sizeof(s_keyscan_pins) / sizeof(s_keyscan_pins[0]))
 #define KEYSCAN_POLL_MS     20       /* 轮询节拍（与键 tick 同） */

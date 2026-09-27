@@ -20,6 +20,7 @@
 
 #include "driver/gpio.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "i2c_bus.h"
 #include "amoled216.h"
 
@@ -91,9 +92,18 @@ esp_err_t pmu_axp2101_init(void)
     i2c_bus_read_reg8v(s_dev, AXP2101_REG_STATUS0, &st0, 1);
     i2c_bus_read_reg8v(s_dev, AXP2101_REG_STATUS1, &st1, 1);
     i2c_bus_read_reg8v(s_dev, AXP2101_REG_BATT_PCT, &pct, 1);
-    i2c_bus_read_reg8v(s_dev, AXP2101_REG_IRQ_STATUS0, &irq0, 1);
-    ESP_LOGI(TAG, "AXP2101 原始值 status0=0x%02X status1=0x%02X batt%%=%d irq0=0x%02X",
-             st0, st1, pct, irq0);
+    /* 【底键取证 2026-09-27】同时读 0x44..0x47（IRQ 状态 0..3）与电源键相关
+     * 寄存器 0x27/0x28（PWRON 长按/短按时长与开关机配置），把"底键按下为什么
+     * 没有任何状态变化"变成可判读的事实。 */
+    uint8_t irq_all[4] = { 0 };
+    uint8_t reg27 = 0, reg28 = 0;
+    i2c_bus_read_reg8v(s_dev, AXP2101_REG_IRQ_STATUS0, irq_all, sizeof(irq_all));
+    irq0 = irq_all[0];
+    i2c_bus_read_reg8v(s_dev, 0x27, &reg27, 1);
+    i2c_bus_read_reg8v(s_dev, 0x28, &reg28, 1);
+    ESP_LOGI(TAG, "AXP2101 原始值 status0=0x%02X status1=0x%02X batt%%=%d "
+                  "irq0..3=[0x%02X 0x%02X 0x%02X 0x%02X] reg27=0x%02X reg28=0x%02X",
+             st0, st1, pct, irq_all[0], irq_all[1], irq_all[2], irq_all[3], reg27, reg28);
 
     /* IRQ 引脚（可选）：profile 未配则跳过，低电走轮询 */
     const int8_t irq = pins->pmu.pmu_irq;
@@ -202,12 +212,57 @@ bool pmu_pwron_short_press(void)
     if (!s_dev) {
         return false;                    /* PMU 未就绪（init 失败/未探测到） */
     }
+    /* 【取证 2026-09-27】底键（Key1=PWRON，实测无反应）：周期性无条件打印
+     * IRQ 状态 0..3 与两个 PWRON 配置寄存器，把"按下时寄存器到底变不变"
+     * 变成可判读事实（1s 限频；确认后删除）。 */
+    {
+        static int64_t s_last_dump_ms;
+        int64_t now_ms = esp_timer_get_time() / 1000;
+        if (now_ms - s_last_dump_ms >= 1000) {
+            s_last_dump_ms = now_ms;
+            uint8_t q[4] = { 0 };
+            uint8_t r27 = 0, r28 = 0;
+            esp_err_t e1 = i2c_bus_read_reg8v(s_dev, AXP2101_REG_IRQ_STATUS0, q, sizeof(q));
+            esp_err_t e2 = i2c_bus_read_reg8v(s_dev, 0x27, &r27, 1);
+            esp_err_t e3 = i2c_bus_read_reg8v(s_dev, 0x28, &r28, 1);
+            ESP_LOGI(TAG, "取证 irq[44..47]=[%02X %02X %02X %02X] reg27=%02X reg28=%02X (e=%d/%d/%d)",
+                     q[0], q[1], q[2], q[3], r27, r28, (int)e1, (int)e2, (int)e3);
+        }
+    }
+    /* 【取证 2026-09-27】底键（Key1=PWRON）实测完全无反应，43 次采样
+     * irq[44..47] 恒 0x00 且 reg27=0x14/reg28=0x00 恒定 → 状态位从未锁存。
+     * 此处只读打印使能寄存器（不做任何写入，避免拿用户设备做实验）。 */
+    {
+        static bool s_irq_en_dumped;
+        if (!s_irq_en_dumped) {
+            s_irq_en_dumped = true;
+            uint8_t en40 = 0, en41 = 0, en42 = 0, en43 = 0;
+            i2c_bus_read_reg8v(s_dev, 0x40, &en40, 1);
+            i2c_bus_read_reg8v(s_dev, 0x41, &en41, 1);
+            i2c_bus_read_reg8v(s_dev, 0x42, &en42, 1);
+            i2c_bus_read_reg8v(s_dev, 0x43, &en43, 1);
+            ESP_LOGI(TAG, "IRQ 使能（只读）en[40..43]=[%02X %02X %02X %02X]",
+                     en40, en41, en42, en43);
+        }
+    }
+
     uint8_t st = 0;
     if (pmu_axp2101_read_reg(AXP2101_REG_IRQ_STATUS0, &st) != ESP_OK) {
         return false;                    /* I2C 抖动：静默（巡检型接口） */
     }
     if (st == 0) {
         return false;
+    }
+
+    /* 【取证 2026-09-27】底键（PWRON）真机无反应：先把"按下时 IRQ_STATUS0
+     * 究竟置了哪一位"打成事实，再据实测校正位定义（不猜手册）。1s 限频。 */
+    {
+        static int64_t s_last_irq_log_ms;
+        int64_t now_ms = esp_timer_get_time() / 1000;
+        if (now_ms - s_last_irq_log_ms >= 1000) {
+            s_last_irq_log_ms = now_ms;
+            ESP_LOGI(TAG, "IRQ_STATUS0=0x%02X（当前假设 b0=short b2=press b3=releas）", st);
+        }
     }
 
     /* 按下沿/释放沿只打日志辅助 bring-up 核对位定义（写 1 清除） */
