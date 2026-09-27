@@ -1151,46 +1151,39 @@ static void strip_blit(const rc_strip_t *s, int32_t rx0, int32_t ry0,
     int32_t off2 = s->last_off << RC_SCALE_SHIFT;
     const uint32_t stride_el = s->stride_b / 2u;
 
-    /* 【合成提速】先算一行"源列 → 掩码位"的可见性；按源 8 列一组的掩码字节
-     * 走快速通道（0x00 跳过 / 0xFF 直拷），避免每像素一次位运算 + 取模。
-     * 目标 x 与源 x 是 2:1 固定映射（period = 源宽×2），故可整组推进。 */
+    /* 【合成提速 · 修正版 2026-09-27】掩码是 **tight 按位打包**（bit = y*w + x，
+     * 与导出端 PartPackWriter 一致），**不是行对齐** —— 上一版提速误按行对齐
+     * (`mask + y*((w+7)/8)`) 取字节、并把旋转后的 bit 位置算错，真机表现为整片
+     * **竖条纹**（列可见性乱掉）。现按 tight 位索引取字节，只做"整字节对齐组"
+     * 的快速通道；非对齐组走逐像素 tight 判定（与原实现完全等价）。 */
     for (int32_t sy = y0; sy < y1; sy++) {
         int32_t src_y = (sy - band_y) >> RC_SCALE_SHIFT;
         const uint16_t *srow = s->px + (size_t)src_y * stride_el;
         uint16_t *drow = g_fb + (size_t)sy * g_sw;
-        if (!s->mask) {
-            for (int32_t sx = rx0; sx < rx0 + rw; sx++) {
-                int32_t m = (sx + off2) % period;
-                if (m < 0) m += period;
-                drow[sx] = srow[m >> RC_SCALE_SHIFT];
-            }
-            continue;
-        }
-        const uint8_t *mbase = s->mask + (size_t)src_y * ((s->w + 7) / 8);
         int32_t sx = rx0;
         while (sx < rx0 + rw) {
             int32_t m = (sx + off2) % period;
             if (m < 0) m += period;
             int32_t src_x = m >> RC_SCALE_SHIFT;
-            int32_t src_bit = src_x & 7;
-            int32_t run = 8 - src_bit;                       /* 到掩码字节边界 */
-            int32_t max_dst = (rx0 + rw - sx + 1) >> 1;      /* 2 目标像素/源列 */
-            if (run > max_dst) run = max_dst;
+            uint32_t bit0 = (uint32_t)src_y * s->w + (uint32_t)src_x;   /* tight 位索引 */
+            int32_t max_src = (rx0 + rw - sx) >> 1;                     /* 本组最多几个源列 */
+            if (max_src <= 0) max_src = 1;
+            int32_t run = 8 - (int32_t)(bit0 & 7u);                     /* 到字节边界 */
+            if (run > max_src) run = max_src;
+            if (src_x + run > (int32_t)s->w) run = (int32_t)s->w - src_x;
             if (run <= 0) run = 1;
-            uint8_t mb = (src_bit == 0) ? mbase[src_x >> 3]
-                                        : (uint8_t)((mbase[src_x >> 3] << src_bit) |
-                                                    (mbase[(src_x >> 3) + 1] >> (8 - src_bit)));
-            /* 仅当整字节且源列不跨周期回绕时走整组路径 */
-            if (run == 8 && src_bit == 0 && src_x + 8 <= (int32_t)s->w) {
-                if (mb == 0x00) { sx += 16; continue; }
-                if (mb == 0xFF) {
-                    memcpy(drow + sx, srow + src_x, 16u);
-                    sx += 16;
+            if (run == 8 && (bit0 & 7u) == 0u) {
+                uint8_t mb = s->mask[bit0 >> 3];
+                if (mb == 0x00) { sx += 2 * run; continue; }            /* 整组透明：跳过 */
+                if (mb == 0xFF) {                                       /* 整组不透明：直拷 */
+                    memcpy(drow + sx, srow + src_x, 2u * (size_t)run * 2u);
+                    sx += 2 * run;
                     continue;
                 }
             }
             for (int32_t k = 0; k < run; k++) {
-                if ((mb >> (7 - ((src_bit + k) & 7))) & 1u) {
+                uint32_t b = bit0 + (uint32_t)k;
+                if (!s->mask || ((s->mask[b >> 3] >> (7 - (b & 7))) & 1u)) {
                     drow[sx] = srow[src_x + k];
                     if (sx + 1 < rx0 + rw) drow[sx + 1] = srow[src_x + k];
                 }
@@ -1901,6 +1894,34 @@ int render_init(const minipet_profile_t *profile)
  *   把整屏重新合成到影子缓冲（g_fb 指针临时切过去），再与"线上"g_fb 逐像素比对：
  *   差异像素 = 脏区漏标留下的陈旧内容（真实拖影），打 WARN + 包围盒。
  * 1s 一次；MP_GHOST_PROBE=1 时启用（排障用，常态关）。 */
+/* 【条带像素自证 2026-09-27】用户照片出现"竖条纹"= 掩码/取样写错。这里把**设备实际
+ * 帧缓冲**里条带区域的若干像素按 hex 打出（附 last_off / y / w / h），主机端用同一
+ * mpk + 同一算法算预期值逐点核对——不靠肉眼、不靠"看起来对"。 */
+#define MP_STRIP_PIXEL_PROBE 1
+#if MP_STRIP_PIXEL_PROBE
+static void strip_pixel_probe(void)
+{
+    for (int i = 0; i < g_strip_n && i < 4; i++) {
+        const rc_strip_t *st = &g_strips[i];
+        if (!st->ok) continue;
+        int32_t band_y = (int32_t)st->y << RC_SCALE_SHIFT;
+        for (int k = 0; k < 3; k++) {
+            int32_t sy = band_y + 6 + k * 40;
+            if (sy < 0 || sy >= g_sh) continue;
+            char line[200];
+            int n = 0;
+            for (int32_t sx = 0; sx < 24 && n < 180; sx += 2) {
+                n += snprintf(line + n, sizeof(line) - (size_t)n, "%04x",
+                              (unsigned)(g_fb[(size_t)sy * g_sw + sx] & 0xFFFF));
+            }
+            line[n] = 0;
+            ESP_LOGW(TAG, "条带像素 probe[%d] w=%d h=%d y=%d off=%d sy=%d px=%s",
+                     i, (int)st->w, (int)st->h, (int)st->y, (int)st->last_off, (int)sy, line);
+        }
+    }
+}
+#endif
+
 #if MP_GHOST_PROBE
 static uint16_t *g_shadow;
 static bool ghost_probe(void)
@@ -2190,6 +2211,14 @@ void render_tick(void)
      * 无感）。有脏区的帧不受影响，动画流畅度不变。 */
 
     if (any) flush_dirty();
+
+#if MP_STRIP_PIXEL_PROBE
+    {   /* 一次性：开机 12s 后打一组条带实际像素（主机端核对用） */
+        static bool s_spp_done;
+        int64_t now_us2 = esp_timer_get_time();
+        if (!s_spp_done && now_us2 > 12000000) { s_spp_done = true; strip_pixel_probe(); }
+    }
+#endif
 
 #if MP_GHOST_PROBE
     /* 拖影自检：1s 一次（重合成整屏有成本，别每帧做） */
