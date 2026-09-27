@@ -1008,6 +1008,24 @@ static void pwron_tick(void)
     if (now - last_poll_ms < PWRON_POLL_MS) return;
     last_poll_ms = now;
 
+    /* 【底键语义定稿 2026-09-27（用户口径）】
+     *   短按：菜单内 = 光标下移；POKER/OFFLINE = 音量+
+     *   长按（≥800ms）：菜单内 = 退出菜单
+     * 长按由驱动侧累计按下持续时间判定（AXP2101 的 short-press 只在释放时
+     * 上报，固件无法用它区分长短按），见 pmu_pwron_long_press()。 */
+    if (pmu_pwron_long_press()) {
+        ESP_LOGI(TAG, "底键（PWRON 长按）");
+        mp_state_t st = state_machine_current();
+        if (st == MP_ST_MENU) {
+            /* 用户定稿：底部长按 = 退出菜单（复用状态机 MENU→POKER 通道） */
+            state_machine_handle(MP_SM_EV_MENU_KEY);
+            ESP_LOGI(TAG, "底键长按 → 退出菜单");
+            return;
+        }
+        note_interaction();
+        return;
+    }
+
     if (!pmu_pwron_short_press()) return;
     ESP_LOGI(TAG, "底键（PWRON 短按）");
     mp_state_t st = state_machine_current();
@@ -1024,12 +1042,11 @@ static void pwron_tick(void)
     /* POKER/OFFLINE：音量加 */
     mp_audio_msg_t m = { .type = MP_AUDIO_VOLUME, .a = +10 };
     if (!mp_post_audio(&m)) ESP_LOGW(TAG, "audio_q 满，音量+丢失");
-    render_banner_show_for("VOL +", 1500);   /* 定时横幅：1.5s 后渲染侧自动隐藏 */
+    render_banner_show_for("VOL +", 1500);
 }
 
 /* ================================================================== */
 /* 慢速巡检：电池 / 温度（E10/E11）                                     */
-/* ================================================================== */
 static void slow_tick(int64_t idle_ms)
 {
     int64_t now_s = mp_now_ms() / 1000;

@@ -83,6 +83,10 @@ void pmu_axp2101_set_isr_callback(void (*cb)(void *arg), void *arg);
  */
 bool pmu_pwron_short_press(void);
 
+/* 底键长按（按住 ≥PWRON_LONG_MS 后释放）：一次性事件，取走即清。
+ * 用于"菜单里长按底键 = 退出菜单"（用户定稿）。 */
+bool pmu_pwron_long_press(void);
+
 #ifdef __cplusplus
 }
 #endif

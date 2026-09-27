@@ -35,6 +35,12 @@ static const char *TAG = "axp2101";
 
 /* IRQ 状态/使能组（地址按 XPowersLib AXP2101 口径 [核对]） */
 #define AXP2101_REG_IRQ_STATUS0  0x44  /* IRQ 状态0，写 1 清除 [地址核对] */
+
+/* 底键长按阈值：按住时长 ≥ 此值判为长按（用户定稿：长按退出菜单） */
+#define PWRON_LONG_MS            800
+static volatile int64_t s_press_ms;
+static volatile bool    s_holding;
+static volatile bool    s_long_latch;
 #define AXP2101_IRQ0_PKEY_SHORT  (1 << 0)  /* PKEY 短按释放 [位定义核对] */
 #define AXP2101_IRQ0_PKEY_PRESS  (1 << 2)  /* PKEY 按下沿   [位定义核对] */
 #define AXP2101_IRQ0_PKEY_RELEAS (1 << 3)  /* PKEY 释放沿   [位定义核对] */
@@ -273,6 +279,27 @@ bool pmu_pwron_short_press(void)
     }
 
     const bool short_press = (st & AXP2101_IRQ0_PKEY_SHORT) != 0;
+    const bool press_edge  = (st & AXP2101_IRQ0_PKEY_PRESS) != 0;
+    const bool releas_edge = (st & AXP2101_IRQ0_PKEY_RELEAS) != 0;
+
+    /* 【底键长按判定 2026-09-27】AXP2101 的 short-press 位只在【释放】时上报，
+     * 无法区分长短按 → 这里用按下/释放沿自己累计按下时长：
+     *   press 沿 → 记 s_press_ms 并置 s_holding
+     *   releas 沿 → 若按住时长 ≥ 阈值则置 s_long_latch（一次性事件）
+     * pmu_pwron_long_press() 由 app 以 100ms 节拍巡检，取走即清。 */
+    if (press_edge) {
+        s_press_ms = esp_timer_get_time() / 1000;
+        s_holding = true;
+    }
+    if (releas_edge && s_holding) {
+        int64_t held = esp_timer_get_time() / 1000 - s_press_ms;
+        s_holding = false;
+        if (held >= PWRON_LONG_MS) {
+            s_long_latch = true;
+            ESP_LOGI(TAG, "PWRON 长按 %lldms（≥%dms）", (long long)held, PWRON_LONG_MS);
+        }
+    }
+
     /* 写 1 清掉已见的 PKEY 位（bit0/2/3）；其余位原样回写不清除 */
     const uint8_t clr = st & (AXP2101_IRQ0_PKEY_SHORT |
                               AXP2101_IRQ0_PKEY_PRESS |
@@ -281,6 +308,13 @@ bool pmu_pwron_short_press(void)
         pmu_axp2101_write_reg(AXP2101_REG_IRQ_STATUS0, clr);
     }
     return short_press;                  /* 短按=按下沿+释放已完成，只报一次 */
+}
+
+bool pmu_pwron_long_press(void)
+{
+    const bool v = s_long_latch;
+    s_long_latch = false;                /* 取走即清（一次性事件） */
+    return v;
 }
 
 void pmu_axp2101_set_isr_callback(void (*cb)(void *arg), void *arg)
