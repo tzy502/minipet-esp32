@@ -141,6 +141,11 @@ void lv_bridge_touch_feed(int x, int y, bool pressed);
  * 根页移动选中项，子页移动列表高亮 */
 void render_menu_nav(int dir);
 
+/* 【用户定稿 2026-09-27】底键在菜单内：短按=光标下移（末行回绕），
+ * 长按(≥800ms)=退出菜单。两个动作均在 input 任务上下文调用。 */
+int  render_menu_nav_down(void);
+void render_menu_request_exit(void);
+
 /* 侧键确认（input 任务调用，顶键短按）：根页=进入选中子页（Exit 行=收菜单，
  * 经状态机 MP_SM_EV_MENU_KEY 通道）；Maps/Paperdoll 子页=执行选中条目并回
  * 根页；BGM 子页=执行选中按钮动作 */

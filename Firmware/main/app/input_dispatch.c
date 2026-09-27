@@ -821,8 +821,15 @@ static void key_tick(void)
     }
 }
 
+static int64_t s_k0_pressed_ms;      /* 菜单内该键按下时刻（长按判定） */
+static bool    s_k0_long_fired;      /* 本次按压已触发长按 */
+static bool    s_k0_wait_release;    /* 正在等释放（短按=下移在释放时执行） */
+
+static void key0_menu_hold_tick(void);   /* 定义见下（前向声明） */
+
 static void key0_tick(void)
 {
+    key0_menu_hold_tick();               /* 菜单内：按住时长状态机（长按退出/短按下移） */
     /* 【中键取证 2026-09-27】用户实测"中键理论向上但没反应"。为区分
      * 「按键根本没接到 GPIO0」与「接到了但被消抖/分支吃掉」：
      * 每 2s 打印 GPIO0 原始电平 + 按下沿累计数；电平变化即时打印。
@@ -864,8 +871,19 @@ static void key0_tick(void)
     note_interaction();
     mp_state_t st = state_machine_current();
     if (st == MP_ST_MENU) {
-        extern void render_menu_nav(int dir);   /* render.h（菜单选择器，真机定稿） */
-        render_menu_nav(0);              /* 菜单内：选中项上移 */
+        /* 【用户定稿 2026-09-27】这个键（红框底键，走 GPIO0 通路）在菜单里：
+         *   短按 → 光标【下移】（此前是上移，用户明确要求改向下）
+         *   长按（≥800ms）→ 退出菜单
+         * 实现：按下沿不直接动作，交给"按住时长"判定——≥阈值走长按退出；
+         * 否则在【释放】时按短按下移（这样长按不会顺带挪一格）。 */
+        extern void render_menu_nav(int dir);
+        extern int  render_menu_nav_down(void);      /* 下移（含末行回绕） */
+        extern void render_menu_request_exit(void);  /* 退出菜单 */
+
+        s_k0_pressed_ms = mp_now_ms();
+        s_k0_long_fired = false;
+        s_k0_wait_release = true;
+        (void)render_menu_nav;
         return;
     }
     if (st == MP_ST_CLOCK_DOZE) {
@@ -876,6 +894,37 @@ static void key0_tick(void)
     mp_audio_msg_t m = { .type = MP_AUDIO_VOLUME, .a = -10 };
     if (!mp_post_audio(&m)) ESP_LOGW(TAG, "audio_q 满，音量-丢失");
     render_banner_show_for("VOL -", 1500);   /* 定时横幅：1.5s 后渲染侧自动隐藏 */
+}
+
+/* 菜单内该键的"按住时长"状态机（key0_tick 每次调用都跑，含无按下沿的轮询帧） */
+#define K0_LONG_MS 800
+static void key0_menu_hold_tick(void)
+{
+    if (!s_k0_wait_release) return;
+    mp_state_t st = state_machine_current();
+    if (st != MP_ST_MENU) {                 /* 已不在菜单：清状态 */
+        s_k0_wait_release = false;
+        return;
+    }
+    bool still_down = key_gpio0_pressed();
+    int64_t held = mp_now_ms() - s_k0_pressed_ms;
+
+    if (still_down && !s_k0_long_fired && held >= K0_LONG_MS) {
+        s_k0_long_fired = true;
+        ESP_LOGI(TAG, "底键长按（≥%dms）→ 退出菜单", K0_LONG_MS);
+        extern void render_menu_request_exit(void);
+        render_menu_request_exit();
+        return;
+    }
+    if (!still_down) {                      /* 释放 */
+        s_k0_wait_release = false;
+        if (!s_k0_long_fired) {
+            ESP_LOGI(TAG, "底键短按 → 菜单光标下移");
+            extern int render_menu_nav_down(void);
+            render_menu_nav_down();
+        }
+        s_k0_long_fired = false;
+    }
 }
 
 /* ================================================================== */

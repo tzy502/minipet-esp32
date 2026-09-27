@@ -411,6 +411,23 @@ static void menu_request_exit(void)
     state_machine_handle(MP_SM_EV_MENU_KEY);
 }
 
+/* 【用户定稿 2026-09-27】底键在菜单内的两个动作对外暴露（input 任务调用）：
+ *   render_menu_nav_down()    短按 → 光标下移（末行回绕到首行）
+ *   render_menu_request_exit() 长按 → 退出菜单（复用状态机 MENU→POKER 通道） */
+int render_menu_nav_down(void)
+{
+    if (!s_br.menu_mode || s_menu.row_cnt <= 0) return -1;
+    int old = s_menu.sel;
+    s_menu.sel = (s_menu.sel + 1) % s_menu.row_cnt;
+    ESP_LOGI("menu", "nav(down) sel %d→%d/%d", old, s_menu.sel, s_menu.row_cnt);
+    return s_menu.sel;
+}
+
+void render_menu_request_exit(void)
+{
+    menu_request_exit();
+}
+
 /* ---------------- 数据收集（真实数据面：asset_dl 本地清单） ----------------
  * 全部条目来自 asset_dl_*_list()（manifest 登记 + TF access 缓存标记），
  * 无写死演示项；asset_dl 侧已在 s_lock 内取快照（可从渲染任务调用）。 */
