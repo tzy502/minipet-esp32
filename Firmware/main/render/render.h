@@ -54,6 +54,10 @@ int  render_init(const minipet_profile_t *profile);
 /* 帧节拍（30fps 定时器驱动；内部完成合成/脏区/display_blit/LVGL） */
 void render_tick(void);
 
+/* 帧数据锁: RAMless 面板持续刷新拷贝帧缓冲前持锁(185B 专用; 216 无消费者) */
+void compositor_frame_lock(void);
+void compositor_frame_unlock(void);
+
 /* 交互活动通知（触摸/按键/IMU）：交互期内冻结地图视差条带刷新，
  * 把渲染预算让给拖拽跟手；1.5s 无交互自动恢复。 */
 void render_note_activity(void);

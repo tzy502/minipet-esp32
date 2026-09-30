@@ -81,6 +81,10 @@ static void rc_unlock(void)
 {
     if (s_rlock) xSemaphoreGiveRecursive(s_rlock);
 }
+
+/* 帧数据锁: 持续刷新拷贝 g_fb 前必须持锁, 防读写撕裂花屏 */
+void compositor_frame_lock(void) { rc_lock(); }
+void compositor_frame_unlock(void) { rc_unlock(); }
 static int32_t g_sw, g_sh;                 /* 屏幕尺寸（480×480） */
 
 static uint16_t *g_fb;                     /* framebuffer（单一所有权） */
@@ -1093,6 +1097,7 @@ static void recompose_entity_locked(void)
     memset(g_ent_cov, 0, RC_ENT_COV_BYTES);
 
     /* RAMless 面板（185B）的持续刷新帧源注册；216（GRAM）为空操作 */
+    display_set_frame_locks(compositor_frame_lock, compositor_frame_unlock);
     display_set_frame_source((const uint16_t *)g_fb, g_sw);
 
     const mpak_layout_t *lt = active_layout();

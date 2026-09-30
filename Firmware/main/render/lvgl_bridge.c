@@ -935,6 +935,10 @@ static lv_obj_t *menu_add_diamond(lv_obj_t *parent)
 static void menu_chrome_build(lv_obj_t *scr, const char *title)
 {
     /* 整屏羊皮纸 + 12px 棕金描边框 */
+    /* 【禁滚动 2026-09-29】菜单控件微量超出 480×480 会让屏幕可滚——
+     * 真机横向拖拽把整个菜单平移出屏（露出空白）。锁死滚动。 */
+    lv_obj_set_scrollable(scr, false);
+    lv_obj_set_scrollbar_mode(scr, LV_SCROLLBAR_MODE_OFF);
     lv_obj_set_style_bg_color(scr, lv_color_hex(MENU_C_PARCH_HI), 0);
     lv_obj_set_style_bg_grad_color(scr, lv_color_hex(MENU_C_PARCH_LO), 0);
     lv_obj_set_style_bg_grad_dir(scr, LV_GRAD_DIR_VER, 0);
@@ -1011,17 +1015,6 @@ static void menu_chrome_build(lv_obj_t *scr, const char *title)
     s_menu.status_label = st;
 }
 
-static void menu_add_hint(lv_obj_t *parent, const char *text)
-{
-    lv_obj_t *lb = lv_label_create(parent);
-    lv_obj_set_style_text_color(lb, lv_color_hex(0x8A7A5C), 0);
-    if (s_menu.f_small) lv_obj_set_style_text_font(lb, s_menu.f_small, 0);
-    lv_label_set_text(lb, text);   /* ASCII：Montserrat 内置字体只含拉丁字形 */
-    /* 底部状态行上方：状态行归 SEL/BGM 回显，提示行让位不占其位 */
-    lv_obj_align(lb, LV_ALIGN_BOTTOM_MID, 0,
-                 -(MENU_SCR_BORDER_W + 2 + MENU_STATUS_H + 6));
-    s_menu.hint_label = lb;
-}
 
 /* 滚筒上下渐隐遮罩：羊皮纸色→透明（渐变端点透明度 = bg_main_opa/bg_grad_opa）。
  * 不可点击：触摸穿透到下方滚筒；自身不参与滚动 */
@@ -1160,9 +1153,7 @@ static void menu_build_list(lv_obj_t *scr, const char *empty_text, const char *h
         /* 截断必须可见：清单条目多于单页行数（不静默吞数据） */
         char more[80];
         snprintf(more, sizeof(more), "%s (+MORE)", hint);
-        menu_add_hint(scr, more);
     } else {
-        menu_add_hint(scr, hint);
     }
 }
 
@@ -1265,17 +1256,12 @@ static void menu_build_roller(lv_obj_t *scr, const char *opts, int cnt,
     s_menu.roller_track = track;
     s_menu.roller_thumb = thumb;
 
-    /* 底部 OK/Back 蓝色渐变按钮（根页 Back=退出；子页 Back=回根页） */
-    int32_t bx = (s_br.sw - (2 * MENU_BTN_W + MENU_BTN_GAP)) / 2;
-    menu_add_opbtn(scr, "确定", menu_btn_ok_cb, bx);
-    menu_add_opbtn(scr, "返回", menu_btn_back_cb, bx + MENU_BTN_W + MENU_BTN_GAP);
 
     /* 行契约映射：滚筒选项回填 row_cnt/row_enabled，menu_activate 原语义零改动 */
     s_menu.row_cnt = cnt;
     for (int i = 0; i < cnt && i < MENU_ROWS_MAX; i++)
         s_menu.row_enabled[i] = en ? en[i] : true;
 
-    menu_add_hint(scr, hint);
 }
 
 /* 选择页（Maps/Paperdoll/Actions）公共装配：收集已在 *_collect 完成，
@@ -1283,6 +1269,7 @@ static void menu_build_roller(lv_obj_t *scr, const char *opts, int cnt,
 static void menu_build_selection_page(lv_obj_t *scr, const char *empty_text,
                                       const char *hint)
 {
+    (void)hint;   /* 提示行已随 UI 精简移除 */
     static char opts[MENU_ROWS_MAX * 48];   /* 仅渲染任务调用，静态免大栈 */
     static bool en[MENU_ROWS_MAX];
     int row = menu_roller_opts_pack(opts, sizeof(opts), en, empty_text);
@@ -1393,7 +1380,6 @@ static void menu_rebuild(void)
         }
         menu_add_row(scr, 6, "< Back",       372, 44, true);
         s_menu.row_cnt = 7;
-        menu_add_hint(scr, "TOUCH OR TOP KEY");
         break;
     }
 
@@ -1404,7 +1390,6 @@ static void menu_rebuild(void)
         menu_add_row(scr, 0, "CONFIRM RESET", 170, 52, true);
         menu_add_row(scr, 1, "< Back",        240, 52, true);
         s_menu.row_cnt = 2;
-        menu_add_hint(scr, "CLEARS WIFI + SERVER, THEN REBOOT");
         break;
     }
     }

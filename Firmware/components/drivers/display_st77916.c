@@ -98,6 +98,8 @@ static void even_round(int *x1, int *y1, int *x2, int *y2)
 /* ══ 持续全帧刷新 ═════════════════════════════════════════════════════ */
 static const uint16_t *s_fb_src;
 static int s_fb_stride;
+static void (*s_frame_lock)(void);
+static void (*s_frame_unlock)(void);
 static volatile bool s_refresh_on;
 static uint8_t *s_refr_stage;
 static int s_refr_rows;
@@ -116,7 +118,9 @@ static void refresh_task(void *arg)
             const int y0 = c * rows;
             const uint8_t *src = (const uint8_t *)(s_fb_src + (size_t)y0 * s_fb_stride);
             if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(200)) != pdTRUE) continue;
+            if (s_frame_lock) s_frame_lock();
             memcpy(stage, src, chunk_sz);
+            if (s_frame_unlock) s_frame_unlock();
             bool slot = tx_slot_take();
             esp_err_t e = esp_lcd_panel_draw_bitmap(s_panel, 0, y0, SW, y0 + rows, stage);
             if (slot && e != ESP_OK) tx_slot_give();
@@ -148,6 +152,12 @@ static int refresh_stage_alloc(void)
         }
     }
     return -1;
+}
+
+void display_set_frame_locks(void (*lock)(void), void (*unlock)(void))
+{
+    s_frame_lock = lock;
+    s_frame_unlock = unlock;
 }
 
 void display_set_frame_source(const uint16_t *fb, int stride)
@@ -249,6 +259,10 @@ esp_err_t display_init(void)
                  (unsigned)vc.init_cmds_size);
     }
 
+    /* 【INVON 必需 2026-09-30】官方 v2 表尾的 0x21(INVON) 是本面板显示前提
+     * （补 0x20 INVOFF 立即黑屏，真机实证）——不要动它。 */
+    
+
     const esp_lcd_panel_dev_config_t pc = {
         .reset_gpio_num = pins->lcd.rst,
         .rgb_ele_order = LCD_RGB_ELEMENT_ORDER_RGB,
@@ -265,12 +279,14 @@ esp_err_t display_init(void)
     esp_lcd_panel_disp_on_off(s_panel, true);
     esp_lcd_panel_swap_xy(s_panel, false);
     esp_lcd_panel_mirror(s_panel, false, false);
-    /* 【BGR 修正 2026-09-30】本面板颜色空间为 BGR（真机照片实证红蓝互换），
-     * 组件 MADCTL 赋值走 invert_color 比特。esp_lcd st77916 的 MADCTL 由
-     * madctl_val 控制 RGB 位——直接发 BGR 位(MADCTL bit3=0x08)。 */
+    /* 【BGR 双帧序写入】MADCTL=0x08(BGR=1)：低字节与中间字节两种寄存器
+     * 寻址各发一次——读路径实证中间字节、组件写路径低字节均存在响应，
+     * 无法预判写路径归属，双写保平安（若某一寻址落在别的寄存器，
+     * 后续 disp_on_off 系列会覆盖回来，无累积风险）。 */
     {
         uint8_t mctl = 0x08;                         /* MY=0,MX=0,MV=0,BGR=1 */
         esp_lcd_panel_io_tx_param(s_io, (uint32_t)0x02 << 24 | 0x36, &mctl, 1);
+        esp_lcd_panel_io_tx_param(s_io, (uint32_t)0x02 << 24 | (uint32_t)0x36 << 16, &mctl, 1);
     }
 
     s_inited = true;

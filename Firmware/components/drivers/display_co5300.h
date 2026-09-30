@@ -82,6 +82,9 @@ esp_err_t display_fill_rect(int16_t x, int16_t y, int16_t w, int16_t h,
  */
 void display_set_frame_source(const uint16_t *fb, int stride);
 
+/** 注册帧数据锁（RAMless 面板持续刷新拷贝帧缓冲前调用；GRAM 板为空操作）。 */
+void display_set_frame_locks(void (*lock)(void), void (*unlock)(void));
+
 /**
  * @brief 进入/退出睡眠（CLOCK_DOZE 待机时钟 / FATAL 关屏用，design §4.3）
  *

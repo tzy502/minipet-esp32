@@ -278,6 +278,11 @@ void display_set_frame_source(const uint16_t *fb, int stride)
     (void)fb; (void)stride;
 }
 
+void display_set_frame_locks(void (*lock)(void), void (*unlock)(void))
+{
+    (void)lock; (void)unlock;   /* 216 GRAM：无持续刷新，无撕裂源 */
+}
+
 esp_err_t display_brightness(uint8_t pct)
 {
     /* CO5300 亮度 = 0x51 DBV 命令（0-255）。panel 未就绪前静默跳过，

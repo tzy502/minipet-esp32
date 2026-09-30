@@ -1,7 +1,7 @@
 {
     "version":            "1.2",
     "project_name":       "minipet",
-    "project_version":    "v0.1.0-6-gea9e49f-dirty",
+    "project_version":    "v0.1.0-7-g2f2ebf8-dirty",
     "project_path":       "/Users/a502/IdeaProjects/minipet-esp32/Firmware",
     "idf_path":           "/Users/a502/esp/esp-idf",
     "build_dir":          "/Users/a502/IdeaProjects/minipet-esp32/Firmware/build-185b",
