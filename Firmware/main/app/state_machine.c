@@ -584,9 +584,30 @@ void state_machine_tick_1hz(void)
 /* ================================================================== */
 
 /* 动作 → 布局包绑定；loop：持续动作循环播，触发型单次播完自动回 stand（E5） */
+static bool heap_ok_for_asset_load(void);
+
+/* 【堆保护 2026-09-29】素材切换要 fopen/fread TF 大包——内部堆见底（<24KB）
+ * 时 newlib 锁分配失败会 abort 重启（真机：菜单确认动作即崩）。 */
+static bool heap_ok_for_asset_load(void)
+{
+    return heap_caps_get_free_size(MALLOC_CAP_INTERNAL) >= 24 * 1024;
+}
+
+static esp_timer_handle_t s_bind_retry_timer;   /* 低堆跳过绑定后的自愈重试 */
+static void bind_retry_cb(void *arg)
+{
+    (void)arg;
+    mp_cmd_t c = { .type = MP_CMD_MANIFEST_SYNCED };   /* 重跑绑定段（内部堆守卫会再拦） */
+    mp_post_cmd(&c);
+}
+
 static void dispatch_action(const char *action)
 {
     char path[MP_MPK_PATH_MAX];
+    if (!heap_ok_for_asset_load()) {
+        ESP_LOGW(TAG, "内部堆不足，跳过动作切换 %s（防 fopen abort）", action);
+        return;
+    }
     if (!asset_dl_layout_path(action, path, sizeof(path))) {
         return;                          /* 布局缺（未下发/被淘汰）：保留旧画面 */
     }
@@ -613,6 +634,10 @@ static void switch_random_expression(void)
 
 static void dispatch_set_parts_by_hash(const char *hash)
 {
+    if (!heap_ok_for_asset_load()) {
+        ESP_LOGW(TAG, "内部堆不足，跳过换装 %s（防 fopen abort）", hash ? hash : "");
+        return;
+    }
     char path[MP_MPK_PATH_MAX];
     if (!hash || !asset_dl_parts_path(hash, path, sizeof(path))) {
         ESP_LOGW(TAG, "SET_PARTS：hash %s 无对应部件包", hash ? hash : "(null)");
@@ -717,9 +742,23 @@ static void dispatch_manifest_synced(void)
     }
 
     /* 默认纸娃娃部件 + 站立布局（E13：每设备独立装扮） */
-    if (asset_dl_parts_path(NULL, path, sizeof(path))) {
+    if (!heap_ok_for_asset_load()) {
+        ESP_LOGW(TAG, "内部堆不足，跳过本轮素材绑定（防低堆 fopen abort）→ 10s 后重试");
+        if (!s_bind_retry_timer) {
+            const esp_timer_create_args_t t = {
+                .callback = bind_retry_cb, .name = "bind_retry",
+            };
+            if (esp_timer_create(&t, &s_bind_retry_timer) == ESP_OK)
+                esp_timer_start_periodic(s_bind_retry_timer, 10ULL * 1000000ULL);
+        }
+    } else if (asset_dl_parts_path(NULL, path, sizeof(path))) {
         int prc = render_set_parts(path);
         ESP_LOGW(TAG, "parts 路径=%s rc=%d", path, prc);
+        if (s_bind_retry_timer) {   /* 绑定成功：停自愈重试 */
+            esp_timer_stop(s_bind_retry_timer);
+            esp_timer_delete(s_bind_retry_timer);
+            s_bind_retry_timer = NULL;
+        }
     } else {
         ESP_LOGE(TAG, "parts 路径查询失败（清单里没有 PARTS）");
     }

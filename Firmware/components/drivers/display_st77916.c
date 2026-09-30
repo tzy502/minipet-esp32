@@ -136,7 +136,7 @@ static void refresh_task(void *arg)
 
 static int refresh_stage_alloc(void)
 {
-    static const int rows_opts[] = { 4, 2 };
+    static const int rows_opts[] = { 2, 1 };
     for (int i = 0; i < 2; i++) {
         s_refr_stage = heap_caps_malloc(SW * rows_opts[i] * 2u,
                                         MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);

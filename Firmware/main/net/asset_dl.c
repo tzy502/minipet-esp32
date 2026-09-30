@@ -388,7 +388,7 @@ static void load_local_manifest(void)
                     /* 【堆保护 2026-09-29】低堆期 fopen 会触发 newlib 锁分配
                      * 失败 → abort 启动循环（真机实证）。空闲不足则跳过 px
                      * 读取（回退清单值，纯装饰性字段） */
-                    if (heap_caps_get_free_size(MALLOC_CAP_INTERNAL) < 24 * 1024) {
+                    if (heap_caps_get_free_size(MALLOC_CAP_INTERNAL) < 8 * 108) {
                         ESP_LOGW(TAG, "内部堆 <24KB，跳过 FONT px 读取（防 newlib abort）");
                     } else {
                     char fp[MP_MPK_PATH_MAX];

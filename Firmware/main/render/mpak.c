@@ -614,10 +614,15 @@ static int parse_bgmap(mpak_t *m)
     if (rc) { heap_caps_free(bg); return MPAK_ERR_FMT; }
 
     uint64_t px = (uint64_t)bg->vw * bg->vh;
+    /* tile 层长度：RGB565 行 + 1bit mask，编码端【整块补齐 4B】——
+     * 240 宽天然对齐（216 板从未暴露）；180 宽时 68850→补 2=68852，
+     * 旧公式严格相等会把 360 档素材全拒（MPAK_ERR_FMT，真机实证）。 */
+    uint32_t tile_expect = (uint32_t)(px * 2u) + (uint32_t)((px + 7u) / 8u);
+    tile_expect = (tile_expect + 3u) & ~3u;
     if (bg->vw == 0 || bg->vh == 0 || bg->vw > 512 || bg->vh > 512 ||
         bg->static_back_len != (uint32_t)(px * 2u) ||
         (bg->tile_layer_len != 0 &&
-         bg->tile_layer_len != (uint32_t)(px * 2u + (px + 7u) / 8u)) ||
+         bg->tile_layer_len != tile_expect) ||
         bg->strip_count > MPAK_BGMAP_MAX_STRIPS) {
         ESP_LOGE(TAG, "bgmap %s geometry invalid (vw=%u vh=%u)", bg->map_id, bg->vw, bg->vh);
         heap_caps_free(bg);

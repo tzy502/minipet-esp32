@@ -1,0 +1,10 @@
+{
+  "name": "lcd185b",
+  "w": 360,
+  "h": 360,
+  "shape": "square",
+  "psramMb": 8,
+  "audio": true,
+  "touch": true,
+  "strips": true
+}
