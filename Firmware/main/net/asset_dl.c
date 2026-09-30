@@ -385,12 +385,19 @@ static void load_local_manifest(void)
             if (strcasecmp(lf->kind, "FONT") == 0) {
                 const char *fdir = kind_dir("FONT");
                 if (fdir) {
+                    /* 【堆保护 2026-09-29】低堆期 fopen 会触发 newlib 锁分配
+                     * 失败 → abort 启动循环（真机实证）。空闲不足则跳过 px
+                     * 读取（回退清单值，纯装饰性字段） */
+                    if (heap_caps_get_free_size(MALLOC_CAP_INTERNAL) < 24 * 1024) {
+                        ESP_LOGW(TAG, "内部堆 <24KB，跳过 FONT px 读取（防 newlib abort）");
+                    } else {
                     char fp[MP_MPK_PATH_MAX];
                     snprintf(fp, sizeof(fp), "%s/%s.mpk", fdir, lf->hash);
                     uint8_t px = read_font_px(fp);
                     if (px) lf->font_px = px;
                     ESP_LOGI(TAG, "FONT %s：包内 size_px=%u（清单值 %u）",
                              lf->hash, (unsigned)px, (unsigned)lf->font_px);
+                    }
                 }
             }
             lf->bytes = (uint32_t)jnum(jf, "bytes", 0);

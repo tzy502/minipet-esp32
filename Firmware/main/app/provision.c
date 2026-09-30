@@ -797,6 +797,24 @@ static esp_err_t wifi_start_ap(const char *ssid_in)
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
 
+    /* 【标记失真防御 2026-09-29】s_ap_up 被误清（如 start_portal 在早启后调用）
+     * 但 APSTA 实际在跑时，走 stop/set_mode/start 全路径会二次分配 beacon/管理
+     * 帧缓冲——落在堆谷底=net80211 空指针 panic（185B 真机实证，复位循环）。
+     * 实际模式已是 APSTA → 补回标记，走上面幂等 set_config 路径。 */
+    wifi_mode_t cur_mode = WIFI_MODE_NULL;
+    if (esp_wifi_get_mode(&cur_mode) == ESP_OK && cur_mode == WIFI_MODE_APSTA) {
+        s_ap_up = true;
+        wifi_config_t ap = { 0 };
+        strlcpy((char *)ap.ap.ssid, ssid, sizeof(ap.ap.ssid));
+        ap.ap.ssid_len = (uint8_t)strlen(ssid);
+        ap.ap.channel = 6;
+        ap.ap.authmode = WIFI_AUTH_OPEN;
+        ap.ap.max_connection = 2;
+        esp_err_t r = esp_wifi_set_config(WIFI_IF_AP, &ap);
+        ESP_LOGW(TAG, "APSTA 实际在跑（标记曾失真），只更新配置：%s", esp_err_to_name(r));
+        return r;
+    }
+
     esp_wifi_stop();    /* 失败重开路径下 WiFi 可能仍以 STA 模式在跑，先停干净 */
     wifi_auto_conn_hold(true);   /* 停/起 WiFi 期间禁止事件驱动自动重连 */
     /* APSTA：STA 口保持 up 才能扫周围 WiFi（GET /scan）。
@@ -1588,8 +1606,15 @@ void provision_start_portal(void)
     s_portal_active = true;
     /* STA 连上后我们把 SoftAP 关了（s_ap_up=false）以省内部堆；此时若因服务端
      * 不可达要重开 portal，必须让 wifi_start_ap 走"重新 set_mode(APSTA)+start"
-     * 的完整路径 —— 显式清标记，避免它以为 AP 还在跑而只 set_config。 */
-    s_ap_up = false;
+     * 的完整路径 —— 显式清标记，避免它以为 AP 还在跑而只 set_config。
+     * 【例外 2026-09-29】AP 实际还在跑（早启路径/离线起播路径）时不清：
+     * 清了会让 portal_task 走全路径重启 AP → 堆谷底二次分配 → panic。 */
+    {
+        wifi_mode_t m = WIFI_MODE_NULL;
+        if (!(esp_wifi_get_mode(&m) == ESP_OK && m == WIFI_MODE_APSTA)) {
+            s_ap_up = false;
+        }
+    }
     if (portal_task_try()) return;
 
     /* 首次失败：转为周期重试（等待该窗口的临时分配释放） */

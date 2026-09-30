@@ -25,7 +25,7 @@ const minipet_profile_t MINIPET_PROFILE_LCD185B = {
     .flash_mb  = 16,
     .cpu_freq_mhz = 240,
 
-    .has_audio = true,    /* ES8311@0x30 在共享 I2C 上；I2S 引脚已配（MCLK2/BCLK48/LRCK38/DOUT47/DIN39/PA9），真机未验证 */
+    .has_audio = false,   /* 【降级 2026-09-29】ES8311 未验证；省 28KB 内部栈给 RAMless 刷新。音频验证后翻回 true */
     .has_touch = false,   /* CST816S@0x15：驱动未接（CST9220 驱动探测 0x5A 失败自动降级） */
     .has_imu   = true,    /* QMI8658@0x6B：INT 未引出 → int1/int2=-1，轮询模式 */
     .has_rtc   = true,    /* PCF85063@0x51，INT=6 */

@@ -65,8 +65,14 @@ static bool IRAM_ATTR color_tx_done_cb(esp_lcd_panel_io_handle_t io,
     return hi == pdTRUE;
 }
 
+static esp_err_t polling_draw(int x1, int y1, int x2, int y2, const uint8_t *px, size_t len);
+
 static bool tx_slot_take(void)
 {
+    /* polling 模式：事务同步完成，无背压概念（恒真直通） */
+    return true;
+#if 0
+    if (!s_tx_slots) return true;
     uint32_t done_seen = s_tx_done_cnt;
     int64_t last_progress = esp_timer_get_time();
     for (;;) {
@@ -83,11 +89,12 @@ static bool tx_slot_take(void)
             return false;
         }
     }
+#endif
 }
 
 static void tx_slot_give(void)
 {
-    xSemaphoreGive(s_tx_slots);
+    if (s_tx_slots) xSemaphoreGive(s_tx_slots);
 }
 
 /* 背光开关（LCD：亮度即背光；PWM 调光后续可换 LEDC，bring-up 先直控） */
@@ -492,6 +499,7 @@ static void refresh_task(void *arg)
     const int chunk_sz = SW * rows * 2u;
     const int chunks = SH / rows;
     TickType_t last_wake = xTaskGetTickCount();
+    uint32_t frames = 0, fails = 0, last_report = 0;
     while (s_refresh_on && s_fb_src && s_panel) {
         for (int c = 0; c < chunks && s_refresh_on; c++) {
             const int y0 = c * rows;
@@ -499,9 +507,15 @@ static void refresh_task(void *arg)
             if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(200)) != pdTRUE) continue;
             memcpy(stage, src, chunk_sz);
             bool slot = tx_slot_take();
-            esp_err_t e = esp_lcd_panel_draw_bitmap(s_panel, 0, y0, SW, y0 + rows, stage);
+            esp_err_t e = polling_draw(0, y0, SW - 1, y0 + rows - 1, stage, chunk_sz);
+            if (e != ESP_OK) fails++;               /* 静默失败会让黑屏无从判读 */
             if (slot && e != ESP_OK) tx_slot_give();
             xSemaphoreGive(s_lock);
+        }
+        frames++;
+        if (frames - last_report >= 150) {           /* ~5s 一条遥测：帧数/失败数 */
+            ESP_LOGW(TAG, "刷新遥测：frames=%u fails=%u", (unsigned)frames, (unsigned)fails);
+            last_report = frames;
         }
         /* ~60fps 节流：80MHz 下全帧 6.5ms 传输 + 5ms 停顿 */
         vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(5));
@@ -515,7 +529,9 @@ static void refresh_task(void *arg)
  * 在 display_init 的堆干净窗口调用（任务内分配会在谷底失败，真机实证）。 */
 static int refresh_stage_alloc(void)
 {
-    static const int rows_opts[] = { 12, 8, 4, 2 };
+    /* 185B 内部堆极紧（素材绑定后健康余量仅 ~10KB）：stage 必须 ≤2.9KB，
+     * 否则 fopen(malloc FILE 锁)/events 任务在谷底直接 abort（真机实证）。 */
+    static const int rows_opts[] = { 4, 2 };
     for (int i = 0; i < 4; i++) {
         s_refr_stage = heap_caps_malloc(SW * rows_opts[i] * 2u,
                                         MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
@@ -535,15 +551,16 @@ void display_set_frame_source(const uint16_t *fb, int stride)
         ESP_LOGW(TAG, "frame_source 忽略：display 未初始化");
         return;
     }
+    s_fb_src = fb;
+    s_fb_stride = stride > 0 ? stride : SW;
+#if CONFIG_MP_LCD_CONTINUOUS_REFRESH
     if (!s_refr_stage && refresh_stage_alloc() != 0) {
         ESP_LOGE(TAG, "刷新 stage 分配失败（内部堆枯竭）——黑屏");
         return;
     }
-    s_fb_src = fb;
-    s_fb_stride = stride > 0 ? stride : SW;
     if (fb && !s_refresh_on) {
         s_refresh_on = true;
-        if (xTaskCreatePinnedToCore(refresh_task, "lcd_refr", 4096, NULL,
+        if (xTaskCreatePinnedToCore(refresh_task, "lcd_refr", 2560, NULL,
                                     4 /* 低于 watchdog(6)/render(5)，高于 idle */,
                                     NULL, 0) != pdPASS) {
             ESP_LOGE(TAG, "刷新任务创建失败");
@@ -552,6 +569,27 @@ void display_set_frame_source(const uint16_t *fb, int stride)
             ESP_LOGW(TAG, "持续全帧刷新已启动（RAMless 模式，%dfps 目标）", 60);
         }
     }
+#else
+    ESP_LOGW(TAG, "持续刷新已禁用（CONFIG_MP_LCD_CONTINUOUS_REFRESH=n）");
+#endif
+}
+
+/* 【polling 写图】绕过 esp_lcd 队列色彩路径：CASET/RASET 走 0x02，像素流
+ * 走 0x32 + tx_param（spi_device_polling_transmit，阻塞直到面板吃完）。
+ * 真机实证队列+DMA 色彩路径静默丢失（RAMRD 不变），polling 是当前唯一
+ * 已验证落显存的通道。 */
+static esp_err_t polling_draw(int x1, int y1, int x2, int y2, const uint8_t *px, size_t len)
+{
+    esp_err_t err;
+    err = esp_lcd_panel_io_tx_param(s_io, (uint32_t)0x02 << 24 | 0x2A,
+                                    (uint8_t[]) { (x1 >> 8) & 0xFF, x1 & 0xFF,
+                                                  (x2 >> 8) & 0xFF, x2 & 0xFF }, 4);
+    if (err != ESP_OK) return err;
+    err = esp_lcd_panel_io_tx_param(s_io, (uint32_t)0x02 << 24 | 0x2B,
+                                    (uint8_t[]) { (y1 >> 8) & 0xFF, y1 & 0xFF,
+                                                  (y2 >> 8) & 0xFF, y2 & 0xFF }, 4);
+    if (err != ESP_OK) return err;
+    return esp_lcd_panel_io_tx_param(s_io, (uint32_t)0x32 << 24 | 0x2C, px, len);
 }
 
 /* 区域 2 像素对齐（同 co5300：先 clamp 屏内再取偶，右/下缘向内收尾） */
@@ -626,7 +664,11 @@ esp_err_t display_init(void)
 
     esp_lcd_panel_io_spi_config_t io_cfg = ST77916_PANEL_IO_QSPI_CONFIG(
                                            pins->lcd.cs, color_tx_done_cb, NULL);
-    io_cfg.trans_queue_depth = TX_QUEUE_DEPTH;
+    /* 【polling 色彩 2026-09-29】诊断实证：参数（polling）能到面板，色彩
+     * （queue+DMA）静默丢失（RAMRD 跨启动恒定）。队列深度保留 1（spi_master
+     * add_device 必建队列，=0 直接 assert），但驱动所有写图走 polling_draw()
+     * —— esp_lcd tx_param 恒为 spi_device_polling_transmit。 */
+    io_cfg.trans_queue_depth = 1;
     io_cfg.pclk_hz = CONFIG_MP_LCD_PCLK_HZ;   /* bring-up 期可降频排除信号完整性 */
     err = esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)SPI2_HOST,
                                    &io_cfg, &s_io);
@@ -706,6 +748,57 @@ esp_err_t display_init(void)
      * 偶数轮绿屏时中央叠 160x160 红块（blit/PSRAM 路径=应用同款）。
      * 全程检查返回码并打日志——上一次测试跑了没人看也没采日志，判读悬空。 */
     {
+        /* 【读回诊断】三段式定位断点层：
+         * ① 0x09 RDDPM（电源模式：bit1=sleep out? bit2=display on?）
+         * ② 全屏写红 → 0x2E RAMRD 读回 8 像素：非零=数据进了显存(扫描门控问题)，零=写入没落地
+         * ③ 再读 0x0A RDDST 交叉验证 */
+        esp_lcd_panel_io_spi_config_t probe_cfg = io_cfg;
+        probe_cfg.pclk_hz = 3 * 1000 * 1000;
+        probe_cfg.on_color_trans_done = NULL;
+        esp_lcd_panel_io_handle_t pio = NULL;
+        if (esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)SPI2_HOST, &probe_cfg, &pio) == ESP_OK) {
+            uint8_t st[4] = { 0 };
+            uint32_t rd;
+            rd = (uint32_t)0x09 << 8; rd |= MP_ST77916_OPCODE_READ << 24;
+            esp_err_t e1 = esp_lcd_panel_io_rx_param(pio, rd, st, 4);
+            ESP_LOGW(TAG, "RDDPM(09)=%02X %02X %02X %02X (%s)", st[0], st[1], st[2], st[3], esp_err_to_name(e1));
+            rd = (uint32_t)0x0A << 8; rd |= MP_ST77916_OPCODE_READ << 24;
+            e1 = esp_lcd_panel_io_rx_param(pio, rd, st, 4);
+            ESP_LOGW(TAG, "RDDST(0A)=%02X %02X %02X %02X (%s)", st[0], st[1], st[2], st[3], esp_err_to_name(e1));
+            esp_lcd_panel_io_del(pio);
+        }
+
+        /* 【强制唤醒】RDDPM 显示面板仍睡眠 → 直接单发 SLPOUT+DISPON 后复读，
+         * 判定"序列被吞"还是"机制不同" */
+        {
+            esp_lcd_panel_io_handle_t wio = NULL;
+            if (esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)SPI2_HOST, &probe_cfg, &wio) == ESP_OK) {
+                esp_lcd_panel_io_tx_param(wio, (uint32_t)0x02 << 24 | 0x11, NULL, 0);   /* SLPOUT */
+                vTaskDelay(pdMS_TO_TICKS(150));
+                esp_lcd_panel_io_tx_param(wio, (uint32_t)0x02 << 24 | 0x29, NULL, 0);   /* DISPON */
+                vTaskDelay(pdMS_TO_TICKS(50));
+                uint8_t st[4] = { 0 };
+                uint32_t rd = (uint32_t)0x09 << 8; rd |= MP_ST77916_OPCODE_READ << 24;
+                esp_err_t e1 = esp_lcd_panel_io_rx_param(wio, rd, st, 4);
+                ESP_LOGW(TAG, "强制唤醒后 RDDPM(09)=%02X %02X %02X %02X (%s)", st[0], st[1], st[2], st[3], esp_err_to_name(e1));
+                esp_lcd_panel_io_del(wio);
+            }
+        }
+
+        display_fill_rect(0, 0, SW, SH, 0xF800);   /* 全屏红（BE 契约） */
+        display_wait_tx_idle();
+
+        if (esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)SPI2_HOST, &probe_cfg, &pio) == ESP_OK) {
+            uint8_t ram[16] = { 0 };
+            uint32_t rd = (uint32_t)0x2E << 8; rd |= MP_ST77916_OPCODE_READ << 24;
+            esp_err_t e2 = esp_lcd_panel_io_rx_param(pio, rd, ram, sizeof(ram));
+            ESP_LOGW(TAG, "RAMRD(2E)=%02X%02X %02X%02X %02X%02X %02X%02X %02X%02X %02X%02X %02X%02X %02X%02X (%s)",
+                     ram[0], ram[1], ram[2], ram[3], ram[4], ram[5], ram[6], ram[7],
+                     ram[8], ram[9], ram[10], ram[11], ram[12], ram[13], ram[14], ram[15],
+                     esp_err_to_name(e2));
+            esp_lcd_panel_io_del(pio);
+        }
+
         esp_err_t e;
         for (int round = 0; round < 8; round++) {
             e = display_fill_rect(0, 0, SW, SH, 0x07E0);   /* 绿（高字节 0x07 先出） */
@@ -784,7 +877,7 @@ esp_err_t display_blit(int x, int y, int w, int h, const uint8_t *rgb565_be)
     esp_err_t err;
     bool slot = tx_slot_take();
     if (aw == w && ah == h) {
-        err = esp_lcd_panel_draw_bitmap(s_panel, x1, y1, x2 + 1, y2 + 1, (void *)rgb565_be);
+        err = polling_draw(x1, y1, x2, y2, rgb565_be, (size_t)aw * ah * 2u);
     } else {
         /* 奇数区域：PSRAM 暂存补齐（同 co5300 语义） */
         size_t sz = (size_t)aw * ah * 2u;
@@ -805,7 +898,7 @@ esp_err_t display_blit(int x, int y, int w, int h, const uint8_t *rgb565_be)
                 dst[rx * 2 + 1] = src[sx * 2 + 1];
             }
         }
-        err = esp_lcd_panel_draw_bitmap(s_panel, x1, y1, x2 + 1, y2 + 1, tmp);
+        err = polling_draw(x1, y1, x2, y2, tmp, sz);
         heap_caps_free(tmp);
     }
     if (slot && err != ESP_OK) tx_slot_give();

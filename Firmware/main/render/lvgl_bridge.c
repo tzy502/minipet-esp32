@@ -82,6 +82,33 @@ typedef enum {
 #define MENU_COLLECT_MAX (MENU_LIST_MAX + 1)  /* 多收 1 条用于探测「还有更多」 */
 #define MENU_DL_TIMEOUT_MS 30000  /* T4：单包下载轮询超时（tick 100ms 轮询落盘） */
 
+/* ---------------- 羊皮纸滚筒主题常量（2026-09-30 定稿，色彩对照原型 HTML） ---------------- */
+#define MENU_SCR_BORDER_W  12       /* 整屏棕金描边框宽（内圈再叠 2px #43331F 细线） */
+#define MENU_TITLE_H       46       /* 标题栏高 */
+#define MENU_STATUS_H      22       /* 底部状态行高 */
+#define MENU_ROLLER_W      360      /* 滚筒宽（水平居中） */
+#define MENU_ROLLER_VIS    5        /* 可见行数 */
+#define MENU_ROLLER_ROW_H  58       /* 行高 = 主字体行高 + text_line_space（反解行距锁定） */
+#define MENU_ROLLER_H      (MENU_ROLLER_VIS * MENU_ROLLER_ROW_H)  /* 290 */
+#define MENU_FADE_H        50       /* 上下渐隐遮罩高 */
+#define MENU_BTN_W         92       /* OK/Back 蓝色渐变按钮 */
+#define MENU_BTN_H         34
+#define MENU_BTN_GAP       14
+#define MENU_SCROLL_W      7        /* 右侧自绘滚动条宽 */
+
+#define MENU_C_PARCH_HI  0xF6EBD2   /* 羊皮纸渐变亮端 */
+#define MENU_C_PARCH_LO  0xEEDCB4   /* 羊皮纸渐变暗端 */
+#define MENU_C_FRAME     0x8A6D35   /* 棕金外框 / thumb */
+#define MENU_C_FRAME_IN  0x43331F   /* 内圈细线 / 标题栏渐变暗端 */
+#define MENU_C_TITLE_A   0x6B5432   /* 标题栏渐变亮端 */
+#define MENU_C_GOLD      0xFFE9B0   /* 标题金字 */
+#define MENU_C_DIAMOND   0xD9A93F   /* 标题两侧菱形装饰 */
+#define MENU_C_TEXT      0x4A3826   /* 正文深棕 */
+#define MENU_C_SELBAND   0xFFF6D8   /* 选中行背景带 */
+#define MENU_C_BLUE_A    0x4F7CD6   /* 按钮蓝渐变亮端 */
+#define MENU_C_BLUE_B    0x2C4F9E   /* 按钮蓝渐变暗端 */
+#define MENU_C_TRACK     0xD8C8A0   /* 滚动条 track */
+
 /* 列表条目（四类列表页共用；数据全部来自 asset_dl 本地清单，无写死演示项） */
 typedef struct {
     char label[32];             /* 显示串（asset_dl 已保证 ASCII；动作页为动作名） */
@@ -97,7 +124,12 @@ typedef struct {
     int      sel;               /* 选中行（input 任务单字写，渲染任务读） */
     int      sel_applied;       /* 已贴高亮的行号（变化才重贴，防 10Hz 失效） */
     lv_obj_t *rows[MENU_ROWS_MAX];
-    bool     row_enabled[MENU_ROWS_MAX];   /* T3：置灰行（离线未缓存）不派发 */
+    bool     row_enabled[MENU_ROWS_MAX];   /* T3：置灰行（离线未缓存）不派发；滚筒页=选项可否确认 */
+
+    /* 滚筒选择页（ROOT/MAPS/PAPERDOLL/ACTIONS）控件；NULL = 行式页 */
+    lv_obj_t *roller;           /* lv_roller INFINITE（触摸拖拽/惯性/吸附原生） */
+    lv_obj_t *roller_track;     /* 右侧自绘滚动条 track（原生条 INFINITE 回绕会跳变，R4） */
+    lv_obj_t *roller_thumb;     /* thumb：高度按 可见行/总行数，y 按选中比例 */
 
     menu_item_t items[MENU_LIST_MAX];
     int        item_cnt;        /* 列表页真实条目数（不含 Back/空态行） */
@@ -290,13 +322,18 @@ int bridge_mode_poker(void)
     return RENDER_OK;
 }
 
-/* ---------------- MENU 真实选择器（E7 菜单真实化） ----------------
- * 旧实现只有黑底占位文字。现为真实选择器：
- *   主菜单：Maps / Paperdoll / Actions / Monsters / BGM / Exit 六行
- *           （触摸点选 + 侧键矩阵；Monsters = NPC 素材页，T2）
+/* ---------------- MENU 真实选择器（E7 菜单真实化 → 2026-09-30 羊皮纸滚筒改版） ----------------
+ * 呈现（视觉定稿 docs/ai/menu-roller-beauty.html + menu-roller-spec.md）：
+ *   整屏羊皮纸渐变 + 12px 棕金描边框（内圈 #43331F 细线）+ 深棕渐变标题栏
+ *   （金字 + 双菱形装饰）+ 底部状态行。
+ *   ROOT/MAPS/PAPERDOLL/ACTIONS 四个"选择"页 = lv_roller INFINITE 无限滚筒
+ *   （5 行 × 58px，触摸拖拽/惯性/吸附由 LVGL 原生承担）+ 上下渐隐遮罩 +
+ *   右侧自绘滚动条 + 底部 OK/Back 蓝色渐变按钮（根页 Back=退出，子页 Back=回根页）。
+ *   NPC/BGM/RESET 控制/缓存页保留行式布局，只统一羊皮纸/棕金配色。
+ * 数据面（全部保留，仅呈现改造）：
  *   Maps     子页：asset_dl_bgmap_list() 真实 BGMAP 条目（hash + ASCII label）
- *            [v]=已缓存 [ ]=未缓存（点选→按 hash 拉包→落盘后 MP_CMD_SET_MAP）
- *            [x]=未缓存且离线 → 置灰不可点（T3）
+ *            [v]=已缓存 [ ]=未缓存（确认→按 hash 拉包→落盘后 MP_CMD_SET_MAP）
+ *            [x]=未缓存且离线 → row_enabled=false 拒绝确认（T3）
  *   Paperdoll 子页：asset_dl_parts_list() 真实 PARTS 装扮条目 → MP_CMD_SET_PARTS
  *            （hash 通道，state_machine.dispatch_set_parts_by_hash → render_set_parts）
  *   Actions  子页：五个真实动作（MP_CMD_SET_ACTION），[v] 由
@@ -374,8 +411,10 @@ void lv_bridge_touch_feed(int x, int y, bool pressed)
 
 /* ---------------- 侧键矩阵钩子（input 任务调用） ---------------- */
 
-/* 侧键导航：dir=0 上移（中键）/ 1 下移（底键）。根页移动选中项，子页移动
- * 列表高亮，越界回绕。只写单字 sel，高亮由菜单 tick 统一贴（跨任务安全） */
+/* 侧键导航：dir=0 上移（中键）/ 1 下移（底键）。滚筒页（ROOT/MAPS/PAPERDOLL/
+ * ACTIONS）：写 sel 后由菜单 tick 在渲染任务里 lv_roller_set_selected(sel,
+ * LV_ANIM_ON) 驱动滚筒平滑滚动——本函数在 input 任务上下文被调，绝不直接动
+ * 控件树（跨任务纪律）；行式页移动行高亮。越界回绕。只写单字 sel */
 void render_menu_nav(int dir)
 {
     if (!s_br.menu_mode || s_menu.row_cnt <= 0) {
@@ -791,11 +830,11 @@ static void menu_dl_poll(void)
 
 static void menu_style_row(lv_obj_t *btn, bool selected)
 {
-    /* 【光标不可见修复 2026-09-27】用户实测"高亮框不跟着走"。除颜色对比不足外，
-     * 更可能是"取消选中"的行没有把选中态视觉撤干净（DIRECT 整屏缓冲下失效区域
-     * 也可能被漏掉）。这里三重加固：①明显色差 ②状态样式 ③末尾显式 invalidate。 */
-    lv_obj_set_style_bg_color(btn, lv_color_hex(selected ? 0x2A4A7A : 0x121216), 0);
-    lv_obj_set_style_border_color(btn, lv_color_hex(selected ? 0x7FC4FF : 0x34343C), 0);
+    /* 【羊皮纸主题 2026-09-30】行式页（Monsters/BGM/Reset）与滚筒页统一配色：
+     * 选中 = #FFF6D8 高亮带 + 棕金 3px 框；未选中 = 浅羊皮底 + 浅棕细框。
+     * 三重加固保留：①明显色差 ②状态样式 ③末尾显式 invalidate。 */
+    lv_obj_set_style_bg_color(btn, lv_color_hex(selected ? MENU_C_SELBAND : 0xEFE2C0), 0);
+    lv_obj_set_style_border_color(btn, lv_color_hex(selected ? MENU_C_FRAME : 0xC9B48A), 0);
     lv_obj_set_style_border_width(btn, selected ? 3 : 2, 0);
     if (selected) lv_obj_add_state(btn, LV_STATE_FOCUSED);
     else          lv_obj_remove_state(btn, LV_STATE_FOCUSED);
@@ -806,9 +845,9 @@ static void menu_style_row(lv_obj_t *btn, bool selected)
  * 侧键把光标移到置灰行时仍可见（文本保持暗色） */
 static void menu_style_row_disabled(lv_obj_t *btn, bool selected)
 {
-    lv_obj_set_style_bg_color(btn, lv_color_hex(0x18181C), LV_STATE_DISABLED);
+    lv_obj_set_style_bg_color(btn, lv_color_hex(0xE6D8B6), LV_STATE_DISABLED);
     lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, LV_STATE_DISABLED);
-    lv_obj_set_style_border_color(btn, lv_color_hex(selected ? 0x3C5A78 : 0x2A2A30),
+    lv_obj_set_style_border_color(btn, lv_color_hex(selected ? 0x8A7A5C : 0xB5A480),
                                   LV_STATE_DISABLED);
 }
 
@@ -818,7 +857,7 @@ static lv_obj_t *menu_add_row(lv_obj_t *parent, int idx, const char *text,
     lv_obj_t *btn = lv_button_create(parent);
     lv_obj_set_pos(btn, 48, y);
     lv_obj_set_size(btn, s_br.sw - 96, h);
-    lv_obj_set_style_radius(btn, 10, 0);
+    lv_obj_set_style_radius(btn, 8, 0);
     lv_obj_set_style_border_width(btn, 2, 0);
     lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, 0);
     lv_obj_set_style_shadow_width(btn, 0, 0);
@@ -831,7 +870,8 @@ static lv_obj_t *menu_add_row(lv_obj_t *parent, int idx, const char *text,
     }
 
     lv_obj_t *lb = lv_label_create(btn);
-    lv_obj_set_style_text_color(lb, lv_color_hex(enabled ? 0xFFFFFF : 0x6A6A74), 0);
+    /* 羊皮纸主题：深棕正文 / 置灰浅棕 */
+    lv_obj_set_style_text_color(lb, lv_color_hex(enabled ? MENU_C_TEXT : 0x8A7A5C), 0);
     if (s_menu.f_item) lv_obj_set_style_text_font(lb, s_menu.f_item, 0);
     lv_label_set_text(lb, text);   /* ASCII：Montserrat 内置字体只含拉丁字形 */
     lv_obj_center(lb);
@@ -853,46 +893,251 @@ static void menu_row_text(char *out, size_t cap, bool cached, bool enabled,
              (label && label[0]) ? label : "(no name)");
 }
 
-static lv_obj_t *menu_add_title(lv_obj_t *parent, const char *text)
+/* ---------------- 羊皮纸公共骨架 + 滚筒套件（2026-09-30 定稿改版） ---------------- */
+
+/* 标题两侧金色菱形装饰（8×8 旋转 45°；transform 单位 0.1°，pivot 锁中心） */
+static lv_obj_t *menu_add_diamond(lv_obj_t *parent)
 {
-    lv_obj_t *lb = lv_label_create(parent);
-    lv_obj_set_style_text_color(lb, lv_color_hex(0xFFFFFF), 0);
-    if (s_menu.f_title) lv_obj_set_style_text_font(lb, s_menu.f_title, 0);
-    lv_label_set_text(lb, text);
-    lv_obj_align(lb, LV_ALIGN_TOP_MID, 0, 36);
-    return lb;
+    lv_obj_t *d = lv_obj_create(parent);
+    lv_obj_set_clickable(d, false);      /* 装饰件：触摸穿透（9.6 推荐替代 remove_flag） */
+    lv_obj_set_scrollable(d, false);
+    lv_obj_set_size(d, 8, 8);
+    lv_obj_set_style_bg_color(d, lv_color_hex(MENU_C_DIAMOND), 0);
+    lv_obj_set_style_bg_opa(d, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(d, 0, 0);
+    lv_obj_set_style_radius(d, 1, 0);
+    lv_obj_set_style_pad_all(d, 0, 0);
+    lv_obj_set_scrollbar_mode(d, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_set_style_transform_pivot_x(d, 4, 0);
+    lv_obj_set_style_transform_pivot_y(d, 4, 0);
+    lv_obj_set_style_transform_rotation(d, 450, 0);   /* 450 = 45.0° */
+    return d;
+}
+
+/* 每页共用骨架：整屏羊皮纸渐变 + 12px 棕金描边 + 内圈 #43331F 细线
+ * + 深棕渐变标题栏（金字居中 + 左右菱形）+ 底部状态行（status_label：
+ * 滚筒页回显当前选中 / BGM 页回显播放态，刷新见 menu_tick_cb） */
+static void menu_chrome_build(lv_obj_t *scr, const char *title)
+{
+    /* 整屏羊皮纸 + 12px 棕金描边框 */
+    lv_obj_set_style_bg_color(scr, lv_color_hex(MENU_C_PARCH_HI), 0);
+    lv_obj_set_style_bg_grad_color(scr, lv_color_hex(MENU_C_PARCH_LO), 0);
+    lv_obj_set_style_bg_grad_dir(scr, LV_GRAD_DIR_VER, 0);
+    lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_color(scr, lv_color_hex(MENU_C_FRAME), 0);
+    lv_obj_set_style_border_width(scr, MENU_SCR_BORDER_W, 0);
+
+    /* 内圈细线（纯装饰，不可点击：触摸穿透不挡滚筒） */
+    lv_obj_t *line = lv_obj_create(scr);
+    lv_obj_set_clickable(line, false);   /* 内圈细线：触摸穿透不挡滚筒 */
+    lv_obj_set_scrollable(line, false);
+    lv_obj_set_pos(line, MENU_SCR_BORDER_W, MENU_SCR_BORDER_W);
+    lv_obj_set_size(line, s_br.sw - 2 * MENU_SCR_BORDER_W,
+                    s_br.sh - 2 * MENU_SCR_BORDER_W);
+    lv_obj_set_style_bg_opa(line, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_color(line, lv_color_hex(MENU_C_FRAME_IN), 0);
+    lv_obj_set_style_border_width(line, 2, 0);
+    lv_obj_set_style_radius(line, 0, 0);
+    lv_obj_set_style_pad_all(line, 0, 0);
+    lv_obj_set_scrollbar_mode(line, LV_SCROLLBAR_MODE_OFF);
+
+    /* 标题栏：深棕渐变 + 底缘深色收边 */
+    lv_obj_t *bar = lv_obj_create(scr);
+    lv_obj_set_clickable(bar, false);    /* 标题栏纯展示 */
+    lv_obj_set_scrollable(bar, false);
+    lv_obj_set_pos(bar, MENU_SCR_BORDER_W + 2, MENU_SCR_BORDER_W + 2);
+    lv_obj_set_size(bar, s_br.sw - 2 * (MENU_SCR_BORDER_W + 2), MENU_TITLE_H);
+    lv_obj_set_style_bg_color(bar, lv_color_hex(MENU_C_TITLE_A), 0);
+    lv_obj_set_style_bg_grad_color(bar, lv_color_hex(MENU_C_FRAME_IN), 0);
+    lv_obj_set_style_bg_grad_dir(bar, LV_GRAD_DIR_VER, 0);
+    lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_color(bar, lv_color_hex(0x2E2314), 0);
+    lv_obj_set_style_border_width(bar, 2, 0);
+    lv_obj_set_style_border_side(bar, LV_BORDER_SIDE_BOTTOM, 0);
+    lv_obj_set_style_radius(bar, 0, 0);
+    lv_obj_set_style_pad_all(bar, 0, 0);
+    lv_obj_set_scrollbar_mode(bar, LV_SCROLLBAR_MODE_OFF);
+
+    lv_obj_t *tt = lv_label_create(bar);
+    lv_obj_set_style_text_color(tt, lv_color_hex(MENU_C_GOLD), 0);
+    if (s_menu.f_title) lv_obj_set_style_text_font(tt, s_menu.f_title, 0);
+    lv_obj_set_style_text_letter_space(tt, 2, 0);
+    lv_label_set_text(tt, title);
+    lv_obj_center(tt);
+
+    /* 菱形贴标题文字两侧（align_to 是一次性定位，先强制布局拿到 label 实宽） */
+    lv_obj_update_layout(tt);
+    lv_obj_t *dg = menu_add_diamond(bar);
+    lv_obj_align_to(dg, tt, LV_ALIGN_OUT_LEFT_MID, -12, 0);
+    dg = menu_add_diamond(bar);
+    lv_obj_align_to(dg, tt, LV_ALIGN_OUT_RIGHT_MID, 12, 0);
+
+    /* 底部状态行 */
+    lv_obj_t *stbox = lv_obj_create(scr);
+    lv_obj_set_clickable(stbox, false);  /* 状态行纯展示 */
+    lv_obj_set_scrollable(stbox, false);
+    lv_obj_set_pos(stbox, MENU_SCR_BORDER_W + 2,
+                   s_br.sh - MENU_SCR_BORDER_W - 2 - MENU_STATUS_H);
+    lv_obj_set_size(stbox, s_br.sw - 2 * (MENU_SCR_BORDER_W + 2), MENU_STATUS_H);
+    lv_obj_set_style_bg_color(stbox, lv_color_hex(0xFFF4D4), 0);
+    lv_obj_set_style_bg_opa(stbox, LV_OPA_90, 0);
+    lv_obj_set_style_border_color(stbox, lv_color_hex(0xC9B48A), 0);
+    lv_obj_set_style_border_width(stbox, 1, 0);
+    lv_obj_set_style_border_side(stbox, LV_BORDER_SIDE_TOP, 0);
+    lv_obj_set_style_radius(stbox, 0, 0);
+    lv_obj_set_style_pad_all(stbox, 0, 0);
+    lv_obj_set_scrollbar_mode(stbox, LV_SCROLLBAR_MODE_OFF);
+
+    lv_obj_t *st = lv_label_create(stbox);
+    lv_obj_set_style_text_color(st, lv_color_hex(MENU_C_TEXT), 0);
+    if (s_menu.f_small) lv_obj_set_style_text_font(st, s_menu.f_small, 0);
+    lv_label_set_text(st, "");
+    lv_obj_center(st);
+    s_menu.status_label = st;
 }
 
 static void menu_add_hint(lv_obj_t *parent, const char *text)
 {
     lv_obj_t *lb = lv_label_create(parent);
-    lv_obj_set_style_text_color(lb, lv_color_hex(0x8A8A94), 0);
+    lv_obj_set_style_text_color(lb, lv_color_hex(0x8A7A5C), 0);
     if (s_menu.f_small) lv_obj_set_style_text_font(lb, s_menu.f_small, 0);
     lv_label_set_text(lb, text);   /* ASCII：Montserrat 内置字体只含拉丁字形 */
-    lv_obj_align(lb, LV_ALIGN_BOTTOM_MID, 0, -16);
+    /* 底部状态行上方：状态行归 SEL/BGM 回显，提示行让位不占其位 */
+    lv_obj_align(lb, LV_ALIGN_BOTTOM_MID, 0,
+                 -(MENU_SCR_BORDER_W + 2 + MENU_STATUS_H + 6));
     s_menu.hint_label = lb;
 }
 
-/* 列表页构建（Maps / Paperdoll / Monsters / Actions 共用布局）：
- *   行 0..item_cnt-1 = 真实条目；空清单插一行置灰空态；末行 Back。
- *   行高 45、间距 50：y = 92 + i*50（i≤6 → 底 437 < 页脚提示 ~448）。 */
-static void menu_build_list(lv_obj_t *scr, const char *title, const char *empty_text,
-                            const char *hint)
+/* 滚筒上下渐隐遮罩：羊皮纸色→透明（渐变端点透明度 = bg_main_opa/bg_grad_opa）。
+ * 不可点击：触摸穿透到下方滚筒；自身不参与滚动 */
+static void menu_add_fade(lv_obj_t *scr, int32_t x, int32_t y, bool top)
 {
-    menu_add_title(scr, title);
+    lv_obj_t *f = lv_obj_create(scr);
+    lv_obj_set_clickable(f, false);      /* 遮罩触摸穿透到滚筒 */
+    lv_obj_set_scrollable(f, false);
+    lv_obj_set_pos(f, x, y);
+    lv_obj_set_size(f, MENU_ROLLER_W, MENU_FADE_H);
+    lv_obj_set_style_bg_color(f, lv_color_hex(top ? MENU_C_PARCH_HI : MENU_C_PARCH_LO), 0);
+    lv_obj_set_style_bg_grad_color(f, lv_color_hex(top ? MENU_C_PARCH_HI : MENU_C_PARCH_LO), 0);
+    lv_obj_set_style_bg_grad_dir(f, LV_GRAD_DIR_VER, 0);
+    lv_obj_set_style_border_width(f, 0, 0);
+    lv_obj_set_style_radius(f, 0, 0);
+    lv_obj_set_style_pad_all(f, 0, 0);
+    lv_obj_set_scrollbar_mode(f, LV_SCROLLBAR_MODE_OFF);
+    if (top) {   /* 上遮罩：上端实、向下渐透 */
+        lv_obj_set_style_bg_main_opa(f, LV_OPA_COVER, 0);
+        lv_obj_set_style_bg_grad_opa(f, LV_OPA_TRANSP, 0);
+    } else {     /* 下遮罩：下端实、向上渐透 */
+        lv_obj_set_style_bg_main_opa(f, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_bg_grad_opa(f, LV_OPA_COVER, 0);
+    }
+}
+
+/* lv_roller 样式集中处（羊皮纸滚筒）：
+ *   主体 LV_PART_MAIN = 羊皮纸渐变底 + f_item(Montserrat20) 深棕字；
+ *   选中行 LV_PART_SELECTED = #FFF6D8 背景带 + f_title(Montserrat28) 深棕大字。
+ * 行高锁定 58：roller 行距 = 主字体行高 + text_line_space，反解行距得到，
+ * visible_row_count(5) 由此得到精确 290 高（与 LVGL 9.6 lv_roller.c 同式）。 */
+static void menu_roller_style(lv_obj_t *r)
+{
+    lv_obj_set_style_bg_color(r, lv_color_hex(MENU_C_PARCH_HI), 0);
+    lv_obj_set_style_bg_grad_color(r, lv_color_hex(MENU_C_PARCH_LO), 0);
+    lv_obj_set_style_bg_grad_dir(r, LV_GRAD_DIR_VER, 0);
+    lv_obj_set_style_bg_opa(r, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(r, 0, 0);
+    lv_obj_set_style_radius(r, 8, 0);
+    lv_obj_set_style_pad_top(r, 0, 0);
+    lv_obj_set_style_pad_bottom(r, 0, 0);
+    lv_obj_set_style_pad_left(r, 0, 0);
+    lv_obj_set_style_pad_right(r, 0, 0);
+    lv_obj_set_style_shadow_width(r, 0, 0);
+    lv_obj_set_style_anim_duration(r, 200, 0);   /* 侧键 set_selected 的平滑滚动时长 */
+
+    const lv_font_t *f = s_menu.f_item;
+    int32_t lh = f ? lv_font_get_line_height(f) : 24;
+    int32_t ls = MENU_ROLLER_ROW_H - lh;
+    if (ls < 4) ls = 4;
+    lv_obj_set_style_text_line_space(r, ls, LV_PART_MAIN);
+    if (f) lv_obj_set_style_text_font(r, f, LV_PART_MAIN);
+    lv_obj_set_style_text_color(r, lv_color_hex(MENU_C_TEXT), LV_PART_MAIN);
+
+    /* 选中行：羊皮纸高亮带横贯滚筒全宽（roller 原生绘制） */
+    if (s_menu.f_title) lv_obj_set_style_text_font(r, s_menu.f_title, LV_PART_SELECTED);
+    lv_obj_set_style_text_color(r, lv_color_hex(MENU_C_TEXT), LV_PART_SELECTED);
+    lv_obj_set_style_bg_color(r, lv_color_hex(MENU_C_SELBAND), LV_PART_SELECTED);
+    lv_obj_set_style_bg_opa(r, LV_OPA_90, LV_PART_SELECTED);
+    lv_obj_set_style_radius(r, 10, LV_PART_SELECTED);
+    lv_obj_set_style_border_width(r, 0, LV_PART_SELECTED);
+}
+
+/* 滚筒 VALUE_CHANGED（触摸释放/点行时刻）：跨任务纪律只写单字 sel，
+ * 状态行/滚动条等控件树操作统一由菜单 tick 的 menu_apply_selection 完成。
+ * 确认不走这里：点击任意行只滚到该行，确认 = OK 按钮/顶键（两段式防误触） */
+static void menu_roller_value_cb(lv_event_t *e)
+{
+    int sel = (int)lv_roller_get_selected((lv_obj_t *)lv_event_get_target(e));
+    if (sel >= 0 && sel < MENU_ROWS_MAX) s_menu.sel = sel;
+}
+
+/* 底部 OK 按钮：顶键同通道（req_ok 旗标，tick 排空派发 menu_activate(sel)） */
+static void menu_btn_ok_cb(lv_event_t *e)
+{
+    (void)e;
+    s_menu.req_ok = true;
+}
+
+/* 底部 Back 按钮：根页=退出菜单（req_exit 走状态机 MENU_KEY 通道）；
+ * 子页=回根页（menu_goto 只落旗标，tick 重建，不在此动控件树） */
+static void menu_btn_back_cb(lv_event_t *e)
+{
+    (void)e;
+    if (s_menu.page == MENU_PAGE_ROOT) s_menu.req_exit = true;
+    else menu_goto(MENU_PAGE_ROOT);
+}
+
+/* 蓝色渐变操作按钮（OK/Back），白字 f_small */
+static lv_obj_t *menu_add_opbtn(lv_obj_t *scr, const char *text,
+                                lv_event_cb_t cb, int32_t x)
+{
+    lv_obj_t *b = lv_button_create(scr);
+    lv_obj_set_pos(b, x, s_br.sh - MENU_SCR_BORDER_W - 2 - MENU_STATUS_H - 6 - MENU_BTN_H);
+    lv_obj_set_size(b, MENU_BTN_W, MENU_BTN_H);
+    lv_obj_set_style_bg_color(b, lv_color_hex(MENU_C_BLUE_A), 0);
+    lv_obj_set_style_bg_grad_color(b, lv_color_hex(MENU_C_BLUE_B), 0);
+    lv_obj_set_style_bg_grad_dir(b, LV_GRAD_DIR_VER, 0);
+    lv_obj_set_style_bg_opa(b, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(b, 8, 0);
+    lv_obj_set_style_border_width(b, 0, 0);
+    lv_obj_set_style_shadow_width(b, 0, 0);
+
+    lv_obj_t *lb = lv_label_create(b);
+    lv_obj_set_style_text_color(lb, lv_color_hex(0xFFFFFF), 0);
+    if (s_menu.f_small) lv_obj_set_style_text_font(lb, s_menu.f_small, 0);
+    lv_label_set_text(lb, text);
+    lv_obj_center(lb);
+
+    lv_obj_add_event_cb(b, cb, LV_EVENT_CLICKED, NULL);
+    return b;
+}
+
+/* 行式列表页构建（现仅 Monsters/NPC 缓存页使用；Maps/Paperdoll/Actions 已改滚筒）：
+ *   行 0..item_cnt-1 = 真实条目；空清单插一行置灰空态；末行 Back。
+ *   行高 42、间距 46：y = 78 + i*46（i≤7 → 底 442 < 底部状态行 444）。 */
+static void menu_build_list(lv_obj_t *scr, const char *empty_text, const char *hint)
+{
     int row = 0;
     if (s_menu.item_cnt <= 0) {
-        menu_add_row(scr, row++, empty_text, 92, 45, false);   /* 明确空态，非假数据 */
+        menu_add_row(scr, row++, empty_text, 78, 42, false);   /* 明确空态，非假数据 */
     } else {
         for (int i = 0; i < s_menu.item_cnt && row < MENU_ROWS_MAX; i++) {
             bool en = s_menu.items[i].cached || !s_menu.offline;   /* T3 置灰判据 */
             char text[48];
             menu_row_text(text, sizeof(text), s_menu.items[i].cached, en,
                           s_menu.items[i].label);
-            menu_add_row(scr, row++, text, 92 + i * 50, 45, en);
+            menu_add_row(scr, row++, text, 78 + i * 46, 42, en);
         }
     }
-    menu_add_row(scr, row, "< Back", 92 + row * 50, 45, true);
+    menu_add_row(scr, row, "< Back", 78 + row * 46, 42, true);
     s_menu.back_idx = row;
     s_menu.row_cnt  = row + 1;
     if (s_menu.truncated) {
@@ -902,6 +1147,132 @@ static void menu_build_list(lv_obj_t *scr, const char *title, const char *empty_
         menu_add_hint(scr, more);
     } else {
         menu_add_hint(scr, hint);
+    }
+}
+
+/* 选择页选项串打包：真实条目 + [v]/[x]/[ ] 缓存标记 + 末行 "< Back"。
+ * LVGL roller 的选项 = 单个 '\n' 分隔串（asset_dl label 为 ASCII，不含 '\n'）。
+ * en[i] = 该选项可否确认（离线未缓存 = false，T3 语义在滚筒上的等价物——
+ * roller 无法逐行置灰，确认路径由 menu_activate 的 row_enabled 挡）。
+ * 返回选项数；back_idx/row_cnt 由调用方据此写入。 */
+static int menu_roller_opts_pack(char *out, size_t cap, bool *en, const char *empty_text)
+{
+    size_t o = 0;
+    int row = 0;
+    /* 防御：snprintf 返回"应为"长度，截断时 o 会超前；clamp 防 size_t 下溢
+     * （label 结构体定长 32、行数 ≤8，理论不可达，只作兜底） */
+#define OPTS_CLAMP() do { if (o > cap - 1) o = cap - 1; } while (0)
+    if (s_menu.item_cnt <= 0) {          /* 明确空态，非假数据 */
+        o += (size_t)snprintf(out, cap, "%s", empty_text);
+        OPTS_CLAMP();
+        en[row++] = false;
+    } else {
+        for (int i = 0; i < s_menu.item_cnt && row < MENU_ROWS_MAX - 1; i++) {
+            bool e = s_menu.items[i].cached || !s_menu.offline;   /* T3 置灰判据 */
+            char text[48];
+            menu_row_text(text, sizeof(text), s_menu.items[i].cached, e,
+                          s_menu.items[i].label);
+            o += (size_t)snprintf(out + o, cap - o, "%s%s", row ? "\n" : "", text);
+            OPTS_CLAMP();
+            en[row++] = e;
+        }
+    }
+    /* 末行 "< Back"：保留既有返回路径（与底部 Back 按钮并存，两路都可回根页） */
+    o += (size_t)snprintf(out + o, cap - o, "%s< Back", row ? "\n" : "");
+    OPTS_CLAMP();
+#undef OPTS_CLAMP
+    en[row] = true;
+    s_menu.back_idx = row;
+    return row + 1;
+}
+
+/* 选择页滚筒构建：lv_roller INFINITE 无限循环 + 5 行 × 58px（垂直居中）
+ * + 上下渐隐遮罩 + 右侧自绘滚动条 + 底部 OK/Back 蓝色按钮。
+ * 触摸拖拽/惯性/吸附由 roller + indev 原生承担（lv_bridge_touch_feed 不变）。 */
+static void menu_build_roller(lv_obj_t *scr, const char *opts, int cnt,
+                              const bool *en, const char *hint)
+{
+    int32_t rx = (s_br.sw - MENU_ROLLER_W) / 2;
+    int32_t btn_top = s_br.sh - MENU_SCR_BORDER_W - 2 - MENU_STATUS_H - 6 - MENU_BTN_H;
+    int32_t ry = MENU_SCR_BORDER_W + 2 + MENU_TITLE_H +
+                 ((btn_top - (MENU_SCR_BORDER_W + 2 + MENU_TITLE_H)) - MENU_ROLLER_H) / 2;
+    if (cnt <= 0) return;
+
+    lv_obj_t *r = lv_roller_create(scr);
+    menu_roller_style(r);                       /* 字体/行距必须先于 visible_row_count */
+    lv_roller_set_options(r, opts, LV_ROLLER_MODE_INFINITE);
+    lv_roller_set_visible_row_count(r, MENU_ROLLER_VIS);
+    lv_obj_set_pos(r, rx, ry);
+    lv_obj_set_width(r, MENU_ROLLER_W);
+    /* 原生滚动条关闭：INFINITE 回绕瞬间原生 thumb 跳变（规格 §5.1-R4），
+     * 位置指示由右侧自绘 track/thumb 承担 */
+    lv_obj_set_scrollbar_mode(r, LV_SCROLLBAR_MODE_OFF);
+    if (s_menu.sel < 0 || s_menu.sel >= cnt) s_menu.sel = 0;
+    lv_roller_set_selected(r, (uint32_t)s_menu.sel, LV_ANIM_OFF);
+    lv_obj_add_event_cb(r, menu_roller_value_cb, LV_EVENT_VALUE_CHANGED, NULL);
+    s_menu.roller = r;
+
+    /* 上下渐隐遮罩（羊皮纸色→透明，触摸穿透） */
+    menu_add_fade(scr, rx, ry, true);
+    menu_add_fade(scr, rx, ry + MENU_ROLLER_H - MENU_FADE_H, false);
+
+    /* 右侧自绘滚动条：track 固定；thumb 高按 可见行/总行数、y 按选中比例移动 */
+    lv_obj_t *track = lv_obj_create(scr);
+    lv_obj_set_clickable(track, false);  /* 滚动条纯指示，不抢触摸 */
+    lv_obj_set_scrollable(track, false);
+    lv_obj_set_pos(track, rx + MENU_ROLLER_W + 12, ry);
+    lv_obj_set_size(track, MENU_SCROLL_W, MENU_ROLLER_H);
+    lv_obj_set_style_bg_color(track, lv_color_hex(MENU_C_TRACK), 0);
+    lv_obj_set_style_bg_opa(track, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(track, 0, 0);
+    lv_obj_set_style_radius(track, 4, 0);
+    lv_obj_set_style_pad_all(track, 0, 0);
+    lv_obj_set_scrollbar_mode(track, LV_SCROLLBAR_MODE_OFF);
+
+    lv_obj_t *thumb = lv_obj_create(track);
+    lv_obj_set_clickable(thumb, false);
+    lv_obj_set_scrollable(thumb, false);
+    lv_obj_set_pos(thumb, 0, 0);
+    lv_obj_set_size(thumb, MENU_SCROLL_W, 16);
+    lv_obj_set_style_bg_color(thumb, lv_color_hex(MENU_C_FRAME), 0);
+    lv_obj_set_style_bg_grad_color(thumb, lv_color_hex(0x5A4632), 0);
+    lv_obj_set_style_bg_grad_dir(thumb, LV_GRAD_DIR_VER, 0);
+    lv_obj_set_style_bg_opa(thumb, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(thumb, 0, 0);
+    lv_obj_set_style_radius(thumb, 3, 0);
+    lv_obj_set_style_pad_all(thumb, 0, 0);
+    lv_obj_set_scrollbar_mode(thumb, LV_SCROLLBAR_MODE_OFF);
+    s_menu.roller_track = track;
+    s_menu.roller_thumb = thumb;
+
+    /* 底部 OK/Back 蓝色渐变按钮（根页 Back=退出；子页 Back=回根页） */
+    int32_t bx = (s_br.sw - (2 * MENU_BTN_W + MENU_BTN_GAP)) / 2;
+    menu_add_opbtn(scr, "OK", menu_btn_ok_cb, bx);
+    menu_add_opbtn(scr, "Back", menu_btn_back_cb, bx + MENU_BTN_W + MENU_BTN_GAP);
+
+    /* 行契约映射：滚筒选项回填 row_cnt/row_enabled，menu_activate 原语义零改动 */
+    s_menu.row_cnt = cnt;
+    for (int i = 0; i < cnt && i < MENU_ROWS_MAX; i++)
+        s_menu.row_enabled[i] = en ? en[i] : true;
+
+    menu_add_hint(scr, hint);
+}
+
+/* 选择页（Maps/Paperdoll/Actions）公共装配：收集已在 *_collect 完成，
+ * 这里打包选项串 → 建滚筒（含截断 (+MORE) 提示）。 */
+static void menu_build_selection_page(lv_obj_t *scr, const char *empty_text,
+                                      const char *hint)
+{
+    static char opts[MENU_ROWS_MAX * 48];   /* 仅渲染任务调用，静态免大栈 */
+    static bool en[MENU_ROWS_MAX];
+    int row = menu_roller_opts_pack(opts, sizeof(opts), en, empty_text);
+    s_menu.row_cnt = row;
+    if (s_menu.truncated) {
+        char more[80];
+        snprintf(more, sizeof(more), "%s (+MORE)", hint);
+        menu_build_roller(scr, opts, row, en, more);
+    } else {
+        menu_build_roller(scr, opts, row, en, hint);
     }
 }
 
@@ -919,6 +1290,9 @@ static void menu_rebuild(void)
     memset(s_menu.row_enabled, 0, sizeof s_menu.row_enabled);
     s_menu.status_label = NULL;
     s_menu.hint_label   = NULL;
+    s_menu.roller       = NULL;     /* 滚筒/滚动条指针随重建刷新（行式页保持 NULL） */
+    s_menu.roller_track = NULL;
+    s_menu.roller_thumb = NULL;
     s_menu.row_cnt = 0;
     s_menu.item_cnt = 0;
     s_menu.back_idx = -1;
@@ -931,57 +1305,62 @@ static void menu_rebuild(void)
     s_menu.offline_shown = s_menu.offline;
     s_menu.rev_shown = asset_dl_local_rev();
 
-    lv_obj_set_style_bg_color(scr, lv_color_hex(0x000000), 0);
-    lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
-    menu_fonts_refresh();
+    menu_fonts_refresh();           /* chrome/滚筒都依赖字体，先于任何控件构建 */
 
     switch (s_menu.page) {
     case MENU_PAGE_ROOT: {
-        menu_add_title(scr, "MiniPet");
-        for (int i = 0; i < ROOT_CNT && i < MENU_ROWS_MAX; i++)
-            menu_add_row(scr, i, ROOT_ROWS[i].label, 100 + i * 56, 50, true);
-        s_menu.row_cnt = (ROOT_CNT < MENU_ROWS_MAX) ? ROOT_CNT : MENU_ROWS_MAX;
-        menu_add_hint(scr, "UP:MID DOWN:BOT LONG:CLOCK");
+        /* 滚筒选择页：根页 7 项（Exit 行=收菜单；BGM 行=呼出半屏控制条），
+         * Back 按钮=退出菜单（与 Exit 项并存） */
+        menu_chrome_build(scr, "MiniPet");
+        static char opts[MENU_ROWS_MAX * 48];   /* 仅渲染任务调用，静态免大栈 */
+        static bool en[MENU_ROWS_MAX];
+        int row = 0;
+        size_t o = 0;
+        for (int i = 0; i < ROOT_CNT && i < MENU_ROWS_MAX; i++) {
+            en[i] = true;
+            o += (size_t)snprintf(opts + o, sizeof(opts) - o, "%s%s",
+                                  row ? "\n" : "", ROOT_ROWS[i].label);
+            row++;
+        }
+        s_menu.row_cnt = row;
+        menu_build_roller(scr, opts, row, en, "UP:MID  DOWN:BOT  LONG:EXIT");
         break;
     }
     case MENU_PAGE_MAPS:
         menu_maps_collect();
-        menu_build_list(scr, "Maps", "NO MAP IN LOCAL MANIFEST",
-                        "TAP: SWITCH/DL   [v] CACHED");
+        menu_chrome_build(scr, "Maps");
+        menu_build_selection_page(scr, "NO MAP IN LOCAL MANIFEST",
+                                  "TAP: SWITCH/DL   [v] CACHED");
         break;
     case MENU_PAGE_PAPERDOLL:
         menu_parts_collect();
-        menu_build_list(scr, "Paperdoll", "NO OUTFIT PACK (SYNC NEEDED)",
-                        "TAP: WEAR PARTS  [v] CACHED");
+        menu_chrome_build(scr, "Paperdoll");
+        menu_build_selection_page(scr, "NO OUTFIT PACK (SYNC NEEDED)",
+                                  "TAP: WEAR PARTS  [v] CACHED");
         break;
     case MENU_PAGE_ACTIONS:
         menu_actions_collect();
-        menu_build_list(scr, "Actions", "NO ACTION PACK (SYNC NEEDED)",
-                        "TAP: PLAY  [v] CACHED  [ ] NO PACK");
+        menu_chrome_build(scr, "Actions");
+        menu_build_selection_page(scr, "NO ACTION PACK (SYNC NEEDED)",
+                                  "TAP: PLAY  [v] CACHED  [ ] NO PACK");
         break;
     case MENU_PAGE_NPC:
+        /* 行式页（NPC 缓存用途清单，非"选择"语义），只统一羊皮纸配色 */
         menu_npc_collect();
-        menu_build_list(scr, "Monsters", "NO NPC ASSET (SERVER PUSH)",
+        menu_chrome_build(scr, "Monsters");
+        menu_build_list(scr, "NO NPC ASSET (SERVER PUSH)",
                         "NPC PACKS: TAP TO CACHE (NO RENDER)");
         break;
     case MENU_PAGE_BGM: {
-        menu_add_title(scr, "BGM");
-        s_menu.status_label = lv_label_create(scr);
-        lv_obj_set_style_text_color(s_menu.status_label, lv_color_hex(0xB9B9C4), 0);
-        if (s_menu.f_small) lv_obj_set_style_text_font(s_menu.status_label, s_menu.f_small, 0);
-        lv_label_set_text(s_menu.status_label, "Tracks:-");
-        lv_obj_align(s_menu.status_label, LV_ALIGN_TOP_MID, 0, 96);
+        /* 行式页（控制项非"选择"语义），配色统一羊皮纸；
+         * 状态行=底部骨架行（tick 500ms 刷新 BGM 态） */
+        menu_chrome_build(scr, "BGM");
         menu_bgm_status_refresh();
-
-        /* 【E6/E8 补齐 2026-09-27】需求：控制条含【音量】；「设备上先选类型」
-         * （WZ/QQ 曲库切换）；「某源整体不可用 → 设备该源入口置灰」。
-         * 此前 BGM 页只有 Play/Pause/Prev/Next，音量只挂物理键、无切源入口、
-         * bgm_source_greyed() 零调用者（置灰从未生效）。 */
-        menu_add_row(scr, 0, "Play / Pause", 150, 48, true);
-        menu_add_row(scr, 1, "Prev",          202, 48, true);
-        menu_add_row(scr, 2, "Next",          254, 48, true);
-        menu_add_row(scr, 3, "Vol -",         306, 48, true);
-        menu_add_row(scr, 4, "Vol +",         358, 48, true);
+        menu_add_row(scr, 0, "Play / Pause", 72, 44, true);
+        menu_add_row(scr, 1, "Prev",         122, 44, true);
+        menu_add_row(scr, 2, "Next",         172, 44, true);
+        menu_add_row(scr, 3, "Vol -",        222, 44, true);
+        menu_add_row(scr, 4, "Vol +",        272, 44, true);
         /* 切源行：置灰跟随 bgm_source_greyed()（该源整体不可用 → 不可点） */
         {
             bool wz_grey = bgm_source_greyed(MP_BGM_SRC_WZ);
@@ -990,22 +1369,20 @@ static void menu_rebuild(void)
             snprintf(src_label, sizeof(src_label), "Source: %s%s",
                      bgm_source_name(), (wz_grey && qq_grey) ? " (BOTH DOWN)" : "");
             /* 两个源都不可用才整体置灰；否则可点切换 */
-            menu_add_row(scr, 5, src_label, 410, 48, !(wz_grey && qq_grey));
+            menu_add_row(scr, 5, src_label, 322, 44, !(wz_grey && qq_grey));
         }
-        menu_add_row(scr, 6, "< Back",        462, 48, true);
+        menu_add_row(scr, 6, "< Back",       372, 44, true);
         s_menu.row_cnt = 7;
         menu_add_hint(scr, "TOUCH OR TOP KEY");
         break;
     }
 
     case MENU_PAGE_RESET: {
-        /* 【E14 补齐 2026-09-27】免插线重配网：清了配网凭据（WiFi + 服务器地址）
-         * 后重启 → 设备进 SoftAP portal（MiniPet-XXXX），手机连上重新填。
-         * 真机背景：AP 在认证阶段拒绝设备（reason=2）时，除重启 AP 外唯一的
-         * 设备侧自救手段；此前只能连电脑 esptool erase_region。 */
-        menu_add_title(scr, "Reset WiFi");
-        menu_add_row(scr, 0, "CONFIRM RESET", 190, 56, true);
-        menu_add_row(scr, 1, "< Back",        270, 56, true);
+        /* 【E14】免插线重配网：清配网凭据（WiFi + 服务器地址）后重启 →
+         * 设备进 SoftAP portal（MiniPet-XXXX）。行式确认页 + 羊皮纸配色 */
+        menu_chrome_build(scr, "Reset WiFi");
+        menu_add_row(scr, 0, "CONFIRM RESET", 170, 52, true);
+        menu_add_row(scr, 1, "< Back",        240, 52, true);
         s_menu.row_cnt = 2;
         menu_add_hint(scr, "CLEARS WIFI + SERVER, THEN REBOOT");
         break;
@@ -1021,17 +1398,48 @@ static void menu_rebuild(void)
         s_menu.hint_once[0] = 0;
     }
 
-    ESP_LOGI(TAG, "menu_rebuild: page=%d rows=%d items=%d offline=%d widgets=%u",
+    ESP_LOGI(TAG, "menu_rebuild: page=%d rows=%d items=%d offline=%d roller=%d widgets=%u",
              (int)s_menu.page, s_menu.row_cnt, s_menu.item_cnt, (int)s_menu.offline,
+             (int)(s_menu.roller != NULL),
              (unsigned)lv_obj_get_child_count(scr));
     lv_obj_invalidate(scr);            /* DIRECT 模式强制整屏重绘入 menu_buf */
 }
 
-/* 高亮跟随 sel（菜单 tick；sel 变化才重贴，避免无谓失效区）。
- * 置灰行不贴高亮底（保持 DISABLED 配色；选中框仍可见） */
+/* 高亮跟随 sel（菜单 tick；sel 变化才动，避免无谓失效区）。
+ * 滚筒页：选中行视觉由 LV_PART_SELECTED 原生绘制，这里只做
+ *   ① 侧键 nav 改写的 sel → lv_roller_set_selected(LV_ANIM_ON) 平滑滚动
+ *     （触摸路径 VALUE_CHANGED 已把 sel 同步，此分支自然旁路）
+ *   ② 自绘滚动条 thumb 按选中比例移动（INFINITE 回绕时回到端点，预期行为）
+ *   ③ 底部状态行回显当前选中
+ * 行式页：逐行贴高亮 + "> " 文字光标（样式之外的光标兜底通道） */
 static void menu_apply_selection(void)
 {
     if (s_menu.sel_applied == s_menu.sel) return;
+
+    if (s_menu.roller) {
+        if (s_menu.sel < 0 || s_menu.sel >= s_menu.row_cnt) s_menu.sel = 0;
+        if ((int)lv_roller_get_selected(s_menu.roller) != s_menu.sel)
+            lv_roller_set_selected(s_menu.roller, (uint32_t)s_menu.sel, LV_ANIM_ON);
+
+        if (s_menu.roller_thumb) {
+            int th = MENU_ROLLER_H * MENU_ROLLER_VIS /
+                     (s_menu.row_cnt > 0 ? s_menu.row_cnt : 1);
+            if (th < 16) th = 16;
+            if (th > MENU_ROLLER_H) th = MENU_ROLLER_H;
+            lv_obj_set_height(s_menu.roller_thumb, th);
+            lv_obj_set_y(s_menu.roller_thumb,
+                         (MENU_ROLLER_H - th) * s_menu.sel /
+                         (s_menu.row_cnt > 1 ? s_menu.row_cnt - 1 : 1));
+        }
+        if (s_menu.status_label) {
+            char opt[48];
+            lv_roller_get_selected_str(s_menu.roller, opt, sizeof(opt));
+            lv_label_set_text_fmt(s_menu.status_label, "SEL: %s", opt);
+        }
+        s_menu.sel_applied = s_menu.sel;
+        return;
+    }
+
     int styled = 0;
     for (int i = 0; i < s_menu.row_cnt && i < MENU_ROWS_MAX; i++) {
         if (!s_menu.rows[i]) continue;
@@ -1112,7 +1520,9 @@ static void menu_tick_cb(lv_timer_t *t)
     }
     if (++s_menu.bgm_refr_div >= 5) {   /* 100ms×5 = 500ms */
         s_menu.bgm_refr_div = 0;
-        menu_bgm_status_refresh();
+        /* 状态行语义分页：滚筒页=SEL 回显（menu_apply_selection 维护），
+         * 仅 BGM 页刷 BGM 播放态，避免 500ms 覆盖滚筒页的选中回显 */
+        if (s_menu.page == MENU_PAGE_BGM) menu_bgm_status_refresh();
         /* 网络态翻转（离线置灰跟随）或清单 rev 变化（列表/缓存标记跟随）→ 重建 */
         bool off = state_machine_offline_mode();
         uint32_t rev = asset_dl_local_rev();
@@ -1167,6 +1577,9 @@ int bridge_mode_menu(void)
     s_menu.dl_cmd = MP_CMD_NONE;
     s_menu.hint_once[0] = 0;
     s_menu.back_idx = -1;
+    s_menu.roller = NULL;             /* 滚筒/滚动条指针随 rebuild 重建（防悬挂引用） */
+    s_menu.roller_track = NULL;
+    s_menu.roller_thumb = NULL;
     menu_rebuild();           /* E7：进入菜单即构建真实选择器（防白屏/黑屏） */
     if (!s_menu.tick) {
         s_menu.tick = lv_timer_create(menu_tick_cb, 100, NULL);  /* 高亮/请求/BGM 状态节拍 */

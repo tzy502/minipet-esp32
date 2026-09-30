@@ -1,0 +1,8 @@
+Command: ninja all
+[1/4] cd /Users/a502/IdeaProjects/minipet-esp32/Firmware/build-185b/esp-idf/esptool_py && /Users/a502/.espressif/python_env/idf5.5_py3.9_env/bin/python /Users/a502/esp/esp-idf/components/partition_table/check_sizes.py --offset 0x8000 partition --type app /Users/a502/IdeaProjects/minipet-esp32/Firmware/build-185b/partition_table/partition-table.bin /Users/a502/IdeaProjects/minipet-esp32/Firmware/build-185b/minipet.bin
+minipet.bin binary size 0x1b4c00 bytes. Smallest app partition is 0x300000 bytes. 0x14b400 bytes (43%) free.
+[2/4] Performing build step for 'bootloader'
+[1/1] cd /Users/a502/IdeaProjects/minipet-esp32/Firmware/build-185b/bootloader/esp-idf/esptool_py && /Users/a502/.espressif/python_env/idf5.5_py3.9_env/bin/python /Users/a502/esp/esp-idf/components/partition_table/check_sizes.py --offset 0x8000 bootloader 0x0 /Users/a502/IdeaProjects/minipet-esp32/Firmware/build-185b/bootloader/bootloader.bin
+Bootloader binary size 0x57c0 bytes. 0x2840 bytes (31%) free.
+[3/4] No install step for 'bootloader'
+[4/4] Completed 'bootloader'

@@ -23,6 +23,11 @@ config MP_LCD_PCLK_HZ
       ST77916 面板 QSPI 时钟。花屏 bring-up 期先降 20MHz 排除信号完整性；
       确认后调回 40MHz。
 
+config MP_LCD_CONTINUOUS_REFRESH
+    bool "持续全帧刷新（1.85B RAMless 面板必需；关=一次性写入模式）"
+    depends on MP_BOARD_LCD185B
+    default y
+
 config MP_LCD_BRINGUP_TEST
     bool "开机全屏色块自检（红→绿→蓝，1.85B bring-up 用，验收后关闭）"
     default n

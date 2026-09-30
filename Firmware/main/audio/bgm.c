@@ -885,6 +885,13 @@ static void bgm_task_retry_cb(void *arg)
 
 void bgm_start(void)
 {
+    /* 【能力位门控 2026-09-29】无音频板（185B has_audio=false）：BGM 任务栈
+     * 24KB + feeder 4KB 全是内部 DRAM——省给 RAMless 刷新。hal_contract.h 已
+     * include（MINIPET_ACTIVE_PROFILE 可用）。216 板 has_audio=true 行为不变。 */
+    if (!MINIPET_ACTIVE_PROFILE.has_audio) {
+        ESP_LOGW(TAG, "本板无音频（has_audio=false）：BGM/feeder 不启动（降级）");
+        return;
+    }
     s_tbl_lock = xSemaphoreCreateMutex();
     if (!s_tbl_lock) {
         ESP_LOGE(TAG, "tbl mutex alloc failed");
