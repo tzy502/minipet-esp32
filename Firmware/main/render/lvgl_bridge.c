@@ -361,6 +361,8 @@ int bridge_mode_poker(void)
 
 /* 字体：内置 Montserrat（sdkconfig.defaults 三行 + 主线程 regen 后生效）；
  * 未 regen 时 #if 短路 → 回退 TF FONT 包（16/24/32），再退 LVGL 默认主题字体 */
+extern const lv_font_t menu_font_cn;   /* 菜单中文字体（烘焙子集，见 render/font_cn/） */
+
 static void menu_fonts_refresh(void)
 {
     s_menu.f_title = NULL;
@@ -377,8 +379,12 @@ static void menu_fonts_refresh(void)
 #if LV_FONT_MONTSERRAT_16
     s_menu.f_small = &lv_font_montserrat_16;
 #endif
-    if (!s_menu.f_title) s_menu.f_title = font_lazy_get(FONT_ID_32);
-    if (!s_menu.f_item)  s_menu.f_item  = font_lazy_get(FONT_ID_24);
+    /* 【中文化 2026-09-29】菜单文字统一用烘焙的 CJK 子集字体（22px，
+     * 覆盖菜单全部汉字 + ASCII）；f_small 仅用于纯英文提示行 */
+    if (1) {
+        s_menu.f_title = &menu_font_cn;
+        s_menu.f_item  = &menu_font_cn;
+    }
     if (!s_menu.f_small) s_menu.f_small = font_lazy_get(FONT_ID_16);
 }
 
@@ -620,13 +626,13 @@ static void menu_bgm_status_refresh(void)
 
 /* 根页行表（显式 idx→page 映射，不再用枚举算术耦合顺序） */
 static const struct { const char *label; int page; } ROOT_ROWS[] = {
-    { "Maps",      MENU_PAGE_MAPS      },
-    { "Paperdoll", MENU_PAGE_PAPERDOLL },
-    { "Actions",   MENU_PAGE_ACTIONS   },
-    { "Monsters",  MENU_PAGE_NPC       },
+    { "地图",     MENU_PAGE_MAPS      },
+    { "纸娃娃",   MENU_PAGE_PAPERDOLL },
+    { "动作",     MENU_PAGE_ACTIONS   },
+    { "怪物",     MENU_PAGE_NPC       },
     { "BGM",       MENU_PAGE_BGM       },
-    { "Reset WiFi", MENU_PAGE_RESET    },   /* E14：清凭据重配网（无需连电脑擦 NVS） */
-    { "Exit",      -1                  },   /* -1 = 收菜单（状态机 MENU_KEY 通道） */
+    { "重置WiFi", MENU_PAGE_RESET     },   /* E14：清凭据重配网（无需连电脑擦 NVS） */
+    { "退出",     -1                  },   /* -1 = 收菜单（状态机 MENU_KEY 通道） */
 };
 #define ROOT_CNT ((int)(sizeof(ROOT_ROWS) / sizeof(ROOT_ROWS[0])))
 
@@ -990,7 +996,7 @@ static void menu_chrome_build(lv_obj_t *scr, const char *title)
 
     lv_obj_t *st = lv_label_create(stbox);
     lv_obj_set_style_text_color(st, lv_color_hex(MENU_C_TEXT), 0);
-    if (s_menu.f_small) lv_obj_set_style_text_font(st, s_menu.f_small, 0);
+    lv_obj_set_style_text_font(st, &menu_font_cn, 0);   /* 选中回显是中文：用 CJK 子集字体 */
     lv_label_set_text(st, "");
     lv_obj_center(st);
     s_menu.status_label = st;
@@ -1247,8 +1253,8 @@ static void menu_build_roller(lv_obj_t *scr, const char *opts, int cnt,
 
     /* 底部 OK/Back 蓝色渐变按钮（根页 Back=退出；子页 Back=回根页） */
     int32_t bx = (s_br.sw - (2 * MENU_BTN_W + MENU_BTN_GAP)) / 2;
-    menu_add_opbtn(scr, "OK", menu_btn_ok_cb, bx);
-    menu_add_opbtn(scr, "Back", menu_btn_back_cb, bx + MENU_BTN_W + MENU_BTN_GAP);
+    menu_add_opbtn(scr, "确定", menu_btn_ok_cb, bx);
+    menu_add_opbtn(scr, "返回", menu_btn_back_cb, bx + MENU_BTN_W + MENU_BTN_GAP);
 
     /* 行契约映射：滚筒选项回填 row_cnt/row_enabled，menu_activate 原语义零改动 */
     s_menu.row_cnt = cnt;
@@ -1311,7 +1317,7 @@ static void menu_rebuild(void)
     case MENU_PAGE_ROOT: {
         /* 滚筒选择页：根页 7 项（Exit 行=收菜单；BGM 行=呼出半屏控制条），
          * Back 按钮=退出菜单（与 Exit 项并存） */
-        menu_chrome_build(scr, "MiniPet");
+        menu_chrome_build(scr, "主菜单");
         static char opts[MENU_ROWS_MAX * 48];   /* 仅渲染任务调用，静态免大栈 */
         static bool en[MENU_ROWS_MAX];
         int row = 0;
@@ -1328,26 +1334,26 @@ static void menu_rebuild(void)
     }
     case MENU_PAGE_MAPS:
         menu_maps_collect();
-        menu_chrome_build(scr, "Maps");
+        menu_chrome_build(scr, "选择地图");
         menu_build_selection_page(scr, "NO MAP IN LOCAL MANIFEST",
                                   "TAP: SWITCH/DL   [v] CACHED");
         break;
     case MENU_PAGE_PAPERDOLL:
         menu_parts_collect();
-        menu_chrome_build(scr, "Paperdoll");
+        menu_chrome_build(scr, "纸娃娃");
         menu_build_selection_page(scr, "NO OUTFIT PACK (SYNC NEEDED)",
                                   "TAP: WEAR PARTS  [v] CACHED");
         break;
     case MENU_PAGE_ACTIONS:
         menu_actions_collect();
-        menu_chrome_build(scr, "Actions");
+        menu_chrome_build(scr, "选择动作");
         menu_build_selection_page(scr, "NO ACTION PACK (SYNC NEEDED)",
                                   "TAP: PLAY  [v] CACHED  [ ] NO PACK");
         break;
     case MENU_PAGE_NPC:
         /* 行式页（NPC 缓存用途清单，非"选择"语义），只统一羊皮纸配色 */
         menu_npc_collect();
-        menu_chrome_build(scr, "Monsters");
+        menu_chrome_build(scr, "怪物");
         menu_build_list(scr, "NO NPC ASSET (SERVER PUSH)",
                         "NPC PACKS: TAP TO CACHE (NO RENDER)");
         break;
@@ -1356,11 +1362,11 @@ static void menu_rebuild(void)
          * 状态行=底部骨架行（tick 500ms 刷新 BGM 态） */
         menu_chrome_build(scr, "BGM");
         menu_bgm_status_refresh();
-        menu_add_row(scr, 0, "Play / Pause", 72, 44, true);
-        menu_add_row(scr, 1, "Prev",         122, 44, true);
-        menu_add_row(scr, 2, "Next",         172, 44, true);
-        menu_add_row(scr, 3, "Vol -",        222, 44, true);
-        menu_add_row(scr, 4, "Vol +",        272, 44, true);
+        menu_add_row(scr, 0, "播放/暂停", 72, 44, true);
+        menu_add_row(scr, 1, "上一首",    122, 44, true);
+        menu_add_row(scr, 2, "下一首",    172, 44, true);
+        menu_add_row(scr, 3, "音量−",     222, 44, true);
+        menu_add_row(scr, 4, "音量+",     272, 44, true);
         /* 切源行：置灰跟随 bgm_source_greyed()（该源整体不可用 → 不可点） */
         {
             bool wz_grey = bgm_source_greyed(MP_BGM_SRC_WZ);
@@ -1434,7 +1440,7 @@ static void menu_apply_selection(void)
         if (s_menu.status_label) {
             char opt[48];
             lv_roller_get_selected_str(s_menu.roller, opt, sizeof(opt));
-            lv_label_set_text_fmt(s_menu.status_label, "SEL: %s", opt);
+            lv_label_set_text_fmt(s_menu.status_label, "选中：%s", opt);
         }
         s_menu.sel_applied = s_menu.sel;
         return;
@@ -1514,10 +1520,9 @@ static void menu_tick_cb(lv_timer_t *t)
      * 强制整屏失效一次：LVGL 会重绘全屏进 menu_buf，脏像素每 100ms 清一遍。
      * 代价：菜单态 10fps 全屏重绘（LVGL 官方在 DIRECT 模式下的推荐做法），
      * 菜单是静态界面，实测无卡顿。 */
-    {
-        lv_obj_t *scr = lv_screen_active();
-        if (scr) lv_obj_invalidate(scr);
-    }
+    /* 【卡顿修复 2026-09-29】移除 100ms 强制整屏失效——滚筒拖拽期 LVGL
+     * 本就按失效区局部重绘，整屏失效使菜单态常驻 10fps 全屏重绘 → 极卡。
+     * 叠影风险：行文本/选中带由 LVGL 失效区自行覆盖，真机验证。 */
     if (++s_menu.bgm_refr_div >= 5) {   /* 100ms×5 = 500ms */
         s_menu.bgm_refr_div = 0;
         /* 状态行语义分页：滚筒页=SEL 回显（menu_apply_selection 维护），

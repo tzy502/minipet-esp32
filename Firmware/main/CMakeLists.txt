@@ -19,6 +19,7 @@ idf_component_register(
         "render/compositor.c"
         "render/entity_anim.c"
         "render/lvgl_bridge.c"
+        "render/font_cn/menu_font_cn.c"
         "render/font_lazy.c"
         "render/clock_digits.c"
         "net/http_client.c"

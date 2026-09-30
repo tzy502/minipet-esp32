@@ -4,6 +4,8 @@
  * + 素材推送（T3/E7）+ 动作/表情/气泡调试（T2/E4，25 表情手动指定）。
  * 换装 = PUT devices/{id} 显式传 petConfig（按设备隔离，manifest rev+1）；
  * 阈值覆盖 = 传 thresholds 对象；显式传 petConfig:null = 清空回默认宠物。
+ * 从预设推送 = 纸娃娃编辑器「已存预设」（服务端 GET /admin/presets，与 PaperdollView 同一份）
+ *   的 appearance 经 appearanceToDraft→draftToAppearance 归一化后走同一 PUT 链路（同一端点/同一 payload）。
  * T2 指令端点服务端**已上线**（实测 202 {"ok":true,"seq":47,...}）：仍保留开卡探测，
  * 老部署实例上端点缺失 → 25 个表情按钮禁用 + 卡片内给出接口需求（见
  * Web/docs/interfaces-needed-from-server.md）；端点在线时探测转 ok，无需改前端。
@@ -14,12 +16,12 @@ import { useRouter } from 'vue-router'
 import {
   NCard, NSpace, NButton, NTag, NDescriptions, NDescriptionsItem, NInput,
   NInputNumber, NCheckbox, NForm, NFormItem, NResult, NSpin, NPopconfirm,
-  NImage, NDivider, NSelect, NAlert, NTooltip, useMessage,
+  NImage, NDivider, NSelect, NAlert, NTooltip, NEmpty, useMessage,
 } from 'naive-ui'
 import {
   getDevice, updateDevice, triggerOta, getCatalog, getMaterials, paperdollThumbUrl,
   pushMaterial, errText, sendDeviceCommand, probeDeviceCommand, deviceCommandPath,
-  DEVICE_COMMAND_TYPE, getDeviceLogs,
+  DEVICE_COMMAND_TYPE, getDeviceLogs, listPresets,
 } from '../api/client'
 import { useDevicesStore } from '../stores/devices'
 import AppearancePicker from '../components/AppearancePicker.vue'
@@ -156,6 +158,65 @@ async function applyPet(clear = false) {
     applying.value = false
   }
 }
+
+// ── 从预设推送（纸娃娃编辑器「已存预设」→ 本设备，同一 E13 提交链路）─────────
+// 预设存服务端（GET /admin/presets，与 PaperdollView 同一份，无本机副本），此处只读列出
+// type==='paperdoll' 的条目。推送 = 预设 data（appearance JSON，槽位 { id } 对象形态；
+// 旧数据可能是 5 槽/纯字符串形态）→ appearanceToDraft 宽容转草稿 → draftToAppearance 归一化
+// → PUT /admin/devices/{id} { petConfig }（与逐槽「应用到设备」同端点同 payload），
+// 服务端 bump manifest rev → 设备数秒内拉取换装；成功后反馈链与 applyPet 相同（load 回填 + 首页缓存刷新）。
+const presets = ref([])
+const presetsLoading = ref(false)
+const presetsError = ref('')
+const pushingPresetId = ref('') // 正在推送的预设 id；非空即「任一推送中」，行间互斥防重复点击
+
+async function loadPresets() {
+  presetsLoading.value = true
+  presetsError.value = ''
+  try {
+    const data = await listPresets()
+    presets.value = data?.presets ?? []
+  } catch (e) {
+    presetsError.value = e?.serverError || '预设列表加载失败'
+  } finally {
+    presetsLoading.value = false
+  }
+}
+
+/** 展示行：仅 paperdoll 预设；顺手把 appearance 转草稿拼 64px 合成缩略图（数据坏损时仅无图，不影响推送）。 */
+const presetRows = computed(() => presets.value
+  .filter((p) => p.type === 'paperdoll')
+  .map((p) => {
+    let thumb = ''
+    try {
+      thumb = paperdollThumbUrl(buildPaperdollId(appearanceToDraft(p.data, p.name)), 64)
+    } catch { /* keep thumb = '' */ }
+    return { ...p, thumb }
+  }))
+
+async function pushPreset(p) {
+  if (pushingPresetId.value) return
+  const d = appearanceToDraft(p.data, p.name) // appearance 槽位串 → 草稿（宽容兼容旧形态）
+  // 与逐槽 apply 的 hasAnyWorn 同口径：全空预设等于「清空装扮」，不静默下发
+  if (!CATEGORIES.some((c) => !!d[c.key])) {
+    message.warning(`预设「${p.name}」没有任何穿戴槽位，已取消推送`)
+    return
+  }
+  pushingPresetId.value = p.id
+  try {
+    // 与 E13 逐槽「应用到设备」同一端点/同一 payload（draftToAppearance 归一化出完整 appearance）
+    await updateDevice(props.id, { petConfig: draftToAppearance(d) })
+    message.success(`已推送预设「${p.name}」到设备，等待设备拉取`)
+    await load() // petConfig 回填面板草稿（与 applyPet 相同的 manifest 反馈链）
+    devicesStore.fetchAll({ silent: true }).catch(() => {})
+    devicesStore.ensurePetConfig(props.id, { force: true }).catch(() => {})
+  } catch (e) {
+    message.error(e?.serverError || `推送预设「${p.name}」失败`)
+  } finally {
+    pushingPresetId.value = ''
+  }
+}
+onMounted(loadPresets)
 
 // ── 阈值覆盖 ────────────────────────────────────────────────────────────
 const overrideThresholds = ref(false)
@@ -528,6 +589,55 @@ async function sendBubble() {
             <n-tag size="small" :bordered="false">{{ hasPetConfig ? '当前有自定义装扮' : '当前为默认宠物' }}</n-tag>
           </div>
         </n-space>
+
+        <!-- 从预设推送：纸娃娃编辑器保存的预设一键下发到本设备（与「应用到设备」同一端点/payload） -->
+        <n-divider style="margin: 14px 0 10px" />
+        <div class="preset-push">
+          <div class="preset-head">
+            <span class="preset-title">从预设推送</span>
+            <span class="hint">选一个纸娃娃编辑器保存的装扮预设，一键推送到该设备（服务端预设，与「纸娃娃」页同一份）</span>
+            <n-button size="tiny" secondary :loading="presetsLoading" @click="loadPresets">刷新</n-button>
+          </div>
+          <n-spin v-if="presetsLoading" size="small" class="preset-empty" />
+          <n-alert v-else-if="presetsError" type="warning" :show-icon="false" size="small">
+            预设列表加载失败：{{ presetsError }}
+            <n-button size="tiny" secondary style="margin-left: 8px" @click="loadPresets">重试</n-button>
+          </n-alert>
+          <n-empty
+            v-else-if="!presetRows.length"
+            size="small"
+            description="暂无预设 —— 先到「纸娃娃」编辑器保存一个装扮预设"
+            class="preset-empty"
+          />
+          <div v-else class="preset-list">
+            <div v-for="p in presetRows" :key="p.id" class="preset-row">
+              <n-image
+                v-if="p.thumb"
+                :src="p.thumb"
+                :key="p.thumb"
+                width="40"
+                height="40"
+                object-fit="contain"
+                class="preset-thumb"
+              />
+              <span v-else class="preset-thumb preset-thumb-none">👗</span>
+              <div class="preset-info">
+                <span class="preset-name">{{ p.name }}</span>
+                <span class="hint">保存于 {{ fmtTime(p.updatedAtUtc) }}</span>
+              </div>
+              <n-button
+                size="tiny"
+                type="primary"
+                secondary
+                :loading="pushingPresetId === p.id"
+                :disabled="!!pushingPresetId"
+                @click="pushPreset(p)"
+              >
+                推送到此设备
+              </n-button>
+            </div>
+          </div>
+        </div>
         <template #action>
           <n-space justify="space-between">
             <n-popconfirm @positive-click="applyPet(true)">
@@ -804,6 +914,22 @@ async function sendBubble() {
 .preview-col { display: flex; flex-direction: column; align-items: center; gap: 8px; }
 .preview-box { width: 160px; height: 160px; display: flex; align-items: center; justify-content: center; }
 .block-center { display: flex; justify-content: center; padding: 48px 0; }
+
+.preset-push { display: flex; flex-direction: column; gap: 8px; }
+.preset-head { display: flex; align-items: center; gap: 10px; }
+.preset-title { font-size: 13px; font-weight: 600; flex: none; }
+.preset-head .hint { flex: 1; }
+.preset-empty { padding: 12px 0; }
+.preset-list { display: flex; flex-direction: column; }
+.preset-row {
+  display: flex; align-items: center; gap: 10px; padding: 6px 0;
+  border-bottom: 1px dashed rgba(128, 128, 140, 0.25);
+}
+.preset-row:last-child { border-bottom: none; }
+.preset-thumb { border-radius: 6px; background: #f7f7fa; flex: none; }
+.preset-thumb-none { width: 40px; height: 40px; display: inline-flex; align-items: center; justify-content: center; }
+.preset-info { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.preset-name { font-weight: 600; font-size: 13px; }
 
 .logbox {
   max-height: 300px;
