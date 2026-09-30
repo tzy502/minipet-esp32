@@ -1502,7 +1502,9 @@ void asset_dl_start(void)
     }
 }
 
-/* 栈阶梯：8192（宽裕）→ 6144（HTTP+cJSON+文件 IO 的下限评估）→ 5120（勉强） */
+/* 栈阶梯：4096（1.85B 小堆板首选：内部堆须留给 RAMless 刷新+绑定门）→
+ * 8192（宽裕）→ 6144 → 5120（勉强）。任务只做 fopen/fread+cJSON 轻解析；
+ * 大堆板首轮 8192 命中行为不变。 */
 static bool asset_dl_spawn_ladder(void)
 {
     static const uint32_t stacks[] = { 8192, 6144, 5120 };

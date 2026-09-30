@@ -117,9 +117,15 @@ static void refresh_task(void *arg)
         for (int c = 0; c < chunks && s_refresh_on; c++) {
             const int y0 = c * rows;
             const uint8_t *src = (const uint8_t *)(s_fb_src + (size_t)y0 * s_fb_stride);
-            if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(200)) != pdTRUE) continue;
+            /* 锁序=先帧锁后显示锁：合成器持帧锁→display_blit 拿显示锁；
+             * 若本任务反序（持显示锁等帧锁）= ABBA 死锁（真机 15s 全系统冻结实证） */
             if (s_frame_lock) s_frame_lock();
+            if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(200)) != pdTRUE) {
+                if (s_frame_unlock) s_frame_unlock();
+                continue;
+            }
             memcpy(stage, src, chunk_sz);
+            xSemaphoreGive(s_lock);
             if (s_frame_unlock) s_frame_unlock();
             bool slot = tx_slot_take();
             esp_err_t e = esp_lcd_panel_draw_bitmap(s_panel, 0, y0, SW, y0 + rows, stage);
@@ -294,14 +300,37 @@ esp_err_t display_init(void)
              SW, SH, BL_GPIO, CONFIG_MP_LCD_PCLK_HZ / 1000000);
 
 #if CONFIG_MP_LCD_BRINGUP_TEST
-    {
-        for (int round = 0; round < 3; round++) {
-            esp_err_t e = display_fill_rect(0, 0, SW, SH, 0x07E0);
-            ESP_LOGW(TAG, "r%d 绿 fill=%s", round, esp_err_to_name(e));
-            vTaskDelay(pdMS_TO_TICKS(2000));
-            e = display_fill_rect(0, 0, SW, SH, 0xFFFF);
-            ESP_LOGW(TAG, "r%d 白 fill=%s", round, esp_err_to_name(e));
-            vTaskDelay(pdMS_TO_TICKS(2000));
+    /* 【配置扫频判读】三色竖条（左红 中绿 右蓝）轮播 4 配置：
+     *   段0=INVON+BGR 段1=INVON+RGB 段2=INVOFF+BGR 段3=INVOFF+RGB
+     * 用户回报"第几段颜色正确"→ 直接锁定 MADCTL/INV 极性。 */
+    for (int r = 0; r < 2; r++) {
+        for (int ci = 0; ci < 4; ci++) {
+            static const uint8_t inv_arg[4] = { 0xFF, 0xFF, 0x00, 0x00 };
+            (void)inv_arg;
+            if (ci >= 2)
+                esp_lcd_panel_io_tx_param(s_io, (uint32_t)0x02 << 24 | 0x20, NULL, 0);  /* INVOFF */
+            else
+                esp_lcd_panel_io_tx_param(s_io, (uint32_t)0x02 << 24 | 0x21, NULL, 0);  /* INVON */
+            uint8_t mad = (ci == 0 || ci == 2) ? 0x08 : 0x00;
+            esp_lcd_panel_io_tx_param(s_io, (uint32_t)0x02 << 24 | 0x36, &mad, 1);      /* MADCTL */
+
+            static uint8_t bar[120 * 2];
+            for (int seg = 0; seg < 3; seg++) {
+                uint16_t c = (seg == 0) ? 0xF800 : (seg == 1) ? 0x07E0 : 0x001F;
+                uint8_t hi = (uint8_t)(c >> 8), lo = (uint8_t)(c & 0xFF);
+                for (int i = 0; i < 120; i++) { bar[i * 2] = hi; bar[i * 2 + 1] = lo; }
+                for (int y = 0; y < (int)SH; y += 2) {
+                    uint8_t ca[4] = { (uint8_t)((seg * 120) >> 8), (uint8_t)(seg * 120),
+                                      (uint8_t)(((seg + 1) * 120 - 1) >> 8), (uint8_t)((seg + 1) * 120 - 1) };
+                    esp_lcd_panel_io_tx_param(s_io, (uint32_t)0x02 << 24 | 0x2A, ca, 4);
+                    uint8_t ra[4] = { 0, (uint8_t)y, 0, (uint8_t)(y + 1) };
+                    esp_lcd_panel_io_tx_param(s_io, (uint32_t)0x02 << 24 | 0x2B, ra, 4);
+                    esp_lcd_panel_io_tx_param(s_io, (uint32_t)0x32 << 24 | 0x2C, bar, sizeof(bar));
+                }
+            }
+            ESP_LOGW(TAG, "配置段 %d：INV=%d BGR=%d（红|绿|蓝竖条）", ci,
+                     (ci == 0 || ci == 2), (ci == 0 || ci == 2) ? 1 : 0);
+            vTaskDelay(pdMS_TO_TICKS(3000));
         }
     }
 #endif

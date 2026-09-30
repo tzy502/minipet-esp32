@@ -1902,7 +1902,10 @@ static uint16_t *layer_rgb_load(const mpak_t *m, uint32_t off, uint32_t len,
         return dst;
     }
 
-    if ((int32_t)vw * RC_SCALE != g_sw || (int32_t)vh * RC_SCALE != g_sh) {
+    /* 【任意比例最近邻 2026-09-30】原仅接受 2x（vw*RC_SCALE==屏宽）；1.85B 360 屏
+     * 用 480 档素材（240 bg → 1.5x）被拒=背景缺失。泛化为 vw/vh→g_sw/g_sh
+     * 最近邻采样（2x 是其特例，216 板行为不变）。 */
+    if (vw == 0 || vh == 0) {
         heap_caps_free(dst);
         return NULL;
     }
@@ -1913,11 +1916,17 @@ static uint16_t *layer_rgb_load(const mpak_t *m, uint32_t off, uint32_t len,
         return NULL;
     }
     uint32_t stride_el = stride_b / 2u;
+    ESP_LOGW(TAG, "[取证] raw[0..3]=%02x%02x %02x%02x %02x%02x %02x%02x dst[0..3]=%04x %04x %04x %04x",
+             raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7],
+             ((uint16_t *)raw)[0], ((uint16_t *)raw)[1], ((uint16_t *)raw)[2], ((uint16_t *)raw)[3]);
     for (int32_t dy = 0; dy < g_sh; dy++) {
-        const uint16_t *srow = (const uint16_t *)raw + (size_t)(dy >> 1) * stride_el;
+        const uint16_t *srow = (const uint16_t *)raw + (size_t)((int64_t)dy * vh / g_sh) * stride_el;
         uint16_t *drow = dst + (size_t)dy * g_sw;
-        for (int32_t dx = 0; dx < g_sw; dx++) drow[dx] = srow[dx >> 1];
+        for (int32_t dx = 0; dx < g_sw; dx++) drow[dx] = srow[(int32_t)((int64_t)dx * vw / g_sw)];
     }
+    ESP_LOGW(TAG, "[取证] dst after: %04x %04x %04x %04x | row165*360: %04x %04x %04x %04x",
+             dst[0], dst[1], dst[2], dst[3],
+             dst[165 * g_sw], dst[165 * g_sw + 1], dst[165 * g_sw + 2], dst[165 * g_sw + 3]);
     heap_caps_free(raw);
     return dst;
 }
@@ -1945,7 +1954,8 @@ static uint8_t *tile_mask_load(const mpak_t *m, uint32_t off, uint32_t len,
     memset(dst, 0, ((size_t)g_sw * g_sh + 7) / 8);
     for (int32_t dy = 0; dy < g_sh; dy++)
         for (int32_t dx = 0; dx < g_sw; dx++) {
-            uint32_t sidx = (uint32_t)(dy >> 1) * vw + (uint32_t)(dx >> 1);
+            uint32_t sidx = (uint32_t)((int64_t)dy * vh / g_sh) * vw +
+                            (uint32_t)((int64_t)dx * vw / g_sw);
             if (rc_mask_bit(raw, sidx))
                 rc_mask_set(dst, (uint32_t)dy * g_sw + dx);
         }
@@ -2626,6 +2636,8 @@ static void render_force_redraw_nolock(void)
     full_recompose();
 }
 
+static bool g_map_static_only = true;   /* 【花屏二分】true=只装载静态层 */
+
 static int render_set_map_nolock(const char *bgmap_path,
                                 const char *strip_parts_paths[], int strip_count)
 {
@@ -2643,6 +2655,10 @@ static int render_set_map_nolock(const char *bgmap_path,
         return RENDER_ERR_ARG;
     }
 
+    ESP_LOGW(TAG, "[取证] bg vw=%u vh=%u static_off=%u static_len=%u tile_len=%u tile_off=%u strips=%u",
+             bg->vw, bg->vh, bg->static_back_off, bg->static_back_len,
+             bg->tile_layer_len, bg->tile_layer_off, bg->strip_count);
+
     scene_free();
 
     g_static = layer_rgb_load(&bm, bg->static_back_off, bg->static_back_len,
@@ -2653,7 +2669,7 @@ static int render_set_map_nolock(const char *bgmap_path,
         full_recompose();
         return MPAK_ERR_FMT;
     }
-    if (bg->tile_layer_len) {
+    if (bg->tile_layer_len && !g_map_static_only) {
         uint32_t stride_b = rc_align4((uint32_t)bg->vw * 2u);
         g_tile = layer_rgb_load(&bm, bg->tile_layer_off,
                                 (uint32_t)bg->vh * stride_b, bg->vw, bg->vh);
@@ -2663,7 +2679,7 @@ static int render_set_map_nolock(const char *bgmap_path,
                                      bg->vw, bg->vh);
     }
 
-    if (strip_count > 0) {
+    if (strip_count > 0 && !g_map_static_only) {
         g_strips = psram((size_t)strip_count * sizeof(rc_strip_t));
         if (!g_strips) { strip_count = 0; }
         g_strip_n = strip_count;
@@ -2685,6 +2701,11 @@ static int render_set_map_nolock(const char *bgmap_path,
 
     /* 【相机下移实验】装载完成后把各层上移，底部缺失行用内嵌地面带补 */
     ground_cam_shift_layers();
+    /* 【缩放器取证】打印静态层首行前 8 像素（与 PC 端导出文件期望值比对） */
+    ESP_LOGW(TAG, "static row0: %04x %04x %04x %04x %04x %04x %04x %04x | row1: %04x %04x %04x %04x",
+             g_static[0], g_static[1], g_static[2], g_static[3],
+             g_static[4], g_static[5], g_static[6], g_static[7],
+             g_static[g_sw], g_static[g_sw + 1], g_static[g_sw + 2], g_static[g_sw + 3]);
 
     g_map_epoch_us = esp_timer_get_time();
     g_map_ok = true;
