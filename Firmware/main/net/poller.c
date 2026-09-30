@@ -187,6 +187,11 @@ static void handle_cmd(cJSON *jc)
     } else if (strcmp(t, "reboot") == 0) {
         c.type = MP_CMD_REBOOT;
         mp_post_cmd(&c);
+    } else if (strcmp(t, "screenshot") == 0) {
+        /* 调试取证：字符串命令 {"t":"screenshot"} → 渲染任务存 BMP 到 TF
+         * （App/服务端 EnqueueLegacy("screenshot","",null) 即可触发） */
+        c.type = MP_CMD_SCREENSHOT;
+        mp_post_cmd(&c);
     } else if (strcmp(t, "bgm") == 0 && v) {
         /* E8：控制入口在设备，但 Web/服务端也可下发纯桌宠指令 */
         mp_audio_msg_t m = { 0 };
@@ -346,6 +351,10 @@ static bool do_poll_once(void)
                     c.a = (int32_t)cJSON_GetNumberValue(pn); mp_post_cmd(&c);
                 } else if (strcmp(tbuf, "reboot") == 0) {
                     mp_cmd_t c = { 0 }; c.type = MP_CMD_REBOOT; mp_post_cmd(&c);
+                } else if (strcmp(tbuf, "screenshot") == 0) {
+                    /* 调试取证：现代口径 {"type":"screenshot"}（Enqueue("screenshot")）
+                     * → 渲染任务存 BMP 到 TF */
+                    mp_cmd_t c = { 0 }; c.type = MP_CMD_SCREENSHOT; mp_post_cmd(&c);
                 } else if (strcmp(tbuf, "bgm") == 0 && cJSON_IsString(vitem)) {
                     mp_audio_msg_t m = { 0 };
                     const char *vv = vitem->valuestring;

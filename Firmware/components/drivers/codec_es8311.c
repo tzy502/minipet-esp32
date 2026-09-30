@@ -84,7 +84,7 @@ static bool                  s_pa_on;
 
 esp_err_t codec_es8311_init(uint32_t sample_rate_hz)
 {
-    const minipet_pins_t *pins = &MINIPET_PROFILE_AMOLED216.pins;
+    const minipet_pins_t *pins = &MINIPET_ACTIVE_PROFILE.pins;
     esp_err_t err;
 
     err = i2c_bus_init();
@@ -218,7 +218,7 @@ esp_err_t codec_es8311_write(const void *pcm16, size_t bytes)
 
 esp_err_t pa_ctrl_enable(bool on)
 {
-    const minipet_pins_t *pins = &MINIPET_PROFILE_AMOLED216.pins;
+    const minipet_pins_t *pins = &MINIPET_ACTIVE_PROFILE.pins;
     gpio_set_level(pins->audio.pa_en, on ? PA_ACTIVE_LEVEL : !PA_ACTIVE_LEVEL);
     s_pa_on = on;
     return ESP_OK;

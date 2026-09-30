@@ -270,7 +270,14 @@ static void app_main_task(void *arg)
      * display_init 由 render_init 内部完成（render.h 契约）。 */
     ESP_ERROR_CHECK(i2c_bus_init());
     ESP_ERROR_CHECK(touch_cst9220_init());
-    ESP_ERROR_CHECK(imu_qmi8658_init());
+    /* IMU 缺失不阻断启动：不带 IMU 的板型（如 1.85B）上 QMI8658 探测 NACK
+     * 会一路返回错误，原先 ESP_ERROR_CHECK 直接 abort → 无限重启，IMU 之后
+     * 的 RTC/PMU/SD/网络/渲染全部验证不到。app 层已有 ready() 降级路径。 */
+    esp_err_t imu_err = imu_qmi8658_init();
+    if (imu_err != ESP_OK) {
+        ESP_LOGE(TAG, "QMI8658 init 失败（%s）：IMU 降级为不可用，继续启动",
+                 esp_err_to_name(imu_err));
+    }
     ESP_ERROR_CHECK(rtc_pcf85063_init());
     ESP_ERROR_CHECK(pmu_axp2101_init());
     bool sd_ok = (sd_mount() == 0);            /* sd_tf.h：返回 errno，挂载 /sdcard */
@@ -304,7 +311,7 @@ static void app_main_task(void *arg)
     provision_portal_early_start_if_needed();
 
     state_machine_init();
-    render_init(&MINIPET_PROFILE_AMOLED216);   /* FATFS 挂载后、首 tick 前（render.h） */
+    render_init(&MINIPET_ACTIVE_PROFILE);   /* FATFS 挂载后、首 tick 前（render.h） */
     provision_dump_internal_heap("render_init 后");
 
     /* 中键历史计数回显（永远生效：GPIO0 通路取证，与标定开关无关） */

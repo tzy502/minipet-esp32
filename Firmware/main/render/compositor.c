@@ -18,6 +18,12 @@
 #include <string.h>
 #include <time.h>
 
+#include <dirent.h>       /* 截图保留最近 3 张：扫描/删除旧 shot_*.bmp */
+#include <errno.h>        /* 截图 open/write 失败原因 */
+#include <fcntl.h>        /* 截图流式写文件（POSIX open/write，免 stdio 缓冲分配） */
+#include <sys/stat.h>     /* mkdir /sdcard/debug */
+#include <unistd.h>       /* write/close/unlink */
+
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 
@@ -1085,6 +1091,9 @@ static void recompose_entity_locked(void)
 {
     memset(g_ent_px, 0, (size_t)RC_ENT_W * RC_ENT_H * 2u);
     memset(g_ent_cov, 0, RC_ENT_COV_BYTES);
+
+    /* RAMless 面板（185B）的持续刷新帧源注册；216（GRAM）为空操作 */
+    display_set_frame_source((const uint16_t *)g_fb, g_sw);
 
     const mpak_layout_t *lt = active_layout();
     if (!lt || !g_parts_ok) return;
@@ -2908,6 +2917,153 @@ void render_input_tilt(float tilt_deg)
     }
     rc_unlock();
 }
+
+/* ================= 调试取证：framebuffer → TF 卡 BMP 截图 =================
+ * 用途：真机渲染问题（残影/错帧/缺块/色偏）的照片取证不如位图可对拍——
+ * 主机端把 BMP 逐像素与合成器预期结果比对，故障在上屏链路还是合成阶段一目了然。
+ *
+ * 实现（约束：内部堆仅 ~17KB，**禁止**分配整帧 24 位缓冲）：
+ *   · 流式写：static 一行缓冲（≤1543B，内部 BSS 不占运行堆）逐行
+ *     RGB565→BGR888 转换后 write 到 FATFS；480×480×3 ≈ 675KB 写入实测
+ *     量级 100–200ms，渲染任务内执行（main.c render_task 排空 cmd_q），
+ *     且每条指令后有 watchdog_kick()，不会触发 E14 熔断。
+ *   · BMP 布局：54B 头 + 自下而上（biHeight>0）的 24 位 BGR 行；
+ *     行按 4 字节对齐（480×3=1440 天然对齐，pad 逻辑仍按通用公式兜底）。
+ *   · 路径 /sdcard/debug/shot_<序号>.bmp：mkdir 层级；序号 = 既有最大 +1，
+ *     保留最近 3 张（按序号最大=最新），写新图前先删最旧的超出部分。
+ *   · sd_tf_is_flash_fallback()==true（TF 缺失回退出厂 Flash 分区）→ 拒绝：
+ *     出厂素材分区仅 6MB，1MB/张 的取证写损耗不可接受。
+ *   · 整程持合成互斥 rc_lock()：本函数虽约定渲染任务调用，但持锁后即使被
+ *     误从其他任务调用也不会读到撕裂帧（与 flush/full_recompose 同一保证）。
+ *     代价是截图 ~150ms 内增量 flush 被串行让路——调试功能可接受。 */
+
+#define MP_SHOT_DIR        "/sdcard/debug"      /* sd_tf.h：挂载点恒为 /sdcard */
+#define MP_SHOT_KEEP       3                    /* 保留最近 3 张 */
+#define MP_SHOT_MAX_W      512                  /* render_init 校验屏宽上限 512 */
+
+/* 一行 BGR 缓冲：最大屏宽 ×3B + 3B 对齐余量（static，不占运行时堆） */
+static uint8_t s_shot_row[MP_SHOT_MAX_W * 3 + 3];
+
+/* BMP 头小端字段写入（FATFS 上直接按字节序写，不做结构体对齐假设） */
+static void shot_put_u16(uint8_t *p, uint16_t v)
+{
+    p[0] = (uint8_t)(v & 0xFFu);
+    p[1] = (uint8_t)(v >> 8);
+}
+static void shot_put_u32(uint8_t *p, uint32_t v)
+{
+    p[0] = (uint8_t)(v & 0xFFu);
+    p[1] = (uint8_t)((v >> 8) & 0xFFu);
+    p[2] = (uint8_t)((v >> 16) & 0xFFu);
+    p[3] = (uint8_t)(v >> 24);
+}
+
+int render_screenshot_to_tf(void)
+{
+    if (!g_inited || !g_fb) {
+        ESP_LOGE(TAG, "截图拒绝：渲染层未初始化");
+        return RENDER_ERR_STATE;
+    }
+    /* 出厂 Flash 素材分区模式（TF 缺失/挂载失败的回退）：6MB 分区经不起
+     * 每张 ~675KB 的取证写损耗（素材区写满会破坏出厂渲染能力）→ 拒绝 */
+    if (sd_tf_is_flash_fallback()) {
+        ESP_LOGW(TAG, "截图拒绝：当前为出厂 Flash 分区模式（无 TF 卡），禁止写入");
+        return RENDER_ERR_UNSUPPORTED;
+    }
+
+    /* 行跨度 4 字节对齐（BMP 规范）；480×3=1440 天然对齐，pad=0 */
+    const size_t row_bytes = (size_t)g_sw * 3u;
+    const size_t stride    = (row_bytes + 3u) & ~(size_t)3u;
+    const size_t pad_bytes = stride - row_bytes;
+    const uint32_t img_size = (uint32_t)stride * (uint32_t)g_sh;
+
+    int64_t t0 = esp_timer_get_time();
+    rc_lock();                             /* 截图期间整屏 flush 串行让路（见函数头注释） */
+
+    /* 1) 建目录（/sdcard 根已由 sd_mount 挂载；debug 层忽略已存在错误） */
+    mkdir(MP_SHOT_DIR, 0775);
+
+    /* 2) 扫描既有 shot_<n>.bmp：求最大序号 + 删最旧（保留最近 MP_SHOT_KEEP 张，
+     *    本次新图计入后仍为 KEEP 张 → 写之前留 KEEP-1 张） */
+    int idxs[MP_SHOT_KEEP + 8];            /* 实际有效个数 ≤ KEEP；容量留余量防竞态 */
+    int n = 0, max_idx = 0;
+    DIR *d = opendir(MP_SHOT_DIR);
+    if (d) {
+        struct dirent *e;
+        while ((e = readdir(d)) != NULL) {
+            unsigned v;
+            if (sscanf(e->d_name, "shot_%u.bmp", &v) != 1) continue;
+            if ((int)v > max_idx) max_idx = (int)v;
+            if (n < (int)(sizeof idxs / sizeof idxs[0])) idxs[n++] = (int)v;
+        }
+        closedir(d);
+    }
+    while (n > MP_SHOT_KEEP - 1) {         /* 删到只剩 KEEP-1 张（新图写入后共 KEEP 张） */
+        int mi = 0;
+        for (int i = 1; i < n; i++) if (idxs[i] < idxs[mi]) mi = i;
+        char old[64];
+        snprintf(old, sizeof(old), MP_SHOT_DIR "/shot_%03d.bmp", idxs[mi]);
+        unlink(old);
+        ESP_LOGI(TAG, "截图轮替：删除最旧 %s", old);
+        idxs[mi] = idxs[--n];
+    }
+
+    /* 3) 流式写 BMP：54B 头 + 自下而上逐行 RGB565→BGR888 */
+    char path[48];
+    snprintf(path, sizeof(path), MP_SHOT_DIR "/shot_%03d.bmp", max_idx + 1);
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (fd < 0) {
+        ESP_LOGE(TAG, "截图失败：open %s errno=%d", path, errno);
+        rc_unlock();
+        return MPAK_ERR_IO;
+    }
+
+    uint8_t hdr[54] = { 0 };
+    hdr[0] = 'B'; hdr[1] = 'M';                    /* bfType */
+    shot_put_u32(hdr + 2,  54u + img_size);        /* bfSize    = 头 + 像素数据 */
+    shot_put_u32(hdr + 10, 54u);                   /* bfOffBits = 像素紧跟头 */
+    shot_put_u32(hdr + 14, 40u);                   /* biSize    = BITMAPINFOHEADER */
+    shot_put_u32(hdr + 18, (uint32_t)g_sw);        /* biWidth */
+    shot_put_u32(hdr + 22, (uint32_t)g_sh);        /* biHeight>0 = 自下而上 */
+    shot_put_u16(hdr + 26, 1u);                    /* biPlanes */
+    shot_put_u16(hdr + 28, 24u);                   /* biBitCount = 24 位 BGR */
+    shot_put_u32(hdr + 30, 0u);                    /* biCompression = BI_RGB */
+    shot_put_u32(hdr + 34, img_size);              /* biSizeImage */
+    /* bfReserved1/2、biXPelsPerMeter/biYPelsPerMeter/biClrUsed/biClrImportant 恒 0 */
+
+    bool io_err = false;
+    if (write(fd, hdr, sizeof hdr) != (ssize_t)sizeof hdr) io_err = true;
+    memset(s_shot_row + row_bytes, 0, pad_bytes);  /* 行尾对齐填充字节（480 宽时恒 0 字节） */
+    /* BMP 行序 = 自下而上：从最后一屏行写到第 0 行 */
+    for (int32_t y = g_sh - 1; y >= 0 && !io_err; y--) {
+        const uint16_t *src = g_fb + (size_t)y * g_sw;
+        uint8_t *dst = s_shot_row;
+        for (int32_t x = 0; x < g_sw; x++) {
+            uint16_t v = src[x];
+            /* RGB565 → 8bit 各通道（与文件内取证 ASCII 探针同口径的左移展开），
+             * BMP 像素序 = B,G,R（小端位图即字节序 BGR） */
+            dst[0] = (uint8_t)((v & 0x1Fu) << 3);          /* B */
+            dst[1] = (uint8_t)(((v >> 5) & 0x3Fu) << 2);   /* G */
+            dst[2] = (uint8_t)(((v >> 11) & 0x1Fu) << 3);  /* R */
+            dst += 3;
+        }
+        if (write(fd, s_shot_row, stride) != (ssize_t)stride) io_err = true;
+    }
+    close(fd);
+    rc_unlock();
+
+    if (io_err) {
+        ESP_LOGE(TAG, "截图失败：write %s 中断（errno=%d）→ 删除不完整文件",
+                 path, errno);
+        unlink(path);                      /* 不完整文件不留作"最近 3 张"之一 */
+        return MPAK_ERR_IO;
+    }
+
+    int64_t ms = (esp_timer_get_time() - t0) / 1000;
+    ESP_LOGI(TAG, "📸 截图已存 %s 用时%lldms", path, (long long)ms);
+    return RENDER_OK;
+}
+
 
 /*
  * ================= PSRAM 预算（480×480，软件设计 4.2 口径） =================

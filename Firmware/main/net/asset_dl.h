@@ -37,6 +37,12 @@ void asset_dl_start(void);
 
 /* 请求一次 manifest diff（boot / poller 发现 mrev 变化 / 状态机回网） */
 void asset_dl_request_sync(void);
+bool asset_dl_sync_attempted(void);
+void asset_dl_reload_local(void);
+bool asset_dl_render_use_factory(void);        /* 渲染根切 /factory（TF 继续作下载根） */
+bool asset_dl_render_root_is_factory(void);
+bool asset_dl_sync_idle(void);        /* sync_once（含下载）是否完全结束 */
+bool asset_dl_critical_ready(void);   /* 关键素材（纸娃娃+stand1）已落盘 TF */        /* sync_once（含下载）是否完全结束 */   /* 重读磁盘 manifest 重建内存表（切工厂分区后调） */   /* 首次清单同步已出结果（供空卡降级判停） */
 
 /* 本地是否已有生效清单（自检决定 POKER/OFFLINE/FATAL 走向） */
 bool asset_dl_have_local_manifest(void);

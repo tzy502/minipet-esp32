@@ -1,5 +1,35 @@
 menu "MiniPet 固件配置"
 
+choice MP_BOARD
+    prompt "目标板型"
+    default MP_BOARD_AMOLED216
+    help
+      选择编译目标的硬件板型。板型决定：profiles 的引脚表/能力位
+      （MINIPET_ACTIVE_PROFILE）、显示驱动（CO5300 vs ST77916）。
+      旧板构建（AMOLED-2.16）是默认值，一切行为不变。
+
+config MP_BOARD_AMOLED216
+    bool "Waveshare ESP32-S3-Touch-AMOLED-2.16（480x480 AMOLED CO5300）"
+
+config MP_BOARD_LCD185B
+    bool "Waveshare ESP32-S3-Touch-LCD-1.85B（360x360 圆 LCD ST77916）"
+endchoice
+
+config MP_LCD_PCLK_HZ
+    int "LCD QSPI 时钟（Hz，仅 MP_BOARD_LCD185B）"
+    default 40000000
+    range 1000000 80000000
+    help
+      ST77916 面板 QSPI 时钟。花屏 bring-up 期先降 20MHz 排除信号完整性；
+      确认后调回 40MHz。
+
+config MP_LCD_BRINGUP_TEST
+    bool "开机全屏色块自检（红→绿→蓝，1.85B bring-up 用，验收后关闭）"
+    default n
+    help
+      display_init 末尾连推三张全屏纯色（各 ~0.7s），与渲染管线完全解耦：
+      颜色正确=传输/像素格式通，花屏=格式/线序问题，不亮=背光/复位问题。
+
 config MINIPET_DEFAULT_SRV_URL
     string "默认服务器地址（NVS srv_url 为空时的兜底）"
     default ""

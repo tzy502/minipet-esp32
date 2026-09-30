@@ -25,7 +25,7 @@ static void key_isr_handler(void *arg)
     (void)arg;
     const int64_t now = esp_timer_get_time();
     const int64_t last = atomic_load(&s_last_edge_us);
-    const bool pressed = (gpio_get_level(MINIPET_PROFILE_AMOLED216.pins.key.menu) == 0);
+    const bool pressed = (gpio_get_level(MINIPET_ACTIVE_PROFILE.pins.key.menu) == 0);
 
     /* 20ms 窗口内的任何电平跳变都视为抖动，仅刷新时间戳 */
     if (now - last < KEY_DEBOUNCE_US) {
@@ -47,7 +47,11 @@ static void key_isr_handler(void *arg)
 
 esp_err_t key_gpio18_init(void)
 {
-    const int8_t pin = MINIPET_PROFILE_AMOLED216.pins.key.menu;
+    const int8_t pin = MINIPET_ACTIVE_PROFILE.pins.key.menu;
+    if (pin < 0) {
+        ESP_LOGW(TAG, "本板无 GPIO18 菜单键（profile key.menu=-1）：跳过初始化");
+        return ESP_OK;   /* 缺席而非错误：输入层按'无菜单键'降级 */
+    }
 
     gpio_config_t io_cfg = {
         .pin_bit_mask = 1ULL << pin,
@@ -75,7 +79,8 @@ esp_err_t key_gpio18_init(void)
 
 bool key_gpio18_pressed(void)
 {
-    return gpio_get_level(MINIPET_PROFILE_AMOLED216.pins.key.menu) == 0;
+    const int8_t pin = MINIPET_ACTIVE_PROFILE.pins.key.menu;
+    return pin >= 0 && gpio_get_level(pin) == 0;
 }
 
 void key_gpio18_set_callback(void (*on_press)(void *arg), void *arg)

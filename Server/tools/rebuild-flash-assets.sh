@@ -114,7 +114,9 @@ IMG="$OUT_DIR/assets.bin"
 echo "   → $IMG ($(wc -c < "$IMG") bytes)"
 
 if [ "$DO_FLASH" = "1" ]; then
-  echo "⑤ 写入 assets 分区（$ASSETS_OFFSET，$(basename "$PORT")）"
+  # ${VAR} 花括号必须保留：变量后紧跟全角标点时裸 $VAR 会被 bash 连进变量名
+  # （真机实证 line 117: ASSETS_OFFSET\xef...: unbound variable）
+  echo "⑤ 写入 assets 分区（${ASSETS_OFFSET}，$(basename "$PORT")）"
   # 串口可能被其他进程占用（串口监视/日志采集）：先给出可读提示
   "$PY" -m esptool --chip esp32s3 -p "$PORT" -b 921600 \
     write_flash "$ASSETS_OFFSET" "$IMG" || {

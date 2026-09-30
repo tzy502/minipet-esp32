@@ -1,0 +1,13 @@
+# Target labels
+ bootloader
+# Source files and their labels
+/Users/a502/IdeaProjects/minipet-esp32/Firmware/build-185b/CMakeFiles/bootloader
+/Users/a502/IdeaProjects/minipet-esp32/Firmware/build-185b/CMakeFiles/bootloader.rule
+/Users/a502/IdeaProjects/minipet-esp32/Firmware/build-185b/CMakeFiles/bootloader-complete.rule
+/Users/a502/IdeaProjects/minipet-esp32/Firmware/build-185b/bootloader-prefix/src/bootloader-stamp/bootloader-build.rule
+/Users/a502/IdeaProjects/minipet-esp32/Firmware/build-185b/bootloader-prefix/src/bootloader-stamp/bootloader-configure.rule
+/Users/a502/IdeaProjects/minipet-esp32/Firmware/build-185b/bootloader-prefix/src/bootloader-stamp/bootloader-download.rule
+/Users/a502/IdeaProjects/minipet-esp32/Firmware/build-185b/bootloader-prefix/src/bootloader-stamp/bootloader-install.rule
+/Users/a502/IdeaProjects/minipet-esp32/Firmware/build-185b/bootloader-prefix/src/bootloader-stamp/bootloader-mkdir.rule
+/Users/a502/IdeaProjects/minipet-esp32/Firmware/build-185b/bootloader-prefix/src/bootloader-stamp/bootloader-patch.rule
+/Users/a502/IdeaProjects/minipet-esp32/Firmware/build-185b/bootloader-prefix/src/bootloader-stamp/bootloader-update.rule

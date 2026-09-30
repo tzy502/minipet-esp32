@@ -53,7 +53,7 @@ esp_err_t i2c_bus_init(void)
         return ESP_OK; /* 幂等 */
     }
 
-    const minipet_pins_t *pins = &MINIPET_PROFILE_AMOLED216.pins;
+    const minipet_pins_t *pins = &MINIPET_ACTIVE_PROFILE.pins;
 
     i2c_master_bus_config_t bus_cfg = {
         .i2c_port           = I2C_NUM_0,

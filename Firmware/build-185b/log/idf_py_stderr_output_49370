@@ -1,0 +1,15 @@
+Command: cmake -G Ninja -DPYTHON_DEPS_CHECKED=1 -DPYTHON=/Users/a502/.espressif/python_env/idf5.5_py3.9_env/bin/python -DESP_PLATFORM=1 -DSDKCONFIG=sdkconfig.185b -DCCACHE_ENABLE=0 /Users/a502/IdeaProjects/minipet-esp32/Firmware
+CMake Warning at /Users/a502/esp/esp-idf/tools/cmake/build.cmake:627 (message):
+Call Stack (most recent call first):
+  /Users/a502/esp/esp-idf/tools/cmake/project.cmake:740 (idf_build_process)
+  CMakeLists.txt:19 (project)
+
+
+info: Trying to set symbol LV_USE_BUILTIN_MALLOC to n, but it is currently selected by choice None. For setting it to n, set another choice symbol to y instead.
+CMake Warning at /Users/a502/esp/esp-idf/tools/cmake/project.cmake:753 (message):
+  Missing kconfig option.  Re-run the build process...
+Call Stack (most recent call first):
+  CMakeLists.txt:19 (project)
+
+
+info: Trying to set symbol LV_USE_BUILTIN_MALLOC to n, but it is currently selected by choice None. For setting it to n, set another choice symbol to y instead.

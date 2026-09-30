@@ -1,0 +1,2 @@
+source /Users/a502/IdeaProjects/minipet-esp32/Firmware/build-185b/bootloader/gdbinit/symbols
+source /Users/a502/IdeaProjects/minipet-esp32/Firmware/build-185b/bootloader/gdbinit/connect

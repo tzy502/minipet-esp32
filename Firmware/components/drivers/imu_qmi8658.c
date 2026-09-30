@@ -92,7 +92,7 @@ static void imu_isr_handler(void *arg)
 
 esp_err_t imu_qmi8658_init(void)
 {
-    const minipet_pins_t *pins = &MINIPET_PROFILE_AMOLED216.pins;
+    const minipet_pins_t *pins = &MINIPET_ACTIVE_PROFILE.pins;
     esp_err_t err;
 
     if (s_ready) {
@@ -142,23 +142,29 @@ esp_err_t imu_qmi8658_init(void)
         }
     }
 
-    /* INT1 = 数据就绪（上升沿）；INT2 一并配成输入备用（中断扩展） */
-    gpio_config_t int1 = {
-        .pin_bit_mask = 1ULL << pins->imu.int1,
-        .mode         = GPIO_MODE_INPUT,
-        .pull_up_en   = GPIO_PULLUP_DISABLE,
-        .intr_type    = QMI8658_INT_EDGE,
-    };
-    gpio_config(&int1);
-    gpio_config_t int2 = {
-        .pin_bit_mask = 1ULL << pins->imu.int2,
-        .mode         = GPIO_MODE_INPUT,
-        .intr_type    = GPIO_INTR_DISABLE,
-    };
-    gpio_config(&int2);
+    /* INT1 = 数据就绪（上升沿）；INT2 一并配成输入备用（中断扩展）。
+     * int1<0 = 该板未引出 INT 脚（如 LCD-1.85B）：跳过 gpio/ISR 配置，
+     * 采样走既有 20ms 轮询兜底（input_dispatch 的 !ready 分支同源）。 */
+    if (pins->imu.int1 >= 0) {
+        gpio_config_t int1 = {
+            .pin_bit_mask = 1ULL << pins->imu.int1,
+            .mode         = GPIO_MODE_INPUT,
+            .pull_up_en   = GPIO_PULLUP_DISABLE,
+            .intr_type    = QMI8658_INT_EDGE,
+        };
+        gpio_config(&int1);
+        gpio_config_t int2 = {
+            .pin_bit_mask = 1ULL << pins->imu.int2,
+            .mode         = GPIO_MODE_INPUT,
+            .intr_type    = GPIO_INTR_DISABLE,
+        };
+        if (pins->imu.int2 >= 0) {
+            gpio_config(&int2);
+        }
 
-    gpio_install_isr_service(0); /* 已装过返回 INVALID_STATE，无碍 */
-    gpio_isr_handler_add(pins->imu.int1, imu_isr_handler, NULL);
+        gpio_install_isr_service(0); /* 已装过返回 INVALID_STATE，无碍 */
+        gpio_isr_handler_add(pins->imu.int1, imu_isr_handler, NULL);
+    }
 
     s_ready = true;
     ESP_LOGI(TAG, "QMI8658 就绪 @0x%02X ±8g/±256dps INT1=%d", addr, pins->imu.int1);

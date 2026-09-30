@@ -1143,6 +1143,15 @@ static void portal_task(void *arg)
 {
     (void)arg;
 
+    /* 【heap 门 2026-09-29】AP 重配会触发 esp_wifi 内部 beacon eb 分配（~752B 内部
+     * 堆）；落在任务创建后的 <3KB 谷底窗口时分配失败 → net80211 空指针 panic
+     * → 复位循环（1.85B 真机实证，216 板同样潜伏只是没踩中）。素材绑定后堆回升，
+     * 这里等最大块到位（≤10s 超时放行）再动 WiFi。 */
+    for (int i = 0; i < 100; i++) {
+        if (heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) >= 6144) break;
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+
     /* 【阶段日志】此前任务静默启动：真机"热点页打不开"时日志里查不到卡在哪一步
      * （起栈→dns→httpd→等待保存），现每一步都留痕。 */
     ESP_LOGW(TAG, "portal_task 起步：内部堆 空闲=%u 最大块=%u",

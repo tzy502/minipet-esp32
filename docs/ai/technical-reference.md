@@ -85,6 +85,21 @@ s.setDTR(False); s.setRTS(True); time.sleep(0.1); s.setRTS(False)   # RTS 脉冲
 | 烧录后行为诡异 | 先确认 flash 真的成功（完整输出见 "Done"）；再排除脏日志误判 |
 | **黑屏 + 串口刷 `boot: No bootable app partitions`（复位循环）** | 烧录中途被取消 → app 分区残缺镜像（`invalid segment length 0xffffffff`），ota_1 又为空 → 处置=重烧完整镜像即愈，与代码无关。**烧录一旦开始不要中断** |
 
+### 2.4B 双板并行开发隔离规约（2026-09-29 起两块板在线）
+
+| 板 | 串口（本次枚举） | 身份特征 | 归属 |
+|---|---|---|---|
+| A（原 2.16） | /dev/cu.usbmodem**21101** | hello 日志 `dev-693ea4`；MAC `44:bd:8d:...` | 主联调板 |
+| B（新入） | /dev/cu.usbmodem**21201** | deviceId 不同；IMU I2C NACK 刷屏为当前特征 | 另一 agent |
+
+**铁律（避免互相影响）**：
+1. **端口名会换**（重插 USB 后 21101/21201 可能互换）——任何 flash/reset 前先静听 5 秒核对身份特征，**禁止裸 `idf.py flash`**（必须 `-p` 显式指定）。
+2. **共享同一个 build 目录**（Firmware/build）：两个 agent 同时 `idf.py build` 会互相踩（ninja 锁/半成品）——构建必须串行；长期解法是各自 `-B build-a` / `-B build-b` 独立构建目录。
+3. 串口互斥：monitor/脚本用完立刻关，不然对方烧录报端口占用。
+4. 服务端天然隔离：deviceId 由 MAC 派生，两板各自注册/配对/manifest，互不覆盖；Web 换装注意选对 deviceId。
+5. WiFi 两板各自 DHCP，无冲突。
+6. 日志文件分板存（/tmp/boardA_*、/tmp/boardB_*），混读会误诊。
+
 ### 2.5 服务端/网络环境
 - 本地服务端（Mac）：`dotnet run`=5059；用户常驻实例抢 5000 勿动；测试显式 `ASPNETCORE_URLS=5059`。dotnet/WZ 数据在 `/Volumes/SSD`（见记忆 dev-env-ssd）。
 - 生产服务端：NAS `http://<NAS_IP>:38090`（**禁改后端**；Mac IP=<MAC_IP>，板子 DHCP≈<DEVICE_IP>）。

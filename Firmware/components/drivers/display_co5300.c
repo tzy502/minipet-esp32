@@ -271,6 +271,13 @@ esp_err_t display_blit(int x, int y, int w, int h, const uint8_t *rgb565_be)
     return err;
 }
 
+/* 216 板（CO5300 GRAM）：脏区增量上屏即可持续显示，无持续刷新需求。
+ * 本函数仅为跨板 API 完整性而存在（185B 的 RAMless 面板才真正消费帧源）。 */
+void display_set_frame_source(const uint16_t *fb, int stride)
+{
+    (void)fb; (void)stride;
+}
+
 esp_err_t display_brightness(uint8_t pct)
 {
     /* CO5300 亮度 = 0x51 DBV 命令（0-255）。panel 未就绪前静默跳过，

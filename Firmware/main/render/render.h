@@ -145,6 +145,15 @@ void render_set_drag_off_y(int32_t py);
 void render_calib_set(bool on, int16_t tx, int16_t ty);
 int32_t render_get_drag_off_y(void);
 
+/* ---------------- 调试取证：framebuffer 整帧存 TF 卡 BMP ------------------
+ * 把当前 g_fb（小端 RGB565）转 24 位 BGR BMP 流式写到
+ * /sdcard/debug/shot_<序号>.bmp（自下而上、54B 头；只留最近 3 张，删最旧）。
+ * 渲染任务内执行（app_cmd_dispatch 转发）= g_fb 天然安全；内部整程持合成
+ * 互斥，跨任务误调用也不会读到撕裂帧。出厂 Flash 素材分区模式
+ * （sd_tf_is_flash_fallback）下拒绝执行 —— 6MB 分区经不起 1MB/张 的写损耗。
+ * 返回 0 成功；负数为错误（RENDER_ERR_* / MPAK_ERR_*）。耗时约 100–200ms。 */
+int render_screenshot_to_tf(void);
+
 /* ==================================================================== */
 /* 【菜单真实化 2026-09】菜单选择器对外钩子（lvgl_bridge.c 实现）          */
 /*                                                                      */

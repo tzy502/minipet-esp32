@@ -134,7 +134,7 @@ static void enter_fatal(const char *line1, const char *line2)
     esp_task_wdt_deinit();
 
     /* 纯黑整屏（AMOLED 纯黑=不发光） */
-    display_fill_rect(0, 0, 480, 480, 0x0000);
+    display_fill_rect(0, 0, MINIPET_ACTIVE_PROFILE.width, MINIPET_ACTIVE_PROFILE.height, 0x0000);
     int rows = fatal_draw_line(line1, 140);
     if (line2 && line2[0]) fatal_draw_line(line2, 140 + rows * TEXT_LINE_H);
 
@@ -314,7 +314,13 @@ bool watchdog_render_allowed(void)
 
 void watchdog_kick(void)
 {
-    if (s_fatal_latched) return;
+    /* FATAL 锁存：软件心跳监控停（本态无渲染心跳是既定事实），但硬件 TWDT
+     * 必须继续喂——否则 CONFIG_ESP_TASK_WDT_PANIC=y 下进 FATAL 5s 必 panic
+     * → 重启循环（真机实证 2026-09-29：黑屏循环的总根因）。 */
+    if (s_fatal_latched) {
+        esp_task_wdt_reset();
+        return;
+    }
     s_last_kick_ms = mp_now_ms();
     esp_task_wdt_reset();
 }
@@ -343,7 +349,7 @@ void watchdog_text_persist(const char *line1, const char *line2)
     /* 只画屏：不关屏不挂起（渲染任务此时无素材可画或已被熔断停止，
      * 该通道独立于渲染路径，E14） */
     s_fatal_latched = true;   /* 停止心跳监控：无渲染心跳是本态的既定事实 */
-    display_fill_rect(0, 0, 480, 480, 0x0000);
+    display_fill_rect(0, 0, MINIPET_ACTIVE_PROFILE.width, MINIPET_ACTIVE_PROFILE.height, 0x0000);
     int rows = fatal_draw_line(line1, 140);
     if (line2 && line2[0]) fatal_draw_line(line2, 140 + rows * TEXT_LINE_H);
 }

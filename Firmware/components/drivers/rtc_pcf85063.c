@@ -57,7 +57,7 @@ static inline uint8_t bin2bcd(uint8_t v)
 
 esp_err_t rtc_pcf85063_init(void)
 {
-    const minipet_pins_t *pins = &MINIPET_PROFILE_AMOLED216.pins;
+    const minipet_pins_t *pins = &MINIPET_ACTIVE_PROFILE.pins;
     esp_err_t err;
 
     if (s_inited) {

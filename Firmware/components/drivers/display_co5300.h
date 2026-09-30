@@ -74,6 +74,15 @@ esp_err_t display_fill_rect(int16_t x, int16_t y, int16_t w, int16_t h,
                             uint16_t rgb565);
 
 /**
+ * @brief 注册持续刷新帧源（RAMless/TE 面板专用；GRAM 板为空操作）
+ *
+ * @param fb 帧缓冲（RGB565，本机字节序或驱动契约字节序）
+ * @param stride 帧缓冲行距（像素）。NULL = 停止持续刷新。
+ * 216（CO5300 GRAM）实现为空操作：脏区增量上屏语义不变。
+ */
+void display_set_frame_source(const uint16_t *fb, int stride);
+
+/**
  * @brief 进入/退出睡眠（CLOCK_DOZE 待机时钟 / FATAL 关屏用，design §4.3）
  *
  * sleep=true: 0x10 SLPIN（屏幕熄灭，功耗降低）

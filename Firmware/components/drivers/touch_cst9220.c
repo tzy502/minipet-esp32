@@ -52,7 +52,7 @@ static void touch_isr_handler(void *arg)
 
 esp_err_t touch_cst9220_init(void)
 {
-    const minipet_pins_t *pins = &MINIPET_PROFILE_AMOLED216.pins;
+    const minipet_pins_t *pins = &MINIPET_ACTIVE_PROFILE.pins;
     esp_err_t err;
 
     err = i2c_bus_init();

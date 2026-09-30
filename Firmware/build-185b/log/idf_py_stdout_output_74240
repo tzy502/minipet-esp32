@@ -1,0 +1,148 @@
+Command: ninja all
+[1/24] Performing build step for 'bootloader'
+[1/1] cd /Users/a502/IdeaProjects/minipet-esp32/Firmware/build-185b/bootloader/esp-idf/esptool_py && /Users/a502/.espressif/python_env/idf5.5_py3.9_env/bin/python /Users/a502/esp/esp-idf/components/partition_table/check_sizes.py --offset 0x8000 bootloader 0x0 /Users/a502/IdeaProjects/minipet-esp32/Firmware/build-185b/bootloader/bootloader.bin
+Bootloader binary size 0x57c0 bytes. 0x2840 bytes (31%) free.
+[2/24] No install step for 'bootloader'
+[3/24] Completed 'bootloader'
+[4/24] Building C object esp-idf/drivers/CMakeFiles/__idf_drivers.dir/sd_tf.c.obj
+[5/24] Building C object esp-idf/drivers/CMakeFiles/__idf_drivers.dir/display_st77916.c.obj
+/Users/a502/IdeaProjects/minipet-esp32/Firmware/components/drivers/display_st77916.c: In function 'display_init':
+/Users/a502/IdeaProjects/minipet-esp32/Firmware/components/drivers/display_st77916.c:358:26: warning: initialization discards 'const' qualifier from pointer target type [-Wdiscarded-qualifiers]
+  358 |         .vendor_config = &vc,
+      |                          ^
+[6/24] Linking C static library esp-idf/drivers/libdrivers.a
+[7/24] Building C object esp-idf/main/CMakeFiles/__idf_main.dir/net/events.c.obj
+[8/24] Building C object esp-idf/main/CMakeFiles/__idf_main.dir/app/watchdog.c.obj
+[9/24] Building C object esp-idf/main/CMakeFiles/__idf_main.dir/main.c.obj
+[10/24] Building C object esp-idf/main/CMakeFiles/__idf_main.dir/render/clock_digits.c.obj
+[11/24] Building C object esp-idf/main/CMakeFiles/__idf_main.dir/app/state_machine.c.obj
+[12/24] Building C object esp-idf/main/CMakeFiles/__idf_main.dir/net/http_client.c.obj
+[13/24] Building C object esp-idf/main/CMakeFiles/__idf_main.dir/render/lvgl_bridge.c.obj
+[14/24] Building C object esp-idf/main/CMakeFiles/__idf_main.dir/net/poller.c.obj
+/Users/a502/IdeaProjects/minipet-esp32/Firmware/main/net/poller.c: In function 'do_poll_once':
+/Users/a502/IdeaProjects/minipet-esp32/Firmware/main/net/poller.c:328:23: warning: variable 'ju' set but not used [-Wunused-but-set-variable]
+  328 |                 cJSON ju = { 0 };
+      |                       ^~
+/Users/a502/IdeaProjects/minipet-esp32/Firmware/main/net/poller.c:325:23: warning: variable 'jn' set but not used [-Wunused-but-set-variable]
+  325 |                 cJSON jn = { 0 };
+      |                       ^~
+/Users/a502/IdeaProjects/minipet-esp32/Firmware/main/net/poller.c:320:23: warning: variable 'jv' set but not used [-Wunused-but-set-variable]
+  320 |                 cJSON jv = { 0 };
+      |                       ^~
+/Users/a502/IdeaProjects/minipet-esp32/Firmware/main/net/poller.c:270:14: warning: unused variable 'rev' [-Wunused-variable]
+  270 |     uint32_t rev = jrev ? (uint32_t)cJSON_GetNumberValue(jrev) : s_since;
+      |              ^~~
+[15/24] Building C object esp-idf/main/CMakeFiles/__idf_main.dir/app/input_dispatch.c.obj
+/Users/a502/IdeaProjects/minipet-esp32/Firmware/main/app/input_dispatch.c:477:13: warning: 'tmap_tap_advance' defined but not used [-Wunused-function]
+  477 | static void tmap_tap_advance(touch_frame_t *f)
+      |             ^~~~~~~~~~~~~~~~
+[16/24] Building C object esp-idf/main/CMakeFiles/__idf_main.dir/audio/bgm.c.obj
+[17/24] Building C object esp-idf/main/CMakeFiles/__idf_main.dir/net/asset_dl.c.obj
+/Users/a502/IdeaProjects/minipet-esp32/Firmware/main/net/asset_dl.c: In function 'sync_once':
+/Users/a502/IdeaProjects/minipet-esp32/Firmware/main/net/asset_dl.c:929:10: warning: unused variable 'pchk' [-Wunused-variable]
+  929 |     char pchk[MP_MPK_PATH_MAX], pdir[64], ldir[64];
+      |          ^~~~
+[18/24] Building C object esp-idf/main/CMakeFiles/__idf_main.dir/app/provision.c.obj
+/Users/a502/IdeaProjects/minipet-esp32/Firmware/main/app/provision.c: In function 'provision_wifi_connect_sta':
+/Users/a502/IdeaProjects/minipet-esp32/Firmware/main/app/provision.c:1431:17: warning: unused variable 's_bssid_picked' [-Wunused-variable]
+ 1431 |     static bool s_bssid_picked;
+      |                 ^~~~~~~~~~~~~~
+/Users/a502/IdeaProjects/minipet-esp32/Firmware/main/app/provision.c: At top level:
+/Users/a502/IdeaProjects/minipet-esp32/Firmware/main/app/provision.c:1319:13: warning: 'sta_pick_strongest_bssid' defined but not used [-Wunused-function]
+ 1319 | static bool sta_pick_strongest_bssid(const char *ssid, uint8_t out_bssid[6], int *out_rssi)
+      |             ^~~~~~~~~~~~~~~~~~~~~~~~
+[19/24] Building C object esp-idf/main/CMakeFiles/__idf_main.dir/render/compositor.c.obj
+/Users/a502/IdeaProjects/minipet-esp32/Firmware/main/render/compositor.c: In function 'ov_draw':
+/Users/a502/IdeaProjects/minipet-esp32/Firmware/main/render/compositor.c:187:26: warning: conversion from 'unsigned int' to 'uint16_t' {aka 'short unsigned int'} changes value from '1052696' to '4120' [-Woverflow]
+  187 | #define RC_OV_PANEL_BG   0x101018u
+      |                          ^~~~~~~~~
+/Users/a502/IdeaProjects/minipet-esp32/Firmware/main/render/compositor.c:415:36: note: in expansion of macro 'RC_OV_PANEL_BG'
+  415 |     ov_fill(0, py0, g_sw, RC_OV_H, RC_OV_PANEL_BG);
+      |                                    ^~~~~~~~~~~~~~
+/Users/a502/IdeaProjects/minipet-esp32/Firmware/main/render/compositor.c:190:26: warning: conversion from 'unsigned int' to 'uint16_t' {aka 'short unsigned int'} changes value from '3950168' to '18008' [-Woverflow]
+  190 | #define RC_OV_DIVIDER    0x3C4658u
+      |                          ^~~~~~~~~
+/Users/a502/IdeaProjects/minipet-esp32/Firmware/main/render/compositor.c:416:30: note: in expansion of macro 'RC_OV_DIVIDER'
+  416 |     ov_fill(0, py0, g_sw, 2, RC_OV_DIVIDER);   /* 顶边分隔线：与宠物区的视觉边界 */
+      |                              ^~~~~~~~~~~~~
+/Users/a502/IdeaProjects/minipet-esp32/Firmware/main/render/compositor.c:188:26: warning: conversion from 'unsigned int' to 'uint16_t' {aka 'short unsigned int'} changes value from '15132400' to '59120' [-Woverflow]
+  188 | #define RC_OV_TITLE_FG   0xE6E6F0u
+      |                          ^~~~~~~~~
+/Users/a502/IdeaProjects/minipet-esp32/Firmware/main/render/compositor.c:422:36: note: in expansion of macro 'RC_OV_TITLE_FG'
+  422 |     ov_text(line, 16, py0 + 14, 3, RC_OV_TITLE_FG, RC_OV_PANEL_BG);
+      |                                    ^~~~~~~~~~~~~~
+/Users/a502/IdeaProjects/minipet-esp32/Firmware/main/render/compositor.c:187:26: warning: conversion from 'unsigned int' to 'uint16_t' {aka 'short unsigned int'} changes value from '1052696' to '4120' [-Woverflow]
+  187 | #define RC_OV_PANEL_BG   0x101018u
+      |                          ^~~~~~~~~
+/Users/a502/IdeaProjects/minipet-esp32/Firmware/main/render/compositor.c:422:52: note: in expansion of macro 'RC_OV_PANEL_BG'
+  422 |     ov_text(line, 16, py0 + 14, 3, RC_OV_TITLE_FG, RC_OV_PANEL_BG);
+      |                                                    ^~~~~~~~~~~~~~
+/Users/a502/IdeaProjects/minipet-esp32/Firmware/main/render/compositor.c:189:26: warning: conversion from 'unsigned int' to 'uint16_t' {aka 'short unsigned int'} changes value from '10133684' to '41140' [-Woverflow]
+  189 | #define RC_OV_INFO_FG    0x9AA0B4u
+      |                          ^~~~~~~~~
+/Users/a502/IdeaProjects/minipet-esp32/Firmware/main/render/compositor.c:430:40: note: in expansion of macro 'RC_OV_INFO_FG'
+  430 |         ov_text(line, 16, py0 + 46, 2, RC_OV_INFO_FG, RC_OV_PANEL_BG);
+      |                                        ^~~~~~~~~~~~~
+/Users/a502/IdeaProjects/minipet-esp32/Firmware/main/render/compositor.c:187:26: warning: conversion from 'unsigned int' to 'uint16_t' {aka 'short unsigned int'} changes value from '1052696' to '4120' [-Woverflow]
+  187 | #define RC_OV_PANEL_BG   0x101018u
+      |                          ^~~~~~~~~
+/Users/a502/IdeaProjects/minipet-esp32/Firmware/main/render/compositor.c:430:55: note: in expansion of macro 'RC_OV_PANEL_BG'
+  430 |         ov_text(line, 16, py0 + 46, 2, RC_OV_INFO_FG, RC_OV_PANEL_BG);
+      |                                                       ^~~~~~~~~~~~~~
+/Users/a502/IdeaProjects/minipet-esp32/Firmware/main/render/compositor.c:192:26: warning: conversion from 'unsigned int' to 'uint16_t' {aka 'short unsigned int'} changes value from '3046763' to '32107' [-Woverflow]
+  192 | #define RC_OV_ITEM_SEL   0x2E7D6Bu
+      |                          ^~~~~~~~~
+/Users/a502/IdeaProjects/minipet-esp32/Firmware/main/render/compositor.c:435:57: note: in expansion of macro 'RC_OV_ITEM_SEL'
+  435 |         ov_text(g_ov_cmd, g_sw - 16 - wpx, py0 + 46, 2, RC_OV_ITEM_SEL, RC_OV_PANEL_BG);
+      |                                                         ^~~~~~~~~~~~~~
+/Users/a502/IdeaProjects/minipet-esp32/Firmware/main/render/compositor.c:187:26: warning: conversion from 'unsigned int' to 'uint16_t' {aka 'short unsigned int'} changes value from '1052696' to '4120' [-Woverflow]
+  187 | #define RC_OV_PANEL_BG   0x101018u
+      |                          ^~~~~~~~~
+/Users/a502/IdeaProjects/minipet-esp32/Firmware/main/render/compositor.c:435:73: note: in expansion of macro 'RC_OV_PANEL_BG'
+  435 |         ov_text(g_ov_cmd, g_sw - 16 - wpx, py0 + 46, 2, RC_OV_ITEM_SEL, RC_OV_PANEL_BG);
+      |                                                                         ^~~~~~~~~~~~~~
+/Users/a502/IdeaProjects/minipet-esp32/Firmware/main/render/compositor.c:193:26: warning: conversion from 'unsigned int' to 'uint16_t' {aka 'short unsigned int'} changes value from '14212841' to '57065' [-Woverflow]
+  193 | #define RC_OV_ITEM_FG    0xD8DEE9u
+      |                          ^~~~~~~~~
+/Users/a502/IdeaProjects/minipet-esp32/Firmware/main/render/compositor.c:454:21: note: in expansion of macro 'RC_OV_ITEM_FG'
+  454 |                     RC_OV_ITEM_FG, sel ? RC_OV_ITEM_SEL : RC_OV_ITEM_BG);
+      |                     ^~~~~~~~~~~~~
+/Users/a502/IdeaProjects/minipet-esp32/Firmware/main/render/compositor.c:188:26: warning: conversion from 'unsigned int' to 'uint16_t' {aka 'short unsigned int'} changes value from '15132400' to '59120' [-Woverflow]
+  188 | #define RC_OV_TITLE_FG   0xE6E6F0u
+      |                          ^~~~~~~~~
+/Users/a502/IdeaProjects/minipet-esp32/Firmware/main/render/compositor.c:456:30: note: in expansion of macro 'RC_OV_TITLE_FG'
+  456 |                              RC_OV_TITLE_FG, RC_OV_ITEM_SEL);
+      |                              ^~~~~~~~~~~~~~
+/Users/a502/IdeaProjects/minipet-esp32/Firmware/main/render/compositor.c:192:26: warning: conversion from 'unsigned int' to 'uint16_t' {aka 'short unsigned int'} changes value from '3046763' to '32107' [-Woverflow]
+  192 | #define RC_OV_ITEM_SEL   0x2E7D6Bu
+      |                          ^~~~~~~~~
+/Users/a502/IdeaProjects/minipet-esp32/Firmware/main/render/compositor.c:456:46: note: in expansion of macro 'RC_OV_ITEM_SEL'
+  456 |                              RC_OV_TITLE_FG, RC_OV_ITEM_SEL);
+      |                                              ^~~~~~~~~~~~~~
+/Users/a502/IdeaProjects/minipet-esp32/Firmware/main/render/compositor.c:194:26: warning: conversion from 'unsigned int' to 'uint16_t' {aka 'short unsigned int'} changes value from '7239302' to '30342' [-Woverflow]
+  194 | #define RC_OV_HINT_FG    0x6E7686u
+      |                          ^~~~~~~~~
+/Users/a502/IdeaProjects/minipet-esp32/Firmware/main/render/compositor.c:462:13: note: in expansion of macro 'RC_OV_HINT_FG'
+  462 |             RC_OV_HINT_FG, RC_OV_PANEL_BG);
+      |             ^~~~~~~~~~~~~
+/Users/a502/IdeaProjects/minipet-esp32/Firmware/main/render/compositor.c:187:26: warning: conversion from 'unsigned int' to 'uint16_t' {aka 'short unsigned int'} changes value from '1052696' to '4120' [-Woverflow]
+  187 | #define RC_OV_PANEL_BG   0x101018u
+      |                          ^~~~~~~~~
+/Users/a502/IdeaProjects/minipet-esp32/Firmware/main/render/compositor.c:462:28: note: in expansion of macro 'RC_OV_PANEL_BG'
+  462 |             RC_OV_HINT_FG, RC_OV_PANEL_BG);
+      |                            ^~~~~~~~~~~~~~
+/Users/a502/IdeaProjects/minipet-esp32/Firmware/main/render/compositor.c: In function 'bubble_render_fallback':
+/Users/a502/IdeaProjects/minipet-esp32/Firmware/main/render/compositor.c:2787:54: warning: unsigned conversion from 'int' to 'uint16_t' {aka 'short unsigned int'} changes value from '1052688' to '4112' [-Woverflow]
+ 2787 |                             cx + col * scale + dx] = 0x101010;
+      |                                                      ^~~~~~~~
+[20/24] Linking C static library esp-idf/main/libmain.a
+[21/24] Generating esp-idf/esp_system/ld/sections.ld
+[22/24] Linking CXX executable minipet.elf
+[23/24] Generating binary image from built executable
+esptool.py v4.12.0
+Creating esp32s3 image...
+Merged 2 ELF sections
+Successfully created esp32s3 image.
+Generated /Users/a502/IdeaProjects/minipet-esp32/Firmware/build-185b/minipet.bin
+[24/24] cd /Users/a502/IdeaProjects/minipet-esp32/Firmware/build-185b/esp-idf/esptool_py && /Users/a502/.espressif/python_env/idf5.5_py3.9_env/bin/python /Users/a502/esp/esp-idf/components/partition_table/check_sizes.py --offset 0x8000 partition --type app /Users/a502/IdeaProjects/minipet-esp32/Firmware/build-185b/partition_table/partition-table.bin /Users/a502/IdeaProjects/minipet-esp32/Firmware/build-185b/minipet.bin
+minipet.bin binary size 0x1b1e50 bytes. Smallest app partition is 0x300000 bytes. 0x14e1b0 bytes (44%) free.

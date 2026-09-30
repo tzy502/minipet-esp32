@@ -366,6 +366,34 @@ void state_machine_boot(bool sd_ok, bool psram_ok)
 
     /* 本地已有素材清单 → 让渲染任务立即从 TF 起播（离线也可跑，E11） */
     ESP_LOGW(TAG, "boot: have_local=%d → 发 MANIFEST_SYNCED", (int)asset_dl_have_local_manifest());
+    if (!asset_dl_have_local_manifest()) {
+        /* 【空卡降级 2026-09-29，用户定稿："没配置走降级"】TF 在位但为空：
+         * 等服务端清单同步最多 12s（清单一到立即继续）；同步已出结果或超时
+         * 仍无本地素材 → 切内部 Flash 出厂素材 + 横幅提示，绝不让用户看黑屏。
+         * boot 上下文安全：此刻无资产绑定/无打开的 SD 文件，可卸 TF。 */
+        /* 等同步【完全结束】再判：have_local 在元数据登记时就翻真（文件可能
+         * 还没下），只看它会在下载中途误判“有素材”→ dispatch 全灭 + 降级切
+         * 分区失败（卸载撞在途下载）→ FATAL（真机实证 2026-09-29）。上限 60s。 */
+        for (int i = 0; i < 240; i++) {
+            if (asset_dl_have_local_manifest() && asset_dl_critical_ready()) break;
+            if (asset_dl_sync_attempted() && asset_dl_sync_idle()) break;
+            vTaskDelay(pdMS_TO_TICKS(250));
+        }
+        if (!(asset_dl_have_local_manifest() && asset_dl_critical_ready())) {
+            if (sd_tf_switch_to_factory() == 0) {
+                /* 双根：TF 保持挂载（下载继续写 /sdcard），渲染读 /factory 快照；
+                 * TF 素材齐了由 sync 门切回渲染根热重绑，全程不打断渲染 */
+                render_banner_show("EMPTY TF - FACTORY ASSETS");
+                mp_cmd_t mc = { .type = MP_CMD_SET_MAP };
+                strlcpy(mc.s, MP_DEFAULT_MAP_ID, sizeof(mc.s));
+                mp_post_cmd(&mc);
+                cmd_simple(MP_CMD_MANIFEST_SYNCED, NULL, 0, 0);
+                ESP_LOGW(TAG, "空卡降级：出厂素材已接管（横幅提示 + 默认地图 %s）",
+                         MP_DEFAULT_MAP_ID);
+            }
+            return;   /* 降级失败（无任何本地素材）：维持后续离线/配网流程 */
+        }
+    }
     if (asset_dl_have_local_manifest()) {
         cmd_simple(MP_CMD_MANIFEST_SYNCED, NULL, 0, 0);
     }
@@ -701,10 +729,40 @@ static void dispatch_manifest_synced(void)
     if (l_ok) { lrc = render_set_layout(path, true); ESP_LOGW(TAG, "layout 路径=%s rc=%d", path, lrc); }
     if (!l_ok || lrc != 0 ||
         !asset_dl_parts_path(NULL, path, sizeof(path))) {
-        ESP_LOGE(TAG, "本地素材加载失败（parts/stand1 缺失）");
-        transition(MP_ST_FATAL);
-        watchdog_text_persist("ASSET LOAD FAILED", "WAIT SERVER SYNC");
-        return;
+        /* 【拉取失败降级 2026-09-29，用户定稿】TF 在位但素材没下全（链路/堆
+         * 紧张）→ 不进 FATAL，切内部 Flash 出厂分区（神子快照）重试一次；
+         * 二次仍失败才 FATAL（真机：出厂分区空壳时代卡过这一步） */
+        ESP_LOGE(TAG, "本地素材加载失败（parts/stand1 缺失）→ 尝试出厂分区降级");
+        /* 切分区会卸载 TF：等在途下载结束（≤10s），否则卸载必失败 */
+        for (int i = 0; i < 40 && !asset_dl_sync_idle(); i++) {
+            vTaskDelay(pdMS_TO_TICKS(250));
+        }
+        if (sd_tf_switch_to_factory() == 0) {
+            /* 【单挂载整体切换】双挂载（/factory max_files=2）实测渲染打开多包
+             * 超额 rc=-1 且内存代价压垮内部堆 → 回退本方案（已验证 rc=0/0）。 */
+            asset_dl_reload_local();
+            char ppath[MP_MPK_PATH_MAX], lpath[MP_MPK_PATH_MAX];
+            /* ⚠️ 两个查询必须各用独立缓冲：layout_path 会覆盖 path（真机实证：
+             * 共用一个缓冲 → render_set_parts 拿到 layout 路径 → 实体空） */
+            if (asset_dl_parts_path(NULL, ppath, sizeof(ppath)) &&
+                asset_dl_layout_path("stand1", lpath, sizeof(lpath))) {
+                int prc = render_set_parts(ppath);
+                int lrc2 = render_set_layout(lpath, true);
+                ESP_LOGW(TAG, "降级绑定：parts=%s rc=%d | layout=%s rc=%d",
+                         ppath, prc, lpath, lrc2);
+                render_banner_show("FACTORY ASSETS - TF SYNC PENDING");
+                ESP_LOGW(TAG, "出厂分区降级成功：神子快照接管渲染");
+            } else {
+                ESP_LOGE(TAG, "出厂分区降级后仍缺素材 → FATAL");
+                transition(MP_ST_FATAL);
+                watchdog_text_persist("ASSET LOAD FAILED", "WAIT SERVER SYNC");
+                return;
+            }
+        } else {
+            transition(MP_ST_FATAL);
+            watchdog_text_persist("ASSET LOAD FAILED", "WAIT SERVER SYNC");
+            return;
+        }
     }
     dispatch_action(MP_ACTION_STAND);
 
@@ -821,6 +879,9 @@ void app_cmd_dispatch(const mp_cmd_t *cmd)
         break;
     case MP_CMD_BGM_PLAYID:                 /* s=数字串曲目 id */
         bgm_play_id((uint32_t)strtoul(cmd->s, NULL, 10));
+        break;
+    case MP_CMD_SCREENSHOT:                 /* 调试取证：g_fb 存 BMP 到 TF（渲染任务上下文） */
+        render_screenshot_to_tf();
         break;
     case MP_CMD_NET_STATE:
     case MP_CMD_BGM_STATE:

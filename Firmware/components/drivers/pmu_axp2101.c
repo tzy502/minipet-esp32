@@ -72,7 +72,7 @@ static void pmu_isr_handler(void *arg)
 
 esp_err_t pmu_axp2101_init(void)
 {
-    const minipet_pins_t *pins = &MINIPET_PROFILE_AMOLED216.pins;
+    const minipet_pins_t *pins = &MINIPET_ACTIVE_PROFILE.pins;
     esp_err_t err;
 
     if (s_inited) {

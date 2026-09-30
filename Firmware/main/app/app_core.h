@@ -168,6 +168,7 @@ typedef enum {
     MP_CMD_BGM_NEXT,        /* 下一首（本地曲目表循环）→ bgm_next            */
     MP_CMD_BGM_PREV,        /* 上一首（本地曲目表循环）→ bgm_prev            */
     MP_CMD_BGM_PLAYID,      /* s=数字串曲目 id → bgm_play_id 选曲播放        */
+    MP_CMD_SCREENSHOT,      /* 调试取证：framebuffer 存 BMP 到 TF（服务端字符串命令触发） */
 } mp_cmd_type_t;
 
 typedef struct {

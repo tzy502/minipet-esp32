@@ -27,6 +27,14 @@ extern "C" {
  */
 int sd_mount(void);
 
+/* TF 在位但无素材、服务端同步失败时：卸载 TF，改挂内部 Flash 出厂素材分区
+ * （/sdcard 路径不变，下游零改动）。幂等；成功返回 0。 */
+int sd_tf_switch_to_factory(void);
+
+/* 工厂分区第二挂载点 /factory（TF 保持挂 /sdcard）：渲染根切工厂用。
+ * 幂等；Flash 回退模式下返回 false（/sdcard 已是工厂，无需第二挂载）。 */
+bool sd_factory_mount_secondary(void);
+
 /** @brief 卸载并释放 SPI 资源（热拔支持用；正常关机可不做） */
 int sd_unmount(void);
 

@@ -61,6 +61,18 @@ typedef struct {
 /** AMOLED-2.16 板 profile 实例（定义在 profile_amoled216.c） */
 extern const minipet_profile_t MINIPET_PROFILE_AMOLED216;
 
+/* ── 多板支持（Kconfig MP_BOARD 选择；见 main/Kconfig.projbuild）─────────
+ * 新板三件套：profile_xxx.c + 本处 extern + drivers 里需要的适配驱动。
+ * MINIPET_ACTIVE_PROFILE 是全工程引用当前板 profile 的唯一入口——
+ * 216 构建下展开为 MINIPET_PROFILE_AMOLED216，行为与引入多板机制前完全一致。 */
+#if CONFIG_MP_BOARD_LCD185B
+/** LCD-1.85B 板 profile 实例（定义在 profile_lcd185b.c） */
+extern const minipet_profile_t MINIPET_PROFILE_LCD185B;
+#define MINIPET_ACTIVE_PROFILE MINIPET_PROFILE_LCD185B
+#else
+#define MINIPET_ACTIVE_PROFILE MINIPET_PROFILE_AMOLED216
+#endif
+
 #ifdef __cplusplus
 }
 #endif

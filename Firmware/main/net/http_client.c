@@ -423,7 +423,7 @@ int mp_http_hello(void)
              mp_http_device_id());
     if (!mp_http_server_url()) return -1;
 
-    const minipet_profile_t *prof = &MINIPET_PROFILE_AMOLED216;
+    const minipet_profile_t *prof = &MINIPET_ACTIVE_PROFILE;
 
     cJSON *root = cJSON_CreateObject();
     cJSON_AddNumberToObject(root, "proto", MP_PROTO_VER);

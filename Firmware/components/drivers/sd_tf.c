@@ -1,8 +1,12 @@
 /**
  * @file sd_tf.c
- * @brief microSD 驱动实现：SPI3_HOST + SDSPI + esp_vfs_fat
+ * @brief microSD 驱动实现：SDMMC 1-bit 原生模式 + esp_vfs_fat
  *
- * 注意：SDSPI 的 host/slot 结构体必须常驻（驱动内部持有指针），用 static。
+ * 2026-09-29 模式切换（SDSPI → SDMMC）：真机实证同一张卡（Mac 可读、FAT32/MBR
+ * 正常）在 SPI 模式 CMD59 被 R1 ILLEGAL_CMD 拒绝（sdmmc_init_spi_crc 0x106），
+ * 而 Waveshare BSP 官方同引脚走 SDMMC 1-bit（bsp_sdcard_mount 原样照抄口径：
+ * CMD=1 CLK=2 D0=3，width=1，无 CD/WP）。SDMMC 原生模式不走 CMD59 路径。
+ * 注意：host/slot 结构体常驻（驱动持有），用 static。
  */
 #include "sd_tf.h"
 
@@ -10,8 +14,8 @@
 #include <stdio.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "driver/spi_master.h"
-#include "driver/sdspi_host.h"
+#include "driver/sdmmc_host.h"
+#include "driver/gpio.h"
 #include "esp_vfs_fat.h"
 #include "wear_levelling.h"
 #include "esp_partition.h"
@@ -21,7 +25,6 @@
 
 static const char *TAG = "sd_tf";
 
-#define SD_SPI_HOST     SPI3_HOST    /* 显示在 SPI2_HOST，互不干扰 */
 #define SD_SPI_HZ       20000000     /* 20MHz：GPIO 矩阵 + 卡兼容性稳妥档 */
 #define SD_MOUNT_POINT  "/sdcard"
 /* 【同时打开文件数 2026-09-27】必须覆盖"常驻打开的素材包"：
@@ -45,11 +48,9 @@ static const char *TAG = "sd_tf";
 static wl_handle_t s_flash_wl = WL_INVALID_HANDLE;
 static bool        s_on_flash;
 
-/* SDSPI 的 host/slot 结构体必须常驻（驱动内部持有指针）。
- * IDF5：SDSPI_HOST_DEFAULT() 返回 sdmmc_host_t（sdspi_host_t 类型已不存在）。
- * C 里花括号宏只能做声明初始化，所以 static 处直接初始化，字段在 sd_mount() 里覆盖。 */
-static sdmmc_host_t          s_host = SDSPI_HOST_DEFAULT();
-static sdspi_device_config_t s_slot = SDSPI_DEVICE_CONFIG_DEFAULT();
+/* SDMMC host/slot 常驻（esp_vfs_fat_sdmmc_mount 内部持有引用） */
+static sdmmc_host_t         s_host = SDMMC_HOST_DEFAULT();
+static sdmmc_slot_config_t  s_slot;
 static sdmmc_card_t         *s_card;
 static bool                  s_mounted;
 
@@ -58,29 +59,40 @@ int sd_mount(void)
     if (s_mounted) {
         return 0;
     }
-    const minipet_pins_t *pins = &MINIPET_PROFILE_AMOLED216.pins;
+    const minipet_pins_t *pins = &MINIPET_ACTIVE_PROFILE.pins;
 
-    /* 1) SPI 总线（SD 卡专用，无 quad 引脚） */
-    spi_bus_config_t bus_cfg = {
-        .mosi_io_num   = pins->sd.mosi,   /* GPIO1  */
-        .miso_io_num   = pins->sd.miso,   /* GPIO3  */
-        .sclk_io_num   = pins->sd.sclk,   /* GPIO2  */
-        .quadwp_io_num = -1,
-        .quadhd_io_num = -1,
-        .max_transfer_sz = 4096,          /* FATFS 单簇级读足够 */
+    /* 原 CS=41（=卡 D3）：SD 卡上电复位时按 CS/D3 电平选模式（低=SPI 高=SD）。
+     * 之前 SPI 固件数十次启动可能已把卡锁在 SPI 态——这里配内部上拉保证
+     * CMD0 期间为高（卡选 SD 模式），若仍超时需拔 USB 给卡断电磁复位 */
+    gpio_config_t cs_pull = {
+        .pin_bit_mask = 1ULL << pins->sd.cs,
+        .mode         = GPIO_MODE_INPUT,
+        .pull_up_en   = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_DISABLE,
     };
-    esp_err_t err = spi_bus_initialize(SD_SPI_HOST, &bus_cfg, SPI_DMA_CH_AUTO);
-    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
-        ESP_LOGE(TAG, "SPI3 初始化失败: %s", esp_err_to_name(err));
-        return EIO;
+    if (pins->sd.cs >= 0) {
+        gpio_config(&cs_pull);   /* cs<0 = 无 CS 脚（SDMMC 原生模式板，如 1.85B） */
     }
 
-    /* 2) SDSPI slot */
-    s_slot.gpio_cs  = pins->sd.cs;        /* GPIO41 */
-    s_slot.host_id = SD_SPI_HOST;
-
-    /* 3) FATFS 挂载（不自动格式化：卡需在 PC 上预先 FAT32/exFAT 格式化） */
-    s_host.slot = SD_SPI_HOST;
+    /* SDMMC 1-bit slot（引脚=BSP 官方宏同款：CMD=1(mosi) CLK=2(sclk) D0=3(miso)）
+     * 不自动格式化：卡需在 PC 上预先 FAT32 格式化 */
+    s_slot = (sdmmc_slot_config_t) {
+        .clk  = pins->sd.sclk,            /* GPIO2 */
+        .cmd  = pins->sd.mosi,            /* GPIO1 */
+        .d0   = pins->sd.miso,            /* GPIO3 */
+        .d1   = GPIO_NUM_NC,
+        .d2   = GPIO_NUM_NC,
+        .d3   = GPIO_NUM_NC,
+        .d4   = GPIO_NUM_NC,
+        .d5   = GPIO_NUM_NC,
+        .d6   = GPIO_NUM_NC,
+        .d7   = GPIO_NUM_NC,
+        .cd   = SDMMC_SLOT_NO_CD,
+        .wp   = SDMMC_SLOT_NO_WP,
+        .width = 1,
+        .flags = 0,
+    };
 
     esp_vfs_fat_mount_config_t mount_cfg = {
         .format_if_mount_failed = false,
@@ -89,13 +101,12 @@ int sd_mount(void)
         .disk_status_check_enable = false,
     };
 
-    err = esp_vfs_fat_sdspi_mount(SD_MOUNT_POINT, &s_host, &s_slot,
-                                  &mount_cfg, &s_card);
+    esp_err_t err = esp_vfs_fat_sdmmc_mount(SD_MOUNT_POINT, &s_host, &s_slot,
+                                            &mount_cfg, &s_card);
     if (err != ESP_OK) {
-        ESP_LOGW(TAG, "SD 挂载失败: %s（未插卡? 卡格式? CS 接线?）→ 尝试内部 Flash assets 分区",
+        ESP_LOGW(TAG, "SD 挂载失败: %s（未插卡? 卡格式?）→ 尝试内部 Flash assets 分区",
                  esp_err_to_name(err));
-        /* 释放 SPI 总线，给重试留干净状态 */
-        spi_bus_free(SD_SPI_HOST);
+        sdmmc_host_deinit();              /* 归还 SDMMC 外设，给重试留干净状态 */
 
         /* Flash 兜底：同一挂载点 /sdcard，下游路径零改动 */
         s_card = NULL;
@@ -130,9 +141,64 @@ int sd_mount(void)
     s_mounted = true;
     s_on_flash = false;
     sdmmc_card_print_info(stdout, s_card);
-    ESP_LOGI(TAG, "SD 已挂载 %s（MOSI=%d CLK=%d MISO=%d CS=%d）",
-             SD_MOUNT_POINT, pins->sd.mosi, pins->sd.sclk,
-             pins->sd.miso, pins->sd.cs);
+    ESP_LOGI(TAG, "SD 已挂载 %s（SDMMC 1-bit：CMD=%d CLK=%d D0=%d）",
+             SD_MOUNT_POINT, pins->sd.mosi, pins->sd.sclk, pins->sd.miso);
+    return 0;
+}
+
+static wl_handle_t s_factory_wl = WL_INVALID_HANDLE;
+
+bool sd_factory_mount_secondary(void)
+{
+    /* 【双根目录】工厂分区挂 /factory（TF 同时挂在 /sdcard）：
+     * 渲染读 /factory（内部 Flash，不受下载影响），下载写 /sdcard（TF）。
+     * 幂等；Flash 回退模式（/sdcard 已是工厂）无需第二挂载返回 false。 */
+    if (s_on_flash) return false;
+    if (s_factory_wl != WL_INVALID_HANDLE) return true;
+    esp_vfs_fat_mount_config_t cfg = {
+        .format_if_mount_failed = false,
+        .max_files              = 2,      /* 渲染侧同时至多开 1-2 个包 */
+        .allocation_unit_size   = 4096,
+    };
+    esp_err_t err = esp_vfs_fat_spiflash_mount_rw_wl("/factory", "assets",
+                                                     &cfg, &s_factory_wl);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "/factory 挂载失败: %s", esp_err_to_name(err));
+        s_factory_wl = WL_INVALID_HANDLE;
+        return false;
+    }
+    ESP_LOGI(TAG, "工厂分区已挂载 /factory（渲染根）");
+    return true;
+}
+
+int sd_tf_switch_to_factory(void)
+{
+    /* 【空卡降级 2026-09-29】TF 在位但为空、服务端清单同步未成功时切回内部
+     * Flash 出厂素材（复用无 TF 兜底整条链）。调用上下文：boot（无资产绑定、
+     * bgm 无打开文件——卸载 TF 安全）。已工厂模式/未挂载则幂等返回。 */
+    if (s_on_flash || !s_mounted) return 0;
+    esp_err_t err = esp_vfs_fat_sdcard_unmount(SD_MOUNT_POINT, s_card);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "TF 卸载失败: %s（放弃降级）", esp_err_to_name(err));
+        return -1;
+    }
+    s_mounted = false;
+    s_card = NULL;
+    esp_vfs_fat_mount_config_t flash_cfg = {
+        .format_if_mount_failed = false,
+        .max_files              = SD_MAX_FILES,
+        .allocation_unit_size   = 4096,
+    };
+    err = esp_vfs_fat_spiflash_mount_rw_wl(SD_MOUNT_POINT, "assets",
+                                           &flash_cfg, &s_flash_wl);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Flash assets 分区挂载失败: %s（降级失败，无本地素材）",
+                 esp_err_to_name(err));
+        s_flash_wl = (wl_handle_t)0;
+        return -1;
+    }
+    s_on_flash = true;
+    ESP_LOGW(TAG, "已切换内部 Flash 出厂素材（TF 为空且清单同步未成）");
     return 0;
 }
 
@@ -159,7 +225,6 @@ int sd_unmount(void)
     }
     s_mounted = false;
     s_card = NULL;
-    spi_bus_free(SD_SPI_HOST);
     return 0;
 }
 
