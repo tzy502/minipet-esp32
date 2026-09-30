@@ -186,15 +186,21 @@ public static class DeviceEndpoints
         return Results.Content(json, "application/json; charset=utf-8");
     }
 
-    /// <summary>单个素材包：流式回 data/cache/export/{deviceId}/（共享包回退全局），禁整载内存。</summary>
+    /// <summary>
+    /// 单个素材包：流式回 data/cache/export/{deviceId}/（共享包回退全局），禁整载内存。
+    /// Range 断点续传（物理路径重载 + enableRangeProcessing）：206 Partial Content +
+    /// Content-Range + 精确 Content-Length 由框架统一处理（区间非法/越界 → 416 +
+    /// `Content-Range: bytes */total`；多区间按 RFC 7233 回 200 全量）；Kestrel 走原生
+    /// sendfile 分段发送。无 Range → 200 全量（行为不变），响应头带 Accept-Ranges: bytes。
+    /// Content-Type/Content-Disposition 与既有语义一致。
+    /// </summary>
     private static IResult HandleAsset(string hash, string? deviceId, DeviceManifestService mfst)
     {
         var file = mfst.FindAssetFile(deviceId, hash);
         if (file == null)
             return Results.Json(new { error = $"素材不存在：{hash}（先跑导出器产出 manifest-assets 与 .mpk）" }, statusCode: 404);
 
-        var fs = new FileStream(file, FileMode.Open, FileAccess.Read, FileShare.Read, 64 * 1024, useAsync: true);
-        return Results.File(fs, "application/octet-stream", Path.GetFileName(file));
+        return Results.File(file, "application/octet-stream", Path.GetFileName(file), enableRangeProcessing: true);
     }
 
     /// <summary>拉指令队列（长轮询挂起 ≤55s；按 seq 有序取走）。</summary>
@@ -283,7 +289,10 @@ public static class DeviceEndpoints
         try
         {
             var stream = await router.OpenStreamAsync(source, id, ctx.RequestAborted);
-            return Results.File(stream.Stream, stream.MimeType);
+            // Range 断点续传（BGM 进度拖动）：可 seek 流（WZ FileStream/内存兜底）交给框架
+            // 处理 206/Content-Range/416（内部 Seek + 64KB 分段拷贝，不整载内存）；QQ 网关
+            // 直链是不可 seek 的 HTTP 转发流（无总长，无法定位区间）→ 维持 200 分块直出。
+            return Results.File(stream.Stream, stream.MimeType, enableRangeProcessing: stream.Stream.CanSeek);
         }
         catch (BgmSourceUnavailableException ex)
         {

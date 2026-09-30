@@ -1,0 +1,508 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<meta name="color-scheme" content="dark">
+<title>滚筒选择器 · 交互原型 · MiniPet ESP32</title>
+<style>
+  :root{
+    --page-bg:#05070d;
+    --screen:#0a0e1a;          /* 参考稿深色底 */
+    --green:#22c55e;           /* 参考稿高亮绿 */
+    --green-soft:rgba(34,197,94,.10);
+    --text:#e2e8f0;
+    --dim:#64748b;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0}
+  body{
+    background:radial-gradient(1200px 800px at 50% -10%, #0d1424, var(--page-bg));
+    color:var(--text);
+    font-family:-apple-system,"PingFang SC","Hiragino Sans GB","Microsoft YaHei","Noto Sans SC",sans-serif;
+    min-height:100vh;display:flex;flex-direction:column;align-items:center;
+    -webkit-font-smoothing:antialiased;
+  }
+  /* ---------- 页头 ---------- */
+  .hd{width:100%;max-width:1060px;padding:22px 24px 6px}
+  .hd-row{display:flex;align-items:center;justify-content:space-between;gap:18px;flex-wrap:wrap}
+  .hd h1{font-size:19px;margin:0;letter-spacing:1px;color:#f1f5f9}
+  .hd h1 small{font-weight:400;color:var(--dim);font-size:12px;margin-left:10px;letter-spacing:.5px}
+  .switch{display:flex;align-items:center;gap:9px;font-size:13px;color:#94a3b8;cursor:pointer;user-select:none}
+  .switch input{position:absolute;opacity:0;width:0;height:0}
+  .switch .slider{width:38px;height:21px;background:#1e293b;border-radius:999px;position:relative;transition:.2s;flex:none;border:1px solid #27354d}
+  .switch .slider::after{content:'';position:absolute;width:15px;height:15px;border-radius:50%;background:#64748b;top:2px;left:2px;transition:.2s}
+  .switch input:checked + .slider{background:rgba(34,197,94,.30);border-color:rgba(34,197,94,.5)}
+  .switch input:checked + .slider::after{left:19px;background:var(--green)}
+  .ops{margin-top:9px;font-size:14px;color:#94a3b8;letter-spacing:.3px}
+  .ops b{color:#4ade80;font-weight:600}
+  .status{margin-top:6px;font-size:12.5px;color:#4b5b74;font-variant-numeric:tabular-nums;letter-spacing:.3px}
+  /* ---------- 设备区 ---------- */
+  .stage{display:flex;gap:58px;align-items:flex-start;justify-content:center;padding:26px 24px 70px;flex-wrap:wrap}
+  .device{display:flex;flex-direction:column;align-items:center;gap:16px}
+  .cap{font-size:13px;color:var(--dim);letter-spacing:.5px;text-align:center;line-height:1.7}
+  .cap b{color:#94a3b8;font-weight:600}
+  .bezel{
+    background:linear-gradient(#0f172a,#111827);
+    border:1px solid #1e293b;padding:14px;
+    box-shadow:0 24px 60px rgba(0,0,0,.55), inset 0 1px 0 rgba(255,255,255,.06);
+  }
+  .bezel.sq{border-radius:38px}
+  .bezel.rd{border-radius:50%}
+  /* ---------- 屏幕通用 ---------- */
+  .screen{
+    position:relative;overflow:hidden;background:var(--screen);
+    touch-action:none;user-select:none;-webkit-user-select:none;
+    cursor:grab;
+  }
+  body.dragging .screen{cursor:grabbing}
+  body.onlykey .screen{cursor:default}
+  .screen.sq{width:480px;height:480px;border-radius:14px}
+  .screen.rd{width:360px;height:360px;border-radius:50%}
+  /* 滚筒行：由 JS 逐帧摆放 */
+  .row{
+    position:absolute;left:0;right:0;top:0;height:var(--rowH);
+    display:flex;align-items:center;justify-content:center;
+    font-size:var(--font);font-weight:600;letter-spacing:2px;color:#e2e8f0;
+    will-change:transform,opacity;white-space:nowrap;
+  }
+  /* 上下渐隐遮罩（不参与滚动） */
+  .fade{position:absolute;left:0;right:0;pointer-events:none;z-index:4}
+  .fade.top{top:0;height:var(--fadeH);background:linear-gradient(to bottom, var(--screen) 8%, rgba(10,14,26,0))}
+  .fade.bot{bottom:0;height:var(--fadeH);background:linear-gradient(to top, var(--screen) 8%, rgba(10,14,26,0))}
+  /* 居中高亮框：绿色圆角（参考稿核心元素） */
+  .frame{
+    position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);
+    width:var(--frameW);height:var(--frameH);
+    border:2px solid var(--green);border-radius:var(--frameR);
+    background:var(--green-soft);
+    box-shadow:0 0 0 1px rgba(34,197,94,.12), 0 0 28px rgba(34,197,94,.16);
+    pointer-events:none;z-index:6;
+  }
+  /* 右侧细滚动条 */
+  .sb{position:absolute;left:var(--sbLeft);top:var(--sbTop);width:3px;height:var(--sbH);
+      background:rgba(255,255,255,.08);border-radius:2px;z-index:7;overflow:hidden}
+  .sb-thumb{position:absolute;left:0;top:0;width:100%;border-radius:2px;background:rgba(34,197,94,.75);will-change:transform}
+  /* 标题 / 提示 / 按钮 */
+  .title{position:absolute;left:0;right:0;top:var(--titleTop);text-align:center;
+         font-size:var(--titleFont);font-weight:800;letter-spacing:4px;color:#f1f5f9;
+         z-index:8;pointer-events:none;text-shadow:0 2px 12px rgba(0,0,0,.6)}
+  .hint{position:absolute;left:0;right:0;bottom:var(--hintBottom);text-align:center;
+        font-size:var(--hintFont);color:#5b6b84;letter-spacing:1px;z-index:8;pointer-events:none}
+  .btnbar{position:absolute;left:0;right:0;bottom:var(--bbBottom);display:none;
+          justify-content:center;gap:var(--bbGap);z-index:9}
+  .screen.sub .btnbar{display:flex}
+  .screen.sub .hint{display:none}
+  .pill{
+    font-size:var(--pillFont);font-weight:600;letter-spacing:2px;cursor:pointer;
+    padding:var(--pillPad);border-radius:999px;
+    border:1px solid rgba(34,197,94,.55);background:rgba(34,197,94,.12);color:#4ade80;
+    transition:filter .15s, transform .1s;
+  }
+  .pill:hover{filter:brightness(1.35)}
+  .pill:active{transform:scale(.96)}
+  .pill.ghost{border-color:rgba(148,163,184,.35);background:rgba(148,163,184,.08);color:#94a3b8}
+  /* toast 提示 */
+  .toast{
+    position:fixed;left:50%;bottom:32px;transform:translateX(-50%) translateY(10px);
+    opacity:0;transition:.25s;pointer-events:none;z-index:99;
+    background:#101828;border:1px solid rgba(34,197,94,.45);color:#d1fae5;
+    padding:10px 22px;border-radius:999px;font-size:14px;letter-spacing:.5px;
+    box-shadow:0 8px 30px rgba(0,0,0,.45);max-width:86vw;text-align:center;
+  }
+  .toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+  @media (max-width:1120px){ .stage{gap:34px} }
+</style>
+</head>
+<body>
+
+<header class="hd">
+  <div class="hd-row">
+    <h1>滚筒选择器 · 交互原型<small>MiniPet ESP32 · 触屏为主 / 单键为辅 · 无限循环</small></h1>
+    <label class="switch">
+      <input type="checkbox" id="keyOnly">
+      <span class="slider"></span>
+      仅按键模式（1.85B 单键验证）
+    </label>
+  </div>
+  <div class="ops" id="ops"></div>
+  <div class="status" id="status">…</div>
+</header>
+
+<main class="stage">
+  <section class="device">
+    <div class="bezel sq"><div class="screen sq" id="screen480"></div></div>
+    <div class="cap"><b>480 × 480 方屏</b>（AMOLED 2.16）· 窗口 5 行 · 行高 88 px<br>主交互：触屏拖拽 / 点击确认</div>
+  </section>
+  <section class="device">
+    <div class="bezel rd"><div class="screen rd" id="screen360"></div></div>
+    <div class="cap"><b>360 × 360 圆屏</b>（LCD 1.85B）· 窗口 3 行 · 行高 64 px<br>辅助：单按键（短按＝确认 / 长按＝退出）</div>
+  </section>
+</main>
+
+<div class="toast" id="toast"></div>
+
+<script>
+'use strict';
+/* =====================================================================
+ * 滚筒选择器交互原型 —— 单文件自包含
+ * 结构：PAGES(页面数据) → PHYS(手感参数) → Roller 视图×2(480方屏/360圆屏)
+ *       → 共享物理控制器(位置/速度/三态) → 输入(指针/滚轮/键盘) → 页面流
+ * 两块屏共享同一份滚筒状态（同一台设备的双屏镜像），任意一块可操作。
+ * ===================================================================== */
+
+/* ---------- 页面数据 ---------- */
+const PAGES = {
+  root:    { title:'MiniPet',  saveName:'',   hint:'滚筒可无限循环：滚到末尾会回绕开头',
+             items:['地图','纸娃娃','BGM','退出'] },
+  maps:    { title:'选择地图',  saveName:'地图', hint:'',
+             items:['小镇广场','森林小径','雪山营地','海边栈道','霓虹夜市','太空舱'] },
+  actions: { title:'选择动作',  saveName:'动作', hint:'',            /* 需求：≥8 项 */
+             items:['站立','行走','奔跑','跳跃','打招呼','睡觉','摇头','转圈','点头','挥手'] },
+  bgm:     { title:'选择曲目',  saveName:'曲目', hint:'',            /* 10 项：演示“10 选项 + 5 行窗口”回绕 */
+             items:['01 保密','02 星尘','03 泡泡','04 夜航','05 豆丁','06 极光','07 橘子汽水','08 雨停了','09 萤火','10 晚安'] },
+};
+const ROOT_GOTO = { 0:'maps', 1:'actions', 2:'bgm' };   /* 根菜单确认项 → 子页（3=退出） */
+
+/* ---------- 手感参数（与 menu-roller-spec.md 第 8 节一一对应） ---------- */
+const PHYS = {
+  FRICTION_PER_FRAME: 0.96,  // 惯性：每 16.7ms 速度乘子（等效时间常数 τ≈409ms，甩一下约滑 5~8 行）
+  V_MIN:      0.0010,        // 行/ms：低于该速度结束惯性 → 吸附
+  V_MAX:      0.06,          // 行/ms：甩动速度上限（防飞出天际）
+  TAU_SNAP:   70,            // ms：吸附指数趋近时间常数（无过冲 → 不弹跳）
+  SNAP_EPS:   0.002,         // 行：吸附完成阈值
+  TAP_DIST:   10,            // px：点击判定位移阈值
+  TAP_TIME:   300,           // ms：点击判定时长阈值
+  WHEEL_STEP: 40,            // 滚轮累计 delta 达到该值 → 走一行
+};
+
+/* ---------- 工具 ---------- */
+const imod  = (v, n) => ((v % n) + n) % n;          // 负数安全取模（JS % 跟随被除数符号）
+const clamp = (v, a, b) => v < a ? a : (v > b ? b : v);
+
+/* ---------- 共享控制器状态 ---------- */
+const ctrl = {
+  page: 'root',
+  pos: 0,          // 滚筒逻辑位置（单位：行，float，无界 → 无限循环）
+  vel: 0,          // 速度（行/ms）
+  mode: 'idle',    // idle | drag | coast | snap
+  target: 0,       // snap 目标行
+  sels: { root:0, maps:0, actions:0, bgm:0 },  // 每页记住上次选择
+  wheelAcc: 0,
+};
+let onlyKey = false;
+let drag = null;   // 当前拖拽会话 {id,y0,p0,t0,moved,samples[]}
+
+/* =====================================================================
+ * 屏幕视图：一块屏 = 一个 Roller 视图（只负责摆放与收集输入）
+ * ===================================================================== */
+const views = [];
+
+function buildView(el, cfg){
+  el.innerHTML =
+    '<div class="strip"></div>' +
+    '<div class="fade top"></div><div class="fade bot"></div>' +
+    '<div class="frame"></div>' +
+    '<div class="sb"><div class="sb-thumb"></div></div>' +
+    '<div class="title"></div>' +
+    '<div class="hint"></div>' +
+    '<div class="btnbar">' +
+      '<button type="button" class="pill ghost" data-act="back">返回</button>' +
+      '<button type="button" class="pill" data-act="save">保存</button>' +
+    '</div>';
+
+  /* 尺寸参数全部走 CSS 变量（480 / 360 两套） */
+  for (const k in cfg.vars) el.style.setProperty(k, cfg.vars[k]);
+
+  const strip = el.querySelector('.strip');
+  const slots = [];
+  const count = cfg.span * 2 + 1;
+  for (let i = 0; i < count; i++) {
+    const r = document.createElement('div');
+    r.className = 'row';
+    r.appendChild(document.createElement('span'));
+    strip.appendChild(r);
+    slots.push(r);
+  }
+
+  const v = {
+    el, cfg, slots,
+    titleEl: el.querySelector('.title'),
+    hintEl:  el.querySelector('.hint'),
+    barEl:   el.querySelector('.btnbar'),
+    thumb:   el.querySelector('.sb-thumb'),
+    N: PAGES[ctrl.page].items.length,
+    trackH: cfg.sbH,
+    thumbH: 24,
+  };
+  views.push(v);
+
+  /* ---- 指针输入（鼠标拖拽 = 模拟手指，触屏同理） ---- */
+  el.addEventListener('pointerdown', e => {
+    if (onlyKey) return;                                  // 仅按键模式：触摸拖拽禁用
+    if (e.target.closest('.pill')) return;                // 按钮不触发滚筒
+    if (drag) return;                                     // 已有手指在拖：忽略第二触点
+    el.setPointerCapture(e.pointerId);
+    drag = { id:e.pointerId, y0:e.clientY, p0:ctrl.pos,
+             t0:e.timeStamp, moved:0,
+             samples:[[e.timeStamp, ctrl.pos]] };
+    ctrl.mode = 'drag'; ctrl.vel = 0;                     // 抓取：立即停住惯性（跟手）
+    document.body.classList.add('dragging');
+  });
+  el.addEventListener('pointermove', e => {
+    if (!drag || e.pointerId !== drag.id || ctrl.mode !== 'drag') return;
+    const dy = e.clientY - drag.y0;
+    drag.moved = Math.max(drag.moved, Math.abs(dy));
+    ctrl.pos = drag.p0 - dy / cfg.rowH;                   // 1:1 跟手，零迟滞（手指向下 → 索引减小）
+    drag.samples.push([e.timeStamp, ctrl.pos]);
+    if (drag.samples.length > 8) drag.samples.shift();
+  });
+  const endDrag = e => {
+    if (!drag || e.pointerId !== drag.id) return;
+    const d = drag; drag = null;
+    document.body.classList.remove('dragging');
+    const dtMs = e.timeStamp - d.t0;
+    const isTap = d.moved < PHYS.TAP_DIST && dtMs < PHYS.TAP_TIME;
+    ctrl.mode = 'idle';
+    if (isTap && e.type === 'pointerup') {
+      /* 点击：命中行 == 居中选中行 → 确认；否则吸附到命中行 */
+      const rect = el.getBoundingClientRect();
+      const yLocal = e.clientY - rect.top - rect.height / 2;
+      const rowT = Math.round(ctrl.pos + yLocal / cfg.rowH);
+      const N = PAGES[ctrl.page].items.length;
+      if (imod(rowT, N) === imod(Math.round(ctrl.pos), N)) confirmCurrent();
+      else startSnap(rowT);
+      return;
+    }
+    /* 拖拽：取最近 ≥25ms 窗口的速度 → 惯性 / 直接吸附 */
+    let vel = 0;
+    const s = d.samples, last = s[s.length - 1];
+    for (let i = 0; i < s.length; i++) {
+      if (last[0] - s[i][0] >= 25) { vel = (last[1] - s[i][1]) / (last[0] - s[i][0]); break; }
+    }
+    vel = clamp(vel, -PHYS.V_MAX, PHYS.V_MAX);
+    if (Math.abs(vel) > PHYS.V_MIN * 1.5) { ctrl.vel = vel; ctrl.mode = 'coast'; }
+    else startSnap(Math.round(ctrl.pos));
+  };
+  el.addEventListener('pointerup', endDrag);
+  el.addEventListener('pointercancel', endDrag);
+  el.addEventListener('contextmenu', e => e.preventDefault());
+
+  /* ---- 滚轮（累计 delta，支持触控板平滑输入） ---- */
+  el.addEventListener('wheel', e => {
+    e.preventDefault();
+    if (onlyKey) return;
+    ctrl.wheelAcc += e.deltaY;
+    if (Math.abs(ctrl.wheelAcc) >= PHYS.WHEEL_STEP) {
+      step(ctrl.wheelAcc > 0 ? 1 : -1);
+      ctrl.wheelAcc = 0;
+    }
+  }, { passive:false });
+
+  /* ---- 子页按钮 ---- */
+  v.barEl.addEventListener('click', e => {
+    const act = e.target.closest('.pill') && e.target.closest('.pill').dataset.act;
+    if (act === 'save') confirmCurrent();   // 子页保存 = 确认当前选中并返回
+    if (act === 'back') goBack();
+  });
+
+  return v;
+}
+
+/* 换页：重建各视图文本/滚动条，位置回到该页记住的选择 */
+function setPageOn(v, key){
+  v.N = PAGES[key].items.length;
+  v.slots.forEach(s => s._key = null);
+  v.titleEl.textContent = PAGES[key].title;
+  v.hintEl.textContent  = PAGES[key].hint;
+  v.el.classList.toggle('sub', key !== 'root');
+  v.thumbH = Math.max(24, v.trackH * clamp(v.cfg.rows / v.N, 0.18, 1));
+  v.thumb.style.height = v.thumbH + 'px';
+  renderView(v);
+}
+
+/* =====================================================================
+ * 渲染：每帧按 pos 摆放槽位（无限回绕 = 行号对 N 取模映射）
+ * ===================================================================== */
+function renderView(v){
+  const items = PAGES[ctrl.page].items, N = v.N;
+  const cfg = v.cfg, rowH = cfg.rowH, cY = cfg.h / 2;
+  const base = Math.round(ctrl.pos);
+  for (let i = 0; i < v.slots.length; i++) {
+    const s   = i - cfg.span;             // 槽位相对中心的行偏移
+    const row = base + s;                 // 逻辑行号（可为负 → imod 回绕）
+    const d   = row - ctrl.pos;           // 与中心的距离（行）
+    const slot = v.slots[i];
+    const key  = ctrl.page + ':' + imod(row, N);
+    if (slot._key !== key) {              // 仅在映射到的选项变化时改文本
+      slot._key = key;
+      slot.firstChild.textContent = items[imod(row, N)];
+    }
+    const o = Math.max(0, 1 - Math.abs(d) * cfg.fadeK);
+    slot.style.opacity = o.toFixed(3);
+    slot.style.visibility = o <= 0.015 ? 'hidden' : 'visible';
+    slot.style.transform =
+      'translateY(' + (cY - rowH / 2 + d * rowH).toFixed(2) + 'px)' +
+      ' scale(' + (1 - Math.min(Math.abs(d), 3) * cfg.scaleK).toFixed(3) + ')';
+  }
+  /* 滚动条：位置比例 = mod(pos,N)/N，回绕时拇指从头再来 */
+  const frac = imod(ctrl.pos, N) / N;
+  v.thumb.style.transform = 'translateY(' + (frac * (v.trackH - v.thumbH)).toFixed(1) + 'px)';
+}
+
+/* =====================================================================
+ * 物理主循环：三态 idle / drag / coast / snap
+ *   drag : pos 跟手（1:1，零迟滞）——在 pointermove 里直接赋值
+ *   coast: pos += v·dt;  v 指数衰减；|v|<V_MIN → snap
+ *   snap : pos 指数趋近 target（无过冲 → 吸附不弹跳）
+ * ===================================================================== */
+function startSnap(t){ ctrl.target = t; ctrl.mode = 'snap'; }
+
+function step(dRow){                       /* 键盘 ↑↓ / 滚轮：走一行（snap 中可累加，连滚不顿挫） */
+  if (ctrl.mode === 'drag') return;
+  if (ctrl.mode === 'snap') ctrl.target += dRow;
+  else startSnap(Math.round(ctrl.pos) + dRow);
+}
+
+const MODE_NAME = { idle:'待机', drag:'拖拽', coast:'惯性', snap:'吸附' };
+let lastTs = 0, lastStatus = 0, lastMode = '';
+
+function tick(now){
+  const dt = Math.min(50, now - lastTs || 16.7);   // 防大步长
+  lastTs = now;
+
+  if (ctrl.mode === 'coast') {
+    ctrl.pos += ctrl.vel * dt;
+    ctrl.vel *= Math.pow(PHYS.FRICTION_PER_FRAME, dt / 16.7);
+    if (Math.abs(ctrl.vel) < PHYS.V_MIN) startSnap(Math.round(ctrl.pos));
+  } else if (ctrl.mode === 'snap') {
+    ctrl.pos += (ctrl.target - ctrl.pos) * (1 - Math.exp(-dt / PHYS.TAU_SNAP));
+    if (Math.abs(ctrl.target - ctrl.pos) < PHYS.SNAP_EPS) {
+      ctrl.pos = ctrl.target; ctrl.mode = 'idle';
+    }
+  }
+  ctrl.wheelAcc *= 0.9;                            // 滚轮累计缓慢清退
+
+  for (const v of views) renderView(v);
+
+  if (ctrl.mode !== lastMode) {
+    lastMode = ctrl.mode;
+    document.body.classList.toggle('dragging', ctrl.mode === 'drag');
+  }
+  if (now - lastStatus > 100) {                    // 状态行 10Hz 节流
+    lastStatus = now;
+    const pg = PAGES[ctrl.page], N = pg.items.length;
+    const sel = imod(Math.round(ctrl.pos), N);
+    document.getElementById('status').textContent =
+      '页面=' + pg.title +
+      ' · 选中=' + pg.items[sel] + '（' + (sel + 1) + '/' + N + '）' +
+      ' · 状态=' + MODE_NAME[ctrl.mode] +
+      ' · 位置=' + ctrl.pos.toFixed(3) + ' 行' +
+      ' · 速度=' + (ctrl.vel * 1000).toFixed(1) + ' 行/s';
+  }
+  requestAnimationFrame(tick);
+}
+
+/* =====================================================================
+ * 页面流：确认 / 返回 / 退出
+ * ===================================================================== */
+function goPage(key, silent){
+  ctrl.page = key;
+  ctrl.pos = ctrl.sels[key]; ctrl.vel = 0; ctrl.target = ctrl.pos;
+  ctrl.mode = 'idle'; ctrl.wheelAcc = 0;
+  for (const v of views) setPageOn(v, key);
+  if (!silent) toast('进入：' + PAGES[key].title);
+}
+
+function goBack(){
+  if (ctrl.page !== 'root') goPage('root');
+  else toast('已在根菜单（真机：长按实体键退出菜单）');
+}
+
+function confirmCurrent(){
+  const pg = PAGES[ctrl.page], N = pg.items.length;
+  const idx = imod(Math.round(ctrl.pos), N);
+  if (ctrl.page === 'root') {
+    if (idx === 3) { toast('已请求退出菜单：返回桌宠主界面（演示结束）'); return; }
+    goPage(ROOT_GOTO[idx]);
+  } else {
+    ctrl.sels[ctrl.page] = idx;
+    goPage('root', true);
+    toast('已保存 · ' + pg.saveName + ' = ' + pg.items[idx]);
+  }
+}
+
+/* =====================================================================
+ * 键盘（两模式通用）：↑↓ 微调 / Enter 确认 / Esc 返回
+ * ===================================================================== */
+window.addEventListener('keydown', e => {
+  if (e.key === 'ArrowDown')      { e.preventDefault(); step(1); }
+  else if (e.key === 'ArrowUp')   { e.preventDefault(); step(-1); }
+  else if (e.key === 'Enter')     { e.preventDefault(); confirmCurrent(); }
+  else if (e.key === 'Escape')    { e.preventDefault(); goBack(); }
+});
+
+/* =====================================================================
+ * 仅按键模式开关：禁用拖拽/滚轮，只用键盘验证单键可达
+ * （真机 1.85B：短按=确认，长按≥600ms=退出；无触摸时的滚动降级方案见规格书）
+ * ===================================================================== */
+const OPS_TOUCH  = '操作：<b>拖拽</b>＝滚动滚筒 · <b>点居中项</b>＝确认 · 滚轮 / ↑ ↓＝微调 · Enter＝确认 · Esc＝返回上级';
+const OPS_KEYONLY = '仅按键模式（模拟 1.85B）：↑ ↓＝选择（降级方案） · <b>Enter</b>＝短按·确认 · <b>Esc</b>＝长按·返回 / 退出 · 触摸拖拽已禁用';
+document.getElementById('keyOnly').addEventListener('change', e => {
+  onlyKey = e.target.checked;
+  document.body.classList.toggle('onlykey', onlyKey);
+  document.getElementById('ops').innerHTML = onlyKey ? OPS_KEYONLY : OPS_TOUCH;
+  toast(onlyKey ? '仅按键模式：拖拽已禁用，请用 ↑ ↓ / Enter / Esc'
+                : '触屏模式：恢复拖拽 / 点击 / 滚轮');
+});
+
+/* ---------- toast ---------- */
+let toastTimer = 0;
+function toast(msg){
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => t.classList.remove('show'), 2000);
+}
+
+/* =====================================================================
+ * 双屏参数（与规格书第 6 节参数表一致）
+ * ===================================================================== */
+buildView(document.getElementById('screen480'), {
+  h:480, rowH:88, rows:5, span:4,          // 5 行窗口 + 上下各 2 个缓冲槽位
+  sbH:384,
+  fadeK:0.42, scaleK:0.05,
+  vars:{
+    '--rowH':'88px',  '--font':'30px',
+    '--frameW':'calc(100% - 32px)', '--frameH':'84px', '--frameR':'18px',
+    '--fadeH':'130px',
+    '--sbLeft':'466px', '--sbTop':'48px', '--sbH':'384px',
+    '--titleTop':'16px',  '--titleFont':'30px',
+    '--hintBottom':'16px','--hintFont':'14px',
+    '--bbBottom':'18px',  '--bbGap':'16px',
+    '--pillFont':'16px',  '--pillPad':'9px 30px',
+  },
+});
+buildView(document.getElementById('screen360'), {
+  h:360, rowH:64, rows:3, span:3,          // 3 行窗口 + 缓冲（圆弧外自动被圆形裁剪 + 渐隐）
+  sbH:120,                                 // 滚动条放在右缘安全区内（x≈320，y 120~240）
+  fadeK:0.55, scaleK:0.06,
+  vars:{
+    '--rowH':'64px',  '--font':'21px',
+    '--frameW':'240px', '--frameH':'58px', '--frameR':'14px',
+    '--fadeH':'92px',
+    '--sbLeft':'319px', '--sbTop':'120px', '--sbH':'120px',
+    '--titleTop':'26px',  '--titleFont':'17px',       // 标题压在 y≈26，避开圆弧
+    '--hintBottom':'26px','--hintFont':'12px',
+    '--bbBottom':'28px',  '--bbGap':'10px',           // 按钮带压在 y≈302~332，弦宽约 192px 内
+    '--pillFont':'13px',  '--pillPad':'6px 18px',
+  },
+});
+
+for (const v of views) setPageOn(v, ctrl.page);
+document.getElementById('ops').innerHTML = OPS_TOUCH;
+requestAnimationFrame(ts => { lastTs = ts; requestAnimationFrame(tick); });
+</script>
+</body>
+</html>
