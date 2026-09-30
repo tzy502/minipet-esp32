@@ -26,6 +26,7 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "lwip/sockets.h"  /* UDP 帧倾倒（远程取证第二通道，免拔卡） */
 
 #include <lvgl.h>
 
@@ -81,6 +82,7 @@ static void rc_unlock(void)
 {
     if (s_rlock) xSemaphoreGiveRecursive(s_rlock);
 }
+
 
 /* 帧数据锁: 持续刷新拷贝 g_fb 前必须持锁, 防读写撕裂花屏 */
 void compositor_frame_lock(void) { rc_lock(); }
@@ -569,7 +571,12 @@ static const char kGroundMapId[] = "000010000";
  * （世界 1x）。于是画面 = 世界 y ∈ [15.5, 255.5]，真 foothold（world 245.5）正好落到
  * 设备 y=460 = 屏底-20 ✓ 人物脚底就踩在红线那层地面上。
  * 关掉本实验：把 MP_GROUND_CAM_SHIFT_PX 置 0 即可（代码路径整体跳过）。 */
-#define MP_GROUND_CAM_SHIFT_PX 248          /* 设备像素；248 = 124 世界像素 */
+/* 【按板定相机下移 2026-10-01】原为全局宏 MP_GROUND_CAM_SHIFT_PX——两个开发
+ * 会话共用工作区时互相覆盖（板B实验改 248，板A构建被动带上 → 板A"背景变了"
+ * 用户报障）。改为 profile 字段 ground_cam_shift_px：板A(amoled216)=0 恢复
+ * 原景（用户定稿：图2 蘑菇屋场景+宠物站地面线即正确），板B(lcd185b)=248
+ * 保留其实验。render_init 从 profile 装载。 */
+static int32_t s_ground_shift_px;       /* 0=实验关闭（板A 定稿值） */
 
 extern const uint8_t ground_band_000010000_bin_start[] asm("_binary_ground_band_000010000_bin_start");
 #define MP_GROUND_BAND_W 240
@@ -1812,9 +1819,10 @@ static void blit_be(int32_t x, int32_t y, int32_t w, int32_t h,
  * 只在命中地面表（= 这张图）且开了实验开关时执行。 */
 static void ground_cam_shift_layers(void)
 {
-#if MP_GROUND_CAM_SHIFT_PX > 0
+    if (s_ground_shift_px <= 0) return;    /* 板A=0（定稿原景）；板B profile 可开 */
+    {
     if (!g_ground_tbl_on) return;
-    const int32_t sh = MP_GROUND_CAM_SHIFT_PX;
+    const int32_t sh = s_ground_shift_px;
     if (sh <= 0 || sh >= g_sh) return;
 
     if (g_static) {
@@ -1850,7 +1858,7 @@ static void ground_cam_shift_layers(void)
     }
     ESP_LOGI(TAG, "相机下移实验：各层上移 %d 行（设备像素），底部用内嵌地面带补齐；条带 y -= %d",
              (int)sh, (int)(sh >> 1));
-#endif
+    }
 }
 
 static void full_recompose(void)
@@ -2092,6 +2100,7 @@ int render_init(const minipet_profile_t *profile)
 
     g_sw = profile->width;
     g_sh = profile->height;
+    s_ground_shift_px = profile->ground_cam_shift_px;   /* 相机下移按板定稿 */
     if (g_sw <= 0 || g_sh <= 0 || g_sw > 512 || g_sh > 512)
         return RENDER_ERR_ARG;
 
@@ -2301,6 +2310,36 @@ static void drag_limit_selftest(void)
 }
 #endif
 
+/* ══ 【越屏弹回 2026-10-01】用户定稿：宠物在屏幕外的面积 >50% → 弹回边框 ══
+ * 触发场景：动作/表情切换（fly 画布 368×258 ≫ stand 214×168）时画布绕 origin
+ * 重展，setter 时夹好的 drag 对新画布失效 → 大半出屏；快速甩动同理。
+ * 每帧合成前跑：可见面积 <50% → 按当前画布把 drag 夹回"矩形完全在屏内"
+ * （与 drag_clamp 同数学）= 贴边弹回；可见 ≥50% 不干预（全屏拖拽保留）。 */
+static void ent_bounce_if_offscreen(void)
+{
+    if (!g_ent_cbox_ok || !g_inited) return;
+    int32_t dw, dh, bx, by;
+    ent_disp_size(&dw, &dh);
+    if (dw <= 0 || dh <= 0) return;
+    ent_screen_pos_at(g_tilt_mdeg, &bx, &by);
+    int32_t x1 = bx + dw, y1 = by + dh;
+    int32_t ox = (x1 < g_sw ? x1 : g_sw) - (bx > 0 ? bx : 0);
+    int32_t oy = (y1 < g_sh ? y1 : g_sh) - (by > 0 ? by : 0);
+    if (ox < 0) ox = 0;
+    if (oy < 0) oy = 0;
+    if ((int64_t)ox * oy * 2 >= (int64_t)dw * dh) return;   /* 可见 ≥50%：不弹 */
+    int32_t px = g_drag_off_x, py = g_drag_off_y;
+    drag_clamp(&px, &py);
+    if (px != g_drag_off_x || py != g_drag_off_y) {
+        mark_ent();                            /* 旧位置标脏（防瞬移残影） */
+        g_drag_off_x = px;
+        g_drag_off_y = py;
+        mark_ent();                            /* 新位置标脏 */
+        ESP_LOGI(TAG, "越屏弹回：可见(%dx%d)/画布(%dx%d)<50%% → drag 夹回(%d,%d)",
+                 ox, oy, (int)dw, (int)dh, (int)px, (int)py);
+    }
+}
+
 void render_tick(void)
 {
     if (!g_inited) return;
@@ -2353,6 +2392,9 @@ void render_tick(void)
 #endif
 
     bool any = false;
+
+    /* 【越屏弹回】动作切换后画布重展可能让宠物大半出屏 → 每帧先纠偏 */
+    ent_bounce_if_offscreen();
 
     /* 1) 实体动画帧/表情/blink */
     rc_anim_ev_t ev;
@@ -2636,7 +2678,11 @@ static void render_force_redraw_nolock(void)
     full_recompose();
 }
 
-static bool g_map_static_only = true;   /* 【花屏二分】true=只装载静态层 */
+/* 【花屏二分已结案 2026-10-01】true=只装载静态层（调试遗留，fbceb82 带入）：
+ * 真机实证后果=条带段（树冠/房子/丘陵）与 tile 地形全不装载 → 只剩天空
+ * static（用户报障"地图渲染有问题/背景只剩天空"）。新分段导出格式下
+ * static 本身就只是天空段，场景中间层全在条带里——此开关必须为 false。 */
+static bool g_map_static_only = false;
 
 static int render_set_map_nolock(const char *bgmap_path,
                                 const char *strip_parts_paths[], int strip_count)
@@ -2970,6 +3016,70 @@ void render_input_tilt(float tilt_deg)
 /* 一行 BGR 缓冲：最大屏宽 ×3B + 3B 对齐余量（static，不占运行时堆） */
 static uint8_t s_shot_row[MP_SHOT_MAX_W * 3 + 3];
 
+/* ══ 【UDP 帧倾倒 2026-10-01】远程取证第二通道（TF 截图要拔卡，远程看不见屏） ══
+ * 把 g_fb（最终合成帧 RGB565）经 UDP 广播倾倒到局域网 :9999。Mac 侧一条命令收帧：
+ *   nc -ulnw 9999 > /tmp/fb.raw   （先收 10B 头 "MPFB"+w+h+pkts，其后为像素包）
+ * 协议：第 0 包 = "MPFB" + w(u16le) + h(u16le) + data_pkts(u16le)；其后每包 =
+ * seq(u16le，从 0 起) + ≤1400B 像素（g_fb 行优先小端，480×480×2=460800B→330 包）。
+ * 每 8 包歇 1 tick 防 lwip pbuf 枯竭；任何失败静默 return——取证通道绝不反噬
+ * 渲染主流程。须持 rc_lock 调用（g_fb 读保护）。 */
+static void frame_dump_udp_locked(void)
+{
+    const size_t total = (size_t)g_sw * g_sh * 2u;
+    const int payload_max = 1400;
+    const int data_pkts = (int)((total + payload_max - 1) / payload_max);
+
+    uint8_t hdr[10];
+    memcpy(hdr, "MPFB", 4);
+    hdr[4] = (uint8_t)(g_sw & 0xff);      hdr[5] = (uint8_t)(g_sw >> 8);
+    hdr[6] = (uint8_t)(g_sh & 0xff);      hdr[7] = (uint8_t)(g_sh >> 8);
+    hdr[8] = (uint8_t)(data_pkts & 0xff); hdr[9] = (uint8_t)(data_pkts >> 8);
+
+    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock < 0) return;
+    int br = 1;
+    setsockopt(sock, SOL_SOCKET, SO_BROADCAST, &br, sizeof(br));
+    struct sockaddr_in dst;
+    memset(&dst, 0, sizeof dst);
+    dst.sin_family = AF_INET;
+    dst.sin_port = htons(9999);
+    dst.sin_addr.s_addr = htonl(INADDR_BROADCAST);
+    if (sendto(sock, hdr, sizeof hdr, 0, (struct sockaddr *)&dst, sizeof dst) < 0) {
+        close(sock);
+        return;
+    }
+    const uint8_t *fb = (const uint8_t *)g_fb;
+    static uint8_t pkt[2 + 1400];          /* 1.4KB 在 bss，不占运行时堆 */
+    int sent = 0;
+    for (int i = 0; i < data_pkts; i++) {
+        size_t off = (size_t)i * payload_max;
+        size_t len = total - off;
+        if (len > (size_t)payload_max) len = payload_max;
+        pkt[0] = (uint8_t)(i & 0xff);
+        pkt[1] = (uint8_t)((i >> 8) & 0xff);
+        memcpy(pkt + 2, fb + off, len);
+        /* 失败退避重试：lwip pbuf 瞬时枯竭（真机：每 8 包歇 1 tick 仍 330 包只
+         * 成 100）。每 2 包歇 1 tick + 单包最多 3 试（2/4ms），最坏 ~3.5s。 */
+        for (int t = 0; t < 3; t++) {
+            if (sendto(sock, pkt, 2 + (int)len, 0,
+                       (struct sockaddr *)&dst, sizeof dst) >= 0) { sent++; break; }
+            vTaskDelay(pdMS_TO_TICKS(2 + 2 * t));
+        }
+        if ((i & 1) == 1) vTaskDelay(1);
+    }
+    close(sock);
+    ESP_LOGI(TAG, "📡 UDP 帧倾倒：1+%d 包（成 %d）→ 广播:9999", data_pkts, sent);
+}
+
+/* 远程取证入口（public）：不依赖 TF，仅倾倒当前合成帧。 */
+void render_frame_dump_udp(void)
+{
+    if (!g_inited || !g_fb) return;
+    rc_lock();
+    frame_dump_udp_locked();
+    rc_unlock();
+}
+
 /* BMP 头小端字段写入（FATFS 上直接按字节序写，不做结构体对齐假设） */
 static void shot_put_u16(uint8_t *p, uint16_t v)
 {
@@ -3076,6 +3186,7 @@ int render_screenshot_to_tf(void)
         if (write(fd, s_shot_row, stride) != (ssize_t)stride) io_err = true;
     }
     close(fd);
+    frame_dump_udp_locked();               /* TF 截图成功 → 顺手 UDP 倾倒一份（同锁） */
     rc_unlock();
 
     if (io_err) {

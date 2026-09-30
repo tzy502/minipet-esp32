@@ -1,6 +1,7 @@
 # MiniPet ESP32 技术总档（唯一权威技术文档）
 
-> 2026-09-27 汇总。本文档 = 硬件事实 + 环境操作 + 架构 + 全部根因台账 + 契约 + 标定状态 + 遗留清单。
+> 2026-09-27 汇总，2026-10-01 增补（预设推送/地图分段/UDP 取证/双板冲突规约）。
+> 本文档 = 硬件事实 + 环境操作 + 架构 + 全部根因台账 + 契约 + 标定状态 + 遗留清单。
 > 新会话/新人接手：先读本文档，再读 `hardware-bringup-issues.md`（联调动态）。
 > 规则：每次修复必须有真机证据（日志/照片）；禁止"代码写完即报完成"。
 
@@ -94,17 +95,41 @@ s.setDTR(False); s.setRTS(True); time.sleep(0.1); s.setRTS(False)   # RTS 脉冲
 
 **铁律（避免互相影响）**：
 1. **端口名会换**（重插 USB 后 21101/21201 可能互换）——任何 flash/reset 前先静听 5 秒核对身份特征，**禁止裸 `idf.py flash`**（必须 `-p` 显式指定）。
-2. **共享同一个 build 目录**（Firmware/build）：两个 agent 同时 `idf.py build` 会互相踩（ninja 锁/半成品）——构建必须串行；长期解法是各自 `-B build-a` / `-B build-b` 独立构建目录。
+2. **构建目录已分板**：板A=Firmware/build、板B=Firmware/build-185b（各自 `-B` 指定）；同目录并行 `idf.py build` 会互相踩（ninja 锁/半成品）。
 3. 串口互斥：monitor/脚本用完立刻关，不然对方烧录报端口占用。
 4. 服务端天然隔离：deviceId 由 MAC 派生，两板各自注册/配对/manifest，互不覆盖；Web 换装注意选对 deviceId。
 5. WiFi 两板各自 DHCP，无冲突。
 6. 日志文件分板存（/tmp/boardA_*、/tmp/boardB_*），混读会误诊。
+7. **共享源文件必须参数化，禁止宏开关**（2026-10-01 血案）：一个 session 把
+   `MP_GROUND_CAM_SHIFT_PX` 宏 0→248，另一板构建被动带上=用户"背景变了"；另一
+   session 在 input_dispatch.c 留半成品（变量用先于声明）→ 对方编译失败。
+   **板级差异一律进 profile 字段**（先例：`ground_cam_shift_px`），跨 session
+   改共享文件前先确认对方没有在飞编辑。
 
 ### 2.5 服务端/网络环境
 - 本地服务端（Mac）：`dotnet run`=5059；用户常驻实例抢 5000 勿动；测试显式 `ASPNETCORE_URLS=5059`。dotnet/WZ 数据在 `/Volumes/SSD`（见记忆 dev-env-ssd）。
 - 生产服务端：NAS `http://<NAS_IP>:38090`（**禁改后端**；Mac IP=<MAC_IP>，板子 DHCP≈<DEVICE_IP>）。
 - 家 WiFi：<SSID> / <WIFI_PASSWORD>（12 位，别输成 13 位）。SoftAP 配网：`<AP_SSID>` → portal 192.168.4.1。
 - 服务端健康自检：`curl -m 5 http://<NAS_IP>:38090/api/device/hello`（GET 应 200）。
+- **地图/NPC 运行时登记**：`POST /api/admin/devices/{id}/push {"kind":"map|npc","id":...,"switch":true}`
+  → WZ 打包+登记+rev bump+自动切图。**会双发切图指令（立即+15s）**——串口连换两次
+  同图=设计行为。资产未被 push 过就不在清单里（"拉取失败"先查清单有没有该条目）。
+
+### 2.6 UDP 帧倾倒（远程看屏取证，2026-10-01 上线）
+
+- **触发**：bubble 文本魔数 `::shot`——`curl -X POST http://<NAS_IP>:38090/api/admin/devices/{id}/command -H "Content-Type: application/json" -d '{"type":"bubble","value":"::shot"}'`。
+  设备把 g_fb（最终合成帧 RGB565）UDP 广播 :9999；TF 截图照旧落 /sdcard/debug/shot_NNN.bmp。
+- **Mac 收帧**（nc 收不全——UDP 到了内核但不进 nc，用 python）：
+  ```python
+  # /tmp/udprx.py：bind 0.0.0.0:9999，SO_RCVBUF 1<<22，收 "MPFB"+w+h+n 头与
+  # seq+1400B 数据包，25s 超时，重组写 /tmp/fb.raw
+  ```
+  然后 RGB565→PNG（PIL）：`Image.frombytes('RGB',(w,h), RGB565le 展开字节)`。
+- **丢包判读链**：设备日志 `📡 UDP 帧倾倒：1+330 包（成 N）`（N<330=设备侧 lwip pbuf
+  枯竭，已带每 2 包歇 1 tick+单包 3 试退避）；`netstat -s -p udp | grep received`
+  触发前后对照（涨了=包到内核，收不到=应用层/nc 语义问题）。
+- **用例**：宠物/地图渲染对不对、脏区残影、弹回/拖拽行为——串口探针看不见的视觉
+  真相，一条命令拿到精确像素。服务端 screenshot 白名单放行后可换正式通道。
 
 ---
 
@@ -126,6 +151,16 @@ app_main（main.c）
 3. blit_be：小端 FB → 大端字节交换（12KB 64B 对齐 stage，**行高恒偶**）→ display_blit
 4. display_co5300.c：esp_lcd QSPI（队列深度 3）+ **槽位信号量背压**（在飞≤3，完成回调归还，2s 泄漏探针）
 5. 面板方向：**swap=false + 无镜像（组合 0，原生方向）**——菜单照片终审：组合1(mirror_x)文字左右镜像、组合2(mirror_y)垂直颠倒，原生即正立
+6. **相机下移实验=profile 字段 `ground_cam_shift_px`**（amoled216=0 定稿原景 /
+   lcd185b=248 实验）：装载地图后 static/tile/掩码整体上移 N 行、底部用内嵌
+   地面带（ground_band_000010000.bin）补齐、条带 y -= N/2 世界像素。**禁止恢复全局
+   宏**（跨 session 冲突血案，见 2.4B 铁律 7）。
+7. **地图分段格式**（运行时登记的 237KB 新包）：static=天空段（back 切段的段0），
+   树冠/房子/丘陵在 speed=0 条带段（y=0 全视口层）、地形在 tile 层——
+   **`g_map_static_only` 必须 false**（true=只装 static=只剩天空，调试遗留入库案）。
+8. **越屏弹回**：`ent_bounce_if_offscreen()` 每帧合成前——宠物出屏面积>50% →
+   drag 按当前画布夹回全可见（贴边），双 mark_ent 防残影（动作切换画布重展是
+   主要出屏来源）。
 
 ### 音频管线（bgm.c）
 触发(audio_q) → 曲目表(SD `minipet/audio/*.mpk` AUDIO_META) → mp_http 流式 GET → minimp3(vendored 真解码) → pcm_ring → feeder 任务 → ES8311 I2S；PA=GPIO46 有数据才开。任务栈 24576（mp3dec scratch ~16KB 在栈上）。
@@ -153,6 +188,9 @@ app_main（main.c）
 | 气泡不显示 | `font 1 not loaded`（服务端字体链断 E12）→ LVGL 渲染静默失败 | **内置 5x7 兜底** bubble_render_fallback（配对码=纯数字不依赖字体链） |
 | 黑屏（历史） | 手写 QSPI 时序不可靠 | 换官方 waveshare BSP |
 | 右缘 480 残影 | mark/compose/blit 三路矩形分歧 | ent_screen_rect_at 权威矩形（先 clamp 再取偶） |
+| **预设推送后宠物消失/全黑** | **s_files 只增量 upsert 不剪除**：服务端重新登记后旧 hash 不被服务+本地 LRU 淘汰，但 parts_path 按"第一个 paperdoll 匹配"仍选中死 hash → open errno=2 → 实体 0×0 | `prune_stale_locked()` 每次完整清单对账剪除；**rev 相等 304 分支也剪**（TF manifest.json 可能是旧固件混入版），剪后不早退走完整路径触发重绑 |
+| **地图只剩天空+黑线** | `g_map_static_only=true` 花屏二分调试态随提交入库：tile+条带段全不装载；新分段格式下 static 本身=天空段 | =false。判读：boot 无条带 parts 的 mpak open = 还开着 |
+| 宠物被拖/换动作后大半出屏 | 动作切换画布重展（fly 368×258≫stand）后旧 drag 失效 | `ent_bounce_if_offscreen()` 每帧：出屏>50% → drag_clamp 夹回贴边 |
 
 ### 输入
 | 症状 | 根因 | 结论/修法 |
@@ -167,11 +205,19 @@ app_main（main.c）
 | 板子 TCP 被服务端 RST（errno=104） | **服务端与请求内容均无责**（Mac 同网段逐字复刻全 200+连发 200；板子 TCP 握手能过、open 阶段被掐） | 已自然恢复（hello ok 多轮）；裸 socket 探针 `raw_tcp_probe_once` 常驻失败路径，复发时自动裁决"NAS 按源拦截 vs 客户端层" |
 | WiFi 每 2-5s 被掐 | poller 循环无条件 connect_sta 掐断活连接 | s_sta_connected 门 + s_conn_busy 闩（set_config 失败须清闩） |
 | URL 双坑 | 手输无 scheme / 浏览器自动 https | NVS 读入时 scheme 归一化（https 强制降 http） |
+| **串口连换多张地图** | push 端点**双发切图指令（立即+15s）**+ 有人连续推图——设计行为不是 bug | 判读：地图装载日志 hash 各不相同=收到的指令就是不同 hash（载荷=BGMAP hash 非 id） |
+| **manifest 拉到了但素材还是旧的** | 设备 s_files 与服务端清单不对账（历史遗留混入） | 已修：每轮 sync 对账剪除；复发先查 boot 日志"清单对账：剪除 N 个" |
+| **同步 40B 大清单静默失败** | 响应缓冲 16K < rev30+ 清单 18.6KB，collect 中断 | MANIFEST_RESP_CAP 16K→24K |
 
 ---
 
 ## 五、跨端契约（C# 导出 ↔ C 解析，全部真机炸过后定稿）
 - MPAK：信封头 **40B**（magic 16B 含 8B 零填充）；PARTS 索引 **20B**（尾 2B pad）；LAYOUT 帧头 **12B** 无 pad、piece **12B**（尾 1B pad）；FONT 头 **8B**、glyph **12B**；AUDIO 轨 **108B**；**offset=位图区相对**。
+- **BGMAP 分段格式**（运行时登记的 237KB 新包，~240×240 1x）：static_back=**天空段**
+  （back 切段的段0），场景中间层=**speed=0 条带段**（wire strip y=0、全视口高、
+  blend bit0=1 带 1bit 掩码，PARTS 小包经 part_ref 引用），地形在 tile 层+掩码。
+  旧 950KB 包=全部 back 合成一张 static——两种格式固件同一路径都能吃，
+  **勿按 static 内容假设"static=完整场景"**（花屏二分案教训）。
 - LAYOUT x/y 已含帧位移（导出契约），move 字段勿重复叠加；piece 顺序=权威绘制序。
 - 协议：poll 回 `{commands:[{seq,type,payload}],lastSeq,mrev}`；hello 返回 `pairingCode`/`deviceId`/`manifestRev`；manifest kind 全大写（固件已 strcasecmp 兼容）。
 - 通用规律：**两端各自实现时必须拿真实响应样本对表**；格式文档字段和≠标注步长时以固件读法为准。
@@ -237,6 +283,8 @@ LCD_DATA0-3=GPIO4/5/6/7、PCLK=38、CS=12、RST=39——**与现板逐脚相同*
 - [ ] calib 红蓝线/白点加关闭路径（现首触常驻；无 render_calib_set(false) 调用者）
 - [ ] 气泡/横幅在 MENU 态不可见（LVGL 整屏覆盖，设计如此，待产品定夺）
 - [ ] touch_cst9220.c 文件头与 input_dispatch 两处映射注释矛盾未清
+- [ ] UDP 帧倾倒触发通道定稿：服务端 command 白名单放行 `screenshot` 后，
+      bubble `::shot` 魔数可退役（设备侧两种口径均已支持，见 §2.6）
 
 ---
 
@@ -245,6 +293,10 @@ LCD_DATA0-3=GPIO4/5/6/7、PCLK=38、CS=12、RST=39——**与现板逐脚相同*
 - E7 NPC 导出器、E8 QQ 音源、设备日志/mDNS、Web 表情入口、entities[] 未上线
 - minimp3 VBR gapless 未处理（首尾 ~529 样本过渡，影响极小）
 - 常态 SNTP 重校准未做（现仅配网流程校时，长期不断电会漂移）
+- **command 白名单未含 `screenshot`**（AdminEndpoints.cs）：设备 poller 两种口径
+  （legacy `{"t":"screenshot"}` / 现代 `{"type":"screenshot"}`）均已支持，放行一行的事
+- 相机下移实验板B侧验收（ground_cam_shift_px=248）归板B session；真 foothold 彻底
+  入镜需服务端按 §14.1 结论重定导出相机（暂缓，用户定稿板A用原景）
 
 ---
 

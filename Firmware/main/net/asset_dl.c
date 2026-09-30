@@ -22,6 +22,7 @@
 #include <strings.h>
 #include <stdio.h>
 #include <errno.h>
+#include <dirent.h>
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
 #include "sd_tf.h"
@@ -49,7 +50,9 @@ static const char *TAG = "asset";
 #define STOP_PCT           80     /* 清到 80% 停手 */
 /* 16K：rev26/54 条目实测 ~11KB。旧 48K 常驻占内部堆 1/3——本板内部堆
  * 143KB 已是万物枯竭的总根源（下载失败/任务创建失败多为连锁反应） */
-#define MANIFEST_RESP_CAP  (16 * 1024)
+/* 24K：rev32 实测 18.6KB（休塔尔克装扮+NPC 后）。旧 16K 在 collect 满
+ * 时返回 false 中断流 → sync 静默失败（真机：进入但永无下载）。 */
+#define MANIFEST_RESP_CAP  (24 * 1024)
 
 /* ------------------------------------------------------------------ */
 /* 本地清单模型（内存 + TF manifest.json 双写）                          */
@@ -387,9 +390,15 @@ static void load_local_manifest(void)
                 if (fdir) {
                     /* 【堆保护 2026-09-29】低堆期 fopen 会触发 newlib 锁分配
                      * 失败 → abort 启动循环（真机实证）。空闲不足则跳过 px
-                     * 读取（回退清单值，纯装饰性字段） */
-                    if (heap_caps_get_free_size(MALLOC_CAP_INTERNAL) < 8 * 108) {
-                        ESP_LOGW(TAG, "内部堆 <24KB，跳过 FONT px 读取（防 newlib abort）");
+                     * 读取（回退清单值，纯装饰性字段）。
+                     * 【板级配置 2026-09-30】门值改由 Kconfig MP_ASSET_HEAP_GATE_KB
+                     * 决定（默认 24KB=216 板保护不变；185B 配 6KB）。原字面量
+                     * 8*108(=864B) 是 8*1024 的历史笔误，与下方日志"24KB"自相
+                     * 矛盾，一并收敛到同一配置源。 */
+                    if (heap_caps_get_free_size(MALLOC_CAP_INTERNAL) <
+                        CONFIG_MP_ASSET_HEAP_GATE_KB * 1024) {
+                        ESP_LOGW(TAG, "内部堆 <%dKB，跳过 FONT px 读取（防 newlib abort）",
+                                 CONFIG_MP_ASSET_HEAP_GATE_KB);
                     } else {
                     char fp[MP_MPK_PATH_MAX];
                     snprintf(fp, sizeof(fp), "%s/%s.mpk", fdir, lf->hash);
@@ -427,6 +436,24 @@ static void load_local_manifest(void)
         ESP_LOGW(TAG, "本地清单 rev=%u：%d 条（PARTS %d / LAYOUT %d / BGMAP %d / FONT %d[px=%s] / AUDIO_META %d）",
                  (unsigned)s_local_rev, s_file_cnt, n_parts, n_layout, n_bgmap, n_font,
                  n_font ? fx : "-", n_audio);
+        /* 【对账 2026-09-30】文件大面积丢失（FAT 损坏/下载中断被清）而清单仍在：
+         * 真机实证 54 条清单配 0 个文件 → dispatch 全灭 → 误降级。缺失>60%
+         * 时把 s_local_rev 归零——sync 视为全量缺失重下（不再 304 短路）。 */
+        {
+            int on_disk = 0;
+            for (int i = 0; i < s_file_cnt; i++) {
+                char pchk[128];
+                const char *d = kind_dir(s_files[i].kind);
+                if (!d) { on_disk++; continue; }      /* 非文件类不罚 */
+                snprintf(pchk, sizeof(pchk), "%s/%.20s.mpk", d, s_files[i].hash);
+                if (access(pchk, F_OK) == 0) on_disk++;
+            }
+            if (s_file_cnt > 0 && on_disk * 10 < s_file_cnt * 4) {   /* <40% 在盘 */
+                ESP_LOGW(TAG, "清单%d条但磁盘仅%d个（<40%%）：FAT丢失 → 清 rev 触发全量重下",
+                         s_file_cnt, on_disk);
+                s_local_rev = 0;
+            }
+        }
     }
 
     cJSON *ct = cJSON_GetObjectItem(root, "clock_table");
@@ -625,6 +652,30 @@ static bool verify_and_commit(dl_ctx_t *c, const char *dir, const char *hash)
     c->f = NULL;
     unlink(final_path);
     return rename(tmp_path, final_path) == 0;
+}
+
+/* 【陈旧条目剪除 2026-10-01】s_files 必须与服务端清单对账。旧实现只增量
+ * upsert：本地清单（出厂 rev1）条目在服务端重新登记/淘汰后 hash 不再被服务，
+ * 文件被本地 LRU 淘汰后也永不再下（下载循环只遍历清单），但 parts_path(NULL)
+ * 按"第一个 paperdoll 匹配"仍选中它 → open errno=2 → 实体 0x0（真机：rev33
+ * 同步后宠物从屏幕消失，critical_ready 却=1，"后台补齐"反复绑死包空转）。
+ * 每次拿到完整清单（含 rev 相等早退前）都以服务端 assets 为准剪除不在清单内
+ * 的行。须持 s_lock 调用；返回剪除数。 */
+static int prune_stale_locked(const cJSON *assets)
+{
+    int kept = 0, removed = 0;
+    for (int i = 0; i < s_file_cnt; i++) {
+        if (cJSON_GetObjectItem(assets, s_files[i].hash)) {
+            s_files[kept++] = s_files[i];
+        } else {
+            removed++;
+        }
+    }
+    s_file_cnt = kept;
+    if (removed > 0)
+        ESP_LOGW(TAG, "清单对账：剪除 %d 个已不被服务的陈旧条目（保留 %d）",
+                 removed, kept);
+    return removed;
 }
 
 /* 元数据登记/刷新（不下载）；返回该 hash 本地是否已有文件 */
@@ -1149,9 +1200,12 @@ static bool manifest_collect(void *ctx_, const char *data, size_t len)
  * 出厂素材模式下的正确语义是：**只用内部 Flash 出厂快照，不尝试写盘**。 */
 static bool asset_dl_download_allowed(void)
 {
-    extern bool sd_tf_is_flash_fallback(void);
-    if (sd_tf_is_flash_fallback()) return false;
-    return true;
+    /* 【死结修复 2026-09-30】旧判据=出厂模式即禁下载——空卡降级后 rev 永不
+     * 拉新（预设推送全灭，真机实证 allowed=0 死循环）。新判据=TF 物理在位：
+     * 下载写 TF（/sdcard 仍挂 TF），渲染暂用出厂分区不受影响；TF 真不在
+     * （挂载失败回退）才禁——素材无处可写。 */
+    extern bool sd_tf_tf_present(void);
+    return sd_tf_tf_present();
 }
 
 static volatile bool s_sync_attempted;   /* 首次 sync_once 已出结果（成败均算） */
@@ -1187,6 +1241,11 @@ bool asset_dl_critical_ready(void)
         }
     }
     xSemaphoreGive(s_lock);
+    /* 【诊断】降级判定为什么失败：parts/stand1 查到的路径与文件是否存在 */
+    ESP_LOGW(TAG, "critical_ready=%d parts=[%s]%d stand1=[%s]%d",
+             (int)(parts_ok && stand1_ok),
+             ph, (int)(access(ph, F_OK) == 0),
+             lh, (int)(access(lh, F_OK) == 0));
     return parts_ok && stand1_ok;
 }
 
@@ -1237,11 +1296,24 @@ static void sync_once(void)
 
     xSemaphoreTake(s_lock, portMAX_DELAY);
 
+    cJSON *a0 = cJSON_GetObjectItem(root, "assets");
     if (rev == s_local_rev && s_local_rev != 0 && s_file_cnt > 0) {
-        xSemaphoreGive(s_lock);
-        cJSON_Delete(root);
-        s_sync_busy = false;
-        return;                                  /* 304 语义：无变化 */
+        /* rev 相等也要对账：TF manifest.json 可能是旧固件写入的混入陈旧条目
+         * 的版本，不清则 parts_path 永远选中已被服务的死 hash（真机实证）。 */
+        bool pruned = false;
+        if (cJSON_IsObject(a0)) {
+            pruned = prune_stale_locked(a0) > 0;
+            if (pruned) save_local_manifest_locked();
+        }
+        if (!pruned) {
+            xSemaphoreGive(s_lock);
+            cJSON_Delete(root);
+            s_sync_busy = false;
+            return;                              /* 304 语义：无变化 */
+        }
+        /* 剪掉了陈旧条目：不早退，继续走完整路径（关键文件门+热切回+
+         * MANIFEST_SYNCED 重绑通知）——否则绑死在死 hash 上的渲染永远没人
+         * 纠正（真机：宠物消失→全黑屏，rev 不变就永远好不了）。 */
     }
 
     /* clock_table（E9/R15：地图时钟锚点表，Web 可改 → rev+1 生效） */
@@ -1265,7 +1337,7 @@ static void sync_once(void)
     }
 
     /* 条目元数据 + 缺包下载（持锁登记元数据；下载在锁外做 IO） */
-    cJSON *assets = cJSON_GetObjectItem(root, "assets");
+    cJSON *assets = cJSON_IsObject(a0) ? a0 : cJSON_GetObjectItem(root, "assets");
     if (cJSON_IsObject(assets)) {
         cJSON *ja;
         cJSON_ArrayForEach(ja, assets) {
@@ -1278,6 +1350,7 @@ static void sync_once(void)
                         cJSON_GetStringValue(cJSON_GetObjectItem(ja, "map")),
                         cJSON_GetStringValue(cJSON_GetObjectItem(ja, "selector")));
         }
+        prune_stale_locked(assets);              /* 以本轮清单为准对账剪除 */
         xSemaphoreGive(s_lock);
 
         /* 【进度口径 2026-09-30】预统计本轮待下载条数作 [i/N] 显示。
@@ -1370,6 +1443,16 @@ static void sync_once(void)
     }
     if (s_missing > 0) {
         ESP_LOGW(TAG, "本轮缺 %d 个非关键资产（地图条带/缩略图等），已通知渲染先起播", s_missing);
+    }
+
+    /* 【热切回 2026-09-30】关键素材已在 TF 落盘：渲染根从出厂分区切回 /sdcard
+     * （重读 TF manifest 重建文件表），随后的 MANIFEST_SYNCED 重绑即用新素材
+     * ——预设推送→下载→自动换装的完整闭环。 */
+    if (asset_dl_render_root_is_factory()) {
+        strlcpy(s_render_root, "/sdcard/minipet", sizeof(s_render_root));
+        asset_dl_reload_local();
+        ESP_LOGW(TAG, "TF 素材齐备 → 渲染根切回 /sdcard（rev=%lu file_cnt=%d）",
+                 (unsigned long)s_local_rev, s_file_cnt);
     }
 
     /* 素材就绪 → 渲染层重读/重绑（render 任务执行：fonts/parts/stand1） */
@@ -1485,6 +1568,26 @@ void asset_dl_start(void)
     ensure_dirs();
     crc32c_init_table();
     load_local_manifest();
+    /* 【诊断】TF 素材目录实况：文件数 + 前 5 个文件名（对账清单 vs 磁盘） */
+    {
+        int n = 0;
+        const char *dirs[] = { "parts", "layout", "bg", "font" };
+        for (int d = 0; d < 4; d++) {
+            char dp[48];
+            snprintf(dp, sizeof(dp), "/sdcard/minipet/%s", dirs[d]);
+            DIR *dr = opendir(dp);
+            if (!dr) { ESP_LOGW(TAG, "dir[%s]: 无", dirs[d]); continue; }
+            struct dirent *e; int c = 0; char head[96] = "";
+            while ((e = readdir(dr)) != NULL) {
+                if (e->d_name[0] == '.') continue;
+                if (c < 3) { strlcat(head, e->d_name, sizeof(head)); strlcat(head, " ", sizeof(head)); }
+                c++; n++;
+            }
+            closedir(dr);
+            ESP_LOGW(TAG, "dir[%s]: %d 个：%s", dirs[d], c, head);
+        }
+        ESP_LOGW(TAG, "TF 素材总文件数=%d", n);
+    }
     /* 任务创建失败=同步/下载全灭（真机实证 2026-09-29：内部堆启动挤压窗口
      * 8K 栈静默失败 → sync_once 永不执行 → 黑屏 60s 后误降级）。栈阶梯
      * （同 render 的降档思路）+ 10s 周期自愈定时器双保险。 */

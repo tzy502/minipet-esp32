@@ -586,11 +586,15 @@ void state_machine_tick_1hz(void)
 /* 动作 → 布局包绑定；loop：持续动作循环播，触发型单次播完自动回 stand（E5） */
 static bool heap_ok_for_asset_load(void);
 
-/* 【堆保护 2026-09-29】素材切换要 fopen/fread TF 大包——内部堆见底（<24KB）
- * 时 newlib 锁分配失败会 abort 重启（真机：菜单确认动作即崩）。 */
+/* 【堆保护 2026-09-29】素材切换要 fopen/fread TF 大包——内部堆见底时
+ * newlib 锁分配失败会 abort 重启（真机：菜单确认动作即崩）。
+ * 【板级配置 2026-09-30】门值不再写死 24KB：改由 Kconfig
+ * MP_ASSET_HEAP_GATE_KB 决定（默认 24 = 216 板既有保护不变；
+ * 185B 内部堆常态空闲仅 ~9.2KB，24KB 门 = 绑定永久拦截 → 娃娃永不显示，
+ * sdkconfig.185b 单独配 6KB——实测该板绑定成功且多轮启动零 abort）。 */
 static bool heap_ok_for_asset_load(void)
 {
-    return heap_caps_get_free_size(MALLOC_CAP_INTERNAL) >= 24 * 1024;
+    return heap_caps_get_free_size(MALLOC_CAP_INTERNAL) >= CONFIG_MP_ASSET_HEAP_GATE_KB * 1024;
 }
 
 static esp_timer_handle_t s_bind_retry_timer;   /* 低堆跳过绑定后的自愈重试 */
@@ -729,6 +733,15 @@ static void dispatch_manifest_synced(void)
     char path[MP_MPK_PATH_MAX];
     ESP_LOGW(TAG, "dispatch_manifest_synced 进入");
 
+    /* 【绑定挂起 2026-09-30】本函数全程要 fopen TF 包（字体×3 / parts /
+     * layout / 降级重绑），185B 的持续全帧刷新任务同持显示锁且抢 TF，
+     * 绑定期挂起刷新（屏面静止在最后合成帧，任务与 stage 均保留）。
+     * 【挂起泄漏红线】本函数共 5 条退出路径——①后台补齐 return ②sync
+     * 在飞 return ③④两处 FATAL return ⑤函数末尾正常走完——每条都先
+     * display_refresh_resume() 再退出，漏一条 = 185B 屏幕永久冻结。
+     * 216 板（GRAM）该 API 为空操作，本段零行为变化。 */
+    display_refresh_suspend();
+
     /* 字体三档（气泡 24 / 列表 16 / 标题 32，E12） */
     static const struct { render_font_t id; int px; } fonts[] = {
         { RENDER_FONT_16, 16 }, { RENDER_FONT_24, 24 }, { RENDER_FONT_32, 32 },
@@ -753,6 +766,11 @@ static void dispatch_manifest_synced(void)
         }
     } else if (asset_dl_parts_path(NULL, path, sizeof(path))) {
         int prc = render_set_parts(path);
+        if (prc != 0) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+            prc = render_set_parts(path);
+            ESP_LOGW(TAG, "parts 首开失败（TF 争用?）重试 rc=%d", prc);
+        }
         ESP_LOGW(TAG, "parts 路径=%s rc=%d", path, prc);
         if (s_bind_retry_timer) {   /* 绑定成功：停自愈重试 */
             esp_timer_stop(s_bind_retry_timer);
@@ -763,19 +781,66 @@ static void dispatch_manifest_synced(void)
         ESP_LOGE(TAG, "parts 路径查询失败（清单里没有 PARTS）");
     }
     /* 加载失败不黑屏：屏显文字提示（E11 素材故障 → dam 语义的文本版） */
+    /* 【TF 并发争用重试 2026-09-30】dispatch（渲染任务）与 sync_once（asset_dl
+     * 任务）并发读 TF：SDMMC 1-bit 下偶发 open 失败（真机：同文件 60s 前
+     * rc=0、dispatch 时 failed→误降级白屏）。读失败等 50ms 重试一次再判。 */
     bool l_ok = asset_dl_layout_path("stand1", path, sizeof(path));
     int lrc = -1;
-    if (l_ok) { lrc = render_set_layout(path, true); ESP_LOGW(TAG, "layout 路径=%s rc=%d", path, lrc); }
+    if (l_ok) {
+        lrc = render_set_layout(path, true);
+        if (lrc != 0) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+            lrc = render_set_layout(path, true);
+            ESP_LOGW(TAG, "layout 首开失败（TF 争用?）重试 rc=%d", lrc);
+        }
+        ESP_LOGW(TAG, "layout 路径=%s rc=%d", path, lrc);
+    }
     if (!l_ok || lrc != 0 ||
         !asset_dl_parts_path(NULL, path, sizeof(path))) {
         /* 【拉取失败降级 2026-09-29，用户定稿】TF 在位但素材没下全（链路/堆
          * 紧张）→ 不进 FATAL，切内部 Flash 出厂分区（神子快照）重试一次；
          * 二次仍失败才 FATAL（真机：出厂分区空壳时代卡过这一步） */
-        ESP_LOGE(TAG, "本地素材加载失败（parts/stand1 缺失）→ 尝试出厂分区降级");
-        /* 切分区会卸载 TF：等在途下载结束（≤10s），否则卸载必失败 */
-        for (int i = 0; i < 40 && !asset_dl_sync_idle(); i++) {
-            vTaskDelay(pdMS_TO_TICKS(250));
+        ESP_LOGE(TAG, "本地素材加载失败（parts/stand1 缺失）");
+        /* 【抢跑修复 2026-09-30】TF 在位 + sync 正在下载（或 GET 飞行中）时
+         * 【绝不切出厂分区】——卸载 TF 会杀死在途下载 socket，形成"降级
+         * 杀救兵"死循环（真机：文件被 FAT 清空后永远等不到重下）。改为：
+         * 等 sync 完整收尾并复查关键素材；只有 sync 已结束且仍缺（服务端
+         * 也救不了/超时 60s）才降级出厂保命。 */
+        {
+            /* 【等待下载推进 2026-09-30】上限 300s；sync 忙（下载中）就一直等
+             * （真机：950KB 大包多轮块化续传需数分钟）；仅当 sync 已收尾且
+             * 连续 3 轮（10s 自愈周期×3）素材仍缺才认命降级。全程喂狗。 */
+            for (int i = 0; i < 1200; i++) {
+                watchdog_kick();
+                if (asset_dl_critical_ready()) break;
+                if (i > 40 && asset_dl_sync_idle()) {
+                    static int s_degrade_grace;
+                    if (++s_degrade_grace >= 6) break;
+                    vTaskDelay(pdMS_TO_TICKS(10000));
+                    continue;
+                }
+                vTaskDelay(pdMS_TO_TICKS(250));
+            }
+            if (asset_dl_critical_ready()) {
+                /* 素材已由后台补齐：重走绑定（不降级不切分区） */
+                char pp[MP_MPK_PATH_MAX], ll[MP_MPK_PATH_MAX];
+                int prc = -1, lrc2 = -1;
+                if (asset_dl_parts_path(NULL, pp, sizeof(pp))) prc = render_set_parts(pp);
+                if (asset_dl_layout_path("stand1", ll, sizeof(ll))) lrc2 = render_set_layout(ll, true);
+                ESP_LOGW(TAG, "后台下载补齐：已绑定 TF 素材（不降级）parts rc=%d layout rc=%d",
+                         prc, lrc2);
+                display_refresh_resume();   /* 退出路径①：恢复刷新（防挂起泄漏） */
+                return;
+            }
         }
+        if (!asset_dl_sync_idle()) {
+            /* sync 仍在飞（下载未收尾）：切分区必撕 FATFS 锁（真机 assert
+             * _lock_close）。此时宁可不降级：渲染已绑出厂或空，等下轮。 */
+            ESP_LOGW(TAG, "sync 仍在飞，跳过本轮降级（防 FATFS 锁撕裂）");
+            display_refresh_resume();   /* 退出路径②：恢复刷新（防挂起泄漏） */
+            return;
+        }
+        ESP_LOGW(TAG, "→ 尝试出厂分区降级");
         if (sd_tf_switch_to_factory() == 0) {
             /* 【单挂载整体切换】双挂载（/factory max_files=2）实测渲染打开多包
              * 超额 rc=-1 且内存代价压垮内部堆 → 回退本方案（已验证 rc=0/0）。 */
@@ -793,11 +858,13 @@ static void dispatch_manifest_synced(void)
                 ESP_LOGW(TAG, "出厂分区降级成功：神子快照接管渲染");
             } else {
                 ESP_LOGE(TAG, "出厂分区降级后仍缺素材 → FATAL");
+                display_refresh_resume();   /* 退出路径③：FATAL 前恢复刷新（防挂起泄漏） */
                 transition(MP_ST_FATAL);
                 watchdog_text_persist("ASSET LOAD FAILED", "WAIT SERVER SYNC");
                 return;
             }
         } else {
+            display_refresh_resume();   /* 退出路径④：FATAL 前恢复刷新（防挂起泄漏） */
             transition(MP_ST_FATAL);
             watchdog_text_persist("ASSET LOAD FAILED", "WAIT SERVER SYNC");
             return;
@@ -815,14 +882,17 @@ static void dispatch_manifest_synced(void)
         }
     }
 
-    /* 【默认地图重投】无 TF 卡（出厂素材模式）启动早期投的 SET_MAP 早于清单解析，
-     * 查不到 BGMAP 路径 → 这里清单就绪后补投一次，保证"没有 TF 卡也渲染默认地图
-     * 000010000"这条需求真的落地（此前静默失败，屏幕永远纯黑底）。 */
-    if (sd_tf_is_flash_fallback() && !g_map_loaded) {
+    /* 【默认地图重投】启动早期投的 SET_MAP 早于清单解析，查不到 BGMAP 路径
+     * → 这里清单就绪后补投一次，保证"渲染默认地图 000010000"真的落地。
+     * 【TF 模式同样重投 2026-10-01】旧条件限出厂模式：TF 模式下地图晚到
+     * （950KB 大包多轮续传，真机本轮 250s 才齐）时 boot 那发失败后没人重投
+     * → 背景全黑到底（真机实证：parts rc=0 宠物在、背景黑）。改为只要
+     * 本轮没装载过地图就补投（g_map_loaded 门保证只补一次）。 */
+    if (!g_map_loaded) {
         mp_cmd_t mc = { .type = MP_CMD_SET_MAP };
         strlcpy(mc.s, MP_DEFAULT_MAP_ID, sizeof(mc.s));
         mp_post_cmd(&mc);
-        ESP_LOGW(TAG, "出厂素材模式：清单就绪 → 重投默认地图 %s", MP_DEFAULT_MAP_ID);
+        ESP_LOGW(TAG, "清单就绪 → 重投默认地图 %s", MP_DEFAULT_MAP_ID);
     }
 
     /* 素材全量重绑后强制一次全屏重绘：清除面板自检色块/旧画面残留
@@ -835,6 +905,10 @@ static void dispatch_manifest_synced(void)
         extern void provision_dump_internal_heap(const char *stage);
         provision_dump_internal_heap("@素材全绑后");
     }
+
+    /* 退出路径⑤（门拦截/绑定成功/失败都汇到这里的正常走完）：恢复刷新。
+     * 至此入口挂起与 5 条退出路径的 resume 一一配对，无泄漏。 */
+    display_refresh_resume();
 }
 
 void app_cmd_dispatch(const mp_cmd_t *cmd)
@@ -847,6 +921,12 @@ void app_cmd_dispatch(const mp_cmd_t *cmd)
         render_set_expression(cmd->s);
         break;
     case MP_CMD_BUBBLE:
+        /* 【远程取证魔数 2026-10-01】bubble 文本 "::shot" → UDP 帧倾倒（不走
+         * TF，不需白名单放行 screenshot）。帧里不含本气泡——在显示前截走。 */
+        if (strncmp(cmd->s, "::shot", 6) == 0) {
+            render_frame_dump_udp();
+            break;
+        }
         /* 【E9/E12 互斥 2026-09-27】待机时钟态（CLOCK_DOZE）是纯黑只数字全屏，
          * 合成器在时钟激活时提前 return（不画气泡层）→ 此态收到气泡（E12 静置
          * 台词默认 300s 与 E9 待机时钟默认 5min 同刻触发）会静默丢失。

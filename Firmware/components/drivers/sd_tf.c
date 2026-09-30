@@ -46,6 +46,8 @@ static const char *TAG = "sd_tf";
 /* TF 挂载失败时的兜底：内部 Flash 的 "assets" FAT 分区挂到同一 /sdcard
  * （出厂预置默认素材，无 TF 也能起播——design-review 3.11 出厂保底） */
 static wl_handle_t s_flash_wl = WL_INVALID_HANDLE;
+static bool s_tf_present;   /* TF 物理在位且挂载成功过（空卡降级后仍 true——
+                             * 下载继续写 TF，只有 TF 真不在才禁下载） */
 static bool        s_on_flash;
 
 /* SDMMC host/slot 常驻（esp_vfs_fat_sdmmc_mount 内部持有引用） */
@@ -140,6 +142,7 @@ int sd_mount(void)
 
     s_mounted = true;
     s_on_flash = false;
+    s_tf_present = true;                 /* TF 在位（此后空卡降级不清此标志） */
     sdmmc_card_print_info(stdout, s_card);
     ESP_LOGI(TAG, "SD 已挂载 %s（SDMMC 1-bit：CMD=%d CLK=%d D0=%d）",
              SD_MOUNT_POINT, pins->sd.mosi, pins->sd.sclk, pins->sd.miso);
@@ -226,6 +229,11 @@ int sd_unmount(void)
     s_mounted = false;
     s_card = NULL;
     return 0;
+}
+
+bool sd_tf_tf_present(void)
+{
+    return s_tf_present;
 }
 
 bool sd_tf_is_flash_fallback(void)

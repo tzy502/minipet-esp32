@@ -880,18 +880,35 @@ static int64_t s_k0_pressed_ms;      /* 菜单内该键按下时刻（长按判�
 static bool    s_k0_long_fired;      /* 本次按压已触发长按 */
 static bool    s_k0_wait_release;    /* 正在等释放（短按=下移在释放时执行） */
 static bool    s_k0_bar_mode;        /* 【E6】本次按压归 BGM 控制条（否则归菜单） */
+/* 【185B 菜单键 2026-10-01】声明提前到首个使用（key0_tick 的 menu<0 分支）之前，
+ * 否则 C 文件作用域声明后置 = 编译错误（板A构建实证）。
+ * 一次按压只产生一个动作：按下沿只上闩不动作，key0_menu_key_long_tick 里
+ * 「持续 ≥700ms → 待机时钟」或「释放且未转时钟 → 菜单开关」二选一——
+ * 与 key_tick（GPIO18）的 clock_fired/menu_fired 互斥口径一致。 */
+static bool    s_k0_menu_latch;
+static int64_t s_k0_menu_press_ms;
+static bool    s_k0_menu_clock_fired;
 
 static void key0_menu_hold_tick(void);   /* 定义见下（前向声明） */
+static void key0_menu_key_long_tick(void);
 
 static void key0_tick(void)
 {
     key0_menu_hold_tick();               /* 菜单内：按住时长状态机（长按退出/短按下移） */
+    key0_menu_key_long_tick();           /* 185B：BOOT=菜单键的长按转时钟 */
     if (!key_gpio0_tick()) return;       /* 消抖后的按下沿事件（一次/按压） */
     ESP_LOGI(TAG, "底键（GPIO0）按下沿");
+    /* 【唤醒前快照】下方 note_interaction() 在 CLOCK_DOZE 态会同步唤醒回
+     * POKER，其后 state_machine_current() 恒读到 POKER（原 DOZE 分支只在
+     * 唤醒事件被锁竞争丢弃时才可达）。185B 菜单键分支用该快照识别
+     * 「本次按下沿已承担唤醒」：唤醒沿只唤醒、不再当菜单键（与 GPIO18 的
+     * MENU_KEY 在 CLOCK_DOZE=仅唤醒同口径），否则在时钟态按一下 BOOT 会
+     * 连菜单一起带出来、按住则唤醒后又被拉回时钟。 */
+    mp_state_t st_before = state_machine_current();
     {
         /* 【中键取证】NVS 累计计数 + 按下时状态机状态：计数证明通路，
          * 状态字节裁决"菜单里没反应"是按键没到还是分支走错 */
-        mp_state_t st_now = state_machine_current();
+        mp_state_t st_now = st_before;
         nvs_handle_t h;
         if (nvs_open("calib", NVS_READWRITE, &h) == ESP_OK) {
             uint32_t n = 0;
@@ -934,10 +951,50 @@ static void key0_tick(void)
         s_k0_bar_mode = true;
         return;
     }
-    /* POKER/OFFLINE：音量减（用户定稿：桌宠页中/底键=音量加减） */
+    /* POKER/OFFLINE：默认音量减（216 板角色分工：GPIO18=菜单键）。
+     * 【185B 2026-10-01】本板无 GPIO18（profile key.menu=-1）且音频关闭——
+     * BOOT(GPIO0) 升级为菜单键：短按（释放时）=菜单开关，长按 ≥700ms=待机
+     * 时钟。动作【不在按下沿】执行：若按下沿就 toggle，长按会「先开菜单
+     * 再转时钟」两个都触发；改在上闩后由 key0_menu_key_long_tick 按
+     * 时长/释放二选一，与 key_tick 的 GPIO18 口径完全一致。 */
+    if (MINIPET_ACTIVE_PROFILE.pins.key.menu < 0) {
+        if (st_before == MP_ST_CLOCK_DOZE) return;   /* 唤醒沿：只唤醒（见上） */
+        s_k0_menu_latch = true;                      /* 上闩：动作延到释放/700ms */
+        s_k0_menu_press_ms = mp_now_ms();
+        s_k0_menu_clock_fired = false;
+        return;
+    }
     mp_audio_msg_t m = { .type = MP_AUDIO_VOLUME, .a = -10 };
     if (!mp_post_audio(&m)) ESP_LOGW(TAG, "audio_q 满，音量-丢失");
     render_banner_show_for("VOL -", 1500);   /* 定时横幅：1.5s 后渲染侧自动隐藏 */
+}
+
+/* 185B 菜单键（menu<0）短按/长按分辨，key0_tick 每轮驱动（不看状态机状态，
+ * 故闩在任何态下都有出路：释放或 700ms 二者必至其一，不会卡死）：
+ *   - 持续 ≥700ms → 待机时钟（IDLE_TIMEOUT），闩清；
+ *   - 释放且未转时钟 → 菜单开关一次（key_fire_menu_toggle，含控制条确认/
+ *     菜单内确认语义）。
+ * 与 key_tick（GPIO18）同构：clock_fired 保证长按转时钟后释放不再补发
+ * 菜单开关（互斥）；按下沿不动作，故短按/长按天然只出其一。
+ * 释放判定用原始电平（同 key0_menu_hold_tick 口径）；驱动 key_gpio0_tick
+ * 的「释放+80ms 静止再上膛」闩保证释放弹回不会产生第二次按下沿。 */
+static void key0_menu_key_long_tick(void)
+{
+    if (!s_k0_menu_latch) return;
+    if (!key_gpio0_pressed()) {              /* 释放沿 */
+        s_k0_menu_latch = false;
+        if (!s_k0_menu_clock_fired) {
+            s_k0_menu_clock_fired = true;    /* 一次按压只 fire 一个动作 */
+            key_fire_menu_toggle();          /* 短按：菜单开关 */
+        }
+        return;
+    }
+    if (mp_now_ms() - s_k0_menu_press_ms >= 700) {
+        s_k0_menu_clock_fired = true;
+        s_k0_menu_latch = false;
+        ESP_LOGI(TAG, "菜单键长按 → 待机时钟");
+        state_machine_handle(MP_SM_EV_IDLE_TIMEOUT);
+    }
 }
 
 /* 菜单内该键的"按住时长"状态机（key0_tick 每次调用都跑，含无按下沿的轮询帧）。

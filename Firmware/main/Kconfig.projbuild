@@ -35,6 +35,17 @@ config MP_LCD_BRINGUP_TEST
       display_init 末尾连推三张全屏纯色（各 ~0.7s），与渲染管线完全解耦：
       颜色正确=传输/像素格式通，花屏=格式/线序问题，不亮=背光/复位问题。
 
+config MP_ASSET_HEAP_GATE_KB
+    int "素材绑定内部堆门（KB）"
+    default 24
+    help
+      fopen/fread TF 素材包前要求的最低内部堆空闲（state_machine 绑定门
+      heap_ok_for_asset_load 与 asset_dl FONT px 读取门共用，防低堆期
+      newlib 锁分配失败 abort）。一套代码、板级配置：默认 24KB =
+      AMOLED-2.16 板既有保护值（行为不变）；内部堆紧张的 1.85B 板在
+      sdkconfig.185b 单独调低（实测绑定成功且多轮启动零 abort 的安全值，
+      见该文件 CONFIG_MP_ASSET_HEAP_GATE_KB）。
+
 config MINIPET_DEFAULT_SRV_URL
     string "默认服务器地址（NVS srv_url 为空时的兜底）"
     default ""

@@ -35,6 +35,10 @@ int sd_tf_switch_to_factory(void);
  * 幂等；Flash 回退模式下返回 false（/sdcard 已是工厂，无需第二挂载）。 */
 bool sd_factory_mount_secondary(void);
 
+/* TF 物理在位且曾挂载成功（空卡降级后仍 true）——下载许可判据：
+ * true=下载写 TF（即使渲染暂用出厂分区）；false=TF 真不在，禁下载。 */
+bool sd_tf_tf_present(void);
+
 /** @brief 卸载并释放 SPI 资源（热拔支持用；正常关机可不做） */
 int sd_unmount(void);
 

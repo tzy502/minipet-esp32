@@ -55,6 +55,8 @@ typedef struct {
     bool     has_pmu;        /**< 电源管理（AXP2101，电量/充电） */
     bool     has_sd;         /**< TF 卡（FATFS 素材缓存） */
     bool     has_key;        /**< 用户按键（GPIO18 菜单键） */
+    int16_t  ground_cam_shift_px; /**< 相机下移实验（真 foothold 层入镜，0=关）：
+                                   *   amoled216=0 定稿原景；lcd185b=248 实验 */
     minipet_pins_t pins;     /**< 完整引脚表 */
 } minipet_profile_t;
 

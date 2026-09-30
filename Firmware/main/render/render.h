@@ -54,7 +54,7 @@ int  render_init(const minipet_profile_t *profile);
 /* 帧节拍（30fps 定时器驱动；内部完成合成/脏区/display_blit/LVGL） */
 void render_tick(void);
 
-/* 帧数据锁: RAMless 面板持续刷新拷贝帧缓冲前持锁(185B 专用; 216 无消费者) */
+/* 帧数据锁（RAMless 面板刷新拷贝帧缓冲前持锁；185B 用，216 无消费者） */
 void compositor_frame_lock(void);
 void compositor_frame_unlock(void);
 
@@ -157,6 +157,9 @@ int32_t render_get_drag_off_y(void);
  * （sd_tf_is_flash_fallback）下拒绝执行 —— 6MB 分区经不起 1MB/张 的写损耗。
  * 返回 0 成功；负数为错误（RENDER_ERR_* / MPAK_ERR_*）。耗时约 100–200ms。 */
 int render_screenshot_to_tf(void);
+/* 【UDP 帧倾倒 2026-10-01】当前合成帧经 UDP 广播 :9999（远程取证，免拔卡）。
+ * 触发：bubble 文本 "::shot"（服务端 screenshot 命令被白名单挡住时的通道）。 */
+void render_frame_dump_udp(void);
 
 /* ==================================================================== */
 /* 【菜单真实化 2026-09】菜单选择器对外钩子（lvgl_bridge.c 实现）          */

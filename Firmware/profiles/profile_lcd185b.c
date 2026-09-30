@@ -17,8 +17,11 @@
 #include "amoled216.h"
 
 const minipet_profile_t MINIPET_PROFILE_LCD185B = {
-    .width  = 360,
-    .height = 360,
+    /* 【合成器空间=480×480 2026-10-01】与 216 板同一套世界→屏幕管线（RC_SCALE=2、
+     * 地面表/娃娃/时钟/横幅全部原逻辑零改动）；360 面板的适配收敛在显示驱动
+     * 的唯一缩放点（480→360 取样）。教训见 docs/ai/amoled185b-bringup-pitfalls.md。 */
+    .width  = 480,
+    .height = 480,
     .shape  = MINIPET_SHAPE_ROUND,
     .shape_name = "round",
     .psram_mb  = 8,
@@ -32,6 +35,7 @@ const minipet_profile_t MINIPET_PROFILE_LCD185B = {
     .has_pmu   = false,   /* BQ27220@0x55 电量计，非 AXP2101（驱动未接，自动降级） */
     .has_sd    = true,    /* SDMMC 槽在线（1-bit：CLK15/CMD14/D0=16），cs 未用=-1 */
     .has_key   = false,   /* 无 GPIO18 菜单键；BOOT=GPIO0 由 key_gpio0 中键复用 */
+    .ground_cam_shift_px = 248, /* 185B 实验：各层上移248行，底部接真 foothold 地面带 */
 
     .pins = {
         .i2c  = { .scl = 10, .sda = 11 },
