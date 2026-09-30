@@ -409,6 +409,15 @@ void lv_bridge_touch_feed(int x, int y, bool pressed)
     if (y < 0) y = 0;
     if (x > s_br.sw - 1) x = s_br.sw - 1;
     if (y > s_br.sh - 1) y = s_br.sh - 1;
+    /* 【诊断 2026-09-29】按下沿必打 + 拖动 1/8 采样，定位触摸断在哪层 */
+    static bool last_p; static int skip;
+    if (pressed != last_p) {
+        ESP_LOGW("mtouch", "feed 沿 x=%d y=%d pressed=%d menu_mode=%d", x, y, pressed, (int)s_br.menu_mode);
+        last_p = pressed; skip = 0;
+    } else if (pressed && ++skip >= 8) {
+        skip = 0;
+        ESP_LOGI("mtouch", "feed 拖 x=%d y=%d", x, y);
+    }
     /* 写序：先坐标后 pressed——读侧见 pressed=true 时坐标必已有效 */
     s_menu.t_x = x;
     s_menu.t_y = y;
@@ -1082,6 +1091,7 @@ static void menu_roller_style(lv_obj_t *r)
 static void menu_roller_value_cb(lv_event_t *e)
 {
     int sel = (int)lv_roller_get_selected((lv_obj_t *)lv_event_get_target(e));
+    ESP_LOGW("mtouch", "roller VALUE_CHANGED sel=%d", sel);
     if (sel >= 0 && sel < MENU_ROWS_MAX) s_menu.sel = sel;
 }
 
@@ -1118,7 +1128,7 @@ static lv_obj_t *menu_add_opbtn(lv_obj_t *scr, const char *text,
 
     lv_obj_t *lb = lv_label_create(b);
     lv_obj_set_style_text_color(lb, lv_color_hex(0xFFFFFF), 0);
-    if (s_menu.f_small) lv_obj_set_style_text_font(lb, s_menu.f_small, 0);
+    lv_obj_set_style_text_font(lb, &menu_font_cn, 0);   /* 按钮文案是中文：用 CJK 字体 */
     lv_label_set_text(lb, text);
     lv_obj_center(lb);
 
@@ -1206,7 +1216,11 @@ static void menu_build_roller(lv_obj_t *scr, const char *opts, int cnt,
 
     lv_obj_t *r = lv_roller_create(scr);
     menu_roller_style(r);                       /* 字体/行距必须先于 visible_row_count */
-    lv_roller_set_options(r, opts, LV_ROLLER_MODE_INFINITE);
+    /* 【不硬填满 2026-09-29】条目少于可见行数（如纸娃娃页仅 1 项）时用
+     * NORMAL：不回绕不重复刷屏；条目多才 INFINITE 循环 */
+    lv_roller_set_options(r, opts,
+                          (cnt >= MENU_ROLLER_VIS) ? LV_ROLLER_MODE_INFINITE
+                                                   : LV_ROLLER_MODE_NORMAL);
     lv_roller_set_visible_row_count(r, MENU_ROLLER_VIS);
     lv_obj_set_pos(r, rx, ry);
     lv_obj_set_width(r, MENU_ROLLER_W);

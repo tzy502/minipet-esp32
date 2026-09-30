@@ -572,36 +572,23 @@ static void touch_tick(void)
         mp_state_t tst = state_machine_current();
         if (tst != MP_ST_POKER && tst != MP_ST_OFFLINE) {
             down = false; drag_active = false; longpress_fired = false;
+            /* 【菜单触摸总根因 2026-09-29】菜单态必须在这里读帧喂 LVGL——
+             * 旧代码此块直接 return，下方的 menu_open 喂入分支是死代码，
+             * 菜单触摸从未生效（滚筒拖拽/点选全灭）。 */
+            if (state_machine_menu_open()) {
+                touch_frame_t mf;
+                if (touch_read_frame(&mf)) {
+                    lv_bridge_touch_feed(mf.x, mf.y, mf.touched);
+                } else {
+                    lv_bridge_touch_feed(0, 0, false);
+                }
+            }
             return;
         }
     }
     static int fail_cnt;                  /* 触摸 I2C 连续读失败计数 */
     static int64_t fail_last_log_ms;
     static bool frame_fmt_logged;         /* 首帧字节转储（只打一次，防 count 位置翻车无据可查） */
-
-    if (state_machine_menu_open()) {
-        /* E6 定稿：菜单是独立全屏窗口，触摸归菜单不穿透（宠物交互冻结）。
-         * 【真机根因修复 2026-09-27】此前本分支只 return、不喂数据，而"喂 LVGL"
-         * 的那段在其之后——菜单态触摸被整段吞掉（LVGL indev 永远收不到按下），
-         * 用户症状：菜单里点哪个按钮都没反应，只剩侧键确认（永远作用于 sel=0）
-         * → "无论怎么点都是第一个 map"。
-         * 现改为：读帧 → lv_bridge_touch_feed(f.x,f.y,f.touched) → 再复位宠物态。 */
-        if (drag_active) {
-            drag_active = false;
-            render_set_drag_off(0);       /* 进菜单前人物回中 */
-        }
-        down = false;
-        longpress_fired = false;
-
-        touch_frame_t mf;
-        if (touch_read_frame(&mf)) {
-            lv_bridge_touch_feed(mf.x, mf.y, mf.touched);
-        } else {
-            /* 读失败：至少发一次"抬起"，避免 LVGL 侧残留 PRESSED 卡住某行 */
-            lv_bridge_touch_feed(0, 0, false);
-        }
-        return;
-    }
 
     touch_frame_t f;
     bool read_ok = touch_read_frame(&f);
