@@ -145,6 +145,11 @@ bool asset_dl_map_hidden(const char *hash_or_id);                     /* 该图�
 int  asset_dl_bgmap_visible_count(void);                              /* 未被隐藏的 BGMAP 条数 */
 bool asset_dl_map_is_active(const char *hash_or_id);                  /* 是否正在渲染的当前图 */
 
+/* 【活动地图持久化 2026-10-01（自 216 迁移）】hash/id → map_id；以及 map_id 是否还在当前清单里。
+ * 用途：活动地图存 map_id（不是 hash——重导会换 hash），开机校验它仍在清单，不在才回默认。 */
+bool asset_dl_map_id_of(const char *hash_or_id, char *out, size_t cap);
+bool asset_dl_map_exists(const char *map_id);
+
 /* per-map 键查询（相机 agent 的 NVS per-map 键同口径，见 requirements §5.3）：
  * out = map_id 优先，无则 "h"+hash 前 14 位；找不到该 BGMAP 条目返回 false */
 bool asset_dl_map_key(const char *hash_or_id, char *out, size_t cap);

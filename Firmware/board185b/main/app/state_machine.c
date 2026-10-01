@@ -703,6 +703,46 @@ static void dispatch_set_parts_by_hash(const char *hash)
     ESP_LOGI(TAG, "换装 %s rc=%d", path, rc);
 }
 
+/* ------------------------------------------------------------------ */
+/* 【活动地图持久化 2026-10-01（自 216 迁移）】用户口径：设置成某张图并调好相机后，
+ * **重启必须还是这张图**，不能重置回默认 000010000。
+ * 存 map_id（不是 hash：重导会换 hash）；开机校验它仍在清单里，不在才回默认。 */
+#define MP_ACTIVE_MAP_NVS_NS  "uimap"
+#define MP_ACTIVE_MAP_NVS_KEY "active"
+
+static void active_map_save(const char *map_id)
+{
+    if (!map_id || !map_id[0]) return;
+    nvs_handle_t h;
+    if (nvs_open(MP_ACTIVE_MAP_NVS_NS, NVS_READWRITE, &h) != ESP_OK) return;
+    char cur[32] = "";
+    size_t len = sizeof cur;
+    bool same = (nvs_get_str(h, MP_ACTIVE_MAP_NVS_KEY, cur, &len) == ESP_OK &&
+                 strcmp(cur, map_id) == 0);
+    if (!same) {
+        if (nvs_set_str(h, MP_ACTIVE_MAP_NVS_KEY, map_id) == ESP_OK) {
+            nvs_commit(h);
+            ESP_LOGW(TAG, "活动地图已记入 NVS：%s（重启后仍用这张）", map_id);
+        }
+    }
+    nvs_close(h);
+}
+
+/* 取出"上次用的图"：不在清单里（被删/被摘）→ 回默认图，避免开机黑屏 */
+static const char *active_map_get(char *buf, size_t cap)
+{
+    nvs_handle_t h;
+    buf[0] = 0;
+    if (nvs_open(MP_ACTIVE_MAP_NVS_NS, NVS_READONLY, &h) == ESP_OK) {
+        size_t len = cap;
+        if (nvs_get_str(h, MP_ACTIVE_MAP_NVS_KEY, buf, &len) != ESP_OK) buf[0] = 0;
+        nvs_close(h);
+    }
+    if (buf[0] && asset_dl_map_exists(buf)) return buf;
+    if (buf[0]) ESP_LOGW(TAG, "上次使用的地图 %s 已不在清单 → 回默认 %s", buf, MP_DEFAULT_MAP_ID);
+    return MP_DEFAULT_MAP_ID;
+}
+
 /* 是否已成功装载过 BGMAP（默认地图重投判据） */
 static bool g_map_loaded;
 
@@ -846,7 +886,13 @@ static void dispatch_map(const char *hash)
     if (n > 0)
         ESP_LOGI(TAG, "地图条带 %d 条：%s | %s", n, strips[0], (n > 1) ? strips[1] : "-");
     ESP_LOGW(TAG, "地图装载 %s（条带 %d）rc=%d", hash, n, mrc);
-    if (mrc == 0) g_map_loaded = true;
+    if (mrc == 0) {
+        g_map_loaded = true;
+        /* 装载成功即记忆（服务端推送 / 菜单选择 / 开机重投三条路径共用）：
+         * 下次开机仍用这张图（用户口径"设置成某张图后重启还是它"）。 */
+        char mid[32];
+        if (asset_dl_map_id_of(hash, mid, sizeof mid)) active_map_save(mid);
+    }
 
     /* 【契约 §3.3 全局加载】装载成功 → 应用该图 NVS 相机（非整图包自动跳过）。
      * 放在 render_set_map 之后：render_cam_* 的"当前图"口径以刚装入的包为准。 */
@@ -1077,10 +1123,14 @@ static void dispatch_manifest_synced(void)
      * → 背景全黑到底（真机实证：parts rc=0 宠物在、背景黑）。改为只要
      * 本轮没装载过地图就补投（g_map_loaded 门保证只补一次）。 */
     if (!g_map_loaded) {
+        /* 【活动图优先 2026-10-01】先取 NVS 记忆的图（校验仍在清单），没有才用默认图；
+         * 二者都可能不在清单 → 后面统一走"清单首图兜底"。 */
+        char mid[32];
+        const char *want = active_map_get(mid, sizeof mid);
         mp_cmd_t mc = { .type = MP_CMD_SET_MAP };
-        strlcpy(mc.s, MP_DEFAULT_MAP_ID, sizeof(mc.s));
+        strlcpy(mc.s, want, sizeof(mc.s));
         mp_post_cmd(&mc);
-        ESP_LOGW(TAG, "清单就绪 → 重投默认地图 %s", MP_DEFAULT_MAP_ID);
+        ESP_LOGW(TAG, "清单就绪 → 重投活动地图 %s（NVS 记忆，缺省 %s）", want, MP_DEFAULT_MAP_ID);
 
         /* ══ 【默认图缺失兜底 2026-10-01 · 真机根因】══════════════════════════
          * 现象：TF 上有地图包、娃娃也渲染，但**背景全黑**，日志只有一句
@@ -1095,14 +1145,26 @@ static void dispatch_manifest_synced(void)
         static char hs[8][20]; static char lb[8][32]; static bool ca[8];
         int n = asset_dl_bgmap_list(hs, lb, ca, 8);
         if (n > 0) {
+            /* 【挑选优先级 2026-10-01 真机修正】原先只挑"第一张已缓存"，真机暴露
+             * 真实场景：NVS 记着 004000032（另一个会话/服务端推过的图），但本设备
+             * 清单里只有另一张 → 兜底会随便挑一张，与用户当前想看的图不符。
+             * 现改为三级优先：
+             *   ① 当前**激活**图（asset_dl_map_is_active：服务端推送或菜单刚选过的
+             *      那张，语义="用户现在要的图"）；
+             *   ② 已缓存的（不用等下载）；
+             *   ③ 清单首图（触发下载）。
+             * 三级都不命中才算真的没图。 */
             int pick = -1;
-            for (int i = 0; i < n; i++) if (ca[i]) { pick = i; break; }   /* 已缓存优先 */
-            if (pick < 0) pick = 0;                                       /* 都没有就选第一张（触发下载） */
+            for (int i = 0; i < n; i++) if (asset_dl_map_is_active(hs[i])) { pick = i; break; }
+            if (pick < 0) for (int i = 0; i < n; i++) if (ca[i]) { pick = i; break; }
+            if (pick < 0) pick = 0;
             mp_cmd_t fc = { .type = MP_CMD_SET_MAP };
             strlcpy(fc.s, hs[pick], sizeof(fc.s));
             mp_post_cmd(&fc);
-            ESP_LOGW(TAG, "默认图 %s 不在清单 → 兜底装载清单首图 %.16s（%s）",
-                     MP_DEFAULT_MAP_ID, hs[pick], lb[pick]);
+            ESP_LOGW(TAG, "目标图 %s 不在清单 → 兜底装载 %s%.16s（%s）",
+                     want,
+                     asset_dl_map_is_active(hs[pick]) ? "当前激活图 " : "",
+                     hs[pick], lb[pick]);
         } else {
             ESP_LOGW(TAG, "清单里没有任何 BGMAP（服务端未登记地图？）—— 背景保持黑底");
         }
