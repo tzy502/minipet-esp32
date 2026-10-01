@@ -48,6 +48,26 @@ static const char *TAG = "sm";
  * 「装载地图 → 读 NVS 应用相机」= 全局加载。 */
 #include "compositor.h"
 
+/* ══ 【气泡整体去除 2026-10-01 · 用户口径（两板同口径）】════════════════════
+ * "整体去除气泡 效果不好" → 桌宠不再显示任何对话气泡；1.85B 同步同改。
+ * 所有气泡渲染收敛到下面的包装函数，CONFIG_MP_BUBBLE_ENABLE=n（默认）时整段不画。
+ * 【配对码不能一起删】MP_CMD_PAIRING_CODE 原本也走气泡（屏显 6 位码）→ 删了
+ * 新设备无法配对；该分支已改走**顶部常驻横幅**（黑底白字，同一可见通道）。 */
+#ifndef CONFIG_MP_BUBBLE_ENABLE
+#define MP_BUBBLE_ENABLE 0
+#else
+#define MP_BUBBLE_ENABLE CONFIG_MP_BUBBLE_ENABLE
+#endif
+
+static void bubble_show(const char *text, render_font_t font)
+{
+#if MP_BUBBLE_ENABLE
+    render_bubble_show(text, font);
+#else
+    (void)text; (void)font;
+#endif
+}
+
 static mp_state_t s_state = MP_ST_BOOT;
 static bool       s_online = false;       /* 服务端可达（poller 维护） */
 static bool       s_force_sleep = false;  /* <10% 强制睡眠保电（E11） */
@@ -58,6 +78,34 @@ static SemaphoreHandle_t s_lock;
 /* 【活动地图持久化】NVS 助手定义在文件后段，boot 段先用 → 这里前置声明 */
 static void active_map_save(const char *map_id);
 static const char *active_map_get(char *buf, size_t cap);
+
+/* 【相机拖动压测】连续平移相机 steps 次、每次 step 世界 px，逐次打点。
+ * 判读：每步耗时 ≈ 整屏合成/上屏成本 ⇒ 瓶颈在合成或 blit；
+ *       个别步尖峰（跨瓦片列那一拍）⇒ 瓶颈在 SD 补块。
+ * 触发通道：服务端 `{"type":"camtest"}`（需服务端白名单）**或**
+ * 气泡魔数 `::camtest <步数>,<步长>`（走已有 bubble 通道，无需部署服务端）。 */
+static void cam_pan_test_run(int steps, int step)
+{
+    if (!render_cam_supported()) { ESP_LOGW(TAG, "相机压测：当前图非整图包"); return; }
+    int32_t x0 = 0, y0 = 0;
+    render_cam_get(&x0, &y0);
+    ESP_LOGW(TAG, "相机压测开始：起点 (%d,%d) 步数 %d 步长 %d", (int)x0, (int)y0, steps, step);
+    int64_t t_all = esp_timer_get_time();
+    int64_t t_max = 0;
+    for (int i = 1; i <= steps; i++) {
+        int64_t t0 = esp_timer_get_time();
+        render_cam_set(x0 + i * step, y0);
+        int64_t dt = esp_timer_get_time() - t0;
+        if (dt > t_max) t_max = dt;
+        ESP_LOGW(TAG, "相机压测 步 %d/%d → x=%d 耗时 %lld ms",
+                 i, steps, (int)(x0 + i * step), (long long)(dt / 1000));
+    }
+    int64_t all = (esp_timer_get_time() - t_all) / 1000;
+    ESP_LOGW(TAG, "相机压测结束：%d 步共 %lld ms（均 %lld ms，最大 %lld ms）"
+                  "—— 判据：均 ≤30ms 为流畅；个别尖峰=补块；每步都百毫秒级=合成/上屏",
+             steps, (long long)all, (long long)(all / (steps ? steps : 1)),
+             (long long)(t_max / 1000));
+}
 
 /* ------------------------------------------------------------------ */
 /* E11 降级事件上报：离线态进出（Web 可见设备健康）                        */
@@ -1189,6 +1237,14 @@ void app_cmd_dispatch(const mp_cmd_t *cmd)
         render_set_expression(cmd->s);
         break;
     case MP_CMD_BUBBLE:
+        /* 【压测魔数】与 `::shot` 同款：不需要服务端白名单即可触发相机拖动压测。
+         * 例：气泡文本 "::camtest 12,8" = 连续平移 12 步、每步 8 世界像素。 */
+        if (strncmp(cmd->s, "::camtest", 9) == 0) {
+            int st = 12, sp = 8;
+            if (sscanf(cmd->s + 9, "%d,%d", &st, &sp) >= 1 && st <= 0) st = 12;
+            cam_pan_test_run(st, sp);
+            break;
+        }
         /* 【远程取证魔数 2026-10-01】bubble 文本 "::shot" → UDP 帧倾倒（不走
          * TF，不需白名单放行 screenshot）。帧里不含本气泡——在显示前截走。 */
         if (strncmp(cmd->s, "::shot", 6) == 0) {
@@ -1204,7 +1260,10 @@ void app_cmd_dispatch(const mp_cmd_t *cmd)
             state_machine_notify_activity();
             ESP_LOGI(TAG, "气泡指令到达：先从待机时钟唤醒回桌宠态");
         }
-        render_bubble_show(cmd->s, RENDER_FONT_24);   /* 协议传 UTF-8（E12） */
+        bubble_show(cmd->s, RENDER_FONT_24);   /* 协议传 UTF-8（E12） */
+        break;
+    case MP_CMD_CAM_PAN_TEST:
+        cam_pan_test_run(cmd->a > 0 ? cmd->a : 20, cmd->b != 0 ? cmd->b : 8);
         break;
     case MP_CMD_SET_MAP:
         dispatch_map(cmd->s);
@@ -1224,8 +1283,15 @@ void app_cmd_dispatch(const mp_cmd_t *cmd)
         esp_restart();
         break;
     case MP_CMD_PAIRING_CODE:
-        /* E13：屏显 6 位配对码 + 配对成功 cheers */
-        render_bubble_show(cmd->s, RENDER_FONT_24);
+        /* E13：屏显 6 位配对码 + 配对成功 cheers。
+         * 【气泡去除后改道 2026-10-01】原走气泡 → 改走顶部常驻横幅，
+         * 保证关掉气泡后新设备仍能看到 6 位配对码。 */
+        {
+            char code_line[28];
+            snprintf(code_line, sizeof(code_line), "PAIR CODE: %.10s",
+                     (cmd->s[0]) ? cmd->s : "------");
+            render_banner_show(code_line);
+        }
         render_set_expression(MP_EXPR_CHEERS);
         break;
     case MP_CMD_MANIFEST_SYNCED:
@@ -1246,14 +1312,14 @@ void app_cmd_dispatch(const mp_cmd_t *cmd)
         else render_banner_hide();
         break;
     case MP_CMD_OTA_BEGIN:
-        render_bubble_show("固件升级中…", RENDER_FONT_24);
+        bubble_show("固件升级中…", RENDER_FONT_24);
         break;
     case MP_CMD_OTA_FAIL:
-        render_bubble_show("升级失败：已回滚", RENDER_FONT_24);
+        bubble_show("升级失败：已回滚", RENDER_FONT_24);
         render_set_expression(MP_EXPR_DAM);
         break;
     case MP_CMD_OTA_DONE:
-        render_bubble_show("升级完成，重启中", RENDER_FONT_24);
+        bubble_show("升级完成，重启中", RENDER_FONT_24);
         break;
     case MP_CMD_BGM_TOGGLE:                 /* BGM 控制：转调 bgm（audio_q 异步生效） */
         bgm_toggle_pause();

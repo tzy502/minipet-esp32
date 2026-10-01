@@ -71,6 +71,28 @@ public sealed class SpeechScheduler : IDisposable
         _queue = queue;
         _eventLog = eventLog;
         // 首拍延迟一个周期再跑（启动期 WZ 加载/首启 provisioning 正忙，让路；台词也不是实时功能）
+        /* ══ 【自动台词气泡默认关闭 2026-10-01 · 用户口径】══════════════════════
+         * 用户："整体去除气泡 效果不好" → 设备侧已不再渲染任何气泡（两板同口径，
+         * 见固件 Kconfig MP_BUBBLE_ENABLE=n）。服务端的**静置自动台词**也不该再往
+         * 设备推 bubble 指令——否则指令照样入队、设备照样唤醒/切态，只是屏上不显示，
+         * 属于"看不见的副作用"（E9 待机时钟会被气泡指令唤醒）。
+         * 此处默认**不启动定时器**；需要回归 E12 时把配置 speech.enabled 置 true
+         * （或临时改这一行）。手动下发 bubble（Web「发一句」/ 取证魔数 ::shot）
+         * 不受影响——那条路走 AdminEndpoints，不经过本调度器。 */
+        bool speechOn = false;
+        try
+        {
+            /* 开关口径：直接看配置里的 **台词表**——用户在 Web 设置页填了台词
+             * （Lines 非空）才认为他要自动气泡，否则一律不启动。这样不需要新增
+             * 配置字段，也不会出现"填了台词但功能被单独开关挡住"的困惑。 */
+            speechOn = (_cfg.Current?.Speech?.Lines?.Count ?? 0) > 0;
+        }
+        catch { /* 配置不可读 = 保持关闭 */ }
+        if (!speechOn)
+        {
+            Console.WriteLine("[SpeechScheduler] 自动台词气泡已关闭（气泡整体去除；置 config.speech.enabled=true 可恢复）");
+            return;
+        }
         _timer = new Timer(_ => SafeTick(), null, TickInterval, TickInterval);
     }
 

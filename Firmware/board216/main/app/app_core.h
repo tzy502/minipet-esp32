@@ -165,6 +165,9 @@ typedef enum {
     MP_CMD_CLOCK,           /* a=1 待机时钟浮现 / 0 隐藏（E9；锚点查 clock_table） */
     MP_CMD_BANNER,          /* a=1 顶部未配网横幅 s=文本 / a=0 隐藏（问题4）   */
     MP_CMD_BGM_TOGGLE,      /* 播放/暂停切换 → bgm_toggle_pause（E8 设备端）  */
+    MP_CMD_CAM_PAN_TEST,    /* 【压测钩子】a=步数 b=步长（世界 px）→ 渲染任务连续平移相机并
+                             * 打点每步耗时（只看日志，不改持久化）。用于真机量化"拖动卡在哪
+                             * 一层"：缓存补读 vs 整屏合成 vs 上屏。仅 admin API 可达。 */
     MP_CMD_BGM_NEXT,        /* 下一首（本地曲目表循环）→ bgm_next            */
     MP_CMD_BGM_PREV,        /* 上一首（本地曲目表循环）→ bgm_prev            */
     MP_CMD_BGM_PLAYID,      /* s=数字串曲目 id → bgm_play_id 选曲播放        */

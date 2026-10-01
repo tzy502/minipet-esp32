@@ -28,6 +28,16 @@ config MP_TOUCH_CST816
       关闭 = drivers 组件整文件剔除（bring-up 隔离开关）；board216 构建
       树不含本驱动，不受影响。
 
+config MP_BUBBLE_ENABLE
+    bool "对话气泡层（E12 台词/配对码/OTA 提示）"
+    default n
+    help
+      用户口径 2026-10-01：「整体去除气泡 效果不好」→ 默认关闭：
+      屏上不再出现任何对话气泡（state_machine 的气泡包装函数整段不画）。
+      注意配对码（MP_CMD_PAIRING_CODE）已改走顶部常驻横幅，与本开关无关，
+      关掉气泡不影响新设备配对。
+      置 y 可整体恢复气泡（回退对照用）。
+
 config MP_ASSET_HEAP_GATE_KB
     int "素材绑定内部堆门（KB）"
     default 6

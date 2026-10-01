@@ -48,6 +48,32 @@ static const char *TAG = "sm";
  * 「装载地图 → 读 NVS 应用相机」= 全局加载。 */
 #include "compositor.h"
 
+/* ══ 【气泡整体去除 2026-10-01 · 用户口径】════════════════════════════════════
+ * 用户："整体去除气泡 效果不好" → 桌宠不再显示任何对话气泡。两板同口径。
+ * 做法：所有气泡渲染收敛到下面这个包装函数，MP_BUBBLE_ENABLE=0 时**整段不画**
+ * （render_bubble_show 不被调用，屏上永不出现气泡框）。
+ * 【为什么不能简单删掉调用点】配对码 MP_CMD_PAIRING_CODE 也走气泡（屏显 6 位码），
+ * 删了会让新设备无法配对 → 该路径改走**顶部常驻横幅**（黑底白字，本就在，
+ * 且是"未配网"横幅的同一通道，用户已熟悉），见 MP_CMD_PAIRING_CODE 分支。
+ * =1 可整体恢复气泡（便于回退对照）。
+ * 【开关出处 2026-10-01 修正】原写死 #define，现改读 Kconfig
+ * `CONFIG_MP_BUBBLE_ENABLE`（default n）——双板共用同名开关，一次口径两板一致，
+ * 且不用改代码即可回退。构建前需 menuconfig 或 sdkconfig 里显式置位。 */
+#ifndef CONFIG_MP_BUBBLE_ENABLE
+#define MP_BUBBLE_ENABLE 0          /* 未定义 = 关（气泡去除） */
+#else
+#define MP_BUBBLE_ENABLE CONFIG_MP_BUBBLE_ENABLE
+#endif
+
+static void bubble_show(const char *text, render_font_t font)
+{
+#if MP_BUBBLE_ENABLE
+    render_bubble_show(text, font);
+#else
+    (void)text; (void)font;
+#endif
+}
+
 static mp_state_t s_state = MP_ST_BOOT;
 static bool       s_online = false;       /* 服务端可达（poller 维护） */
 static bool       s_force_sleep = false;  /* <10% 强制睡眠保电（E11） */
@@ -1123,7 +1149,7 @@ void app_cmd_dispatch(const mp_cmd_t *cmd)
             state_machine_notify_activity();
             ESP_LOGI(TAG, "气泡指令到达：先从待机时钟唤醒回桌宠态");
         }
-        render_bubble_show(cmd->s, RENDER_FONT_24);   /* 协议传 UTF-8（E12） */
+        bubble_show(cmd->s, RENDER_FONT_24);   /* 协议传 UTF-8（E12） */
         break;
     case MP_CMD_SET_MAP:
         dispatch_map(cmd->s);
@@ -1143,8 +1169,17 @@ void app_cmd_dispatch(const mp_cmd_t *cmd)
         esp_restart();
         break;
     case MP_CMD_PAIRING_CODE:
-        /* E13：屏显 6 位配对码 + 配对成功 cheers */
-        render_bubble_show(cmd->s, RENDER_FONT_24);
+        /* E13：屏显 6 位配对码 + 配对成功 cheers。
+         * 【2026-10-01 气泡去除后改道】原走气泡（render_bubble_show）——气泡整体
+         * 停用后，配对码若无替代通道，新设备将无法完成配对（屏上看不到码）。
+         * 现改走**顶部常驻横幅**：黑底白字、5x7 字模（纯 ASCII，6 位数字完全可读），
+         * 与"未配网"横幅同一通道，配对成功后由 poller/配网流程发 BANNER 清除。 */
+        {
+            char code_line[28];   /* "PAIR CODE: " + 最多 10 位（配对码恒 6 位；留余量防 -Wformat-truncation） */
+            snprintf(code_line, sizeof(code_line), "PAIR CODE: %.10s",
+                     (cmd->s[0]) ? cmd->s : "------");
+            render_banner_show(code_line);
+        }
         render_set_expression(MP_EXPR_CHEERS);
         break;
     case MP_CMD_MANIFEST_SYNCED:
@@ -1165,14 +1200,14 @@ void app_cmd_dispatch(const mp_cmd_t *cmd)
         else render_banner_hide();
         break;
     case MP_CMD_OTA_BEGIN:
-        render_bubble_show("固件升级中…", RENDER_FONT_24);
+        bubble_show("固件升级中…", RENDER_FONT_24);
         break;
     case MP_CMD_OTA_FAIL:
-        render_bubble_show("升级失败：已回滚", RENDER_FONT_24);
+        bubble_show("升级失败：已回滚", RENDER_FONT_24);
         render_set_expression(MP_EXPR_DAM);
         break;
     case MP_CMD_OTA_DONE:
-        render_bubble_show("升级完成，重启中", RENDER_FONT_24);
+        bubble_show("升级完成，重启中", RENDER_FONT_24);
         break;
     case MP_CMD_BGM_TOGGLE:                 /* BGM 控制：转调 bgm（audio_q 异步生效） */
         bgm_toggle_pause();

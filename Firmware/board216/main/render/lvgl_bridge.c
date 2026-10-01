@@ -998,7 +998,9 @@ static bool cam_apply_pan(int32_t sx, int32_t sy, bool snap)
     if (nx == ox && ny == oy) return false;   /* 吸附后同格/已到边界：本拍无运动 */
     /* 【极限档】真的动了才进/续 level 2：拖动期只画 static 底图 + 零窗口缓存 IO，
      * 松手 200ms 后由渲染层自动回 level 1 → level 0（"松手出全图"）。 */
-    render_cam_adjust_motion();
+    /* 【同上】拖动期不再推进降级档：背景照常全层渲染（用户定稿）。
+     * 这里只记录"手指在动"的时戳，供渲染层的松手判定使用（不改变渲染内容）。 */
+    render_cam_adjust_motion_notify();
     return true;
 }
 
@@ -1289,12 +1291,14 @@ static bool menu_map_fn_camera_enter(void)
         return false;
     }
     s_cam.on = true;
-    /* 【性能模式 2026-10-01 两级降级】用户口径"调摄像头时卡顿太严重"：进调参态
-     * 先落到 level 1（跳条带层，只留 static+tile）；一旦手指开始拖动，UX 层的
-     * render_cam_adjust_motion() 会把它推进 level 2（极限：只画 static 底图 +
-     * 窗口缓存零 TF 读 + 步长吸附）；松手 200ms 后渲染层自动 2→1→0
-     * （条带重新出现 = "松手出全图"）。收尾（cam_finish_core）直接回 level 0。 */
-    render_cam_adjust_set(RC_CAM_ADJ_NO_STRIP);
+    /* 【2026-10-01 用户定稿：调参期背景必须正常渲染】早先为省时间做了两级降级
+     * （level 1 跳条带 / level 2 只画 static 底图），用户明确否掉：
+     *   "调整 bac 还是需要正常渲染的，只是没遇到的 tile 可以不加载到内存，
+     *    优化性能"
+     * ⇒ 调参态**不再降级**，始终 level 0 全层渲染；性能改由"服务端分块包 +
+     * 固件只加载可见 tile（LRU 淘汰）"承担（见 docs/ai/map-tiled-format-contract.md）。
+     * 降级档 API 保留但不再由 UX 触发（万一将来需要兜底）。 */
+    render_cam_adjust_set(RC_CAM_ADJ_OFF);
 
     /* ⑤ 调参态常驻横幅：入队放在 MENU_EXIT/POKER on_enter 之后，保证压过未配网
      *    横幅（cmd_q FIFO，同一渲染任务帧内顺序落地） */

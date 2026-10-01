@@ -13,9 +13,11 @@
 #include <inttypes.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>      /* pread / fileno：瓦片整块读（契约 §6 只允许整块 pread） */
 
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "watchdog.h"    /* 瓦片整块读循环喂狗（渲染任务 5s 不喂 = E14 熔断黑屏） */
 
 static const char *TAG = "mpak";
 
@@ -118,6 +120,93 @@ static int cur_name(cur_t *c, char *out, size_t out_sz /* 含 NUL，=33 */)
 }
 
 static size_t align4(size_t n) { return (n + 3u) & ~3u; }
+
+/* ------------------------------------------------------------------ */
+/* 瓦片几何（契约 docs/ai/map-tiled-format-contract.md §2/§6）          */
+/* ------------------------------------------------------------------ */
+
+/* 瓦片边长候选表（**从包内长度反解，不硬编码**；128 优先 = 契约 §2 现档）。
+ * 为什么可以反解：逐行口径与瓦片口径的层长度集合不相交 ——
+ *   行口径 static = vh*align4(vw*2)（或旧紧打包 vw*vh*2）
+ *   瓦片口径 static = ceil(vw/T)*ceil(vh/T)*T*T*2
+ * 唯一重合的退化情形是"整层恰好一块瓦片"（vw=vh=T）：此时两种布局逐字节相同，
+ * 取哪一种都读到同样的像素，故无歧义风险。
+ * 未来服务端换档（64/256/512）时固件无需改代码，只要长度自洽就能认。 */
+static const int32_t k_tile_cand[] = { 128, 64, 256, 512, 32, 16 };
+#define MPAK_TILE_CAND_N ((int)(sizeof k_tile_cand / sizeof k_tile_cand[0]))
+
+static int32_t tile_grid_axis(int32_t len, int32_t tile)
+{
+    return (len + tile - 1) / tile;
+}
+
+/* 层像素区长度 == gx*gy*T*T*2 → 返回该 T（否则 0）。gx/gy 可空。 */
+static int32_t tile_probe_px_len(uint32_t len, int32_t lw, int32_t lh,
+                                 int32_t *gx_out, int32_t *gy_out)
+{
+    if (len == 0 || lw <= 0 || lh <= 0) return 0;
+    for (int i = 0; i < MPAK_TILE_CAND_N; i++) {
+        int32_t T = k_tile_cand[i];
+        int32_t gx = tile_grid_axis(lw, T), gy = tile_grid_axis(lh, T);
+        uint64_t need = (uint64_t)gx * (uint64_t)gy * (uint64_t)T * (uint64_t)T * 2u;
+        if (need == len) {
+            if (gx_out) *gx_out = gx;
+            if (gy_out) *gy_out = gy;
+            return T;
+        }
+    }
+    return 0;
+}
+
+/* 瓦片掩码区长度 = gx*gy*(T*T/8)（T%8==0 才有定义） */
+static uint32_t tile_mask_len_of(int32_t T, int32_t gx, int32_t gy)
+{
+    if (T <= 0 || (T & 7) != 0) return 0;
+    return (uint32_t)((uint64_t)gx * (uint64_t)gy * (uint64_t)(T / 8) * (uint64_t)T);
+}
+
+/* 单件（PARTS part）瓦片布局探测：像素区 = gx*gy*T*T*2（右/下补 0），
+ * 掩码区 = gx*gy*(T*T/8)。extent 是"到下一件起点"的字节数（单件包 = 位图区尾）。
+ * 返回 T（命中）或 0；*alpha 报告是否带掩码。 */
+static int32_t part_tile_probe(uint32_t extent, int32_t w, int32_t h,
+                               int32_t *gx_out, int32_t *gy_out, bool *alpha)
+{
+    for (int i = 0; i < MPAK_TILE_CAND_N; i++) {
+        int32_t T = k_tile_cand[i];
+        int32_t gx = tile_grid_axis(w, T), gy = tile_grid_axis(h, T);
+        uint32_t pxb = (uint32_t)((uint64_t)gx * gy * T * T * 2u);
+        uint32_t mkb = tile_mask_len_of(T, gx, gy);
+        if (extent == pxb) {
+            if (gx_out) *gx_out = gx;
+            if (gy_out) *gy_out = gy;
+            if (alpha) *alpha = false;
+            return T;
+        }
+        if (mkb && (extent == pxb + mkb || extent == (uint32_t)align4((size_t)pxb + mkb))) {
+            if (gx_out) *gx_out = gx;
+            if (gy_out) *gy_out = gy;
+            if (alpha) *alpha = true;
+            return T;
+        }
+    }
+    return 0;
+}
+
+/* 路径 → 文件身份（FNV-1a 32）。与 mpak_open 的自增 file_id 分处两个取值空间：
+ * 自增 id 从小整数开始，这里**顶位置 1** ⇒ 两套身份永不相撞（瓦片缓存键的一部分）。
+ * 为什么条带要用路径身份而不是每次 open 的句柄身份：条带补读是"按需 open → pread
+ * → close"，若身份随句柄走，同一文件两次打开之间缓存全失效（每次补边都要重读整列
+ * 瓦片）；用路径身份则"内容不变 ⇒ 缓存有效"，且路径是内容哈希命名的（见 asset_dl）。 */
+uint32_t mpak_path_id(const char *path)
+{
+    uint32_t h = 2166136261u;
+    if (!path) return 0;
+    for (const char *p = path; *p; p++) {
+        h ^= (uint8_t)*p;
+        h *= 16777619u;
+    }
+    return h | 0x80000000u;
+}
 
 /* ------------------------------------------------------------------ */
 /* crc32c（软件实现；表运行期生成一次，仅渲染任务访问，无锁）            */
@@ -469,11 +558,37 @@ static int parse_parts(mpak_t *m)
                    ext <= tab[i].pixel_bytes + mask_al + 3u) {
             tab[i].has_alpha = true;
         } else {
-            ESP_LOGE(TAG, "part %" PRIu32 " extent %u matches neither opaque nor alpha",
-                     tab[i].id, ext);
-            free(offs);
-            heap_caps_free(tab);
-            return MPAK_ERR_FMT;
+            /* ── 瓦片口径（契约 §2；2026-10-01）──────────────────────────────
+             * 【为什么必须在这里认】整图条带的像素在独立小 PARTS 包里，BGMAP 的
+             * bit1 管不到它；包自身唯一的自证就是"长度 == gx*gy*T*T*2（+掩码）"。
+             * 认不出的后果不是"少画一条带"，而是 mpak_open 直接 MPAK_ERR_FMT →
+             * strip_load_world 整条失败 → 真机表现为"整图只有底图、条带全灭"。
+             * 逐行口径先判（老包走原分支，行为逐字节不变），只有逐行两式都不匹配
+             * 时才试瓦片口径 ⇒ ≤1024 的老宠物件/老条带完全不受影响。 */
+            int32_t tgx = 0, tgy = 0;
+            bool t_alpha = false;
+            int32_t T = part_tile_probe(ext, tab[i].w, tab[i].h, &tgx, &tgy, &t_alpha);
+            if (T) {
+                tab[i].tiled      = true;
+                tab[i].tile       = (uint16_t)T;
+                tab[i].gx         = (uint16_t)tgx;
+                tab[i].gy         = (uint16_t)tgy;
+                tab[i].has_alpha  = t_alpha;
+                /* pixel_bytes/mask_bytes 改写成**盘上真实**字节数：消费侧
+                 * （compositor 的条带装载）用它们算掩码区起点与尺寸。 */
+                tab[i].pixel_bytes = (uint32_t)((uint64_t)tgx * tgy * T * T * 2u);
+                tab[i].mask_bytes  = tile_mask_len_of(T, tgx, tgy);
+                ESP_LOGI(TAG, "part %" PRIu32 " %ux%u 为瓦片存储（tile=%d 网格 %dx%d%s）",
+                         tab[i].id, tab[i].w, tab[i].h, (int)T, (int)tgx, (int)tgy,
+                         t_alpha ? " +掩码" : "");
+            } else {
+                ESP_LOGE(TAG, "part %" PRIu32 " extent %u matches neither opaque nor alpha"
+                              "（逐行 %" PRIu32 "/掩码 %" PRIu32 "；瓦片口径亦不匹配）",
+                         tab[i].id, ext, tab[i].pixel_bytes, mask_raw);
+                free(offs);
+                heap_caps_free(tab);
+                return MPAK_ERR_FMT;
+            }
         }
         tab[i].extent = ext;
     }
@@ -719,17 +834,62 @@ static int parse_bgmap(mpak_t *m)
     tile_expect = (tile_expect + 3u) & ~3u;                       /* 旧公式 */
     uint32_t tile_expect_enc = tile_rgb + tile_mask_al;           /* 编码端公式 */
 
+    /* ── 瓦片口径（契约 docs/ai/map-tiled-format-contract.md §2/§5；2026-10-01）──
+     * 【为什么靠长度反解而不是只看 flags bit1】
+     *   1. 逐行口径与瓦片口径的层长度集合不相交（见 tile_probe_px_len 注释），
+     *      长度本身就是硬证据：静态层长度 == gx*gy*T*T*2 时，它**不可能**是逐行打包；
+     *   2. bit1 要等尾扩展块读出来才知道，而扩展块位置又依赖 tile_layer_len 的
+     *      口径 —— 先判长度再交叉校验 bit1，才不会拿"逐行口径的偏移"去找瓦片包的
+     *      扩展块（两者差着 padding 的倍数）；
+     *   3. 服务端若忘置 bit1，固件仍能按瓦片正确读（只告警）；服务端置了 bit1 而
+     *      文件其实是逐行打包，则退回逐行读（只告警）—— 两种半升级状态都不黑屏。 */
+    int32_t tgx = 0, tgy = 0;
+    int32_t tile_t = tile_probe_px_len(bg->static_back_len, bg->vw, bg->vh, &tgx, &tgy);
+    uint32_t tiled_rgb_len  = 0;
+    uint32_t tiled_mask_len = 0;
+    if (tile_t > 0) {
+        tiled_rgb_len  = (uint32_t)((uint64_t)tgx * tgy * tile_t * tile_t * 2u);
+        tiled_mask_len = tile_mask_len_of(tile_t, tgx, tgy);
+    }
+    bool tiled = (tile_t > 0);
+
+    /* tile 层长度必须与 static 同一 TILE 口径（不同 = 包自相矛盾，硬失败：
+     * 半瓦片半逐行的包没有正确读法，静默猜只会画出错位图）。 */
+    if (tiled && bg->tile_layer_len != 0 &&
+        bg->tile_layer_len != tiled_rgb_len &&
+        bg->tile_layer_len != tiled_rgb_len + tiled_mask_len) {
+        ESP_LOGE(TAG, "bgmap %s 瓦片口径自相矛盾：static=%" PRIu32 "B(→tile=%d 网格 %dx%d)"
+                      " 但 tile_layer=%" PRIu32 "B（期望 %" PRIu32 "±掩码 %" PRIu32 "）",
+                 bg->map_id, bg->static_back_len, (int)tile_t, (int)tgx, (int)tgy,
+                 bg->tile_layer_len, tiled_rgb_len, tiled_mask_len);
+        heap_caps_free(bg);
+        return MPAK_ERR_FMT;
+    }
+
     if ((bg->static_back_len != static_tight &&
-         bg->static_back_len != static_aligned) ||
+         bg->static_back_len != static_aligned &&
+         bg->static_back_len != tiled_rgb_len) ||
         (bg->tile_layer_len != 0 &&
          bg->tile_layer_len != tile_expect &&
-         bg->tile_layer_len != tile_expect_enc) ||
+         bg->tile_layer_len != tile_expect_enc &&
+         bg->tile_layer_len != tiled_rgb_len &&
+         bg->tile_layer_len != tiled_rgb_len + tiled_mask_len) ||
         bg->strip_count > MPAK_BGMAP_MAX_STRIPS) {
         ESP_LOGE(TAG, "bgmap %s geometry invalid (vw=%u vh=%u static=%" PRIu32
                       " tile=%" PRIu32 ")",
                  bg->map_id, bg->vw, bg->vh, bg->static_back_len, bg->tile_layer_len);
         heap_caps_free(bg);
         return MPAK_ERR_FMT;
+    }
+
+    bg->tiled = tiled;
+    if (tiled) {
+        bg->tile            = tile_t;
+        bg->gx              = tgx;
+        bg->gy              = tgy;
+        bg->tile_px_bytes   = tiled_rgb_len;
+        bg->tile_mask_bytes = (bg->tile_layer_len > tiled_rgb_len)
+                              ? (bg->tile_layer_len - tiled_rgb_len) : 0;
     }
 
     /* 【BGMAP 层偏移自愈 2026-09-27】真凶级布局 bug：BgmapPackWriter 估 headerLen 时
@@ -755,6 +915,13 @@ static int parse_bgmap(mpak_t *m)
         bg->static_back_off = strips_end;
         bg->tile_layer_off   = strips_end + bg->static_back_len;
     }
+    /* tile 掩码区起点（**用自愈后的 tile_layer_off**）：瓦片口径 = 像素区之后
+     * （像素区 = gx*gy*T*T*2，右/下补 0 也算在区内），行口径 = vh*align4(vw*2)。
+     * 两个口径的数值**不可互换**（差着瓦片 padding 的倍数），所以由 mpak 统一算好
+     * 交给 compositor，避免第二处再推一遍公式推错。 */
+    bg->tile_mask_off = bg->tiled
+        ? bg->tile_layer_off + bg->tile_px_bytes
+        : bg->tile_layer_off + (uint32_t)bg->vh * stride_al;
 
     if (bg->strip_count) {
         bg->strips = psram_alloc(bg->strip_count * sizeof(mpak_strip_t));
@@ -825,6 +992,21 @@ static int parse_bgmap(mpak_t *m)
                 bg->ground_len = glen;
                 bg->full_map   = (eflags & MPAK_BGMAP_FLAG_FULL_MAP) != 0;
 
+                /* ── 瓦片标志交叉校验（契约 §1：flags bit1 = TILED）──────────────
+                 * 布局口径以"层长度恒等式"为准（见上面 tile_probe_px_len），bit1 只做
+                 * 一致性告警：两种半升级状态（服务端忘置位 / 置了位但文件还是逐行）
+                 * 都要能读出正确画面，绝不能黑屏。 */
+                bool flag_tiled = (eflags & MPAK_BGMAP_FLAG_TILED) != 0;
+                if (flag_tiled && !bg->tiled) {
+                    ESP_LOGW(TAG, "bgmap %s flags bit1(TILED)=1 但层长度是逐行口径"
+                                  "（static=%" PRIu32 "B）→ 按逐行读（服务端半升级）",
+                             bg->map_id, bg->static_back_len);
+                } else if (!flag_tiled && bg->tiled) {
+                    ESP_LOGW(TAG, "bgmap %s 层长度=瓦片口径（tile=%d 网格 %dx%d）但 flags"
+                                  " bit1=0 → 仍按瓦片读（服务端忘置位）",
+                             bg->map_id, (int)bg->tile, (int)bg->gx, (int)bg->gy);
+                }
+
                 /* 地面表缓存取舍（契约 §3.1 允许"整块读"或"按需 2B 读"）：
                  * 选**open 时整块缓存**，理由：
                  *  1) 调用频次：地面线在相机每次移动/角色每次换地图都要重算，
@@ -858,13 +1040,22 @@ static int parse_bgmap(mpak_t *m)
         }
     }
 
-    /* 装载日志（验收锚点）：整图包 `full_map=1 ground=NNNNB`；旧包 `full_map=0 ground=0B` */
+    /* 装载日志（验收锚点）：整图包 `full_map=1 ground=NNNNB`；旧包 `full_map=0 ground=0B`。
+     * 瓦片包额外打 `tiled=1 tile=128 网格 18x15`（真机判读"这条包到底走哪条路"）。 */
     ESP_LOGI(TAG, "bgmap %s vw=%u vh=%u full_map=%d ground=%" PRIu32 "B"
                   " ext_off=%" PRId32 " static=%" PRIu32 "@%" PRIu32
                   " tile=%" PRIu32 "@%" PRIu32 " strips=%" PRIu32,
              bg->map_id, bg->vw, bg->vh, bg->full_map ? 1 : 0, bg->ground_len,
              bg->ext_off, bg->static_back_len, bg->static_back_off,
              bg->tile_layer_len, bg->tile_layer_off, bg->strip_count);
+    if (bg->tiled) {
+        ESP_LOGI(TAG, "bgmap %s 瓦片布局：tile=%d 网格 %dx%d 像素区 %" PRIu32 "B/层"
+                      "（行口径同图需 %" PRIu32 "B）+ 掩码 %" PRIu32 "B@%" PRIu32
+                      " flags=0x%08" PRIx32,
+                 bg->map_id, (int)bg->tile, (int)bg->gx, (int)bg->gy, bg->tile_px_bytes,
+                 (uint32_t)bg->vh * stride_al, bg->tile_mask_bytes, bg->tile_mask_off,
+                 bg->ext_flags);
+    }
 
     m->u.bgmap = bg;
     return MPAK_OK;
@@ -899,6 +1090,10 @@ int mpak_bgmap_read_tile(const mpak_t *m, uint8_t *dst, size_t cap)
 /*     全局 bit 号算字节区间，天然跨行正确。                             */
 /*  3) 世界矩形 → 文件偏移用 **vw**（整图宽）算行距，跟窗口宽 w 无关；    */
 /*     窗口越界部分补 0（调用方自己按 vw/vh 裁剪），不报错。             */
+/*                                                                     */
+/* ⚠️ 上面 2) 只适用于**逐行包**。瓦片包（tiled，契约 §3）的掩码是       */
+/*    **块内逐行字节对齐**（块内第 y 行占 [y*T/8, y*T/8+T/8)），两套位序   */
+/*    不可混用 —— 分流点在 mpak_bgmap_read_*_rect，见下面的瓦片读模块。  */
 /* ------------------------------------------------------------------ */
 
 /* static_back 源行距（字节）：由 static_back_len 反推实际布局（见 parse_bgmap）。
@@ -931,6 +1126,303 @@ static int bg_rect_args(const mpak_t *m, int32_t w, int32_t h,
         return MPAK_ERR_ARG;
     return MPAK_OK;
 }
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * 瓦片(tile)整块读 + PSRAM 瓦片缓存（契约 §2/§6；2026-10-01）
+ *
+ * 【要解决的问题（真机实测根因）】整图窗口填充原来按"跨行距逐行读"：static 层
+ * 行距 4540B 而每行只需 672B ⇒ 读效率 15%，SD 顺序吞吐 1336 KB/s 只跑出
+ * ~130KB/s，一次装载 8.5~17.2s。瓦片布局下同一窗口只需读"覆盖它的那几块"
+ * （288×288 窗口 @128 瓦片 ≈ 9~16 块 ≈ 288~512KB），且**每块一次 pread**。
+ *
+ * 【缓存策略】像素块与掩码块各一张定容槽表，全局 LRU、按需懒分配：
+ *   · 只读"被请求到的那一块" —— 窗口/条带没覆盖到的瓦片既不读也不驻留
+ *     （条带未进视野时连窗口缓存都不分配，见 compositor 的 strip_wc_alloc）；
+ *   · 命中 = 纯 PSRAM memcpy，一次 SD 命令都不发（契约 §6 硬要求）；
+ *   · 槽位缓冲按需分配（第一张瓦片读进来时才 malloc 32KB/2KB），所以旧包
+ *     （非瓦片）与"没有一条带可见"的场景下这套缓存**一个字节都不占**。
+ * 【容量取舍】16 槽 = 512KB 像素 + 32KB 掩码（槽数可用 -D 覆盖）。
+ *   为什么不是把所有可见层都装下：288×288 世界窗口 @128 瓦片对**每一层**
+ *   就要 9~16 块，static + tile 两层叠加已 >16 ⇒ 再大也装不下"所有层"，只是
+ *   线性吃 PSRAM。16 槽的实际效果是"最近走过的那一层基本全命中"，跨层切换时
+ *   按 LRU 补最近的一列/一行块（每次边界跨越约 1 列 = 3~4 块 ≈ 128KB）。
+ * 【线程契约】只在渲染任务（持 rc_lock 的合成/同步路径）里访问，无锁。
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+#ifndef MPAK_TILE_PX_SLOTS
+#define MPAK_TILE_PX_SLOTS 16       /* 像素块槽数（每槽 tile*tile*2 = 32KB @128） */
+#endif
+#ifndef MPAK_TILE_CV_SLOTS
+#define MPAK_TILE_CV_SLOTS 16       /* 掩码块槽数（每槽 tile*tile/8 = 2KB @128）  */
+#endif
+
+typedef struct {
+    uint8_t *data;                  /* 槽缓冲（懒分配；PSRAM） */
+    size_t   cap;                   /* 已分配字节数（块大小变了要重分配） */
+    uint32_t fid;                   /* 文件身份（mpak_t.file_id / mpak_path_id） */
+    uint32_t base;                  /* 层基址（同一文件里的不同层不串） */
+    uint32_t idx;                   /* 瓦片序号（行主序 ty*gx+tx） */
+    uint32_t stamp;                 /* LRU 时间戳（单调递增） */
+    bool     valid;
+} mpak_tile_slot_t;
+
+static mpak_tile_slot_t s_ts_px[MPAK_TILE_PX_SLOTS];
+static mpak_tile_slot_t s_ts_cv[MPAK_TILE_CV_SLOTS];
+static uint32_t s_ts_stamp;         /* LRU 时钟 */
+static uint32_t s_ts_blocks;        /* 统计：实际整块读次数 */
+static uint32_t s_ts_hits;          /* 统计：命中次数 */
+static uint32_t s_ts_bytes;         /* 统计：整块读字节数 */
+
+void mpak_tile_stat_reset(void) { s_ts_blocks = s_ts_hits = s_ts_bytes = 0; }
+
+void mpak_tile_stat_get(uint32_t *blocks, uint32_t *hits, uint32_t *bytes)
+{
+    if (blocks) *blocks = s_ts_blocks;
+    if (hits)   *hits   = s_ts_hits;
+    if (bytes)  *bytes  = s_ts_bytes;
+}
+
+void mpak_tile_cache_flush(void)
+{
+    for (int i = 0; i < MPAK_TILE_PX_SLOTS; i++) s_ts_px[i].valid = false;
+    for (int i = 0; i < MPAK_TILE_CV_SLOTS; i++) s_ts_cv[i].valid = false;
+    /* 只清键不 free：缓冲下次直接复用（反复 malloc/free 大块是 PSRAM 碎片源） */
+}
+
+void mpak_tile_src_init(mpak_tile_src_t *s, uint32_t file_id, int fd, uint32_t base_off,
+                        int32_t lw, int32_t lh, int32_t tile)
+{
+    if (!s) return;
+    memset(s, 0, sizeof *s);
+    s->file_id = file_id;
+    s->fd      = fd;
+    s->base_off = base_off;
+    s->lw = lw;
+    s->lh = lh;
+    s->tile = tile;
+    if (tile > 0 && lw > 0 && lh > 0) {
+        s->gx = tile_grid_axis(lw, tile);
+        s->gy = tile_grid_axis(lh, tile);
+    }
+}
+
+/* 取一块（idx）到缓存并返回块数据指针；未命中时整块 pread（**唯一**允许的读法）。
+ * 返回 NULL = 读失败/无槽可分配（调用方报 IO/NOMEM，不静默画错）。 */
+static const uint8_t *ts_fetch(mpak_tile_slot_t *tab, int n, size_t block,
+                               const mpak_tile_src_t *s, uint32_t idx)
+{
+    if (s->fd < 0 || block == 0) return NULL;
+    uint32_t abs = s->base_off + (uint32_t)((uint64_t)idx * block);
+
+    int slot = -1;
+    for (int i = 0; i < n; i++) {
+        mpak_tile_slot_t *t = &tab[i];
+        if (t->valid && t->fid == s->file_id && t->base == s->base_off && t->idx == idx) {
+            t->stamp = ++s_ts_stamp;
+            s_ts_hits++;
+            return t->data;
+        }
+        if (!t->valid && slot < 0) slot = i;                 /* 优先空槽 */
+    }
+    /* 全满：淘汰最久未用（LRU） */
+    if (slot < 0) {
+        slot = 0;
+        for (int i = 1; i < n; i++)
+            if (tab[i].stamp < tab[slot].stamp) slot = i;
+    }
+    mpak_tile_slot_t *t = &tab[slot];
+    if (!t->data || t->cap < block) {
+        uint8_t *p = heap_caps_malloc(block, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!p) {
+            ESP_LOGE(TAG, "瓦片缓存槽分配失败（%zuB，PSRAM 空闲 %uB）",
+                     block, (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+            t->valid = false;
+            return NULL;
+        }
+        if (t->data) heap_caps_free(t->data);                /* 块大小换档（tile 变了） */
+        t->data = p;
+        t->cap  = block;
+    }
+    /* 每块喂一次狗：一次装载要读几十块，单块 32KB 在 SD 上 ≈ 24ms，
+     * 累加可超渲染任务的 5s TWDT 预算（历史事故 E14 熔断黑屏）。 */
+    watchdog_kick();
+    ssize_t got = pread(s->fd, t->data, block, (off_t)abs);
+    if (got != (ssize_t)block) {
+        ESP_LOGE(TAG, "瓦片整块读失败 fd=%d off=%u len=%zu got=%d",
+                 s->fd, (unsigned)abs, block, (int)got);
+        t->valid = false;
+        return NULL;
+    }
+    t->valid = true;
+    t->fid = s->file_id;
+    t->base = s->base_off;
+    t->idx = idx;
+    t->stamp = ++s_ts_stamp;
+    s_ts_blocks++;
+    s_ts_bytes += (uint32_t)block;
+    return t->data;
+}
+
+/* 层上 (x,y) 所在瓦片的块数据（像素/掩码共用；块大小由调用方给） */
+static const uint8_t *ts_tile_at(mpak_tile_slot_t *tab, int n, size_t block,
+                                 const mpak_tile_src_t *s, int32_t tx, int32_t ty)
+{
+    if (tx < 0 || ty < 0 || tx >= s->gx || ty >= s->gy) return NULL;
+    return ts_fetch(tab, n, block, s, (uint32_t)(ty * s->gx + tx));
+}
+
+/* 契约 §6：tx=x/TILE, ty=y/TILE, in_x=x%TILE, in_y=y%TILE；
+ * tile_off = px_off + (ty*gx+tx)*TILE*TILE*2；byte_off = tile_off + (in_y*TILE+in_x)*2。
+ * 掩码：tile_off_cov + (ty*gx+tx)*2048 + in_y*(TILE/8)，位序 MSB-first（x=0 在最高位）。 */
+int mpak_tile_read_px(const mpak_tile_src_t *s, int32_t x, int32_t y, int32_t w, int32_t h,
+                      uint16_t *dst, int32_t dst_stride_px)
+{
+    if (!s || !dst) return MPAK_ERR_ARG;
+    if (w < 0 || h < 0 || dst_stride_px < w) return MPAK_ERR_ARG;
+    if (w == 0 || h == 0) return MPAK_OK;
+    if (s->tile <= 0 || s->gx <= 0 || s->gy <= 0 || s->fd < 0) return MPAK_ERR_FMT;
+    const int32_t  T  = s->tile;
+    const size_t  blk = (size_t)T * (size_t)T * 2u;
+    for (int32_t dy = 0; dy < h; dy++) {
+        const int32_t wy = y + dy;
+        uint16_t *drow = dst + (size_t)dy * dst_stride_px;
+        if (wy < 0 || wy >= s->lh) { memset(drow, 0, (size_t)w * 2u); continue; }
+        const int32_t ty = wy / T, iny = wy % T;
+        int32_t dx = 0;
+        while (dx < w) {
+            const int32_t wx = x + dx;
+            if (wx < 0 || wx >= s->lw) { drow[dx] = 0; dx++; continue; }  /* 层外：补 0 */
+            const int32_t tx = wx / T, inx = wx % T;
+            int32_t run = T - inx;            /* 本段不跨块：wx+run ≤ (tx+1)*T */
+            if (run > w - dx) run = w - dx;
+            const uint8_t *b = ts_tile_at(s_ts_px, MPAK_TILE_PX_SLOTS, blk, s, tx, ty);
+            if (!b) return MPAK_ERR_IO;
+            memcpy(drow + dx, b + ((size_t)iny * T + inx) * 2u, (size_t)run * 2u);
+            dx += run;
+        }
+    }
+    return MPAK_OK;
+}
+
+int mpak_tile_read_mask(const mpak_tile_src_t *s, int32_t x, int32_t y, int32_t w, int32_t h,
+                        uint8_t *dst, int32_t dst_stride_px)
+{
+    if (!s || !dst) return MPAK_ERR_ARG;
+    if (w < 0 || h < 0 || dst_stride_px < w) return MPAK_ERR_ARG;
+    if (w == 0 || h == 0) return MPAK_OK;
+    if (s->tile <= 0 || s->gx <= 0 || s->gy <= 0 || s->fd < 0) return MPAK_ERR_FMT;
+    const int32_t T = s->tile;
+    if ((T & 7) != 0) return MPAK_ERR_FMT;           /* 块内行按 T/8 字节对齐 ⇒ T 必须 8 的倍数 */
+    const size_t blk = (size_t)T * (size_t)T / 8u;
+    const int32_t rb = T / 8;                        /* 块内每行字节 */
+    for (int32_t dy = 0; dy < h; dy++) {
+        const int32_t wy = y + dy;
+        uint8_t *drow = dst + (size_t)dy * dst_stride_px;
+        if (wy < 0 || wy >= s->lh) { memset(drow, 0, (size_t)w); continue; }
+        const int32_t ty = wy / T, iny = wy % T;
+        int32_t dx = 0;
+        while (dx < w) {
+            const int32_t wx = x + dx;
+            if (wx < 0 || wx >= s->lw) { drow[dx] = 0; dx++; continue; }
+            const int32_t tx = wx / T, inx = wx % T;
+            int32_t run = T - inx;
+            if (run > w - dx) run = w - dx;
+            const uint8_t *b = ts_tile_at(s_ts_cv, MPAK_TILE_CV_SLOTS, blk, s, tx, ty);
+            if (!b) return MPAK_ERR_IO;
+            const uint8_t *brow = b + (size_t)iny * rb;
+            for (int32_t i = 0; i < run; i++) {
+                const int32_t bx = inx + i;
+                drow[dx + i] = (uint8_t)((brow[bx >> 3] >> (7 - (bx & 7))) & 1u);
+            }
+            dx += run;
+        }
+    }
+    return MPAK_OK;
+}
+
+/* 预取：只把"被请求矩形覆盖到的块"拉进缓存（不碰矩形外的块）。
+ * 用途：给 `::shot`/真机排障做"窗口预热"对比；装载期**不**单跑一遍——
+ * 见 cam_scene_load 的说明（缓存装不下两层窗口，单独预取反而多读一遍 SD）。 */
+static int ts_prefetch(mpak_tile_slot_t *tab, int n, size_t block,
+                       const mpak_tile_src_t *s, int32_t x, int32_t y, int32_t w, int32_t h)
+{
+    if (!s) return MPAK_ERR_ARG;
+    if (w <= 0 || h <= 0) return MPAK_OK;
+    if (s->tile <= 0 || s->gx <= 0 || s->gy <= 0 || s->fd < 0) return MPAK_ERR_FMT;
+    const int32_t T = s->tile;
+    int32_t tx0 = x / T, tx1 = (x + w - 1) / T;
+    int32_t ty0 = y / T, ty1 = (y + h - 1) / T;
+    if (x < 0) tx0 = 0;
+    if (y < 0) ty0 = 0;
+    if (tx1 >= s->gx) tx1 = s->gx - 1;
+    if (ty1 >= s->gy) ty1 = s->gy - 1;
+    for (int32_t ty = ty0; ty <= ty1; ty++)
+        for (int32_t tx = tx0; tx <= tx1; tx++) {
+            if (!ts_tile_at(tab, n, block, s, tx, ty)) return MPAK_ERR_IO;
+        }
+    return MPAK_OK;
+}
+
+int mpak_tile_prefetch(const mpak_tile_src_t *s, int32_t x, int32_t y, int32_t w, int32_t h)
+{
+    if (!s) return MPAK_ERR_ARG;
+    if (s->tile <= 0) return MPAK_ERR_FMT;
+    return ts_prefetch(s_ts_px, MPAK_TILE_PX_SLOTS, (size_t)s->tile * s->tile * 2u, s, x, y, w, h);
+}
+
+/* BGMAP 层 → 瓦片源（fd 走 FILE* 的 fd：pread 不改文件位置，与 fseek/fread 共存安全）。
+ * ⚠️ layer_off 是 **payload 相对**（bg->static_back_off 等的口径），而
+ * mpak_tile_src_t.base_off 要的是**绝对文件偏移** ⇒ 这里必须加 m->payload_off。
+ * （漏加 = 每次整块读都前移 40B = 画面整体错位 + 头部读到 map_id 的 0 字节；
+ * host 对拍 tools/test_tiled_bgmap.c 的 ② 就是专门钉这一条的。） */
+static int bg_tiled_src(const mpak_t *m, uint32_t layer_off, mpak_tile_src_t *s)
+{
+    const mpak_bgmap_t *bg = m->u.bgmap;
+    int fd = m->f ? fileno(m->f) : -1;
+    if (fd < 0) return MPAK_ERR_IO;
+    mpak_tile_src_init(s, m->file_id, fd, m->payload_off + layer_off,
+                       bg->vw, bg->vh, bg->tile);
+    return (s->tile > 0 && s->gx > 0 && s->gy > 0) ? MPAK_OK : MPAK_ERR_FMT;
+}
+
+/* 瓦片口径的层矩形读（static / tile 像素层共用） */
+static int bg_tiled_read_rgb(const mpak_t *m, uint32_t layer_off,
+                             int32_t x, int32_t y, int32_t w, int32_t h,
+                             uint16_t *dst, int32_t dst_stride_px)
+{
+    mpak_tile_src_t s;
+    int rc = bg_tiled_src(m, layer_off, &s);
+    if (rc) return rc;
+    return mpak_tile_read_px(&s, x, y, w, h, dst, dst_stride_px);
+}
+
+int mpak_bgmap_prefetch_static(const mpak_t *m, int32_t x, int32_t y, int32_t w, int32_t h)
+{
+    if (!m || !m->u.bgmap) return MPAK_ERR_ARG;
+    const mpak_bgmap_t *bg = m->u.bgmap;
+    if (!bg->tiled) return MPAK_OK;                    /* 旧包：无瓦片概念，no-op */
+    mpak_tile_src_t s;
+    int rc = bg_tiled_src(m, bg->static_back_off, &s);
+    if (rc) return rc;
+    return ts_prefetch(s_ts_px, MPAK_TILE_PX_SLOTS, (size_t)s.tile * s.tile * 2u, &s, x, y, w, h);
+}
+
+int mpak_bgmap_prefetch_tile(const mpak_t *m, int32_t x, int32_t y, int32_t w, int32_t h,
+                             bool with_mask)
+{
+    if (!m || !m->u.bgmap) return MPAK_ERR_ARG;
+    const mpak_bgmap_t *bg = m->u.bgmap;
+    if (!bg->tiled) return MPAK_OK;
+    mpak_tile_src_t s;
+    int rc = bg_tiled_src(m, bg->tile_layer_off, &s);
+    if (rc) return rc;
+    rc = ts_prefetch(s_ts_px, MPAK_TILE_PX_SLOTS, (size_t)s.tile * s.tile * 2u, &s, x, y, w, h);
+    if (rc || !with_mask || bg->tile_mask_bytes == 0) return rc;
+    rc = bg_tiled_src(m, bg->tile_mask_off, &s);
+    if (rc) return rc;
+    return ts_prefetch(s_ts_cv, MPAK_TILE_CV_SLOTS, (size_t)s.tile * s.tile / 8u, &s, x, y, w, h);
+}
+
 
 /* 通用 RGB565 世界矩形读（static 与 tile 共用；stride_b = 源行距字节） */
 /* 整图窗口读的预读块（PSRAM 单例，懒分配）。64KB 在"命令数下降"与
@@ -1057,12 +1549,17 @@ static int bg_read_rect_rgb(const mpak_t *m, uint32_t layer_off, uint32_t layer_
     }
 }
 
+/* ══ 分流点：tiled=true 走瓦片缓存整块读，false 走原逐行（预读块）路径 ══
+ * 两条路径的**入参与语义完全一致**（世界矩形 + dst 行距 + 越界补 0），所以
+ * compositor 侧一行都不用改分流：旧包（无 bit1 / 长度是逐行口径）逐字节不变。 */
 int mpak_bgmap_read_static_rect(const mpak_t *m, int32_t x, int32_t y,
                                 int32_t w, int32_t h, uint16_t *dst, int32_t dst_stride_px)
 {
     int rc = bg_rect_args(m, w, h, dst, dst_stride_px);
     if (rc) return rc;
     const mpak_bgmap_t *bg = m->u.bgmap;
+    if (bg->tiled)
+        return bg_tiled_read_rgb(m, bg->static_back_off, x, y, w, h, dst, dst_stride_px);
     return bg_read_rect_rgb(m, bg->static_back_off, bg->static_back_len,
                             bg_static_stride(bg), x, y, w, h, dst, dst_stride_px);
 }
@@ -1074,6 +1571,8 @@ int mpak_bgmap_read_tile_rect(const mpak_t *m, int32_t x, int32_t y,
     if (rc) return rc;
     const mpak_bgmap_t *bg = m->u.bgmap;
     if (bg->tile_layer_len == 0) return MPAK_ERR_RANGE;     /* 该图无 tile 层 */
+    if (bg->tiled)
+        return bg_tiled_read_rgb(m, bg->tile_layer_off, x, y, w, h, dst, dst_stride_px);
     uint32_t stride_b = bg_tile_stride(bg);
     /* layer_len 只给 RGB 区（= vh×行距），掩码区不会被误读进来 */
     return bg_read_rect_rgb(m, bg->tile_layer_off, (uint32_t)bg->vh * stride_b,
@@ -1091,6 +1590,18 @@ int mpak_bgmap_read_tile_mask_rect(const mpak_t *m, int32_t x, int32_t y,
 
     const int32_t vw = (int32_t)bg->vw, vh = (int32_t)bg->vh;
     const uint32_t stride_b = bg_tile_stride(bg);
+
+    /* 瓦片口径：掩码按**同网格**分块，每块 T*T/8 字节（契约 §3），
+     * 与像素区长度一起由 parse_bgmap 反解（tile_mask_off / tile_mask_bytes）。 */
+    if (bg->tiled) {
+        if (bg->tile_mask_bytes < tile_mask_len_of(bg->tile, bg->gx, bg->gy))
+            return MPAK_ERR_FMT;                        /* 包损坏：掩码区长度不足 */
+        mpak_tile_src_t s;
+        rc = bg_tiled_src(m, bg->tile_mask_off, &s);
+        if (rc) return rc;
+        return mpak_tile_read_mask(&s, x, y, w, h, dst, dst_stride_px);
+    }
+
     const uint32_t rgb_bytes = (uint32_t)vh * stride_b;
     if (bg->tile_layer_len < rgb_bytes) return MPAK_ERR_FMT;
     const uint32_t mask_off   = bg_tile_mask_off(bg);
@@ -1406,6 +1917,15 @@ int mpak_open(mpak_t *m, const char *path, uint64_t expect_hash, uint64_t expect
 {
     if (!m || !path) return MPAK_ERR_ARG;
     memset(m, 0, sizeof *m);
+
+    /* 文件身份（瓦片缓存键）：全局自增，永不复用 —— fd 会被 close/reopen 复用，
+     * 而"打开同一路径的两次 open"在这套缓存里必须是同一个身份（条带每次补读都
+     * open/close，靠身份相同才能命中上次读进来的瓦片）。 */
+    {
+        static uint32_t s_file_seq;
+        m->file_id = ++s_file_seq;
+        if (m->file_id == 0) m->file_id = ++s_file_seq;      /* 回绕保护（0 = 无身份） */
+    }
 
     m->f = fopen(path, "rb");
     if (!m->f) {

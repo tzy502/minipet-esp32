@@ -188,6 +188,16 @@ static void handle_cmd(cJSON *jc)
         c.type = MP_CMD_SET_MAP;
         strlcpy(c.s, v, sizeof(c.s));
         mp_post_cmd(&c);
+    } else if (strcmp(t, "camtest") == 0) {
+        /* 【压测钩子】{"type":"camtest","value":"<步数>,<步长>"} → 连续平移相机 */
+        c.type = MP_CMD_CAM_PAN_TEST;
+        c.a = 20; c.b = 8;
+        if (v) {
+            int st = 0, sp = 0;
+            if (sscanf(v, "%d,%d", &st, &sp) >= 1 && st > 0) c.a = st;
+            if (sp != 0) c.b = sp;
+        }
+        mp_post_cmd(&c);
     } else if (strcmp(t, "brightness") == 0) {
         c.type = MP_CMD_BRIGHTNESS;
         c.a = n;
