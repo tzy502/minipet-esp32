@@ -35,6 +35,10 @@ var options = new ExportOptions
     IncludeAudio = true,
     IncludeFontTime = true,
     FirmwareVer = "0.0.0",
+    // 分块（tiled）布局：**默认开**（仅整图包生效）——新导出直接是 128×128 瓦片口径，
+    // 固件按块连续读（SD 顺序 1336KB/s vs 跨行距逐行 ~130KB/s）。
+    // --legacy-rows 关掉它做逐行对拍/回退。
+    Tiled = true,
 };
 
 string? wzDataPath = Environment.GetEnvironmentVariable("MINIPET_WZ_DATA");
@@ -64,18 +68,26 @@ for (int i = 0; i < args.Length; i++)
         case "--font-family": options.FontFamily = Next(); break;
         case "--dump-footholds": dumpFootholds = Next(); break;
         case "--full-map": options.FullMap = true; break;   // R2 整图口径（默认关 = 240×240 窗口包不变）
+        case "--tiled": options.Tiled = true; break;        // 分块（128×128 瓦片）布局；**已默认开**，此处显式声明
+        case "--legacy-rows": options.Tiled = false; break; // 关分块 → 旧逐行布局（对拍/回退用）
         case "--help" or "-h":
             Console.WriteLine("""
                 用法: Exporter [--appearance <json>] [--profile <名|路径>] [--maps <id,...>] [--out <dir>]
                        [--device-id <id>] [--wz <WZ数据目录>] [--fonts 16,24,32|--no-fonts]
                        [--no-audio] [--no-fonttime] [--firmware <ver>] [--charset <file>] [--font-family <名>]
-                       [--dump-footholds <mapId>] [--full-map]
+                       [--dump-footholds <mapId>] [--full-map] [--tiled|--legacy-rows]
                 默认: profile=amoled216  out=data/cache/export  fonts=16  audio=on  fontTime=on
                 WZ 目录: --wz 或环境变量 MINIPET_WZ_DATA
                 --dump-footholds: 只打印该图 foothold 第 0 层（地面层）+ 设备视口相机换算，
                                   并输出可直接粘进固件的 C 数组（不导出任何资产）
                 --full-map: R2 整图口径（vw/vh = 整图 1x 世界尺寸 + 条带 y 世界系 + 尾部地面表扩展块）；
                             **默认关**（现网 240×240 窗口包逐字节不变）。整图包体量 MB 级。
+                --tiled:    分块（tiled）布局（**默认开**，需 --full-map 才生效）：static / tile（含掩码）/
+                            条带三类层改 128×128 世界像素瓦片存储，尾扩展块 flags bit1=1；
+                            固件按块连续读（SD 顺序 1336KB/s vs 跨行距逐行 ~130KB/s）。
+                            契约 docs/ai/map-tiled-format-contract.md。
+                --legacy-rows: 关分块 → 旧逐行布局（整图包 flags bit1=0）。同一张图分别用两种口径
+                            导出到不同 --out 目录，即可用 Server/tools/bgmap-tiled-verify.py 逐像素对拍。
                 """);
             return 0;
         default:

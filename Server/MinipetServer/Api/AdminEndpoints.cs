@@ -26,6 +26,23 @@ public static class AdminEndpoints
             devices = reg.List().Select(d => DeviceCard(d, reg, health)).ToList(),
         }));
 
+        /// <summary>
+        /// 删除已链接的硬件（用户口径："服务端运行删除链接过的硬件"）。
+        /// 语义：只摘设备登记条目（DeviceRecord）——在线设备下一次 poll 即被拒
+        /// （404 device_not_found）→ 表现为立刻掉线，要重新接入必须重新 hello 配对；
+        /// 已导出的资产缓存目录保留（同 deviceId 再接入可复用，避免重烘素材）。
+        /// 返回 { ok, deviceId, removed }；设备不存在返回 404。
+        /// </summary>
+        g.MapDelete("/devices/{id}", (string id, DeviceRegistry reg, DeviceEventLog eventLog) =>
+        {
+            var dev = reg.Get(id);
+            if (dev == null) return NotFoundDevice(id);
+            bool removed = reg.Remove(id);
+            if (removed) eventLog.Append(id, "设备已从服务端删除（用户操作）");
+            Console.WriteLine($"[DeviceDelete] 删除设备 {id}（name={dev.Name}）→ removed={removed}");
+            return Results.Json(new { ok = removed, deviceId = id, removed }, statusCode: removed ? 200 : 404);
+        });
+
         g.MapGet("/devices/{id}", (string id, DeviceRegistry reg, ConfigService cfg, HealthReport health)
             => Detail(id, reg, cfg, health) ?? NotFoundDevice(id));
 
@@ -496,8 +513,14 @@ public static class AdminEndpoints
                 // 现网 7 张图已全部整图化并在真机验证 ⇒ 缺省改为 **true**；
                 // 需要旧口径时显式传 fullMap:false（CLI 同理）。
                 bool fullMap = kind == "map" && body?.FullMap != false;
+                // 分块（tiled）布局开关；仅整图包生效（承载位 = 尾扩展块 flags bit1）。
+                // 【2026-10-01】缺省 true = 新导出直接走 128×128 瓦片布局（固件按块连续读：
+                // SD 顺序 1336KB/s vs 跨行距逐行 ~130KB/s，装载 8~17s 的根因）。
+                // 需要对照/回退时显式传 tiled:false（得到逐行整图包，旧固件也能读）。
+                bool tiled = fullMap && body?.Tiled != false;
                 if (fullMap)
-                    Console.WriteLine($"[DevicePush] 设备 {id} 地图 {assetId} 请求**整图口径**（R2：vw/vh=整图 1x 尺寸 + 地面表）");
+                    Console.WriteLine($"[DevicePush] 设备 {id} 地图 {assetId} 请求**整图口径**（R2：vw/vh=整图 1x 尺寸 + 地面表）"
+                                      + $"＋**{(tiled ? "分块(tiled) 128×128 瓦片" : "逐行 rows")}布局**");
                 _ = Task.Run(() =>
                 {
                     try
@@ -506,7 +529,7 @@ public static class AdminEndpoints
                         // 调用方放后台线程）→ bump rev（设备长轮询被唤醒、拉到新 manifest）
                         // → 最后才 enqueue 切图指令（设备先拿到新 manifest 再收到 map 指令才稳）。
                         bool generated = kind == "map"
-                            ? assets.EnsureMapAsync(id, assetId, fullMap)
+                            ? assets.EnsureMapAsync(id, assetId, fullMap, tiled)
                             : assets.EnsureNpcAsync(id, assetId);
                         Console.WriteLine($"[DevicePush] 设备 {id} {kind} {assetId} 资产登记{(generated ? "完成（新打包）" : "跳过（已登记，幂等）")}");
                         // 登记成功必 bump：manifest-assets.json 变了，rev 不动设备感知不到。
@@ -693,6 +716,14 @@ public static class AdminEndpoints
         /// 仅 kind=map 有意义；整图包体量 17MB 级，仅供支持整图相机的固件使用。
         /// </summary>
         public bool? FullMap { get; set; }
+
+        /// <summary>
+        /// **分块（tiled）布局**（2026-10-01，缺省 = 跟随 FullMap）：整图包的 static / tile（含掩码）/
+        /// 条带三类层改成 128×128 世界像素瓦片存储（尾扩展块 flags bit1=1），固件按块连续读
+        /// （SD 顺序吞吐 1336KB/s vs 跨行距逐行 ~130KB/s）。仅 kind=map 且 FullMap=true 时生效；
+        /// 显式 false = 逐行口径（对拍/回退用）。契约 docs/ai/map-tiled-format-contract.md。
+        /// </summary>
+        public bool? Tiled { get; set; }
     }
 
     /// <summary>

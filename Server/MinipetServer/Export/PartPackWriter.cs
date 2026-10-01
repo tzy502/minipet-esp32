@@ -27,6 +27,11 @@ namespace MiniPet.Export;
 /// 掩码/行距推算公式（回放与固件同源）：
 /// pitch = (w*2 + 3) &amp; ~3；maskBytes = ((w*h + 7) &gt;&gt; 3 + 3) &amp; ~3；recordSize = pitch*h + maskBytes。
 ///
+/// **分块（tiled）变体**（整图 BGMAP 的条带小包；契约 <c>docs/ai/map-tiled-format-contract.md</c> §2~§4）：
+/// 索引字段（part_id/expr_group/w/h/origin/offset）与 20B 条目**完全不变**，只是位图记录变成长度
+/// <c>gx*gy*32768 + gx*gy*2048</c> 的瓦片区 + 同网格掩码区（几何由 w/h 推算，见 <see cref="TiledLayout"/>）；
+/// 记录自身不带"是否分块"标志位，由引用它的 BGMAP 尾扩展块 flags bit1=1 判定。
+///
 /// expr_group：face 类部件的表情变体组号 —— 同组 25 个变体共享 group、part_id 连续
 /// （组内第 i 个 id = 组基准 + expression 列表偏移 i）；非 face 件 group=0。
 /// </summary>
@@ -59,10 +64,20 @@ public static class PartPackWriter
     }
 
     /// <summary>SKBitmap(BGRA8888) → RGB565 + 1bit 掩码记录（纯函数，无进程级缓存）。</summary>
-    public static EncodedPart Encode(SKBitmap bmp)
+    public static EncodedPart Encode(SKBitmap bmp) => Encode(bmp, tiled: false);
+
+    /// <summary>
+    /// SKBitmap(BGRA8888) → RGB565 + 1bit 掩码记录（<paramref name="tiled"/> = 分块口径，契约 §2/§3）。
+    /// </summary>
+    public static EncodedPart Encode(SKBitmap bmp, bool tiled)
     {
         int w = bmp.Width, h = bmp.Height;
-        return new EncodedPart { W = w, H = h, Data = EncodeRgb565WithMask(bmp) };
+        return new EncodedPart
+        {
+            W = w,
+            H = h,
+            Data = tiled ? EncodeRgb565TiledWithMask(bmp) : EncodeRgb565WithMask(bmp),
+        };
     }
 
     /// <summary>编码核心：BGRA8888（或 RGBA8888）位图 → [RGB565 行对齐 4B][1bit mask 补 4B]。</summary>
@@ -73,7 +88,27 @@ public static class PartPackWriter
     public static byte[] EncodeRgb565(SKBitmap bmp)
         => EncodeCore(bmp, withMask: false);
 
-    private static byte[] EncodeCore(SKBitmap bmp, bool withMask)
+    /// <summary>
+    /// 「逐行」口径的像素区长度（= align4(w*2) * h）。分块口径见 <see cref="TiledLayout"/>。
+    /// </summary>
+    public static int RowsPixelBytes(int w, int h) => w <= 0 || h <= 0 ? 0 : Align4(w * 2) * h;
+
+    /// <summary>
+    /// 分块（tiled）口径：BGRA8888（或 RGBA8888）位图 → RGB565 **128×128 世界像素瓦片**
+    /// （契约 §2：每块 32768B 写满、右/下越界补 0）。供整图 BGMAP 的 static 层使用。
+    /// </summary>
+    public static byte[] EncodeRgb565Tiled(SKBitmap bmp)
+        => EncodeCore(bmp, withMask: false, tiled: true);
+
+    /// <summary>
+    /// 分块（tiled）口径：RGB565 瓦片区 + **同网格 1bit 掩码瓦片区**（每块 2048B、行 16B、
+    /// MSB-first，契约 §3；掩码区紧跟在像素区之后、无额外补齐）。供整图 BGMAP 的 tile 层
+    /// 与条带 PARTS 记录使用。
+    /// </summary>
+    public static byte[] EncodeRgb565TiledWithMask(SKBitmap bmp)
+        => EncodeCore(bmp, withMask: true, tiled: true);
+
+    private static byte[] EncodeCore(SKBitmap bmp, bool withMask, bool tiled = false)
     {
         int w = bmp.Width, h = bmp.Height;
         if (w <= 0 || h <= 0) return Array.Empty<byte>();
@@ -89,8 +124,10 @@ public static class PartPackWriter
         }
 
         int pitch = Align4(w * 2);
-        int pixelBytes = pitch * h;
-        int maskBytes = withMask ? Align4((w * h + 7) >> 3) : 0;
+        int pixelBytes = tiled ? TiledLayout.PixelsLen(w, h) : pitch * h;
+        int maskBytes = withMask
+            ? (tiled ? TiledLayout.MaskLen(w, h) : Align4((w * h + 7) >> 3))
+            : 0;
         var outBuf = new byte[pixelBytes + maskBytes];
 
         bool bgra = src.ColorType == SKColorType.Bgra8888;
@@ -100,31 +137,72 @@ public static class PartPackWriter
             {
                 byte* basePtr = (byte*)src.GetPixels();
                 int stride = src.RowBytes;
-                for (int y = 0; y < h; y++)
+                if (!tiled)
                 {
-                    byte* row = basePtr + (long)y * stride;
-                    int rowOut = y * pitch;
-                    int bitBase = y * w; // 掩码按行连续打包（w*h bit 总体连续，此处等价逐像素序）
-                    for (int x = 0; x < w; x++)
+                    for (int y = 0; y < h; y++)
                     {
-                        byte b = row[x * 4], g = row[x * 4 + 1], r = row[x * 4 + 2], a = row[x * 4 + 3];
-                        if (bgra) { /* 已按 BGRA 取 */ }
-                        else { (r, b) = (b, r); } // RGBA8888 → 交换 R/B
-                        int a8 = a;
-                        if (a8 != 0 && a8 != 255 && src.AlphaType == SKAlphaType.Premul)
+                        byte* row = basePtr + (long)y * stride;
+                        int rowOut = y * pitch;
+                        int bitBase = y * w; // 掩码按行连续打包（w*h bit 总体连续，此处等价逐像素序）
+                        for (int x = 0; x < w; x++)
                         {
-                            // 1bit 掩码下半透明像素将变为不透明：反预乘恢复原色，避免边缘发暗
-                            r = (byte)Math.Min(255, r * 255 / a8);
-                            g = (byte)Math.Min(255, g * 255 / a8);
-                            b = (byte)Math.Min(255, b * 255 / a8);
+                            byte b = row[x * 4], g = row[x * 4 + 1], r = row[x * 4 + 2], a = row[x * 4 + 3];
+                            if (bgra) { /* 已按 BGRA 取 */ }
+                            else { (r, b) = (b, r); } // RGBA8888 → 交换 R/B
+                            int a8 = a;
+                            if (a8 != 0 && a8 != 255 && src.AlphaType == SKAlphaType.Premul)
+                            {
+                                // 1bit 掩码下半透明像素将变为不透明：反预乘恢复原色，避免边缘发暗
+                                r = (byte)Math.Min(255, r * 255 / a8);
+                                g = (byte)Math.Min(255, g * 255 / a8);
+                                b = (byte)Math.Min(255, b * 255 / a8);
+                            }
+                            ushort rgb565 = (ushort)(((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3));
+                            outBuf[rowOut + x * 2] = (byte)(rgb565 & 0xFF);
+                            outBuf[rowOut + x * 2 + 1] = (byte)(rgb565 >> 8);
+                            if (withMask && a >= 128)
+                            {
+                                int bit = bitBase + x;
+                                outBuf[pixelBytes + (bit >> 3)] |= (byte)(0x80 >> (bit & 7));
+                            }
                         }
-                        ushort rgb565 = (ushort)(((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3));
-                        outBuf[rowOut + x * 2] = (byte)(rgb565 & 0xFF);
-                        outBuf[rowOut + x * 2 + 1] = (byte)(rgb565 >> 8);
-                        if (withMask && a >= 128)
+                    }
+                }
+                else
+                {
+                    // ── 分块（tiled）口径：契约 §2/§3 ──
+                    // 瓦片写满（越界补 0，由数组零初始化兜底）；网格 gx=ceil(w/128) 行主序 idx=ty*gx+tx。
+                    int gx = TiledLayout.GridX(w);
+                    int ts = TiledLayout.TileSize;
+                    int maskBase = pixelBytes;                  // 掩码区紧跟像素区
+                    for (int y = 0; y < h; y++)
+                    {
+                        byte* row = basePtr + (long)y * stride;
+                        int ty = y / ts, inY = y % ts;
+                        for (int x = 0; x < w; x++)
                         {
-                            int bit = bitBase + x;
-                            outBuf[pixelBytes + (bit >> 3)] |= (byte)(0x80 >> (bit & 7));
+                            byte b = row[x * 4], g = row[x * 4 + 1], r = row[x * 4 + 2], a = row[x * 4 + 3];
+                            if (bgra) { /* 已按 BGRA 取 */ }
+                            else { (r, b) = (b, r); } // RGBA8888 → 交换 R/B
+                            int a8 = a;
+                            if (a8 != 0 && a8 != 255 && src.AlphaType == SKAlphaType.Premul)
+                            {
+                                r = (byte)Math.Min(255, r * 255 / a8);
+                                g = (byte)Math.Min(255, g * 255 / a8);
+                                b = (byte)Math.Min(255, b * 255 / a8);
+                            }
+                            ushort rgb565 = (ushort)(((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3));
+                            int tile = (ty * gx + x / ts) * TiledLayout.TilePixelBytes;
+                            int off = tile + (inY * ts + x % ts) * 2;
+                            outBuf[off] = (byte)(rgb565 & 0xFF);
+                            outBuf[off + 1] = (byte)(rgb565 >> 8);
+                            if (withMask && a >= 128)
+                            {
+                                // 位序与逐行口径完全一致（MSB-first，x=0 在最高位），只是按块定位
+                                int mOff = maskBase + (ty * gx + x / ts) * TiledLayout.TileMaskBytes
+                                           + inY * TiledLayout.MaskRowBytes + (x % ts) / 8;
+                                outBuf[mOff] |= TiledLayout.MaskBit(x % ts);
+                            }
                         }
                     }
                 }
@@ -142,8 +220,11 @@ public static class PartPackWriter
     /// <summary>
     /// 组装 PARTS payload。条目顺序即写入顺序；offset 显式寻址（不复用数据的条目按顺序追加，
     /// ShareBitmapOf 命中先前条目的位图时复用其 offset）。
+    /// <paramref name="tiled"/> = true 时每个位图记录按**128×128 世界像素瓦片**编码
+    /// （整图 BGMAP 的条带小包用；记录 = [分块像素区][分块掩码区]，几何由该 part 的 w/h 推算，
+    /// 索引/偏移字段口径**不变**）。契约 §4。
     /// </summary>
-    public static byte[] Build(IReadOnlyList<PartEntry> parts)
+    public static byte[] Build(IReadOnlyList<PartEntry> parts, bool tiled = false)
     {
         if (parts == null || parts.Count == 0) throw new ArgumentException("PARTS 包至少需要一个部件", nameof(parts));
 
@@ -162,7 +243,7 @@ public static class PartPackWriter
                 sizes[i] = (shared.W, shared.H);
                 continue;
             }
-            var enc = Encode(p.Bitmap);
+            var enc = Encode(p.Bitmap, tiled);
             starts[i] = dataLen;
             sizes[i] = (enc.W, enc.H);
             blobs.Add(enc.Data);

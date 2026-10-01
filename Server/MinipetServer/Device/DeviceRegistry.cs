@@ -108,11 +108,48 @@ public sealed class DeviceRegistry
         finally { _rw.ExitReadLock(); }
     }
 
+    /// <summary>
+    /// 设备列表（2026-10-01 排序定稿）：**当前在线排最前**，同组内按 lastSeen 倒序
+    /// （最近连接的靠前）；离线设备沉底。理由：Web「设备」页与手机端都以"我现在
+    /// 要操作哪台"为第一诉求，在线且刚连过的必须一眼可见（用户口径：保持连接的
+    /// 排序在前面）。排序在服务端统一做，前端不再自己排（两端观感一致）。
+    /// </summary>
     public List<DeviceRecord> List()
     {
         _rw.EnterReadLock();
-        try { return _store.Devices.Select(Clone).ToList(); }
+        try
+        {
+            var now = DateTime.UtcNow;
+            return _store.Devices
+                .Select(Clone)
+                .OrderByDescending(d => IsOnline(d, now))          // 在线优先
+                .ThenByDescending(d => d.LastSeenUtc ?? DateTime.MinValue)  // 最近连接优先
+                .ThenBy(d => d.Name, StringComparer.Ordinal)       // 稳定兜底（避免同秒抖动）
+                .ToList();
+        }
         finally { _rw.ExitReadLock(); }
+    }
+
+    /// <summary>
+    /// 删除设备（用户口径："删除链接过的硬件"）——把该设备从设备表里摘掉：
+    ///   · 仅删登记信息（DeviceRecord）；配对码、指令队列由各自服务按 deviceId
+    ///     自然失效，不需要级联清理；
+    ///   · 已落盘的导出资产目录（data/cache/export/&lt;deviceId&gt;）**保留**——设备
+    ///     若再次上报会用同一个 deviceId 复用，删了反而要重烘全部素材；
+    ///   · 设备若还在线，下次 poll 会因 Get 返回 null 被拒（404 device_not_found），
+    ///     即"删掉后立刻掉线"，这是预期行为（要重新接入必须重新 hello）。
+    /// 返回 true = 确实删掉了一条。
+    /// </summary>
+    public bool Remove(string deviceId)
+    {
+        _rw.EnterWriteLock();
+        try
+        {
+            int n = _store.Devices.RemoveAll(d => string.Equals(d.DeviceId, deviceId, StringComparison.Ordinal));
+            if (n > 0) SaveLocked();
+            return n > 0;
+        }
+        finally { _rw.ExitWriteLock(); }
     }
 
     public static bool IsOnline(DeviceRecord d, DateTime? now = null)

@@ -59,27 +59,35 @@ public sealed class DeviceAssetService
     /// <paramref name="fullMap"/>（R2 整图口径 2026-10-01，**默认 false**）：
     /// true = 按整图世界尺寸 1x 导出（vw/vh = 整图 bbox + 尾部地面表扩展块）；
     /// false = 现网 240×240 窗口口径（逐字节不变）。
-    /// 幂等口径：按条目里的 `viewport` 字段（"full"/"window"，缺失=window 兼容旧索引）
-    /// **与请求口径一致才跳过**；口径不同则重导并替换该地图条目（否则切不回/切不过去）。
+    /// <paramref name="tiled"/>（分块布局 2026-10-01，**默认 true**）：整图包的 static/tile/条带
+    /// 三层按 128×128 世界像素瓦片存储（BGMAP flags bit1=1）。仅 fullMap 时生效（窗口包无承载位）。
+    /// 幂等口径：按条目里的 `viewport` 字段（"full"/"window"，缺失=window 兼容旧索引）**与**
+    /// `layout` 字段（"tiled"，缺失=逐行兼容旧索引）**与请求口径都一致才跳过**；
+    /// 口径不同则重导并替换该地图条目（否则切不回/切不过去，新固件也永远拿不到分块包）。
     /// 同步方法（打包本体在 WzService 内部锁内串行，同 EnsurePacked 口径；
     /// 需要异步语义由调用方 Task.Run 放后台线程）。
     /// </summary>
-    public bool EnsureMapAsync(string deviceId, string mapId, bool fullMap = false)
+    public bool EnsureMapAsync(string deviceId, string mapId, bool fullMap = false, bool tiled = true)
     {
         ValidateIds(deviceId, mapId, "地图 id");
         mapId = mapId.Trim();
+        bool wantTiled = fullMap && tiled;      // 窗口包无法承载分块标志（flags 在尾扩展块）
         lock (_deviceLocks.GetOrAdd(deviceId, _ => new object()))
         {
             var deviceDir = DeviceDir(deviceId);
             var root = ReadIndex(Path.Combine(deviceDir, ManifestBuilder.AssetsManifestFileName));
             string wantViewport = fullMap ? "full" : "window";
-            if (HasEntry(root, selector: "map", key: "map", value: mapId, viewport: wantViewport)) return false;
+            if (HasEntry(root, selector: "map", key: "map", value: mapId, viewport: wantViewport,
+                         layout: wantTiled ? "tiled" : "rows")) return false;
 
             var warnings = new List<string>();
             /* E13：按该设备 hello 上报的 profile 烘焙（w/h/shape/psram/audio）；
  * 取不到才回落默认 480×480（见 AssetExporter.ExportMapAssets 注释）。 */
             var devProfile = _reg.Get(deviceId)?.Profile;
-            var assets = new AssetExporter(_wz).ExportMapAssets(mapId, warnings, ToExportProfile(devProfile), fullMap);
+            if (tiled && !fullMap)
+                Console.WriteLine($"[DevicePush] 地图 {mapId} 为窗口口径 → 分块(tiled)不可用，按逐行导出");
+            var assets = new AssetExporter(_wz).ExportMapAssets(mapId, warnings, ToExportProfile(devProfile),
+                fullMap, wantTiled);
             // 口径切换（window ↔ full）时替换：先摘掉该地图的旧 BGMAP 条目，否则 manifest 里
             // 会同时存在两条同 map 的 selector=map 条目（设备列表出现重复项/切图 hash 取错）。
             RemoveMapEntries(root, mapId);
@@ -165,8 +173,12 @@ public sealed class DeviceAssetService
     /// 走重打覆盖——否则坏索引永不被纠正，设备永不下载（同 PaperdollPackService.HasAppearance）。
     /// <paramref name="viewport"/>（可选）：再要求条目的 `viewport` 字段匹配（"full"/"window"）；
     /// 缺失该字段的旧条目按 "window" 处理（兼容 2026-10-01 之前登记的索引）。
+    /// <paramref name="layout"/>（可选）：再要求条目的 `layout` 字段匹配（"tiled"/"rows"）；
+    /// 缺失该字段的旧条目按 "rows"（逐行）处理 —— 2026-10-01 分块布局上线前的整图条目
+    /// 都是逐行的，不这样判会导致"已登记 ⇒ 跳过"，设备永远拿不到分块包。
     /// </summary>
-    private static bool HasEntry(JsonObject root, string selector, string key, string value, string? viewport = null)
+    private static bool HasEntry(JsonObject root, string selector, string key, string value,
+        string? viewport = null, string? layout = null)
     {
         var primaryKind = selector == "map" ? "BGMAP" : "PARTS";
         if (root["assets"] is not JsonObject ao) return false;
@@ -177,10 +189,20 @@ public sealed class DeviceAssetService
             if (!string.Equals(e[key]?.GetValue<string>(), value, StringComparison.Ordinal)) continue;
             if (string.Equals(e["kind"]?.GetValue<string>(), primaryKind, StringComparison.Ordinal))
             {
-                if (viewport == null) return true;
-                var vp = e["viewport"]?.GetValue<string>();
-                if (string.IsNullOrEmpty(vp)) vp = "window";   // 旧条目无 viewport 字段 = 窗口口径
-                if (string.Equals(vp, viewport, StringComparison.Ordinal)) return true;
+                if (viewport == null && layout == null) return true;
+                if (viewport != null)
+                {
+                    var vp = e["viewport"]?.GetValue<string>();
+                    if (string.IsNullOrEmpty(vp)) vp = "window";   // 旧条目无 viewport 字段 = 窗口口径
+                    if (!string.Equals(vp, viewport, StringComparison.Ordinal)) continue;
+                }
+                if (layout != null)
+                {
+                    var ly = e["layout"]?.GetValue<string>();
+                    if (string.IsNullOrEmpty(ly)) ly = "rows";     // 旧条目无 layout 字段 = 逐行口径
+                    if (!string.Equals(ly, layout, StringComparison.Ordinal)) continue;
+                }
+                return true;
             }
         }
         return false;

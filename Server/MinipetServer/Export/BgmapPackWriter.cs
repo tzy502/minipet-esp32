@@ -62,6 +62,28 @@ namespace MiniPet.Export;
 ///
 /// 新固件取扩展块的定位规则（无需新字段）：
 ///   ext_off = align4(tile_layer_off + tile_layer_len)；读 16B 头，校验 magic 后再用 ground_off。
+///
+/// ═════════════ 分块（tiled）布局（2026-10-01；冻结契约 docs/ai/map-tiled-format-contract.md）═════════════
+/// 动因：SD 顺序读 1336 KB/s，而跨行距逐行读只有 ~130 KB/s（真机实测），装载 8~17s。
+/// 开关：<see cref="BgmapInput.Tiled"/> ⇒ 尾扩展块 flags 置 **bit1 = <see cref="BgmapFlagTiled"/>**；
+/// 信封 / 头 / 字段顺序 / 尺寸语义 / 地面表 / 条带语义**全部不变**，只有"层长度"的含义随 bit1 变：
+/// <code>
+/// static_back_len = gx*gy*32768                     （旧：vh*align4(vw*2)）
+/// tile_layer_len  = gx*gy*32768 + gx*gy*2048        （旧：RGB 行区 + align4(掩码)）
+///                   掩码区紧跟像素区之后、无额外补齐（沿用"掩码偏移 = 像素区之后"的既有口径）
+/// gx = ceil(lw/128), gy = ceil(lh/128)，瓦片写满、越界补 0（契约 §2/§3）
+/// </code>
+/// **条带**：条带像素不在本包内（仍由 strip.part_ref 指向独立小 PARTS 包），因此 bit1 同时也是
+/// 那些 PARTS 包的口径标志 —— 分块导出时条带小包的位图记录必须一并按瓦片编码
+/// （<see cref="PartPackWriter.Build"/> 的 tiled 参数），三类层**不得混用**。
+///
+/// 【固件侧前置项，服务端实现时读 mpak.c 得出，已在契约文档末尾"实现注记"登记】
+///   ① `parse_bgmap` 的 static/tile `*_len` 白名单（static_tight / static_aligned / tile_expect /
+///      tile_expect_enc）在**读尾扩展块之前**判定 ⇒ 分块长度会被 MPAK_ERR_FMT 直接拒收，
+///      必须先读 flags（或把分块长度纳入白名单）再判几何；
+///   ② 条带小 PARTS 包：`parse_parts` 的 extent 推断只认 `pixel_bytes` /
+///      `pixel_bytes+mask`（掩码补 4B）⇒ 分块记录（更大且非该两式）会被拒，需按 bit1 放行；
+///   ③ 分块后条带像素寻址不得再用 `row_bytes`（契约 §5）。
 /// </summary>
 public static class BgmapPackWriter
 {
@@ -75,6 +97,13 @@ public static class BgmapPackWriter
 
     /// <summary>flags bit0：整图包（vw/vh = 整图世界尺寸；strip.y = 世界系 y）。</summary>
     public const uint BgmapFlagFullMap = 1u;
+
+    /// <summary>
+    /// flags bit1：**分块（tiled）布局** —— 本包的三类像素层（static / tile / 条带）按
+    /// <see cref="TiledLayout"/> 的 128×128 世界像素瓦片存储（冻结契约
+    /// <c>docs/ai/map-tiled-format-contract.md</c> §1）。未置位 ⇒ 一切按旧「逐行」格式解析。
+    /// </summary>
+    public const uint BgmapFlagTiled = 2u;
 
     /// <summary>地面表「该列无 foothold」哨兵。</summary>
     public const ushort GroundNone = 0xFFFF;
@@ -119,8 +148,20 @@ public static class BgmapPackWriter
         /// </summary>
         public ushort[]? GroundTable;
 
+        /// <summary>
+        /// **分块（tiled）布局**（契约 §1~§5）：static / tile 两层改成 128×128 世界像素瓦片存储
+        /// （tile 层掩码同网格分块、紧跟像素区之后），并在尾扩展块 flags 置 bit1。调用方还须把
+        /// 条带小 PARTS 包也按分块口径编码（<see cref="PartPackWriter.Build"/> 的 tiled 参数）——
+        /// bit1 是三类层共用的口径标志，**不允许混用**。
+        /// 仅在整图包（<see cref="IsFullMap"/>）下可用：flags 位于尾扩展块，窗口包没有承载位。
+        /// </summary>
+        public bool Tiled;
+
         /// <summary>是否整图包（= 是否追加扩展块）。</summary>
         public bool IsFullMap => GroundTable != null;
+
+        /// <summary>尾扩展块 flags 实写值（bit0 整图 / bit1 分块）。</summary>
+        public uint Flags => BgmapFlagFullMap | (Tiled ? BgmapFlagTiled : 0u);
     }
 
     public static byte[] Build(BgmapInput input)
@@ -131,13 +172,22 @@ public static class BgmapPackWriter
         if (input.GroundTable != null && input.GroundTable.Length != input.Vw)
             throw new ArgumentException(
                 $"整图地面表长度 {input.GroundTable.Length} != vw {input.Vw}（第 x 列 ↔ 世界 x）", nameof(input));
+        /* 分块口径的承载位在尾扩展块 flags（bit1）里：没有扩展块就没有地方声明布局，
+         * 强行按分块写会得到一个"旧固件当逐行读"的坏包 —— 直接拒绝。 */
+        if (input.Tiled && !input.IsFullMap)
+            throw new ArgumentException(
+                "tiled（分块）布局仅支持整图包：flags bit1 位于尾扩展块，窗口包无承载字段", nameof(input));
 
         // static_back = 纯 RGB565（不透明底，无掩码尾）；tile_layer = RGBA5650（RGB565 + 1bit mask，同 PARTS 编码）
+        // 分块口径（契约 §2/§3）：两层都是 128×128 瓦片；tile 掩码区同网格分块、紧跟像素区。
+        bool tiled = input.Tiled;
         var staticData = input.StaticBack != null
-            ? PartPackWriter.EncodeRgb565(input.StaticBack)
+            ? (tiled ? PartPackWriter.EncodeRgb565Tiled(input.StaticBack)
+                     : PartPackWriter.EncodeRgb565(input.StaticBack))
             : Array.Empty<byte>();
         var tileData = input.TileLayer != null
-            ? PartPackWriter.EncodeRgb565WithMask(input.TileLayer)
+            ? (tiled ? PartPackWriter.EncodeRgb565TiledWithMask(input.TileLayer)
+                     : PartPackWriter.EncodeRgb565WithMask(input.TileLayer))
             : Array.Empty<byte>();
 
         // 【布局修正 2026-09-27】每条条带实际序列化 14B（part_ref u64 + y i16 +
@@ -191,7 +241,7 @@ public static class BgmapPackWriter
                 w.Write(BgmapExtensionMagic);          // 文件字节序 = 45 47 50 4D
                 w.Write((uint)groundBytes);            // = vw × 2
                 w.Write((uint)groundOff);              // payload 起算
-                w.Write(BgmapFlagFullMap);             // bit0 = 1：整图包
+                w.Write(input.Flags);                  // bit0 = 整图包；bit1 = 分块（tiled）布局
                 foreach (var g in input.GroundTable) w.Write(g);
                 int tailPad = (4 - (groundBytes & 3)) & 3;
                 for (int i = 0; i < tailPad; i++) w.Write((byte)0);

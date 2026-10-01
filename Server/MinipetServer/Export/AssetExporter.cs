@@ -40,6 +40,14 @@ public sealed class ExportOptions
     /// 无任何降采样）+ 尾部地面表扩展块。**默认 false** = 现网 240×240 窗口口径逐字节不变。
     /// </summary>
     public bool FullMap;
+
+    /// <summary>
+    /// **分块（tiled）布局**（2026-10-01；冻结契约 <c>docs/ai/map-tiled-format-contract.md</c>）：
+    /// 整图包的 static / tile（含掩码）/ 条带像素改成 128×128 世界像素瓦片存储
+    /// （flags bit1 = <see cref="BgmapPackWriter.BgmapFlagTiled"/>），让固件按块连续读。
+    /// 仅在 <see cref="FullMap"/> 时生效（窗口包没有承载 flags 的尾扩展块，自动忽略并退回逐行）。
+    /// </summary>
+    public bool Tiled;
 }
 
 /// <summary>单个导出产物（一个 hash 一个文件）。</summary>
@@ -162,7 +170,7 @@ public sealed class AssetExporter
         // ── 2. 地图：BGMAP + 条带小 PARTS + 缩略图 + clock_table ──
         foreach (var mapId in o.Maps.Where(m => !string.IsNullOrWhiteSpace(m)).Distinct())
         {
-            try { ExportMap(mapId.Trim(), profile, summary, o.FullMap); }
+            try { ExportMap(mapId.Trim(), profile, summary, o.FullMap, o.Tiled); }
             catch (Exception ex)
             {
                 Console.Error.WriteLine($"[AssetExporter] 地图 {mapId} 导出失败: {ex}");
@@ -605,7 +613,8 @@ public sealed class AssetExporter
         return (tm & 4) != 0 || (tm & 8) != 0;
     }
 
-    private void ExportMap(string mapId, DeviceProfile profile, ExportSummary summary, bool fullMap = false)
+    private void ExportMap(string mapId, DeviceProfile profile, ExportSummary summary, bool fullMap = false,
+        bool tiledRequested = false)
     {
         var map = _map.LoadMap(mapId);
         if (map == null) { summary.Warnings.Add($"地图 {mapId} 加载失败"); return; }
@@ -638,6 +647,11 @@ public sealed class AssetExporter
             summary.Warnings.Add($"地图 {mapId} 整图尺寸 {worldW}×{worldH} 非法或超 u16，已退回窗口包");
             full = false;
         }
+        /* 分块（tiled）口径（契约 §1）：承载位是**尾扩展块 flags bit1**，只有整图包才有扩展块 ⇒
+         * 窗口包/整图退回窗口包时自动退回逐行（不静默产出"固件按逐行读"的坏包）。 */
+        bool tiled = full && tiledRequested;
+        if (tiledRequested && !full)
+            Console.WriteLine($"[AssetExporter] 地图 {mapId} 非整图包 → 忽略分块(tiled)口径，按逐行导出");
 
         int vw, vh;
         float camX, camY;
@@ -813,7 +827,7 @@ public sealed class AssetExporter
                     var bandPayload = PartPackWriter.Build(new[]
                     {
                         new PartPackWriter.PartEntry { PartId = 1, ExprGroup = 0, Bitmap = bandBmp, OriginX = 0, OriginY = 0 },
-                    });
+                    }, tiled);   /* 分块口径：条带位图记录一并按 128×128 瓦片编码（契约 §4） */
                     bandBmp.Dispose();   // Build 内已编码；整图带是 MB 级位图，立刻释放
                     var bandAsset = AddAsset(summary, MpakKind.Parts, bandPayload,
                                             $"背景层 {mapId}#{segBacks[0].Id}", selector: null);
@@ -861,12 +875,12 @@ public sealed class AssetExporter
                 using var srcBmp = SKBitmap.Decode(png);
                 if (srcBmp == null) continue;
                 int period = b.Cx > 0 ? b.Cx : srcBmp.Width;
-                using var tiled = PreTileHorizontal(srcBmp, period);
+                using var tiledBmp = PreTileHorizontal(srcBmp, period);
                 var (ox, oy) = _wz.GetOrigin(texPath);
                 var stripPayload = PartPackWriter.Build(new[]
                 {
-                    new PartPackWriter.PartEntry { PartId = 1, ExprGroup = 0, Bitmap = tiled, OriginX = ox, OriginY = oy },
-                });
+                    new PartPackWriter.PartEntry { PartId = 1, ExprGroup = 0, Bitmap = tiledBmp, OriginX = ox, OriginY = oy },
+                }, tiled);   /* 分块口径：滚动条带位图记录按自身 w×h 的 128 网格分块（契约 §4） */
                 var stripAsset = AddAsset(summary, MpakKind.Parts, stripPayload, $"条带 {mapId}#{b.Id}", selector: null);
 
                 int tm = BackTileMode(b.Type);
@@ -937,7 +951,16 @@ public sealed class AssetExporter
             TileLayer = tileBmp,
             Strips = strips,
             GroundTable = groundTable,
+            Tiled = tiled,
         });
+        if (tiled)
+        {
+            int gx = TiledLayout.GridX(vw), gy = TiledLayout.GridY(vh);
+            Console.WriteLine($"[AssetExporter]   分块(tiled)口径：瓦片 {gx}×{gy}="
+                              + $"{gx * gy} 块（static {TiledLayout.PixelsLen(vw, vh)}B + "
+                              + $"tile {TiledLayout.PixelsLen(vw, vh)}B + 掩码 {TiledLayout.MaskLen(vw, vh)}B，"
+                              + $"块 128×128 世界像素，越界补 0；flags bit1=1）");
+        }
 
         // 5. 缩略图（96×96，nearest 保持像素风）
         ulong thumbHash = 0;
@@ -971,6 +994,12 @@ public sealed class AssetExporter
          * 窗口口径**不写**该字段 ⇒ 现网 manifest 结构零变化（DeviceAssetService.HasEntry
          * 把"无 viewport 字段"等同 window，兼容 2026-10-01 之前登记的旧索引）。 */
         if (full) extra["viewport"] = "full";
+        /* 存储布局标注（**仅分块包**下发；字符串，两个 manifest 写手都直收，设备/Web 未知字段忽略）：
+         * "tiled" = static/tile/条带三类层按 128×128 瓦片存储（BGMAP flags bit1=1）。
+         * 作用有两个：① 服务端幂等判定（DeviceAssetService.HasEntry 的 layout 过滤）能把
+         * "已登记但仍是逐行口径"的整图条目判为待重导，否则新固件永远拿不到分块包；
+         * ② 运维/排障时一眼看出设备上那份包是什么口径。逐行口径**不写**该字段。 */
+        if (tiled) extra["layout"] = "tiled";
         if (thumbHash != 0) extra["thumb"] = $"{thumbHash:x16}";
         AddAsset(summary, MpakKind.Bgmap, bgmapPayload,
             string.IsNullOrEmpty(mapName) ? $"map_{mapId}" : mapName, selector: "map", extra: extra);
@@ -1175,9 +1204,11 @@ public sealed class AssetExporter
     /// （480×480，与 PaperdollPackService/ClockTableSeeder 同口径）。
     /// 渲染期告警（条带素材缺失等）追加进 warnings；地图加载失败/产物为空抛
     /// InvalidOperationException。clock_table 建议值不在此返回（由 ClockTableSeeder/配置管理）。
+    /// <paramref name="tiled"/>（2026-10-01）：分块布局（契约 map-tiled-format-contract.md）；
+    /// **null = 跟随口径**（整图包 → 分块；窗口包无承载位 → 逐行）。仅 fullMap 时生效。
     /// </summary>
     public List<ExportedAsset> ExportMapAssets(string mapId, List<string>? warnings = null,
-        DeviceProfile? deviceProfile = null, bool fullMap = false)
+        DeviceProfile? deviceProfile = null, bool fullMap = false, bool? tiled = null)
     {
         if (string.IsNullOrWhiteSpace(mapId)) throw new ArgumentException("地图 id 不能为空", nameof(mapId));
         if (!_wz.IsLoaded) throw new InvalidOperationException("WZ 未加载（先调用 WzService.LoadWz）");
@@ -1187,7 +1218,7 @@ public sealed class AssetExporter
          * 完全没参与烘焙。现在调用方（DeviceAssetService）把该设备记录里的
          * profile 传进来；为空才回落到默认（ViewportW/H 内部有 480 兜底）。
          * fullMap=true（R2 整图）时 profile 只影响条带是否导出（Strips），视口由整图 bbox 决定。 */
-        ExportMap(mapId.Trim(), deviceProfile ?? new DeviceProfile(), summary, fullMap);
+        ExportMap(mapId.Trim(), deviceProfile ?? new DeviceProfile(), summary, fullMap, tiled ?? fullMap);
         warnings?.AddRange(summary.Warnings);
         if (summary.Assets.Count == 0)
             throw new InvalidOperationException(
