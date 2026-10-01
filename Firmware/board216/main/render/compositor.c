@@ -1901,14 +1901,8 @@ static uint16_t *layer_rgb_load(const mpak_t *m, uint32_t off, uint32_t len,
     uint16_t *dst = psram((size_t)g_sw * g_sh * 2u);
     if (!dst) return NULL;
 
-    if (vw == (uint16_t)g_sw && vh == (uint16_t)g_sh &&
-        stride_b == (uint32_t)g_sw * 2u) {
-        if (mpak_read_at((mpak_t *)m, m->payload_off + off, dst, len) != MPAK_OK) {
-            heap_caps_free(dst);
-            return NULL;
-        }
-        return dst;
-    }
+    /* （旧"vw==屏宽直接 1:1 拷贝"路径已删 2026-10-01：那正是旧版整屏包
+     * vw=480 图 1:1 上屏、地图相对角色小一半的 bug 载体——见下 legacy 分支。） */
 
     /* 【任意比例最近邻 2026-09-30】原仅接受 2x（vw*RC_SCALE==屏宽）；1.85B 360 屏
      * 用 480 档素材（240 bg → 1.5x）被拒=背景缺失。泛化为 vw/vh→g_sw/g_sh
@@ -1924,6 +1918,27 @@ static uint16_t *layer_rgb_load(const mpak_t *m, uint32_t off, uint32_t len,
         return NULL;
     }
     uint32_t stride_el = stride_b / 2u;
+
+    /* 【旧版整屏口径兼容 2026-10-01】旧导出器（NAS 在跑的镜像）vw=屏幕宽、
+     * zoom=1 整屏出图：480 图 = 480 世界 px（视场是新契约 240 的 2 倍），头里
+     * vw=480 恰好命中上面的"直接 1:1 拷贝"路径 → 地图按 1:1 上屏，而角色按
+     * 契约 1x 素材 ×2 上屏 —— 地图相对角色小了一半（用户双端照片实测：桌面
+     * 角色:招牌面板=1.3、设备=2.4）。旧图按契约视场 g_sw/RC_SCALE 中心裁窗、
+     * ×RC_SCALE 展开：src = (vw−FOV)/2 + d/RC_SCALE，与 240 档新包同一观感。 */
+    if ((int32_t)vw >= g_sw && (int32_t)vh >= g_sh) {
+        const int32_t fov_w = g_sw / RC_SCALE, fov_h = g_sh / RC_SCALE;
+        const int32_t ox = ((int32_t)vw - fov_w) / 2, oy = ((int32_t)vh - fov_h) / 2;
+        ESP_LOGW(TAG, "[旧包兼容] vw=%u vh=%u 整屏口径 → 中心裁 %dx%d 世界窗 ×%d 展开（offset %d,%d）",
+                 vw, vh, fov_w, fov_h, RC_SCALE, ox, oy);
+        for (int32_t dy = 0; dy < g_sh; dy++) {
+            const uint16_t *srow = (const uint16_t *)raw + (size_t)(oy + dy / RC_SCALE) * stride_el;
+            uint16_t *drow = dst + (size_t)dy * g_sw;
+            for (int32_t dx = 0; dx < g_sw; dx++) drow[dx] = srow[ox + dx / RC_SCALE];
+        }
+        heap_caps_free(raw);
+        return dst;
+    }
+
     ESP_LOGW(TAG, "[取证] raw[0..3]=%02x%02x %02x%02x %02x%02x %02x%02x dst[0..3]=%04x %04x %04x %04x",
              raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7],
              ((uint16_t *)raw)[0], ((uint16_t *)raw)[1], ((uint16_t *)raw)[2], ((uint16_t *)raw)[3]);
@@ -1960,6 +1975,21 @@ static uint8_t *tile_mask_load(const mpak_t *m, uint32_t off, uint32_t len,
      * 之类有结构的缓冲，残留 bit 还会是**成排的竖条纹**（上一版实体缓冲漏 memset
      * 时用户照片同样是"黑色竖条 + 随机竖条纹"，同一病灶）。必须先整体清零。 */
     memset(dst, 0, ((size_t)g_sw * g_sh + 7) / 8);
+    /* 【旧版整屏口径兼容 2026-10-01】与 layer_rgb_load 同步：vw≥屏宽 = 旧包
+     * 世界 1:1 掩码，按契约视场中心裁窗采样，与 static 的裁剪完全对齐。 */
+    if ((int32_t)vw >= g_sw && (int32_t)vh >= g_sh) {
+        const int32_t fov_w = g_sw / RC_SCALE, fov_h = g_sh / RC_SCALE;
+        const int32_t ox = ((int32_t)vw - fov_w) / 2, oy = ((int32_t)vh - fov_h) / 2;
+        for (int32_t dy = 0; dy < g_sh; dy++)
+            for (int32_t dx = 0; dx < g_sw; dx++) {
+                uint32_t sidx = (uint32_t)(oy + dy / RC_SCALE) * vw +
+                                (uint32_t)(ox + dx / RC_SCALE);
+                if (rc_mask_bit(raw, sidx))
+                    rc_mask_set(dst, (uint32_t)dy * g_sw + dx);
+            }
+        heap_caps_free(raw);
+        return dst;
+    }
     for (int32_t dy = 0; dy < g_sh; dy++)
         for (int32_t dx = 0; dx < g_sw; dx++) {
             uint32_t sidx = (uint32_t)((int64_t)dy * vh / g_sh) * vw +
