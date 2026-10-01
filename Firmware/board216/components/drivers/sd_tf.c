@@ -10,6 +10,8 @@
  */
 #include "sd_tf.h"
 
+#include <time.h>        /* time()：TF 自愈节流用系统时钟 */
+
 #include <errno.h>
 #include <stdio.h>
 #include "freertos/FreeRTOS.h"
@@ -103,12 +105,28 @@ int sd_mount(void)
         .disk_status_check_enable = false,
     };
 
-    esp_err_t err = esp_vfs_fat_sdmmc_mount(SD_MOUNT_POINT, &s_host, &s_slot,
-                                            &mount_cfg, &s_card);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "SD 挂载失败: %s（未插卡? 卡格式?）→ 尝试内部 Flash assets 分区",
-                 esp_err_to_name(err));
+    /* 【挂载重试 2026-10-01】真机反复出现 `sdmmc_init_ocr: send_op_cond(1)
+     * returned 0x107`（TIMEOUT）→ 一次没谈成 OCR 就整机回退"出厂素材模式"：
+     * 表现是背景变默认图、相机不可用、**气泡中文全丢**（出厂字库只有 116 字），
+     * 而重插/重启后又能好——典型的卡上电时序/接触边缘问题。
+     * 这里改成 4 次重试（每次 host deinit + 250ms 让卡与控制器都回到干净态），
+     * 覆盖绝大多数边缘情况；仍失败才走 Flash 兜底。 */
+    esp_err_t err = ESP_FAIL;
+    for (int attempt = 0; attempt < 4; attempt++) {
+        s_host = (sdmmc_host_t)SDMMC_HOST_DEFAULT();
+        err = esp_vfs_fat_sdmmc_mount(SD_MOUNT_POINT, &s_host, &s_slot,
+                                      &mount_cfg, &s_card);
+        if (err == ESP_OK) {
+            if (attempt) ESP_LOGW(TAG, "SD 挂载第 %d 次成功（前几次 0x%x）", attempt + 1, err);
+            break;
+        }
+        ESP_LOGW(TAG, "SD 挂载失败（第 %d/4 次）: %s", attempt + 1, esp_err_to_name(err));
         sdmmc_host_deinit();              /* 归还 SDMMC 外设，给重试留干净状态 */
+        vTaskDelay(pdMS_TO_TICKS(250));
+    }
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "SD 挂载 4 次均失败: %s（未插卡? 卡接触? 卡格式?）→ 尝试内部 Flash assets 分区",
+                 esp_err_to_name(err));
 
         /* Flash 兜底：同一挂载点 /sdcard，下游路径零改动 */
         s_card = NULL;
@@ -239,6 +257,59 @@ bool sd_tf_tf_present(void)
 bool sd_tf_is_flash_fallback(void)
 {
     return s_on_flash;      /* 由 sd_mount() 的 Flash 回退分支置位 */
+}
+
+/* ------------------------------------------------------------------ */
+/* 【TF 掉卡自愈 2026-10-01】                                            */
+/* ------------------------------------------------------------------ */
+/* 出厂回退态下周期性探测"卡是否回来了"。只做 **纯卡层探测**（sdmmc_card_init），
+ * 不挂 FS、不触碰已打开的文件（渲染侧此刻正把字体/素材从 Flash 分区读着，
+ * 贸然卸载 /sdcard 会把它们的 fd 打断）。探测成功 = 卡已可通信 → 由调用方
+ * （poller）安排一次重启，让启动路径重新按 TF 优先挂载。
+ * 节流：RTC 记忆上次自愈重启时刻，5 分钟内最多一次，防"边缘卡"把设备拖进
+ * 重启循环。 */
+#define SD_HEAL_RTC_MAGIC 0x53444831u   /* 'SDH1' */
+static RTC_NOINIT_ATTR uint32_t s_heal_magic;
+static RTC_NOINIT_ATTR uint32_t s_heal_last_s;
+
+bool sd_tf_probe_card(void)
+{
+    if (!s_on_flash) return false;                 /* 只在出厂回退态探测 */
+    sdmmc_host_t host = SDMMC_HOST_DEFAULT();
+    host.max_freq_khz = 10000;                     /* 探测用低频，边缘卡更容易谈成 */
+    if (sdmmc_host_init() != ESP_OK) return false;
+    if (sdmmc_host_init_slot(host.slot, &s_slot) != ESP_OK) {
+        sdmmc_host_deinit();
+        return false;
+    }
+    sdmmc_card_t *card = calloc(1, sizeof(sdmmc_card_t));   /* card_init 需要已分配的结构 */
+    if (!card) { sdmmc_host_deinit(); return false; }
+    esp_err_t err = sdmmc_card_init(&host, card);
+    free(card);
+    sdmmc_host_deinit();
+    if (err == ESP_OK) {
+        ESP_LOGW(TAG, "TF 卡探测成功（卡已恢复通信）");
+        return true;
+    }
+    return false;
+}
+
+/* 是否允许为"TF 恢复"重启一次（5 分钟节流，RTC 记忆跨重启） */
+bool sd_tf_heal_reboot_allowed(void)
+{
+    time_t now = time(NULL);
+    if (s_heal_magic != SD_HEAL_RTC_MAGIC) {       /* 冷启动（RTC 域刚上电） */
+        s_heal_magic = SD_HEAL_RTC_MAGIC;
+        s_heal_last_s = 0;
+    }
+    if (now < 1600000000) return true;             /* 系统时间无效：不节流（极少见） */
+    if (s_heal_last_s && (uint32_t)now - s_heal_last_s < 300u) {
+        ESP_LOGW(TAG, "TF 恢复重启节流中（%us 前刚试过）→ 本次只记录不自愈",
+                 (unsigned)((uint32_t)now - s_heal_last_s));
+        return false;
+    }
+    s_heal_last_s = (uint32_t)now;
+    return true;
 }
 
 bool sd_is_mounted(void)

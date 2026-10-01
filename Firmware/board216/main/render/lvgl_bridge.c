@@ -1073,6 +1073,9 @@ void bridge_cam_settle_after_reload(void)
  * （待机时钟/OTA…）只复原相机与横幅，**不**重派发地图（避免在待机/升级里重载包）。 */
 static void cam_finish_core(bool confirm, bool full, const char *why)
 {
+    /* 收尾先撤性能降级：后面要重合成完整画面（含条带） */
+    render_cam_adjust_set(false);
+
     if (!s_cam.on) return;
     s_cam.on = false;
     s_cam.dragging = false;
@@ -1226,6 +1229,10 @@ static bool menu_map_fn_camera_enter(void)
         return false;
     }
     s_cam.on = true;
+    /* 【性能模式 2026-10-01】用户口径"调摄像头时卡顿太严重"：进调参态即隐藏
+     * 背景条带层（只留 static+tile），拖动帧耗时可降一个量级；
+     * 收尾（cam_finish_core）恢复完整合成。 */
+    render_cam_adjust_set(true);
 
     /* ⑤ 调参态常驻横幅：入队放在 MENU_EXIT/POKER on_enter 之后，保证压过未配网
      *    横幅（cmd_q FIFO，同一渲染任务帧内顺序落地） */

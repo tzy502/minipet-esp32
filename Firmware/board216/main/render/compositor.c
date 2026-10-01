@@ -144,6 +144,8 @@ typedef struct {
 } rc_strip_t;
 static rc_strip_t *g_strips;
 static int         g_strip_n;
+/* 相机调参性能模式（用户要求：拖动时隐藏条带层，只留 static+tile） */
+static bool        g_cam_adjust;
 
 /* ── R2 整图相机状态（契约 §3.2；详见 compose_region 前的相机块）── */
 static bool    g_cam_on;                   /* true = 当前包为整图（相机可用） */
@@ -1994,9 +1996,26 @@ static int cam_strip_sync(rc_strip_t *s)
     return rc;
 }
 
+static void full_recompose(void);     /* 前向：调参模式切换后整屏重合成 */
+
+void render_cam_adjust_set(bool on)
+{
+    if (!g_inited) return;
+    rc_lock();
+    if (g_cam_adjust != on) {
+        g_cam_adjust = on;
+        ESP_LOGW(TAG, "相机调参性能模式：%s（%s）", on ? "开" : "关",
+                 on ? "跳过条带层，只画 static+tile" : "恢复完整合成");
+        full_recompose();            /* 进出各重合成一帧，避免残影 */
+    }
+    rc_unlock();
+}
+bool render_cam_adjust_get(void) { return g_cam_adjust; }
+
 static void cam_scene_sync(void)
 {
     if (!g_cam_on) return;
+    if (g_cam_adjust) return;        /* 调参态：条带缓存既不补读也不搬移（零 TF 读） */
     s_cam_io_rows = s_cam_io_cols = s_cam_io_bytes = 0;
     s_cam_strip_fopens = 0;
     int64_t t0 = esp_timer_get_time();
@@ -2438,9 +2457,11 @@ static void compose_region(int32_t x, int32_t y, int32_t w, int32_t h)
     }
 
     /* 2) 条带（旧包：x 向循环平铺；整图：世界系 y + 世界对齐采样） */
-    for (int i = 0; i < g_strip_n; i++) {
-        if (g_strips[i].world) cam_strip_compose(&g_strips[i], x, y, w, h);
-        else                   strip_blit(&g_strips[i], x, y, w, h);
+    if (!g_cam_adjust) {                 /* 调参态：整图条带层整层跳过（性能） */
+        for (int i = 0; i < g_strip_n; i++) {
+            if (g_strips[i].world) cam_strip_compose(&g_strips[i], x, y, w, h);
+            else                   strip_blit(&g_strips[i], x, y, w, h);
+        }
     }
 
     /* 3) tile_layer（1bit alpha 叠加；列偏移与 static_back 同理必须 +x，

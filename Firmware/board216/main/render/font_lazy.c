@@ -36,6 +36,7 @@ typedef struct {
     uint32_t   slot_sz;
     uint32_t   next_slot;          /* 环形替换指针 */
     int32_t    base_line;
+    uint8_t  *src_scratch;   /* 4bpp 源位图暂存（A8 展开用） */
 } fl_inst_t;
 
 static fl_inst_t s_inst[FONT_ID_COUNT];
@@ -81,8 +82,14 @@ static bool fl_glyph_dsc(const lv_font_t *font, lv_font_glyph_dsc_t *dsc,
     dsc->ofs_x        = g->off_x;
     dsc->ofs_y        = -g->bearing_y; /* 向上为正 → LVGL 向下为正 */
     dsc->gid.index    = letter;         /* 反查键：0 保留为无效 */
-    dsc->format       = LV_FONT_GLYPH_FORMAT_A4;
-    dsc->stride       = (g->w + 1) / 2; /* 4bpp 紧行长 == LVGL A4 行规则 */
+    /* 【必须是 A8 + static_bitmap】LVGL 9.6 draw_letter 只有
+     * `static_bitmap && format == A8` 才走"原始位图指针"路径；
+     * 否则它把 get_glyph_bitmap 的返回值当 lv_draw_buf_t* 解引用
+     * （draw_buf->data / ->header.stride 全是位图字节）→ 野指针崩溃
+     * （真机 EXCVADDR=0xaaddccbb/0x0c000000，位置 lv_draw_sw_blend_color_to_rgb565）。
+     * 故此处报 A8（1B/px），位图在 fl_glyph_bmp 里由 4bpp 展开成 8bpp。 */
+    dsc->format       = LV_FONT_GLYPH_FORMAT_A8;
+    dsc->stride       = g->w;           /* A8 行距 = 宽（字节/行） */
     dsc->is_placeholder = 0;
     dsc->resolved_font = font;
     return true;
@@ -90,7 +97,9 @@ static bool fl_glyph_dsc(const lv_font_t *font, lv_font_glyph_dsc_t *dsc,
 
 static const void *fl_glyph_bmp(lv_font_glyph_dsc_t *dsc, lv_draw_buf_t *draw_buf)
 {
-    (void)draw_buf;                     /* A4 原样透传，无解码目标缓冲需求 */
+    /* 契约：本字体 static_bitmap=1 + format=A8 ⇒ LVGL 必以 draw_buf == NULL 调用，
+     * 返回值按"原始 A8 掩码指针"消费（环形缓存保证同步消费期内有效）。 */
+    (void)draw_buf;
     if (!dsc || dsc->gid.index == 0) return NULL;
     uint32_t letter = dsc->gid.index;
     fl_inst_t *self = fl_self(dsc->resolved_font);
@@ -109,9 +118,29 @@ static const void *fl_glyph_bmp(lv_font_glyph_dsc_t *dsc, lv_draw_buf_t *draw_bu
     self->next_slot = (self->next_slot + 1) % FL_CACHE_SLOTS;
     s->valid = false;
     s->cp    = letter;
-    if (mpak_font_read_glyph_bmp(&self->mpk, g, s->bmp, self->slot_sz) != MPAK_OK) {
+    uint32_t w = g->w, h = g->h;
+    uint32_t src_sz = ((w + 1u) / 2u) * h;
+    if (src_sz > self->mpk.u.font->max_bmp_bytes || w * h > self->slot_sz) {
+        ESP_LOGE(TAG, "glyph U+%04" PRIx32 " 尺寸越界 %ux%u (src %u>%u, a8 %u>%u)", letter,
+                 (unsigned)w, (unsigned)h, (unsigned)src_sz,
+                 (unsigned)self->mpk.u.font->max_bmp_bytes,
+                 (unsigned)(w * h), (unsigned)self->slot_sz);
+        return NULL;
+    }
+    if (w == 0 || h == 0) return NULL;      /* 零尺寸字形：不画（LVGL 不会为此调位图） */
+    if (mpak_font_read_glyph_bmp(&self->mpk, g, self->src_scratch, src_sz) != MPAK_OK) {
         ESP_LOGE(TAG, "glyph U+%04" PRIx32 " read failed", letter);
         return NULL;
+    }
+    /* 4bpp(A4) → 8bpp(A8)：LVGL static 原始位图路径按 1B/px 取掩码 */
+    for (uint32_t y = 0; y < h; y++) {
+        const uint8_t *srow = self->src_scratch + (size_t)y * ((w + 1u) / 2u);
+        uint8_t *drow = s->bmp + (size_t)y * w;
+        for (uint32_t x = 0; x < w; x++) {
+            uint8_t v = (x & 1u) ? (uint8_t)(srow[x >> 1] & 0x0Fu)
+                                 : (uint8_t)(srow[x >> 1] >> 4);
+            drow[x] = (uint8_t)(v * 17u);        /* 0..15 → 0..255 */
+        }
     }
     s->valid = true;
     return s->bmp;
@@ -142,6 +171,10 @@ void font_lazy_deinit(font_id_t id)
         heap_caps_free(self->slot_bufs);
         self->slot_bufs = NULL;
     }
+    if (self->src_scratch) {
+        heap_caps_free(self->src_scratch);
+        self->src_scratch = NULL;
+    }
     memset(&self->font, 0, sizeof self->font);
 }
 
@@ -158,11 +191,29 @@ int font_lazy_init(font_id_t id, const char *mpk_path)
     if (rc != MPAK_OK) return rc;
 
     const mpak_font_t *ft = self->mpk.u.font;
-    self->slot_sz  = ft->max_bmp_bytes;
+    /* 【A8 展开 2026-10-01】LVGL 9.3+ 自定义字体必须给出 .static_bitmap 标记，
+     * 否则 draw_letter 会把 get_glyph_bitmap 的返回值当 lv_draw_buf_t* 解析
+     * （真机崩溃：EXCVADDR=0x0c000000 出现在 lv_draw_sw_blend_color_to_rgb565，
+     * 中文位图头 8 字节被当地址；ASCII 侥幸没崩）。走 static 原始位图路径时
+     * LVGL 要求 **A8（1B/px）**，所以这里按 w*h 算槽位，并把包里的 4bpp
+     * 展开成 A8 再交给 LVGL。 */
+    uint32_t a8_max = 0;
+    for (uint32_t i = 0; i < ft->glyph_count; i++) {
+        uint32_t sz = (uint32_t)ft->glyphs[i].w * (uint32_t)ft->glyphs[i].h;
+        if (sz > a8_max) a8_max = sz;
+    }
+    self->slot_sz  = a8_max ? a8_max : 1;
     self->slot_bufs = heap_caps_malloc((size_t)FL_CACHE_SLOTS * self->slot_sz,
                                        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!self->slot_bufs) {
         mpak_close(&self->mpk);
+        return MPAK_ERR_NOMEM;
+    }
+    self->src_scratch = heap_caps_malloc(ft->max_bmp_bytes ? ft->max_bmp_bytes : 1,
+                                         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!self->src_scratch) {
+        mpak_close(&self->mpk);
+        heap_caps_free(self->slot_bufs); self->slot_bufs = NULL;
         return MPAK_ERR_NOMEM;
     }
     fl_clear_slots(self);
@@ -178,6 +229,11 @@ int font_lazy_init(font_id_t id, const char *mpk_path)
     memset(&self->font, 0, sizeof self->font);
     self->font.get_glyph_dsc    = fl_glyph_dsc;
     self->font.get_glyph_bitmap = fl_glyph_bmp;
+#if LV_VERSION_CHECK(9, 3, 0) || LVGL_VERSION_MAJOR >= 10
+    /* 告诉 LVGL：位图是"原始静态"指针（环形缓存保证同步消费有效），
+     * 走 lv_font_get_glyph_static_bitmap_internal 的 A8 mask 路径。 */
+    self->font.static_bitmap    = 1;
+#endif
     self->font.line_height      = ft->size_px;
     self->font.base_line        = self->base_line;
 

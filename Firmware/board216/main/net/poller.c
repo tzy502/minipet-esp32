@@ -673,6 +673,26 @@ static void poller_task(void *arg)
         /* 长轮询可能 hold 50s：再补一次日志上报机会（内部节流，不会连发） */
         mp_http_device_log_step();
 
+        /* 【TF 掉卡自愈 2026-10-01】出厂回退态（SD 挂载失败）下每 60s 纯卡层探一次：
+         * 卡回来了就重启一次让启动路径重新按 TF 优先挂载——否则设备会一直停在
+         * 出厂素材（背景默认图/相机不可用/气泡中文全丢），只能人工断电。
+         * 5 分钟节流在 sd_tf 侧（RTC 记忆），防边缘卡把设备拖进重启循环。 */
+        extern bool sd_tf_is_flash_fallback(void);
+        extern bool sd_tf_probe_card(void);
+        extern bool sd_tf_heal_reboot_allowed(void);
+        if (sd_tf_is_flash_fallback()) {
+            static int64_t s_tf_probe_ms;
+            int64_t tnow = mp_now_ms();
+            if (tnow - s_tf_probe_ms > 60000) {
+                s_tf_probe_ms = tnow;
+                if (sd_tf_probe_card() && sd_tf_heal_reboot_allowed()) {
+                    ESP_LOGW(TAG, "TF 卡已恢复 → 3s 后自动重启，切回 TF 素材（相机/中文气泡/整图）");
+                    vTaskDelay(pdMS_TO_TICKS(3000));
+                    esp_restart();
+                }
+            }
+        }
+
         if (ok) {
             s_last_poll_status = 200;
             s_poll_fail_streak = 0;

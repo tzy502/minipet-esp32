@@ -129,6 +129,15 @@ void render_cam_center(void);
  * 返回 -1 = 无地面表/越界/非整图（调用方回落通用线 ground_line_y_at 的口径不变）。 */
 int32_t render_ground_screen_y(int32_t screen_x);
 
+/* 【相机调参性能模式 2026-10-01】用户口径："调整摄像头时卡顿太严重，
+ * 调整的时候把背景（条带层）全部隐藏，只留 tile"。
+ * on=true → 合成与窗口缓存同步都**跳过整图条带层**（条带是最贵的一层：
+ * 每条带一份 336×N 缓存 + 逐像素 1bit 掩码 + 时间滚动相位），拖动只重画
+ * static+tile ⇒ 帧耗时可降一个量级；on=false → 恢复完整合成（收尾一帧）。
+ * 语义：纯渲染降级，不动任何持久化状态；进出都会整屏重合成一次。 */
+void render_cam_adjust_set(bool on);
+bool render_cam_adjust_get(void);
+
 #ifdef __cplusplus
 }
 #endif
