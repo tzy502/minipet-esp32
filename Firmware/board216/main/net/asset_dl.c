@@ -53,7 +53,14 @@ static const char *TAG = "asset";
  * 143KB 已是万物枯竭的总根源（下载失败/任务创建失败多为连锁反应） */
 /* 24K：rev32 实测 18.6KB（休塔尔克装扮+NPC 后）。旧 16K 在 collect 满
  * 时返回 false 中断流 → sync 静默失败（真机：进入但永无下载）。 */
-#define MANIFEST_RESP_CAP  (24 * 1024)
+/* 【2026-10-01 再爆一次：24K 又不够了】真机实证：整图导出 + 中文名 label 之后
+ * 清单涨到 **27,461 B** > 24,576 → manifest_collect 拒绝续收 → 响应被截断 →
+ * cJSON_Parse 失败 → sync_once **静默 return**（无任何 E 级日志）→ 新登记的地图
+ * 永远下不来、本地清单停在旧 rev（真机表现：推了 5 张整图包，设备一张都不下）。
+ * 教训与 16K→24K 那次同款：**清单体积只增不减，上限必须留足并显式报错**。
+ * 64KB 缓冲走 PSRAM（内部堆此刻只剩 ~50KB，再吃 64KB 会把 SD/newlib 逼死；
+ * PSRAM 有 6MB+，cJSON 解析只读它）。 */
+#define MANIFEST_RESP_CAP  (64 * 1024)
 
 /* ------------------------------------------------------------------ */
 /* 本地清单模型（内存 + TF manifest.json 双写）                          */
@@ -1379,6 +1386,7 @@ static void evict_if_needed(void)
 typedef struct {
     char  *buf;
     size_t len, cap;
+    bool   truncated;      /* 超限截断标记（上层据此明确报错，不再静默解析失败） */
 } manifest_ctx_t;
 
 static bool manifest_collect(void *ctx_, const char *data, size_t len)
@@ -1389,6 +1397,14 @@ static bool manifest_collect(void *ctx_, const char *data, size_t len)
         r->len += len;
         r->buf[r->len] = 0;
         return true;
+    }
+    /* 【禁止静默】截断 = 本轮清单作废（JSON 必不完整）。旧实现只 return false，
+     * 上层见 status=200 仍去 parse → 失败 → 静默 return，故障完全不可见。 */
+    if (!r->truncated) {
+        r->truncated = true;
+        ESP_LOGE(TAG, "清单响应超限（已收 %u B ≥ 上限 %u B）→ 本轮作废；"
+                      "请抬高 MANIFEST_RESP_CAP（清单只增不减）",
+                 (unsigned)(r->len + len), (unsigned)r->cap);
     }
     return false;
 }
@@ -1468,9 +1484,10 @@ static void sync_once(void)
     /* 【堆纪律 2026-09-29】缓冲改为 sync 窗口内临时分配、解析后立刻释放。
      * 旧 static 常驻 16K：本板内部堆 143KB，联网+同步窗口期常驻占用直接把
      * 堆压到 2.4KB——SD 读扇区 0x101、mpak 全灭、降级切分区失败连环炸。 */
-    char *resp = malloc(MANIFEST_RESP_CAP);
+    char *resp = heap_caps_malloc(MANIFEST_RESP_CAP, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!resp) resp = malloc(MANIFEST_RESP_CAP);      /* PSRAM 失败才退内部堆 */
     if (!resp) { ESP_LOGE(TAG, "manifest 缓冲分配失败 %u", (unsigned)MANIFEST_RESP_CAP); s_sync_busy = false; s_sync_attempted = true; return; }
-    manifest_ctx_t ctx = { .buf = resp, .cap = MANIFEST_RESP_CAP };
+    manifest_ctx_t ctx = { .buf = resp, .cap = MANIFEST_RESP_CAP, .truncated = false };
 
     /* manifest 端点服务端必填 deviceId（DeviceEndpoints.cs HandleManifest 签名
      * string deviceId；缺失即 400）——真机实证：不带参永久 400 → 素材包一个
@@ -1489,9 +1506,14 @@ static void sync_once(void)
     }
 
     cJSON *root = cJSON_Parse(resp);
-    free(resp);                            /* cJSON 树自持数据，大缓冲即刻归还堆 */
+    heap_caps_free(resp);                  /* cJSON 树自持数据，大缓冲即刻归还堆 */
     resp = NULL;
-    if (!root) { s_sync_busy = false; return; }
+    if (!root) {
+        ESP_LOGE(TAG, "清单 JSON 解析失败（响应 %u B%s）→ 本轮放弃，保持本地 rev=%u",
+                 (unsigned)ctx.len, ctx.truncated ? "，已截断" : "", (unsigned)s_local_rev);
+        s_sync_busy = false;
+        return;
+    }
 
     uint32_t rev = (uint32_t)jnum(root, "rev", 0);
 

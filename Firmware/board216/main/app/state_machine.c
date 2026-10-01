@@ -814,7 +814,12 @@ static void dispatch_map(const char *hash)
     }
     int n = asset_dl_map_strips(bg, strips, 16);
     if (n < 0) n = 0;
-    if (n > 8) n = 8;
+    /* 【条带数上限修正 2026-10-01】原写死 8：整图新导出里 神秘岛 14 条、明珠港 12 条、
+     * 时空裂缝 1 条……被截到 8 → 渲染层判"条带不全"→ **缺段不绘制**（背景少层、
+     * 看着就是"背景不对"）。缓冲区本就是 16（strips[16]/strip_ptrs[16]），
+     * 渲染层 g_strips 也是按 strip_count 动态分配 ⇒ 上限放开到 16 即可。
+     * 判据日志：`地图装载 <id>（条带 N）rc=0` 的 N 应等于 BGMAP 声明条带数。 */
+    if (n > 16) n = 16;
     for (int i = 0; i < n; i++) strip_ptrs[i] = strips[i];
     int mrc = render_set_map(bg, (n > 0) ? strip_ptrs : NULL, n);
     if (n > 0)
