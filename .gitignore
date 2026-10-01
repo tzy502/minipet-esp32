@@ -77,3 +77,6 @@ Server/MinipetServer/wwwroot/*
 # 否则全新 clone / CI 会因为找不到该文件而构建失败（v0.1.0 曾踩过）。
 !Firmware/board216/main/render/data/*.bin
 !Firmware/board185b/main/render/data/*.bin
+
+# 相机预览导出的调试用参考图（CameraService 预览渲染残留，勿入库）
+Server/MinipetServer/_ref_*.png
