@@ -488,8 +488,14 @@ public static class AdminEndpoints
                     return Results.Json(new { error = "WZ 未加载（到「设置」页配置后重试）" }, statusCode: 503);
 
                 bool switchAfter = body?.Switch != false;
-                // R2 整图口径开关（缺省 false = 现网 240×240 窗口包，行为不变）；仅 map 生效
-                bool fullMap = kind == "map" && body?.FullMap == true;
+                // R2 整图口径开关；仅 map 生效。
+                // 【2026-10-01 默认翻转】原先缺省 false（= 240×240 窗口包），但：
+                //   · 设备侧相机只对整图包可用（窗口包没余量可平移）；
+                //   · Web 的「推送地图」按钮不带 fullMap → 会把已经整图化的地图**退回窗口包**
+                //     （真机踩过：切图后画面变回"一个小窗口"，用户口径"背景切到错误的"）。
+                // 现网 7 张图已全部整图化并在真机验证 ⇒ 缺省改为 **true**；
+                // 需要旧口径时显式传 fullMap:false（CLI 同理）。
+                bool fullMap = kind == "map" && body?.FullMap != false;
                 if (fullMap)
                     Console.WriteLine($"[DevicePush] 设备 {id} 地图 {assetId} 请求**整图口径**（R2：vw/vh=整图 1x 尺寸 + 地面表）");
                 _ = Task.Run(() =>
