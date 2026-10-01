@@ -137,12 +137,14 @@ public static class CameraEndpoints
         /// 磁盘 mpak 不动（设备侧 LRU 自己淘汰；服务端留文件可重推，删除不可逆故不做）。
         ///
         /// 保护：**设备当前正在使用的那张图拒绝删除**（409，中文原因），见下方口径注释。
+        /// ?force=true 可越过保护（页面在二次确认后自动带上）——留给"清单里只剩这一张、又不想要它"
+        /// 的场景：设备会回落到清单里的其它图，清单空了则背景为黑（返回体 warning 会说明）。
         /// 幂等：清单里没有这张图 → 200 { removed:false, idempotent:true }（不是 500，也不必 404——
         /// 页面重试/重复点击都应当成功）。设备不存在 404、mapId 空 400。
         /// </summary>
         g.MapDelete("/devices/{id}/camera/maps/{mapId}", (string id, string mapId, DeviceRegistry reg,
             CameraService camera, CameraPlanStore store, DeviceAssetService assets, DeviceManifestService mfst,
-            DeviceEventLog eventLog) =>
+            DeviceEventLog eventLog, bool? force = null) =>
         {
             if (reg.Get(id) == null) return NotFoundDevice(id);
             var mid = mapId?.Trim();
@@ -167,22 +169,27 @@ public static class CameraEndpoints
             string activeNote = string.IsNullOrEmpty(lastMapId)
                 ? "服务端没有该设备的切图/机位记录（口径：最后设过机位或最后推送切图的那张），本次未做占用保护"
                 : $"服务端口径的当前图 = {lastMapId}（最后设过机位 / 最后推送切图的那张）";
-            if (!string.IsNullOrEmpty(lastMapId) && string.Equals(lastMapId, mid, StringComparison.Ordinal))
+            bool forced = force == true;
+            if (!forced && !string.IsNullOrEmpty(lastMapId) && string.Equals(lastMapId, mid, StringComparison.Ordinal))
             {
                 var cur = camera.FindMap(id, mid);
                 var curLabel = cur != null ? $"{cur.Label}（{mid}）" : mid;
                 Console.WriteLine($"[MapDelete] 设备 {id} 拒绝删除当前正在使用的图 {mid}（lastMapId 口径）");
                 return Results.Json(new
                 {
-                    error = $"地图 {curLabel} 是设备当前正在使用的图（{activeNote}）——删了会没有背景可渲染。"
+                    error = $"地图 {curLabel}是设备当前正在使用的图（{activeNote}）——删了会没有背景可渲染。"
                             + "请先切到别的图：到「素材推送」把目标地图推一次（缺省勾选自动切图即会切过去），"
-                            + "或在「选镜头」里给目标图上送一次机位，然后再删这张。",
+                            + "或在「选镜头」里给目标图上送一次机位，然后再删这张。"
+                            + "（确实要删：DELETE …?force=true —— 设备会回落到清单里的其它图，清单空了则背景为黑）",
                     code = "map_in_use",
                     deviceId = id,
                     mapId = mid,
                     activeMapId = lastMapId,
+                    forceHint = "加 ?force=true 可强制删除（页面在二次确认后会自动带上）",
                 }, statusCode: 409);
             }
+            if (forced)
+                Console.WriteLine($"[MapDelete] 设备 {id} **强制删除**当前正在使用的图 {mid}（force=true，用户二次确认）");
 
             var result = assets.DeleteMap(id, mid);
             long rev = mfst.GetCurrentRev(id);
@@ -219,6 +226,8 @@ public static class CameraEndpoints
                 remainingMaps = result.RemainingMaps,
                 manifestRev = rev,
                 activeMapId = lastMapId,
+                /** true = 本次是"强制删除正在使用的图"（force=true，页面二次确认后才带） */
+                forced,
                 warning = result.RemainingMaps == 0
                     ? "该设备清单里已经没有任何地图：设备下次同步后没有 BGMAP 可渲染"
                       + "（固件会尝试回落默认图 000010000，那份没登记则背景为黑）"
@@ -227,6 +236,7 @@ public static class CameraEndpoints
                     ? "已从该设备素材清单移除该地图及其专用素材（BGMAP 主包 + 条带 PARTS + 缩略图）；"
                       + "磁盘 .mpk 保留（设备侧按清单对账剪除条目，文件由其 LRU 淘汰）；"
                       + "设备下次同步（长轮询 ≤55s，已被 rev 唤醒）后本地清单里不再有这张图。"
+                      + (forced ? "本次为强制删除正在使用的图：设备会回落到清单里的其它图，清单已空则背景为黑。" : "")
                     : "该图本来就不在该设备清单里（幂等：无需删除）。"
             });
         });

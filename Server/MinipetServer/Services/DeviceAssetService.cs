@@ -252,7 +252,9 @@ public sealed class DeviceAssetService
                 if (referenced.Contains(hash))
                 {
                     result.KeptAssets.Add(new DeletedAsset { Hash = hash, Kind = kind, Label = cand.Label,
-                        Reason = "仍被其它存活条目引用（引用计数 > 0：同内容条带被另一张图共用），保留" });
+                        Reason = "仍被其它存活条目引用（引用计数 > 0："
+                                 + (isThumb ? "同内容缩略图被另一个 BGMAP 的 thumb 指向" : "同内容条带被另一张图的 BGMAP 条带表共用")
+                                 + "），保留" });
                     continue;
                 }
                 if (isParts && !stripRefsComplete)

@@ -21,15 +21,18 @@
  */
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import {
-  NAlert, NButton, NCard, NEmpty, NInputNumber, NSelect, NSpace, NSpin, NTag, NTooltip, useMessage,
+  NAlert, NButton, NCard, NEmpty, NInputNumber, NPopconfirm, NSelect, NSpace, NSpin, NTag, NTooltip,
+  useDialog, useMessage,
 } from 'naive-ui'
 import {
-  cameraPreviewUrl, cameraViewportUrl, errText, getCameraMaps, saveCameraPosition, sendCameraCommand,
+  cameraPreviewUrl, cameraViewportUrl, deleteCameraMap, errText, getCameraMaps, saveCameraPosition, sendCameraCommand,
 } from '../api/client'
 import { fmtTime } from '../utils/format'
 
 const props = defineProps({ deviceId: { type: String, required: true } })
 const message = useMessage()
+// 删除正在使用的地图（服务端 409）时用对话框做二次确认（App.vue 已挂 NDialogProvider）
+const dialog = useDialog()
 
 // ── 状态 ────────────────────────────────────────────────────────────────
 const loading = ref(false)
@@ -37,9 +40,11 @@ const loadError = ref('')
 const unsupported = ref(false)      // 服务端没这组端点（旧部署实例）→ 卡片给可读提示
 const maps = ref([])
 const mapId = ref('')
+const lastMapId = ref('')           // 服务端口径的"当前图"（最后设过机位/最后推送切图的那张）
 const x = ref(0)
 const y = ref(0)
 const busy = ref('')                // '' | 'save' | 'apply'
+const deleting = ref('')            // 正在删除的 mapId（按钮 loading）
 const savedAt = ref(null)           // 服务端已记录时间（当前图）
 const lastSeq = ref(null)
 const statusText = ref('')
@@ -65,6 +70,7 @@ async function load(keepMap = true) {
   try {
     const data = await getCameraMaps(props.deviceId)
     maps.value = data?.maps ?? []
+    lastMapId.value = data?.lastMapId ?? ''
     unsupported.value = false
     if (!maps.value.length) {
       mapId.value = ''
@@ -271,6 +277,60 @@ async function doApply(saveFirst = false) {
   }
 }
 
+/**
+ * 删除一张地图（从该设备素材清单移除）。
+ *
+ * 服务端 DELETE …/camera/maps/{mapId}：摘掉该图 BGMAP 主条目 + 仅它引用的派生素材
+ * （条带 PARTS / 缩略图，引用计数保护共享素材）→ BumpRev → 设备下次同步对账剪除本地条目。
+ * 失败路径全中文：409 = 服务端判定这张图正被设备使用（口径见端点注释），直接把服务端
+ * 返回的原因吐给用户，不自己造文案；用户若确实要删，再走一次二次确认带 force=true
+ * （留给"清单里只剩这一张、又不想要它"的场景：设备回落到其它图，清单空了背景为黑）。
+ * 成功后重新拉清单（load）——面板上的张数/下拉选项/剩余地图都要看到删掉后的结果。
+ *
+ * @param {object} m 地图条目（GET …/camera/maps 的 maps[i]）
+ * @param {boolean} force 已确认要强制删除正在使用的图
+ */
+async function doDelete(m, force = false) {
+  if (!m || deleting.value) return
+  deleting.value = m.mapId
+  try {
+    const r = await deleteCameraMap(props.deviceId, m.mapId, force)
+    const left = r?.remainingMaps ?? 0
+    if (r?.removed) {
+      message.success(
+        `已删除「${m.label}」：移除 BGMAP 主包 + ${r?.removedCount ?? 0} 个专用素材，`
+        + `清单还剩 ${left} 张图（设备下次同步后生效）`,
+        { duration: 6000 }
+      )
+    } else {
+      message.info(`「${m.label}」本来就不在清单里（幂等）：清单还剩 ${left} 张图`)
+    }
+    if (r?.keptCount) {
+      message.warning(`有 ${r.keptCount} 个候选素材因仍被其它条目引用而保留（共享内容，不删）`, { duration: 6000 })
+    }
+    if (r?.warning) message.warning(r.warning, { duration: 8000 })
+    await load(true)     // 刷新列表（保持当前选图，若被删则回落到 lastMapId/首张）
+  } catch (e) {
+    const st = e?.response?.status
+    if (st === 409 && !force) {
+      // 服务端判定"正在使用"：把中文原因原样给用户，并给一条明确的强制出口（二次确认）
+      dialog.warning({
+        title: '这张图正被设备使用',
+        content: `${e?.serverError || '服务端拒绝删除'}\n\n仍要强制删除「${m.label}」吗？`
+          + '设备会回落到清单里的其它图；清单里若没有别的图，背景会是黑的。',
+        positiveText: '仍要删除（强制）',
+        negativeText: '取消',
+        onPositiveClick: () => { doDelete(m, true) },
+      })
+    } else {
+      message.error(errText(e), { duration: 9000 })
+    }
+    console.warn(`[camera] 删除地图 ${m.mapId} 失败:`, st, e?.serverError)
+  } finally {
+    deleting.value = ''
+  }
+}
+
 // 预览图随窗口尺寸变化重新量（取景框位置按显示宽度换算）
 let ro = null
 onMounted(() => {
@@ -340,6 +400,70 @@ watch(mapId, () => { imgLoaded.value = false; imgW.value = 0 })
           共 {{ maps.length }} 张（清单来自设备 manifest 的 BGMAP 条目，尺寸读 BGMAP 包头）
         </span>
       </n-space>
+
+      <!-- 地图清单（每行一个「删除」）：删 = 从该设备 manifest 摘掉这张图的 BGMAP 主包 +
+           仅它引用的派生素材（条带 PARTS / 缩略图），并 BumpRev 让设备下次同步剪除本地条目
+           （设备菜单里随之消失）。"当前使用"的那行标出来、按钮照样可点：由服务端判定并回中文
+           原因（409），页面原样展示；确实要删可在随后对话框里二次确认强制删除。 -->
+      <div class="map-manage">
+        <div class="map-manage-head">
+          <span class="map-manage-title">地图清单（{{ maps.length }} 张）</span>
+          <span class="hint">
+            删除 = 从设备清单移除该地图及其专用素材，<b>设备下次同步后生效</b>
+            （服务端只摘清单条目，磁盘包保留，设备侧按清单对账剪除）
+          </span>
+        </div>
+        <div class="map-rows">
+          <div
+            v-for="m in maps"
+            :key="m.mapId"
+            class="map-row"
+            :class="{ current: m.mapId === lastMapId }"
+          >
+            <img
+              v-if="m.thumbUrl"
+              class="map-row-thumb"
+              :src="m.thumbUrl"
+              alt=""
+              @error="(ev) => { ev.target.style.visibility = 'hidden' }"
+            >
+            <div class="map-row-main">
+              <div class="map-row-name">
+                {{ m.label }}<span class="map-row-id">{{ m.mapId }}</span>
+              </div>
+              <div class="hint">
+                {{ m.vw }}×{{ m.vh }} ·
+                {{ m.viewport === 'full' ? '整图包' : '窗口包' }} ·
+                布局 {{ m.layout }} ·
+                {{ m.saved ? `机位 ${m.x},${m.y}` : '未记录机位' }}
+                · {{ Math.round((m.bytes ?? 0) / 1024) }} KB
+              </div>
+            </div>
+            <n-tag v-if="m.mapId === lastMapId" size="small" type="warning" :bordered="false">当前使用</n-tag>
+            <!-- 每行一个删除按钮：当前使用的那张**照样可点**——由服务端判定并给中文原因
+                 （409），页面再把原因显示出来（要求：删除失败要显示服务端返回的中文原因）；
+                 用户若确实要删，随后的对话框里可以二次确认强制删除。 -->
+            <n-popconfirm
+              :positive-button-props="{ type: 'error', size: 'small' }"
+              :negative-button-props="{ size: 'small' }"
+              @positive-click="doDelete(m)"
+            >
+              <template #trigger>
+                <n-button size="tiny" tertiary type="error" :loading="deleting === m.mapId" :disabled="!!deleting">
+                  删除
+                </n-button>
+              </template>
+              将从设备清单移除「{{ m.label }}」（{{ m.mapId }}）及其专用素材：<br>
+              BGMAP 主包 + 只被它引用的条带 PARTS / 缩略图（纸娃娃、字体等共享素材不受影响）。<br>
+              <b>设备下次同步（≤55s）后生效</b>，之后设备菜单里不再出现这张图。
+              <span v-if="m.mapId === lastMapId">
+                <br><b>注意：这张是设备「当前使用」的图</b>——服务端会拒绝并给出中文原因；
+                确实要删时可在随后弹出的对话框里二次确认强制删除。
+              </span>
+            </n-popconfirm>
+          </div>
+        </div>
+      </div>
 
       <n-alert v-if="map && !pannable" type="warning" :show-icon="false" size="small">
         该图是 <b>窗口包</b>（vw×vh = {{ map.vw }}×{{ map.vh }}，没有平移余量）：设备上无法平移相机。
@@ -558,6 +682,34 @@ watch(mapId, () => { imgLoaded.value = false; imgW.value = 0 })
 
 .cam-coord { margin-top: 2px; }
 .cam-coord-label { font-size: 12px; opacity: 0.7; width: 12px; }
+
+/* 地图清单（删除入口）：行 = 缩略图 + 名称/尺寸口径 + 当前使用标记 + 删除按钮 */
+.map-manage { border: 1px solid rgba(128, 128, 140, 0.22); border-radius: 8px; padding: 8px 10px; }
+.map-manage-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 10px; margin-bottom: 6px; }
+.map-manage-title { font-size: 13px; font-weight: 600; }
+.map-rows { max-height: 260px; overflow: auto; }
+.map-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 4px;
+  border-top: 1px solid rgba(128, 128, 140, 0.14);
+}
+.map-row:first-child { border-top: none; }
+.map-row.current { background: rgba(255, 209, 102, 0.08); border-radius: 6px; }
+.map-row-thumb {
+  width: 40px;
+  height: 40px;
+  flex: 0 0 40px;
+  object-fit: cover;
+  border-radius: 6px;
+  background: #14161c;
+  image-rendering: pixelated;
+}
+.map-row-main { flex: 1 1 auto; min-width: 0; }
+.map-row-name { font-size: 13px; line-height: 1.5; }
+.map-row-id { margin-left: 8px; font-size: 12px; opacity: 0.6; font-family: ui-monospace, monospace; }
+
 .cam-range { line-height: 1.7; }
 .cam-actions { margin-top: 2px; }
 .cam-status { line-height: 1.7; }

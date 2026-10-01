@@ -95,6 +95,25 @@ export function saveCameraPosition(deviceId, mapId, x, y) {
     .then((r) => r.data)
 }
 
+/**
+ * 从该设备素材清单**删除一张地图**（DELETE …/camera/maps/{mapId}）。
+ * 服务端摘掉 manifest-assets.json 里这张图的 BGMAP 主条目 + **仅它引用**的派生素材
+ * （条带 PARTS / 缩略图，按引用计数判据，见 DeviceAssetService.DeleteMap），随后 BumpRev
+ * → 设备下次同步（长轮询 ≤55s，会被立即唤醒）对账剪除本地条目，菜单里这张图随之消失。
+ * 返回：200 { ok, removed, idempotent, label, removedAssets[], removedCount, keptAssets[],
+ *             remainingMaps, manifestRev, forced, warning?, note }（removed=false = 本来就没有，幂等成功）
+ * 失败：404 设备不存在；409 { error } = 该图正被设备使用（中文原因直接展示给用户）；
+ *       400 mapId 非法。**服务端不删磁盘 .mpk**（设备侧按清单剪条 + 自己的 LRU 淘汰文件）。
+ * force=true 越过"正在使用"保护（页面二次确认后才带）：设备回落到清单里的其它图，
+ * 清单空了则背景为黑（响应 warning 会说明）。
+ */
+export function deleteCameraMap(deviceId, mapId, force = false) {
+  return http
+    .delete(`/admin/devices/${encodeURIComponent(deviceId)}/camera/maps/${encodeURIComponent(mapId)}`
+      + (force ? '?force=true' : ''))
+    .then((r) => r.data)
+}
+
 /** 相机机位下发（设备指令 type=cam，value="x,y"）。 */
 export const DEVICE_COMMAND_CAM = 'cam'
 
