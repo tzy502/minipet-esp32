@@ -707,8 +707,17 @@ static void drag_clamp(int32_t *px, int32_t *py)
                      + ent_tilt_off_px(g_tilt_mdeg);
     int32_t base_y = g_sh / 2 - (g_ent_oy - g_ent_cy0) * RC_SCALE + RC_ENT_CENTER_OFF_Y
                      + (g_ent_base_wy << RC_SCALE_SHIFT);
+    /* 【2026-10-02 用户口径定稿】"上下左右都不允许桌宠超过 50% 在屏幕外面"：
+     * 四边一律**允许最多一半出屏**（原来左右是"整块必须在屏内"=完全不许出，
+     * 上下却几乎可以整只拖出去 ⇒ 手感不对称，用户报"上下允许超出、左右完全不允许"）。
+     * 判据（单轴）：显示矩形在该轴上的可见长度 ≥ 一半。
+     *   左边：left ≤ dw/2            ⇒ px ≤  dw/2 - base_x
+     *   右边：left + dw ≥ sw - dw/2  ⇒ px ≥  sw - dw - dw/2 - base_x
+     * 与 ent_bounce_if_offscreen 的"可见面积 <50% 就弹回"同口径（那条是面积兜底）。 */
     if (px) {
-        int32_t lo = -base_x, hi = g_sw - dw - base_x;
+        int32_t half = dw / 2;
+        int32_t hi = half - base_x;
+        int32_t lo = g_sw - dw - half - base_x;
         if (hi < lo) hi = lo;                    /* 画布比屏还宽：贴左 */
         if (*px < lo) *px = lo;
         if (*px > hi) *px = hi;
@@ -721,9 +730,13 @@ static void drag_clamp(int32_t *px, int32_t *py)
          *      （"拖拽下界/松手落回地面线 这两个我没要求不要乱加"），故恢复为
          *      **下界 = 屏幕最底**（脚底可一直拖到屏底，可全屏拖动）。
          * 上界 lo 仍让画布顶边不越屏顶（不许把整只宠物拖出画面）。 */
-        int32_t anchor_off = (g_ent_oy - g_ent_cy0) * RC_SCALE;   /* 锚点在显示矩形内的 y */
-        int32_t lo = -base_y;
-        int32_t hi = g_sh - anchor_off - base_y;
+        /* 【2026-10-02 用户口径定稿】纵向同样"最多一半出屏"：
+         *   上边：top ≤ dh/2            ⇒ py ≤  dh/2 - base_y
+         *   下边：bottom ≥ sh - dh/2    ⇒ py ≥  sh - dh - dh/2 - base_y
+         * （原口径是"上边不许出、下边可到屏底"，即上下不对称；现按用户要求统一为 50%）。 */
+        int32_t halfh = dh / 2;
+        int32_t hi = halfh - base_y;
+        int32_t lo = g_sh - dh - halfh - base_y;
         if (hi < lo) hi = lo;
         if (*py < lo) *py = lo;
         if (*py > hi) *py = hi;
