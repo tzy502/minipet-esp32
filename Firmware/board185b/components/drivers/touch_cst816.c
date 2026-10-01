@@ -7,19 +7,23 @@
  *  - TP_RST = GPIO1，TP_INT = GPIO4（profiles/lcd185b.h .pins.touch，引脚唯一来源）；
  *  - 同总线其它器件（QMI8658/PCF85063）均为 400K 档 → 本驱动同档。
  *
- * CST816S 协议（公开常识，Hynitron CST816S 数据帧，写入备查）：
- *  I2C 从寄存器 0x00 起连续读多点帧（本驱动突发读 6 字节 d[0..5]，d[6] 可另读）：
- *    0x00：bit3..0 = 触点数（低 4 位有效）
- *    0x01：手势码（0x00=无 …，本驱动暂不透出，留手势扩展）
- *    0x03：X 高 8 位（12bit 坐标的 bit11..4）
- *    0x04：(X 低 4 位 << 4) | Y 高 4 位 —— 高 nibble=X bit3..0，低 nibble=Y bit11..8
- *    0x05：Y 低 8 位（bit7..0）
- *    0x06：触点 ID / 事件（press/down/up，本驱动暂不透出）
- *  12bit 坐标重组：x = (d[3] << 4) | (d[4] >> 4)；y = ((d[4] & 0x0F) << 8) | d[5]。
- *  【TODO 坐标方向校准】X/Y 原始值直接透传。360 圆屏原生竖向（面板 0..359），
- *  与本工程合成器 480×480 空间的映射（swap/镜像/缩放）等真机按四角+中心实测
- *  后再定——方法论与 216 板 tmap 8 候选自校准一致（board216 input_dispatch.c
- *  的 tmap_apply 先例），届时在消费层（input 任务）加映射表，本驱动保持透传。
+ * CST816S 协议（**以官方 esp_lcd_touch_cst816s v1.1.0 为准**，2026-10-01 定稿）：
+ *  I2C 从寄存器 **0x02** 起连续读 5 字节（官方 DATA_START_REG=0x02）：
+ *    0x00：手势码（0x00=无 …，本驱动不透出）
+ *    0x01：触点数（与 0x02 处重复编码，本驱动不读）
+ *    0x02：X 高位（12bit 的 bit11..8，占低 4 位）      → d[0]
+ *    0x03：X 低位（bit7..0）                          → d[1]
+ *    0x04：Y 高位（bit11..8，占低 4 位）              → d[2]
+ *    0x05：Y 低位（bit7..0）                          → d[3]
+ *    0x06：触点 ID / 事件（不读）
+ *  12bit 坐标重组：x = (d[0] & 0x0F) << 8 | d[1]；y = (d[2] & 0x0F) << 8 | d[3]。
+ *  （官方 bitfield：num / x_h:4 / x_l / y_h:4 / y_l，与本式逐位等价。）
+ *  【演进史 · 教训】本驱动初版按"0x00 起 6 字节 + [count,XH,XY,YL] 位打包"写，
+ *  与官方口径整体错位一字节 → 真机坐标恒为垃圾、触屏形同不通。**移植触摸驱动
+ *  的第一件事是去官方 managed_component 里核 DATA_START_REG 与 bitfield**，
+ *  不要照抄另一块板的芯片（216 是 CST9220，帧格式完全不同）。
+ *  【坐标方向】X/Y 原始值透传 = 面板原生坐标（官方 BSP touch_flags 全 0）。
+ *  360→480 上采样与 swap/镜像映射在消费层（input_dispatch.c 的 tmap_apply）。
  *
  * 驱动风格：纯轮询（同 key_gpio0 的无 ISR 风格）——init 不装任何中断服务，
  * TP_INT(GPIO4) 只配输入留作将来；touch_cst816_set_isr_callback() 首次注册
@@ -41,15 +45,25 @@ static const char *TAG = "cst816";
 
 #define CST816_ADDR        0x15    /* 7-bit */
 #define CST816_I2C_HZ      400000  /* 同总线 QMI8658/PCF85063 档位 */
-#define CST816_REG_DATA    0x00    /* 数据帧起始寄存器 */
-#define CST816_FRAME_LEN   6       /* 突发读 6 字节（0x06 触点 ID 暂不读） */
+/* ══ 【帧窗口定稿 2026-10-01：0x02 起 6 字节，与官方驱动逐字一致】════════════
+ * 依据 espressif__esp_lcd_touch_cst816s v1.1.0：
+ *   #define DATA_START_REG (0x02)
+ *   typedef struct { uint8_t num; uint8_t x_h:4; uint8_t :4; uint8_t x_l;
+ *                    uint8_t y_h:4; uint8_t :4; uint8_t y_l; } data_t;
+ * 寄存器图：0x00=手势码 0x01=触点数 0x02=X高位(低4位) 0x03=X低位
+ *           0x04=Y高位(低4位) 0x05=Y低位 0x06=触点ID 0x07=…（见官方 read_id 0xA7）
+ * 上一版从 0x00 起读 6 字节 + 按 [count,XH,XY,YL] 解析 → **每个字段错位**，
+ * 真机坐标恒为垃圾（触屏不灵的真根因）。 */
+#define CST816_REG_DATA    0x02    /* 数据帧起始寄存器（官方 DATA_START_REG） */
+#define CST816_FRAME_LEN   5       /* num + xh + xl + yh + yl（读到 0x06 为止，ID 不读） */
+#define CST816_REG_CHIPID  0xA7    /* 芯片 ID（官方 read_id 同址；取证用） */
 
-/* 帧内偏移（若与实测不符只需改这里） */
-#define CST816_OFF_COUNT   0       /* d0: 低 4 位 = 触点数 */
-#define CST816_OFF_GESTURE 1       /* d1: 手势码（暂不透出） */
-#define CST816_OFF_XH      3       /* d3: X bit11..4 */
-#define CST816_OFF_XY      4       /* d4: 高 nibble=X bit3..0，低 nibble=Y bit11..8 */
-#define CST816_OFF_YL      5       /* d5: Y bit7..0 */
+/* 帧内偏移（num 在 d[0] 是"重复编码"的触点数，与 0x01 处同值） */
+#define CST816_OFF_COUNT   0       /* d0: 触点数（官方 num 字段） */
+#define CST816_OFF_XH      1       /* d1: X 高位（bit11..8，取低 4 位） */
+#define CST816_OFF_XL      2       /* d2: X 低位（bit7..0） */
+#define CST816_OFF_YH      3       /* d3: Y 高位（bit11..8，取低 4 位） */
+#define CST816_OFF_YL      4       /* d4: Y 低位（bit7..0） */
 
 /* 复位时序（官方 BSP 口径）：高 10ms → 低 10ms → 高 10ms → 等 50ms 后探测 0x15 */
 #define CST816_RST_PRE_MS   10
@@ -121,6 +135,20 @@ esp_err_t touch_cst816_init(void)
         return ESP_OK;
     }
 
+    /* 【指纹取证 2026-10-01】摸清这块屏到底挂的是谁、数据窗口起在哪：
+     *   ① 芯片 ID 寄存器 0xA7（官方 read_id 同址；CST816S 家族常见 0xB4/0xB5/0xB6）
+     *   ② 0x00..0x07 的原始字节（**开机无人触摸时读**：坐标寄存器应近 0，
+     *      触点数应 0 → 哪个字节是点数、窗口从哪起，一眼可判）
+     * 结论出来后把这段降到 LOGD 或删掉。 */
+    {
+        uint8_t id = 0, win[8] = { 0 };
+        i2c_bus_read_reg8v(s_dev, CST816_REG_CHIPID, &id, 1);
+        i2c_bus_read_reg8v(s_dev, 0x00, win, sizeof(win));
+        ESP_LOGW(TAG, "指纹：chipID@0xA7=%02X | reg00..07=[%02X %02X %02X %02X %02X %02X %02X %02X]"
+                      "（无触摸时应为 点数=0、坐标≈0）",
+                 id, win[0], win[1], win[2], win[3], win[4], win[5], win[6], win[7]);
+    }
+
     ESP_LOGI(TAG, "CST816S 就绪 INT=%d RST=%d（纯轮询）",
              pins->touch.intr, pins->touch.rst);
     return ESP_OK;
@@ -143,13 +171,13 @@ esp_err_t touch_cst816_read(touch_point_t *out)
 
     const uint8_t fingers = d[CST816_OFF_COUNT] & 0x0F;
     out->fingers = fingers;
-    out->pressed = (fingers >= 1);
-    /* 12bit 重组（布局见文件头注释）：X=XH:XY高nibble，Y=XY低nibble:YL。
-     * 原始值透传，方向/镜像/缩放映射留真机校准（TODO 见文件头）。 */
-    out->x = (uint16_t)((((uint16_t)d[CST816_OFF_XH]) << 4) |
-                        (d[CST816_OFF_XY] >> 4));
-    out->y = (uint16_t)(((((uint16_t)d[CST816_OFF_XY]) & 0x0F) << 8) |
-                        d[CST816_OFF_YL]);
+    out->pressed = (fingers >= 1 && fingers <= 5);   /* >5 = 非法帧，按未按下处理 */
+    /* 12bit 重组（与官方 bitfield 逐位等价）：
+     *   x = (d[x_h] & 0x0F) << 8 | d[x_l]     y = (d[y_h] & 0x0F) << 8 | d[y_l]
+     * 原始值透传（0..359 面板原生），方向/镜像/360→480 上采样在消费层
+     * （input_dispatch.c 的 tmap_apply + ×4/3）。 */
+    out->x = (uint16_t)((((uint16_t)d[CST816_OFF_XH] & 0x0F) << 8) | d[CST816_OFF_XL]);
+    out->y = (uint16_t)((((uint16_t)d[CST816_OFF_YH] & 0x0F) << 8) | d[CST816_OFF_YL]);
     return ESP_OK;
 }
 
