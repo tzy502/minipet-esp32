@@ -59,6 +59,8 @@ esp_err_t display_blit(int x, int y, int w, int h, const uint8_t *rgb565_be);
 /* 等上一笔 color 传输读完调用方缓冲（重填共用暂存前必调；见 .c 注释的混行竞态）。
  * 返回时保证无在飞传输；display_tx_busy() 供探针判定"填缓冲时是否仍有传输在飞"。 */
 void display_wait_tx_idle(void);
+/* 该缓冲是否仍在飞（false = 可安全重填）。合成器 3 缓冲流水用。 */
+bool display_blit_buf_busy(const void *buf);
 bool display_tx_busy(void);
 
 /** @brief 亮度百分比 0-100（映射到 DBV 0-255，寄存器 0x51） */

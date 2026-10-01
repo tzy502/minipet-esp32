@@ -57,12 +57,15 @@ static const uint16_t SH = 480;
  * 被 WiFi+GDMA 并发吞掉后槽位永不归还，风暴转持续性）。现以计数信号量把
  * 在飞硬限在深度内：推送前取槽（满则阻塞排队 = 健康背压），完成回调归还，
  * 队列从此不满 → NO_MEM 路径不再触发。 */
+static void inflight_pop(void);      /* 前向：完成回调里弹出在飞登记 */
+
 static bool IRAM_ATTR color_tx_done_cb(esp_lcd_panel_io_handle_t io,
                                        esp_lcd_panel_io_event_data_t *edata,
                                        void *user)
 {
     (void)io; (void)edata; (void)user;
     s_tx_done_cnt++;
+    inflight_pop();                      /* 按序弹出在飞缓冲登记（见 display_blit_buf_busy） */
     BaseType_t hi = pdFALSE;
     xSemaphoreGiveFromISR(s_tx_slots, &hi);
     return hi == pdTRUE;
@@ -200,6 +203,47 @@ void display_set_orientation(bool swap_xy, bool mirror_x, bool mirror_y)
  * 第 N+1 块的填充已经把同一块内存覆盖 ⇒ 面板收到**两个块的数据混在一起**：
  * 真机表现就是横彩条/竖条纹/"分割线"（用户照片实证）。
  * 本函数取槽再立刻归还：返回时保证"无在飞传输"，可安全重填暂存。 */
+/* ══ 【上屏流水：按缓冲粒度的在飞跟踪 2026-10-01】══════════════════════════
+ * 动机：合成器 blit_be 原来只有**一块**暂存 + 每块前 display_wait_tx_idle()
+ * ⇒ 每块都要等上一笔传完才填下一块，SPI **完全不流水**：真机满屏 blit 63ms
+ * （QSPI 40MHz 四线理论 20MB/s ⇒ 460KB 应 ~23ms）。
+ * 做法：驱动侧登记"在飞缓冲指针环"（发送顺序 FIFO，完成回调按序弹出），
+ * 合成器用 3 块暂存轮转，填之前只等**这一块**的上一笔传完 ⇒ 传输连续。
+ * 完成回调在 ISR 上下文，这里用临界区保护环形读写。 */
+#define DISP_INFLIGHT_MAX 4
+static const void *s_inflight[DISP_INFLIGHT_MAX];
+static volatile int s_inf_head, s_inf_tail;
+static portMUX_TYPE s_inf_mux = portMUX_INITIALIZER_UNLOCKED;
+
+static void inflight_push(const void *buf)
+{
+    portENTER_CRITICAL(&s_inf_mux);
+    int nh = (s_inf_head + 1) % DISP_INFLIGHT_MAX;
+    if (nh != s_inf_tail) {            /* 环满（不该发生，队列深度更小）→ 丢弃登记 */
+        s_inflight[s_inf_head] = buf;
+        s_inf_head = nh;
+    }
+    portEXIT_CRITICAL(&s_inf_mux);
+}
+
+static void inflight_pop(void)
+{
+    portENTER_CRITICAL(&s_inf_mux);
+    if (s_inf_tail != s_inf_head) s_inf_tail = (s_inf_tail + 1) % DISP_INFLIGHT_MAX;
+    portEXIT_CRITICAL(&s_inf_mux);
+}
+
+/* 该缓冲是否仍在飞（合成器填暂存前查；false = 可安全重填） */
+bool display_blit_buf_busy(const void *buf)
+{
+    bool busy = false;
+    portENTER_CRITICAL(&s_inf_mux);
+    for (int i = s_inf_tail; i != s_inf_head; i = (i + 1) % DISP_INFLIGHT_MAX)
+        if (s_inflight[i] == buf) { busy = true; break; }
+    portEXIT_CRITICAL(&s_inf_mux);
+    return busy;
+}
+
 void display_wait_tx_idle(void)
 {
     if (!s_inited) return;
@@ -233,7 +277,9 @@ esp_err_t display_blit(int x, int y, int w, int h, const uint8_t *rgb565_be)
     esp_err_t err;
     bool slot = tx_slot_take();          /* 背压：无空闲槽则排队等待（见 color_tx_done_cb） */
     if (aw == w && ah == h) {
+        inflight_push(rgb565_be);        /* 登记在飞（合成器据此判断暂存可否重填） */
         err = esp_lcd_panel_draw_bitmap(s_panel, x1, y1, x2 + 1, y2 + 1, (void *)rgb565_be);
+        if (err != ESP_OK) inflight_pop();
     } else {
         /* 奇数区域：PSRAM 暂存补齐（边缘像素按邻边复制，视觉无差） */
         size_t sz = (size_t)aw * ah * 2u;

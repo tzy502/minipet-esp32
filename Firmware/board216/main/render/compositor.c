@@ -2407,13 +2407,10 @@ static void cam_adjust_tick(int64_t now_us)
             cam_adjust_apply_level(RC_CAM_ADJ_NO_STRIP, /*recompose=*/true);
             rc_unlock();
         }
-    } else if (g_cam_adjust_lvl == RC_CAM_ADJ_NO_STRIP) {
-        if (g_cam_adj_l1_us && now_us - g_cam_adj_l1_us >= (int64_t)RC_CAM_ADJ_L1_IDLE_MS * 1000) {
-            rc_lock();
-            cam_adjust_apply_level(RC_CAM_ADJ_OFF, /*recompose=*/true);   /* 松手出全图 */
-            rc_unlock();
-        }
     }
+    /* 【不再自动回 level 0】用户定稿：整个"摄像机流程"内都不渲染条带层，
+     * 直到保存/取消（lvgl_bridge 的 cam_finish_core → render_cam_adjust_set(OFF)）。
+     * 否则松手 300ms 后条带就回来并触发 2~3s 重填，用户看到的还是"卡住"。 */
 }
 
 static void cam_scene_sync(void)
@@ -2425,7 +2422,11 @@ static void cam_scene_sync(void)
      * level 1：static/tile 照常补读（**这是拖动结束后的补内容点**：不补的话缓存
      * 还留在拖动前的锚点，屏幕边缘就是黑带），只有条带层既不合成都不同步
      * （条带是最贵的一层：每条带一份 336×N 缓存 + 逐像素掩码 + 时间相位）。 */
-    if (g_cam_adjust_lvl >= RC_CAM_ADJ_MINIMAL) return;
+    /* 【摄像机流程内不碰条带 2026-10-01 用户定稿】level ≥1（进流程即置）时
+     * 条带缓存**既不补读也不搬移**：天空之城 14 条带下，补一次要 2~3s（逐行包）
+     * 且每 2~3s 来一次 —— 这就是用户口径"拖动还是卡住"的主因。
+     * 流程内只画 static+tile（地形本体），保存/取消立即回 level 0 全层恢复。 */
+    if (g_cam_adjust_lvl >= RC_CAM_ADJ_NO_STRIP) return;
     s_cam_io_rows = s_cam_io_cols = s_cam_io_bytes = 0;
     s_cam_strip_fopens = 0;
     mpak_tile_stat_reset();           /* 瓦片口径统计：本轮补边实际读了几块/命中几块 */
@@ -2639,10 +2640,12 @@ static void map_bg_compose_into(uint16_t *dst, int32_t x, int32_t y, int32_t w, 
     uint16_t *save = g_fb;
     g_fb = dst;
     cam_static_compose(x, y, w, h);
-    for (int i = 0; i < g_strip_n; i++) {
-        if (!g_strips) break;                       /* 护栏：条带表与计数同源 */
-        if (g_strips[i].world) cam_strip_compose(&g_strips[i], x, y, w, h);
-        else                   strip_blit(&g_strips[i], x, y, w, h);
+    if (g_cam_adjust_lvl < RC_CAM_ADJ_NO_STRIP) {   /* 摄像机流程内：跳过条带层 */
+        for (int i = 0; i < g_strip_n; i++) {
+            if (!g_strips) break;                   /* 护栏：条带表与计数同源 */
+            if (g_strips[i].world) cam_strip_compose(&g_strips[i], x, y, w, h);
+            else                   strip_blit(&g_strips[i], x, y, w, h);
+        }
     }
     cam_tile_compose(x, y, w, h);
     g_fb = save;
@@ -3297,7 +3300,7 @@ static void compose_region(int32_t x, int32_t y, int32_t w, int32_t h)
 
     /* 2) 条带（旧包：x 向循环平铺；整图：世界系 y + 世界对齐采样）
      * 整图且在扁平缓冲上 = 已在 fb 里压平，这里整段跳过（否则等于重算一遍）。 */
-    if (!bg_from_fb && !cam_minimal) {
+    if (!bg_from_fb && !cam_minimal && g_cam_adjust_lvl < RC_CAM_ADJ_NO_STRIP) {
         for (int i = 0; i < g_strip_n; i++) {
             if (!g_strips) break;               /* 护栏：条带表与计数同源 */
             if (g_strips[i].world) cam_strip_compose(&g_strips[i], x, y, w, h);
@@ -3618,7 +3621,11 @@ static void flush_dirty(void)
  * → 心跳停、指令收不到、BGM 不出声。
  * 24KB 取 480×25×2，保证 480 宽下 rows_per=25 → 仍是奇数，故这里**主动取偶数
  * 行数**（见下方 rows_per 计算），让每块恒为整行高，快速通道恒命中、驱动零分配。 */
-static uint8_t s_blit_stage[12288] __attribute__((aligned(64)));   /* 回退到已知稳定值：24KB 版本与脸部分割线报障同期 */
+/* 【3 缓冲流水 2026-10-01】见 blit_be 注释：单块会让 SPI 串行化（满屏 63ms）。
+ * 块大小沿用已验证值 12288B（早前 24KB 版本与"脸部分割线"报障同期，不要动）。 */
+#define RC_BLIT_STAGES 3
+static uint8_t s_blit_stage[RC_BLIT_STAGES][12288] __attribute__((aligned(64)));
+static int     s_blit_stage_idx;
 
 static void blit_be(int32_t x, int32_t y, int32_t w, int32_t h,
                     const uint16_t *src, int32_t src_stride)
@@ -3628,7 +3635,12 @@ static void blit_be(int32_t x, int32_t y, int32_t w, int32_t h,
      * ret=257（ESP_ERR_INVALID_ARG，超 esp_lcd 单笔 max_transfer_sz），整屏区域
      * 反而完全不刷新。结论：竖条纹不在"分块窗口"这一层（真凶见 strip_blit 的
      * 0xFF 分支 2x 展开缺失），故回滚为经校验的分块暂存路径。 */
-    const int32_t chunk_px = (int32_t)sizeof s_blit_stage / 2;
+    /* 【3 缓冲流水 2026-10-01】原来单块暂存 + 每块前 display_wait_tx_idle()
+     * ⇒ 每块都等上一笔传完才填，SPI 完全不流水：真机满屏 blit 63ms
+     * （QSPI 40MHz 四线理论 20MB/s ⇒ 460KB 应 ~23ms）。
+     * 改为 3 块轮转：填之前只等**这一块**自己的上一笔传完（display_blit_buf_busy），
+     * 于是发送队列始终有活 ⇒ 传输连续。竞态防护不降级：仍然是"确认该缓冲不在飞才填"。 */
+    const int32_t chunk_px = (int32_t)sizeof s_blit_stage[0] / 2;
     int32_t rows_per = (w > 0) ? chunk_px / w : 0;
     if (rows_per < 2) rows_per = 2;
     if (rows_per & 1) rows_per--;         /* 恒偶：避免 display_blit 的 even_round 把块高改奇 */
@@ -3641,6 +3653,7 @@ static void blit_be(int32_t x, int32_t y, int32_t w, int32_t h,
 
     for (int32_t r0 = 0; r0 < h; r0 += rows_per) {
         int32_t hh = (r0 + rows_per < h) ? rows_per : (h - r0);
+        const int64_t t_wait0 = esp_timer_get_time();
         /* 【混行竞态根修 2026-09-27】填暂存前先等上一笔传输读完它。
          * 此前顺序是"填→发→填→发…"，而等槽发生在 display_blit 内部 ⇒ 上一笔 DMA
          * 仍在读 s_blit_stage 时就被本块覆盖 → 面板收到两块混合数据 =
@@ -3648,8 +3661,14 @@ static void blit_be(int32_t x, int32_t y, int32_t w, int32_t h,
         /* 探针语义：本块填暂存时"上一笔传输仍在飞"= 修复前必然出混行的那一笔。
          * 计数 >0 即**证明该竞态真实存在**（真机实测 ~150 次/s，几乎每块都命中）。 */
         if (display_tx_busy()) g_blit_race_hits++;
-        display_wait_tx_idle();
-        uint8_t *d = s_blit_stage;
+        uint8_t *stage = s_blit_stage[s_blit_stage_idx];
+        s_blit_stage_idx = (s_blit_stage_idx + 1) % RC_BLIT_STAGES;
+        /* 只等"这一块暂存"的上一笔传完（其余在飞无妨，正好重叠） */
+        while (display_blit_buf_busy(stage)) {
+            if (esp_timer_get_time() - t_wait0 > 2000000) break;   /* 2s 兜底，绝不死等 */
+            vTaskDelay(1);
+        }
+        uint8_t *d = stage;
         for (int32_t r = 0; r < hh; r++) {
             const uint16_t *s = src + (size_t)(r0 + r) * src_stride;
             for (int32_t c = 0; c < w; c++) {
@@ -3663,24 +3682,24 @@ static void blit_be(int32_t x, int32_t y, int32_t w, int32_t h,
          * 面板就会收到混行数据 —— 这正是用户照片竖条纹/横彩条的根因）。
          * 修复后该计数应恒为 0；留作永久回归哨兵。 */
         uint32_t h_before = 2166136261u;
-        for (int32_t i = 0; i < w * hh * 2; i++) { h_before ^= s_blit_stage[i]; h_before *= 16777619u; }
+        for (int32_t i = 0; i < w * hh * 2; i++) { h_before ^= stage[i]; h_before *= 16777619u; }
         if (s_forensic_chunks > 0) {
             uint32_t fh = 2166136261u;
             for (int32_t i = 0; i < w * hh * 2; i++) {
-                fh ^= s_blit_stage[i];
+                fh ^= stage[i];
                 fh *= 16777619u;
             }
-            esp_err_t derr = display_blit((int)x, (int)(y + r0), (int)w, (int)hh, s_blit_stage);
+            esp_err_t derr = display_blit((int)x, (int)(y + r0), (int)w, (int)hh, stage);
             ESP_LOGW(TAG, "取证blit rect=(%d,%d %dx%d) len=%d ret=%d fnv=%08x",
                      (int)x, (int)(y + r0), (int)w, (int)hh, (int)(w * hh * 2),
                      (int)derr, (unsigned)fh);
         } else {
-            display_blit((int)x, (int)(y + r0), (int)w, (int)hh, s_blit_stage);
+            display_blit((int)x, (int)(y + r0), (int)w, (int)hh, stage);
         }
         display_wait_tx_idle();              /* 等这一笔读完，再做校验/重填 */
         {
             uint32_t h_after = 2166136261u;
-            for (int32_t i = 0; i < w * hh * 2; i++) { h_after ^= s_blit_stage[i]; h_after *= 16777619u; }
+            for (int32_t i = 0; i < w * hh * 2; i++) { h_after ^= stage[i]; h_after *= 16777619u; }
             if (h_after != h_before) {
                 g_blit_verify_fail++;
                 if (g_blit_verify_fail < 4)

@@ -84,18 +84,32 @@ static const char *active_map_get(char *buf, size_t cap);
  *       个别步尖峰（跨瓦片列那一拍）⇒ 瓶颈在 SD 补块。
  * 触发通道：服务端 `{"type":"camtest"}`（需服务端白名单）**或**
  * 气泡魔数 `::camtest <步数>,<步长>`（走已有 bubble 通道，无需部署服务端）。 */
+static void cam_pan_test_run_ex(int steps, int step, int level);
+
 static void cam_pan_test_run(int steps, int step)
 {
+    cam_pan_test_run_ex(steps, step, -1);
+}
+
+static void cam_pan_test_run_ex(int steps, int step, int level)
+{
+    /* 真实拖动节奏：每步之间让渲染帧跑一次（约 60ms），否则 20 次 set 会被
+     * 批成一次大平移，测出的不是"每步成本"。level 参数用于对比"摄像机流程内
+     * （level 1，不画条带）"与"常态（level 0，全层）"。 */
     if (!render_cam_supported()) { ESP_LOGW(TAG, "相机压测：当前图非整图包"); return; }
     int32_t x0 = 0, y0 = 0;
     render_cam_get(&x0, &y0);
-    ESP_LOGW(TAG, "相机压测开始：起点 (%d,%d) 步数 %d 步长 %d", (int)x0, (int)y0, steps, step);
+    int lvl_save = render_cam_adjust_get();
+    if (level >= 0) render_cam_adjust_set(level);
+    ESP_LOGW(TAG, "相机压测开始：起点 (%d,%d) 步数 %d 步长 %d 档位 %d→%d",
+             (int)x0, (int)y0, steps, step, lvl_save, level >= 0 ? level : lvl_save);
     int64_t t_all = esp_timer_get_time();
     int64_t t_max = 0;
     for (int i = 1; i <= steps; i++) {
         int64_t t0 = esp_timer_get_time();
         render_cam_set(x0 + i * step, y0);
         int64_t dt = esp_timer_get_time() - t0;
+        vTaskDelay(pdMS_TO_TICKS(60));        /* 让出一帧：模拟手指移动的真实节奏 */
         if (dt > t_max) t_max = dt;
         ESP_LOGW(TAG, "相机压测 步 %d/%d → x=%d 耗时 %lld ms",
                  i, steps, (int)(x0 + i * step), (long long)(dt / 1000));
@@ -105,6 +119,7 @@ static void cam_pan_test_run(int steps, int step)
                   "—— 判据：均 ≤30ms 为流畅；个别尖峰=补块；每步都百毫秒级=合成/上屏",
              steps, (long long)all, (long long)(all / (steps ? steps : 1)),
              (long long)(t_max / 1000));
+    if (level >= 0) render_cam_adjust_set(lvl_save);   /* 复原档位 */
 }
 
 /* ------------------------------------------------------------------ */
@@ -1240,9 +1255,10 @@ void app_cmd_dispatch(const mp_cmd_t *cmd)
         /* 【压测魔数】与 `::shot` 同款：不需要服务端白名单即可触发相机拖动压测。
          * 例：气泡文本 "::camtest 12,8" = 连续平移 12 步、每步 8 世界像素。 */
         if (strncmp(cmd->s, "::camtest", 9) == 0) {
-            int st = 12, sp = 8;
-            if (sscanf(cmd->s + 9, "%d,%d", &st, &sp) >= 1 && st <= 0) st = 12;
-            cam_pan_test_run(st, sp);
+            int st = 12, sp = 8, lv = -1;
+            sscanf(cmd->s + 9, "%d,%d,%d", &st, &sp, &lv);
+            if (st <= 0) st = 12;
+            cam_pan_test_run_ex(st, sp, lv);
             break;
         }
         /* 【远程取证魔数 2026-10-01】bubble 文本 "::shot" → UDP 帧倾倒（不走
