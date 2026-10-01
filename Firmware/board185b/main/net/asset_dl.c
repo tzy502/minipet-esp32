@@ -35,6 +35,7 @@
 #include "freertos/semphr.h"
 #include "esp_log.h"
 #include "esp_vfs_fat.h"
+#include "nvs.h"               /* per-map 隐藏标识（namespace "maphide"，§4.4） */
 #include "cJSON.h"
 
 #include "app_core.h"
@@ -75,7 +76,8 @@ typedef struct {
 static local_file_t s_files[MAX_FILES];
 static int          s_file_cnt;
 static uint32_t     s_local_rev;
-static char         s_active_map[32];          /* 当前地图（clock 锚点/LRU） */
+static char         s_active_map[32];          /* 当前地图 id（clock 锚点/LRU） */
+static char         s_active_map_hash[20];     /* 当前地图内容 hash（隐藏判定用，见 map_is_active） */
 
 /* clock_table（E9/R15：[x,y] = 烘焙视口内屏幕坐标，世界 1x 口径下发给渲染层） */
 static struct { char map_id[32]; int16_t x, y; } s_clock_tab[MAX_CLOCK_MAPS];
@@ -157,7 +159,7 @@ static bool file_cached_row(const local_file_t *lf)
     return (access(path, F_OK) == 0);
 }
 
-/* 纯可打印 ASCII？（菜单字体 Montserrat 无 CJK 字形，中文串渲染成空白） */
+/* 纯可打印 ASCII？（map_id/entity/hash 字段的判据） */
 static bool ascii_printable(const char *s)
 {
     if (!s || !s[0]) return false;
@@ -167,13 +169,187 @@ static bool ascii_printable(const char *s)
     return true;
 }
 
-/* 菜单显示串：① label(ASCII) → ② map_id/entity(ASCII) → ③ hash 前 8 位 */
-static void pick_ascii_label(const local_file_t *lf, char *out, size_t cap)
+/* 【中文化 2026-10-01】可显示串判据：非空 + 无控制字符。
+ * 与 ascii_printable 的区别 = **放行 UTF-8 多字节**：服务端 L1 修好后地图
+ * label 就是中文原名（"射手村：射手村"），必须原样透传到菜单；
+ * 是否缺字（烘焙子集覆盖不到）由菜单层判（lvgl_bridge 的 menu_label_font_safe）。 */
+static bool displayable_label(const char *s)
 {
-    if (ascii_printable(lf->label))        strlcpy(out, lf->label, cap);
-    else if (ascii_printable(lf->map_id))  strlcpy(out, lf->map_id, cap);
-    else if (ascii_printable(lf->entity))  strlcpy(out, lf->entity, cap);
-    else                                   snprintf(out, cap, "%.8s", lf->hash);
+    if (!s || !s[0]) return false;
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        if (*p < 0x20 || *p == 0x7F) return false;
+    }
+    return true;
+}
+
+/* §3.2 L2 兜底（用户已拍板）：push 端点没接 WZ 地图名时 label = "map_<纯数字id>"
+ * → 剥掉 "map_" 前缀只显示阿拉伯数字原名（"map_000010000" → "000010000"）。
+ * 严格 ^map_[0-9]+$ 才剥：真中文名/其它 label 原样返回（不误伤）。 */
+static void strip_map_prefix(const char *in, char *out, size_t cap)
+{
+    if (strncmp(in, "map_", 4) == 0 && in[4] &&
+        strspn(in + 4, "0123456789") == strlen(in + 4)) {
+        strlcpy(out, in + 4, cap);
+        return;
+    }
+    strlcpy(out, in, cap);
+}
+
+/* UTF-8 安全拷贝（截断只退到完整码点边界）：label 缓冲 32B ≈ 10 个汉字，
+ * 服务端中文地图名可能更长——strlcpy 会在码点中间截断，留下半个序列，
+ * LVGL 拿到非法 UTF-8 渲染成乱码/方块（观感 = "最后一个字是怪字"）。
+ * 纯逻辑边界用例已自测（/tmp/menu_logic_test，见汇报）。 */
+static void utf8_safe_copy(const char *in, char *out, size_t cap)
+{
+    size_t o = 0;
+    const char *p = in;
+    if (!cap) return;
+    while (*p && o + 1 < cap) {
+        unsigned char c = (unsigned char)*p;
+        size_t len = 1;
+        if ((c & 0xE0) == 0xC0) len = 2;
+        else if ((c & 0xF0) == 0xE0) len = 3;
+        else if ((c & 0xF8) == 0xF0) len = 4;
+        if (o + len + 1 > cap) break;              /* 放不下完整码点 → 到此为止 */
+        for (size_t k = 0; k < len && p[k]; k++) out[o++] = p[k];
+        p += len;
+    }
+    out[o] = 0;
+}
+
+/* 菜单显示串：① label（可显示：含中文原名；map_ 数字前缀剥除；UTF-8 整码点截断）
+ *             → ② map_id/entity(ASCII) → ③ hash 前 8 位 */
+static void pick_display_label(const local_file_t *lf, char *out, size_t cap)
+{
+    if (displayable_label(lf->label)) {
+        char t[64];
+        strip_map_prefix(lf->label, t, sizeof(t));
+        utf8_safe_copy(t, out, cap);
+    }
+    else if (ascii_printable(lf->map_id))    strlcpy(out, lf->map_id, cap);
+    else if (ascii_printable(lf->entity))    strlcpy(out, lf->entity, cap);
+    else                                     snprintf(out, cap, "%.8s", lf->hash);
+}
+
+/* ------------------------------------------------------------------ */
+/* 地图"删除" = 本地隐藏标识（NVS per-map，§4.4）                        */
+/* ------------------------------------------------------------------ */
+/* 键长上限 = NVS_KEY_NAME_MAX_SIZE-1 = 15 字符；hash 是 16 hex 装不下，
+ * 故 map_id（真机为 9 位数字）优先，无 map_id 时用 "h"+hash 前 14 位。 */
+#define MP_HIDE_NVS_NS  "maphide"
+
+static void hide_key_of(const local_file_t *lf, char *out, size_t cap)
+{
+    if (lf->map_id[0] && strlen(lf->map_id) <= 15) {
+        strlcpy(out, lf->map_id, cap);
+    } else {
+        char t[17];
+        snprintf(t, sizeof(t), "h%.14s", lf->hash);
+        strlcpy(out, t, cap);
+    }
+}
+
+/* 双键行定位（内容 hash 或地图 id，与 asset_dl_map_path 同口径）。
+ * 调用方须持 s_lock；返回 s_files 下标，-1 = 无此 BGMAP。 */
+static int find_bgmap_locked(const char *hash_or_id)
+{
+    if (!hash_or_id || !hash_or_id[0]) return -1;
+    for (int i = 0; i < s_file_cnt; i++) {
+        if (strcasecmp(s_files[i].kind, "BGMAP") != 0) continue;
+        if (strcmp(s_files[i].hash, hash_or_id) == 0) return i;
+        if (s_files[i].map_id[0] && strcmp(s_files[i].map_id, hash_or_id) == 0) return i;
+    }
+    return -1;
+}
+
+/* 隐藏标识读取（NVS 单键 u8；键不存在/命名空间不存在 = 未隐藏） */
+static bool map_hidden_locked(const local_file_t *lf)
+{
+    char key[16];
+    hide_key_of(lf, key, sizeof(key));
+    nvs_handle_t h;
+    if (nvs_open(MP_HIDE_NVS_NS, NVS_READONLY, &h) != ESP_OK) return false;
+    uint8_t v = 0;
+    bool hid = (nvs_get_u8(h, key, &v) == ESP_OK && v != 0);
+    nvs_close(h);
+    return hid;
+}
+
+bool asset_dl_map_hidden(const char *hash_or_id)
+{
+    bool hid = false;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    int idx = find_bgmap_locked(hash_or_id);
+    if (idx >= 0) hid = map_hidden_locked(&s_files[idx]);
+    xSemaphoreGive(s_lock);
+    return hid;
+}
+
+bool asset_dl_map_set_hidden(const char *hash_or_id, bool hidden)
+{
+    bool ok = false;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    int idx = find_bgmap_locked(hash_or_id);
+    if (idx >= 0) {
+        char key[16];
+        hide_key_of(&s_files[idx], key, sizeof(key));
+        nvs_handle_t h;
+        if (nvs_open(MP_HIDE_NVS_NS, NVS_READWRITE, &h) == ESP_OK) {
+            esp_err_t err = hidden ? nvs_set_u8(h, key, 1) : nvs_erase_key(h, key);
+            if (err == ESP_ERR_NVS_NOT_FOUND) err = ESP_OK;   /* 解除不存在的标识 = 成功 */
+            if (err == ESP_OK) err = nvs_commit(h);
+            nvs_close(h);
+            ok = (err == ESP_OK);
+        }
+        /* 取证锚点：菜单"删除"与 poller"推送解除"都经这里，一条日志看清置位/解除 */
+        ESP_LOGW(TAG, "地图隐藏标识 %s：key=%s hash=%.16s map_id=%s → %s",
+                 hidden ? "置位" : "解除", key, s_files[idx].hash,
+                 s_files[idx].map_id[0] ? s_files[idx].map_id : "-",
+                 ok ? "OK" : "FAIL");
+    } else {
+        ESP_LOGW(TAG, "地图隐藏标识：%s 无对应 BGMAP 条目（清单未登记？）",
+                 hash_or_id ? hash_or_id : "(null)");
+    }
+    xSemaphoreGive(s_lock);
+    return ok;
+}
+
+int asset_dl_bgmap_visible_count(void)
+{
+    int n = 0;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    for (int i = 0; i < s_file_cnt; i++) {
+        if (strcasecmp(s_files[i].kind, "BGMAP") != 0) continue;
+        if (map_hidden_locked(&s_files[i])) continue;
+        n++;
+    }
+    xSemaphoreGive(s_lock);
+    return n;
+}
+
+bool asset_dl_map_is_active(const char *hash_or_id)
+{
+    bool act = false;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    int idx = find_bgmap_locked(hash_or_id);
+    if (idx >= 0 && s_active_map_hash[0]) {
+        act = (strcmp(s_files[idx].hash, s_active_map_hash) == 0);
+    }
+    xSemaphoreGive(s_lock);
+    return act;
+}
+
+bool asset_dl_map_key(const char *hash_or_id, char *out, size_t cap)
+{
+    bool ok = false;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    int idx = find_bgmap_locked(hash_or_id);
+    if (idx >= 0) {
+        hide_key_of(&s_files[idx], out, cap);   /* 键口径与隐藏标识/相机 NVS 一致 */
+        ok = true;
+    }
+    xSemaphoreGive(s_lock);
+    return ok;
 }
 
 /* kind 过滤 + cached 标记。调用方须持 s_lock */
@@ -189,8 +365,10 @@ static int kind_list_locked(const char *kind, char hashes[][20], char labels[][3
             if (!(strcmp(s_files[i].selector, "paperdoll") == 0 ||
                   strncmp(s_files[i].entity, "paperdoll", 9) == 0)) continue;
         }
+        /* §4.4：用户隐藏（"删除"）的图不进列表——文件仍在 TF、LRU 照常管 */
+        if (strcasecmp(kind, "BGMAP") == 0 && map_hidden_locked(&s_files[i])) continue;
         if (hashes) strlcpy(hashes[n], s_files[i].hash, 20);
-        if (labels) pick_ascii_label(&s_files[i], labels[n], 32);
+        if (labels) pick_display_label(&s_files[i], labels[n], 32);
         if (cached) cached[n] = file_cached_row(&s_files[i]);
         n++;
     }
@@ -235,7 +413,7 @@ int asset_dl_npc_list(char entities[][40], char hashes[][20], char labels[][32],
 
         strlcpy(entities[n], s_files[i].entity, 40);
         if (hashes) strlcpy(hashes[n], s_files[i].hash, 20);
-        if (labels) pick_ascii_label(&s_files[i], labels[n], 32);
+        if (labels) pick_display_label(&s_files[i], labels[n], 32);
         if (cached) cached[n] = file_cached_row(&s_files[i]);
         n++;
     }
@@ -309,6 +487,7 @@ static void load_local_manifest(void)
     s_file_cnt = 0;
     s_local_rev = 0;
     s_active_map[0] = 0;
+    s_active_map_hash[0] = 0;
     s_clock_cnt = 0;
 
     char mf_path[48];
@@ -363,7 +542,7 @@ static void load_local_manifest(void)
             if ((s = cJSON_GetStringValue(cJSON_GetObjectItem(jf, "selector"))))
                 strlcpy(lf->selector, s, sizeof(lf->selector));
             if ((s = cJSON_GetStringValue(cJSON_GetObjectItem(jf, "label"))))
-                strlcpy(lf->label, s, sizeof(lf->label));
+                utf8_safe_copy(s, lf->label, sizeof(lf->label));   /* 整码点截断 */
             /* 【锚点 2026-09-27】LAYOUT 条目的 origin=[x,y]（画布内 body 锚点）。
              * 旧固件只拿到 bounds（画布尺寸），摆放只能退化成"画布左上角对齐屏心"，
              * 与"origin 与屏幕中点重合"差 origin×2 px，且换动作时锚点漂移 → 人物跳。
@@ -392,7 +571,7 @@ static void load_local_manifest(void)
                      * 失败 → abort 启动循环（真机实证）。空闲不足则跳过 px
                      * 读取（回退清单值，纯装饰性字段）。
                      * 【板级配置 2026-09-30】门值改由 Kconfig MP_ASSET_HEAP_GATE_KB
-                     * 决定（本板默认 6KB）。原字面量
+                     * 决定（默认 24KB=216 板保护不变）。原字面量
                      * 8*108(=864B) 是 8*1024 的历史笔误，与下方日志"24KB"自相
                      * 矛盾，一并收敛到同一配置源。 */
                     if (heap_caps_get_free_size(MALLOC_CAP_INTERNAL) <
@@ -413,6 +592,18 @@ static void load_local_manifest(void)
             lf->fav = cJSON_IsTrue(cJSON_GetObjectItem(jf, "fav"));
             lf->last_used_ms = (int64_t)jnum(jf, "ts", 0);
             s_file_cnt++;
+        }
+    }
+
+    /* 当前图 id（active_map）→ 反解内容 hash：隐藏标识/正在渲染判定要用
+     * （清单里 active_map 只存 id，见 save_local_manifest_locked） */
+    if (s_active_map[0]) {
+        for (int i = 0; i < s_file_cnt; i++) {
+            if (strcasecmp(s_files[i].kind, "BGMAP") == 0 &&
+                strcmp(s_files[i].map_id, s_active_map) == 0) {
+                strlcpy(s_active_map_hash, s_files[i].hash, sizeof(s_active_map_hash));
+                break;
+            }
         }
     }
 
@@ -678,9 +869,15 @@ static int prune_stale_locked(const cJSON *assets)
     return removed;
 }
 
-/* 元数据登记/刷新（不下载）；返回该 hash 本地是否已有文件 */
+/* 元数据登记/刷新（不下载）；返回该 hash 本地是否已有文件。
+ * 【label 落库 2026-10-01 中文化前置】服务端 manifest 的 label 此前**从未进设备**
+ * （旧签名只有 action/entity/map/selector）→ s_files[].label 恒空 → 菜单只能走
+ * ②map_id 兜底显示 "000010000"，服务端 L1（接 WZ 地图名）改了也**到不了屏上**。
+ * 现按 upsert 语义落库：服务端给了就覆盖（rev bump 后 L1 修复即生效），
+ * 没给则保留本地值（不退化成空）。UTF-8 整码点截断，防中文名截半个字。 */
 static bool upsert_meta(const char *hash, const char *kind, const char *action,
-                        const char *entity, const char *map_id, const char *selector)
+                        const char *entity, const char *map_id, const char *selector,
+                        const char *label)
 {
     bool found_file = false;
     char path[MP_MPK_PATH_MAX];
@@ -705,6 +902,10 @@ static bool upsert_meta(const char *hash, const char *kind, const char *action,
         if (entity)   strlcpy(slot->entity, entity, sizeof(slot->entity));
         if (map_id)   strlcpy(slot->map_id, map_id, sizeof(slot->map_id));
         if (selector) strlcpy(slot->selector, selector, sizeof(slot->selector));
+        if (label && label[0] &&
+            strcmp(slot->label, label) != 0) {          /* 变化才写（防无谓重写清单） */
+            utf8_safe_copy(label, slot->label, sizeof(slot->label));
+        }
         if (found_file && slot->last_used_ms == 0) slot->last_used_ms = mp_now_ms();
     }
     return found_file;
@@ -1348,7 +1549,8 @@ static void sync_once(void)
                         cJSON_GetStringValue(cJSON_GetObjectItem(ja, "action")),
                         cJSON_GetStringValue(cJSON_GetObjectItem(ja, "entity")),
                         cJSON_GetStringValue(cJSON_GetObjectItem(ja, "map")),
-                        cJSON_GetStringValue(cJSON_GetObjectItem(ja, "selector")));
+                        cJSON_GetStringValue(cJSON_GetObjectItem(ja, "selector")),
+                        cJSON_GetStringValue(cJSON_GetObjectItem(ja, "label")));
         }
         prune_stale_locked(assets);              /* 以本轮清单为准对账剪除 */
         xSemaphoreGive(s_lock);
@@ -1953,15 +2155,19 @@ void asset_dl_set_active_map(const char *hash)
 {
     if (!hash || !hash[0]) return;
     xSemaphoreTake(s_lock, portMAX_DELAY);
-    for (int i = 0; i < s_file_cnt; i++) {
-        if (strcasecmp(s_files[i].kind, "BGMAP") == 0 &&
-            strcmp(s_files[i].hash, hash) == 0) {
-            if (s_files[i].map_id[0]) {
-                strlcpy(s_active_map, s_files[i].map_id, sizeof(s_active_map));
-            }
-            s_files[i].last_used_ms = mp_now_ms();
-            break;
+    /* 【双键 2026-10-01】调用方两种口径：菜单点选=内容 hash、状态机/服务端指令=
+     * 地图 id（见 asset_dl_map_path 同款说明）。旧实现只认 hash → 按 id 下发时
+     * s_active_map 不更新（clock 锚点停在上一张图）。现统一走 find_bgmap_locked，
+     * 顺带记录当前图的**内容 hash**（"隐藏当前图"判定要用，见 map_is_active）。 */
+    int idx = find_bgmap_locked(hash);
+    if (idx >= 0) {
+        if (s_files[idx].map_id[0]) {
+            strlcpy(s_active_map, s_files[idx].map_id, sizeof(s_active_map));
         }
+        strlcpy(s_active_map_hash, s_files[idx].hash, sizeof(s_active_map_hash));
+        s_files[idx].last_used_ms = mp_now_ms();
+    } else {
+        ESP_LOGW(TAG, "set_active_map：%s 无对应 BGMAP 条目（清单未就绪？）", hash);
     }
     save_local_manifest_locked();
     xSemaphoreGive(s_lock);

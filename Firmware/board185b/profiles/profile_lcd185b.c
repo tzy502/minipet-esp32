@@ -17,9 +17,18 @@
 #include "lcd185b.h"
 
 const minipet_profile_t MINIPET_PROFILE_LCD185B = {
-    /* 【合成器空间=480×480 2026-10-01】与既有 480 世界→屏幕管线同构（RC_SCALE=2、
-     * 地面表/娃娃/时钟/横幅全部原逻辑零改动），360 面板的适配收敛在显示驱动
-     * 的唯一缩放点（480→360 取样）。教训见 docs/amoled185b-bringup-pitfalls.md（随板文档）。 */
+    /* 【合成器空间 = 480×480（2026-10-01 修复回归）】与既有 480 世界→屏幕管线
+     * 同构：RC_SCALE=2 是**全局契约**（实体/条带/时钟/娃娃一律 <<RC_SCALE_SHIFT
+     * 即 2×），360 面板的适配只收敛在显示驱动的唯一缩放点（refresh_task 的
+     * 480→360 ×3/4 最近邻取样）。
+     *
+     * 【为什么必须回 480】工作区一度把这里改成 360：于是 static/tile 走
+     * layer_rgb_load 的通用路径变成 240→360 = **1.5×**，而条带（strip_blit 的
+     * band_y = y<<1）/实体/时钟仍是 **2×** —— 层间比例不一致 → 上半地形错位/
+     * 重复图案（bring-up 坑档 §2.1 的症状）与画面整体比例失真。
+     * 定稿依据见 docs/amoled185b-bringup-pitfalls.md §一/§五（480 合成器 →
+     * 0.75 驱动取样 → 360 面板）。教训：板级差异走 profile 字段，但
+     * width/height 是**合成器空间**不是面板尺寸，改它等于改全局缩放契约。 */
     .width  = 480,
     .height = 480,
     .shape  = MINIPET_SHAPE_ROUND,
@@ -28,20 +37,21 @@ const minipet_profile_t MINIPET_PROFILE_LCD185B = {
     .flash_mb  = 16,
     .cpu_freq_mhz = 240, /* 双核 240MHz（sdkconfig 同步声明） */
 
-    .has_audio = false,   /* 【降级定稿】音频链路未验证；省 28KB 内部栈给 RAMless 刷新 */
-    .has_touch = false,   /* CST816S@0x15：驱动未接（探测地址不符自动降级） */
+    .has_audio = true,    /* 【2026-10-01 移植】ES8311 + I2S TX（MCLK2/BCLK48/LRCK38/DOUT47/PA9） */
+    .has_touch = true,    /* 【2026-10-01 移植】CST816S@0x15（INT=4 RST=1，纯轮询） */
     .has_imu   = true,    /* QMI8658@0x6B：INT 未引出 → int1/int2=-1，轮询模式 */
     .has_rtc   = true,    /* PCF85063@0x51，INT=6 */
-    .has_pmu   = false,   /* BQ27220@0x55 电量计，驱动未接（自动降级） */
+    .has_pmu   = true,    /* 【2026-10-01 移植】BQ27220@0x55 电量计（只读标准命令） */
     .has_sd    = true,    /* SDMMC 槽在线（1-bit：CLK15/CMD14/D0=16），cs 未用=-1 */
     .has_key   = false,   /* 无独立菜单键脚；BOOT=GPIO0 菜单键（input_dispatch） */
-    .ground_cam_shift_px = 248, /* 185B 实验：各层上移248行，底部接真 foothold 地面带 */
+    .ground_cam_shift_px = 248, /* 185B 实验：各层上移248行，底部接真 foothold 地面带
+                                 * （单位=合成器 px；整图包路径自动跳过，见 compositor） */
 
     .pins = {
         .i2c  = { .scl = 10, .sda = 11 },
         .lcd  = { .sio0 = 46, .sio1 = 45, .sio2 = 42, .sio3 = 41,
                   .sclk = 40, .cs = 21, .rst = 3 },
-        .touch = { .intr = 4, .rst = 1 },   /* CST816S（占位，驱动未接） */
+        .touch = { .intr = 4, .rst = 1 },   /* CST816S（touch_cst816.c，纯轮询） */
         .imu  = { .int1 = -1, .int2 = -1 }, /* INT 脚未标注 → 轮询模式 */
         .rtc  = { .intr = 6 },
         .audio = { .mclk = 2, .bclk = 48, .lrck = 38,

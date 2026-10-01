@@ -21,7 +21,7 @@
  *   队列：event_q（input→net 上报）/ cmd_q（net→render 执行）/
  *         audio_q（UI/net→bgm 控制；PCM 走 PSRAM 环形缓冲）
  */
-#define MP_TASK_PROBE 0   /* 任务存活取证（排障时置 1：poller 阶段/bgm 步骤/消息计数） */
+#define MP_TASK_PROBE 1   /* 任务存活取证（排障时置 1：poller 阶段/bgm 步骤/消息计数） */
 
 #include <stdio.h>
 #include <assert.h>
@@ -115,6 +115,10 @@ static void render_task(void *arg)
                 extern volatile int32_t  g_poll_last_status;
                 extern volatile uint32_t g_bgm_msgs, g_feeder_loops;
                 extern volatile uint32_t g_bgm_step;
+                extern volatile uint32_t g_bgm_drop_nodec, g_bgm_drop_offline,
+                                         g_bgm_drop_greyed, g_bgm_wr_err;
+                extern volatile uint32_t g_bgm_underruns, g_bgm_ring_min, g_bgm_wr_max_us;
+                extern volatile uint32_t g_bgm_gap_max_us, g_bgm_gap_over, g_bgm_gap_at_ms;
                 extern volatile uint32_t g_pol_stage[10];
                 extern volatile int32_t  g_bgm_state_probe;
                 ESP_LOGW("tprobe", "poller 阶段=[%u %u %u %u %u %u %u %u %u] 门失败=%u 成功=%u 失败=%u | "
@@ -127,8 +131,24 @@ static void render_task(void *arg)
                          (unsigned)g_poll_ok, (unsigned)g_poll_fail,
                          (unsigned)g_bgm_msgs, (int)g_bgm_state_probe,
                          (unsigned)g_feeder_loops);
-                ESP_LOGW("tprobe", "bgm 步骤=%u（1入口 2拿到id 3codec 4表情 5表锁 6表建成 7会话返回）",
-                         (unsigned)g_bgm_step);
+                ESP_LOGW("tprobe", "bgm 步骤=%u（1入口 2拿到id 3codec 4表情 5表锁 6表建成 7会话返回）"
+                                   " 丢弃[无解码器=%u 断网=%u 置灰=%u] codec写失败=%u",
+                         (unsigned)g_bgm_step,
+                         (unsigned)g_bgm_drop_nodec, (unsigned)g_bgm_drop_offline,
+                         (unsigned)g_bgm_drop_greyed, (unsigned)g_bgm_wr_err);
+                /* 【卡顿取证】断供次数 / 周期内最低水位（样本）/ I2S 单次写最长耗时 */
+                ESP_LOGW("tprobe", "bgm 音频：断供=%u 最低水位=%d 样本（%d ms）| I2S 写最长=%u us | 音量=%u",
+                         (unsigned)g_bgm_underruns, (int)g_bgm_ring_min,
+                         (int)(g_bgm_ring_min == 0xFFFFFFFFu ? -1
+                               : (int32_t)((uint64_t)g_bgm_ring_min * 1000u /
+                                           (uint64_t)((bgm_rate_get() ? bgm_rate_get() : 44100) * 2u))),
+                         (unsigned)g_bgm_wr_max_us, (unsigned)bgm_volume_get());
+                ESP_LOGW("tprobe", "bgm 卡顿取证：写间隔最长=%u us @%ums | >150ms 次数=%u（DMA 深度 22.05k≈139ms）",
+                         (unsigned)g_bgm_gap_max_us, (unsigned)g_bgm_gap_at_ms,
+                         (unsigned)g_bgm_gap_over);
+                g_bgm_ring_min = 0xFFFFFFFFu;
+                g_bgm_wr_max_us = 0;
+                g_bgm_gap_max_us = 0;
             }
         }
 #endif
@@ -143,6 +163,61 @@ static bool g_input_created;
 static void input_task(void *arg)
 {
     input_dispatch_task(arg);             /* 不返回 */
+}
+
+/* ------------------------------------------------------------------ */
+/* 方向标定工具（触摸 down 沿轮播 8 组合；标定期才有效）                  */
+/* ------------------------------------------------------------------ */
+/* 【2026-10-01 从 216 移植】185B 的面板方向按 bring-up 结论固化在
+ * display_st77916.c 的 display_init（固定 MADCTL），故这里默认关闭
+ * （MP_ORIENT_CALIB=0 ⇒ 本函数是空操作）。保留的理由：
+ *   · input_dispatch 的 touch_tick 无条件调用它（与 216 同构，不做条件编译）；
+ *   · 换屏/换安装方向时，把下面开关置 1 即可用"点屏幕"逐个试 8 种镜像组合，
+ *     选中态写 NVS calib/k，开机自动应用并打日志，据日志回填 display_init。
+ * 与 216 差别：这里直接调 display_set_orientation()（本板驱动有同名接口）。 */
+#define MP_ORIENT_CALIB 0   /* 0=关闭（方向已固化）；1=开启点屏轮播标定 */
+
+typedef struct { bool swap, mx, my; } orient_combo_t;
+static const orient_combo_t s_orient_combos[8] __attribute__((unused)) = {
+    { false, false, false }, { false, true,  false },
+    { false, false, true  }, { false, true,  true  },
+    { true,  false, false }, { true,  true,  false },
+    { true,  false, true  }, { true,  true,  true  },
+};
+static uint8_t s_orient_k __attribute__((unused));
+
+static void orient_apply(uint8_t k) __attribute__((unused));
+static void orient_apply(uint8_t k)
+{
+#if MP_ORIENT_CALIB
+    const orient_combo_t *c = &s_orient_combos[k & 7];
+    display_set_orientation(c->swap, c->mx, c->my);
+    render_force_redraw();
+    ESP_LOGW("orient", "组合 %d/7 swap=%d mx=%d my=%d", k & 7,
+             (int)c->swap, (int)c->mx, (int)c->my);
+#else
+    (void)k;
+#endif
+}
+
+/* input_dispatch 触摸 down 沿调用（仅 MP_ORIENT_CALIB=1 期有行为） */
+void mp_orient_calib_tap(void)
+{
+#if MP_ORIENT_CALIB
+    static int64_t last_tap;
+    int64_t now = esp_timer_get_time();
+    if (now - last_tap < 400000) return;    /* 防连点跳两个组合 */
+    last_tap = now;
+    s_orient_k = (s_orient_k + 1) & 7;
+    nvs_handle_t h;
+    if (nvs_open("calib", NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_u8(h, "k", s_orient_k);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+    orient_apply(s_orient_k);
+    render_banner_show_for("ABCDEFG", 3000);   /* 镜像判读：字母反写=镜像 */
+#endif
 }
 
 /* ------------------------------------------------------------------ */
@@ -217,8 +292,12 @@ static void app_main_task(void *arg)
     /* 驱动 init（drivers.h 规定顺序：i2c_bus → 各器件 → sd）。
      * display_init 由 render_init 内部完成（render.h 契约）。 */
     ESP_ERROR_CHECK(i2c_bus_init());
+    /* 【2026-10-01 板级裁剪】触摸 init 不在这里：本板 touch_cst816_init() 在
+     * input 任务开头调用（历史口径，见 input_dispatch_task），驱动探测失败
+     * 只降级不阻断。216 在此处 ESP_ERROR_CHECK(touch_cst9220_init()) 是它
+     * 自己的启动序，不适用于本板。 */
     /* IMU 缺失不阻断启动：QMI8658 探测 NACK 会一路返回错误，原先
-     * ESP_ERROR_CHECK 直接 abort → 无限重启，IMU 之后的 RTC/SD/网络/渲染
+     * ESP_ERROR_CHECK 直接 abort → 无限重启，IMU 之后的 RTC/PMU/SD/网络/渲染
      * 全部验证不到。app 层已有 ready() 降级路径。 */
     esp_err_t imu_err = imu_qmi8658_init();
     if (imu_err != ESP_OK) {
@@ -226,6 +305,10 @@ static void app_main_task(void *arg)
                  esp_err_to_name(imu_err));
     }
     ESP_ERROR_CHECK(rtc_pcf85063_init());
+    /* 【2026-10-01 移植】电量计 BQ27220@0x55（216 是 AXP2101@0x34）。
+     * 照 IMU 的容错写法：探测失败只降级（驱动内部已 log-and-continue 返回
+     * ESP_OK），绝不用 ESP_ERROR_CHECK 把"电量计不在"升级成无限重启。 */
+    pmu_bq27220_init();
     bool sd_ok = (sd_mount() == 0);            /* sd_tf.h：返回 errno，挂载 /sdcard */
     if (!sd_ok) {
         ESP_LOGE(TAG, "TF mount failed（E11 降级矩阵地基缺失）");

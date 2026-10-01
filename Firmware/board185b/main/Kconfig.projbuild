@@ -19,6 +19,15 @@ config MP_LCD_BRINGUP_TEST
       display_init 末尾连推三张全屏纯色（各 ~0.7s），与渲染管线完全解耦：
       颜色正确=传输/像素格式通，花屏=格式/线序问题，不亮=背光/复位问题。
 
+config MP_TOUCH_CST816
+    bool "CST816S 触摸驱动（板载 0x15，TP_RST=GPIO1/TP_INT=GPIO4，纯轮询）"
+    default y
+    help
+      编译进 touch_cst816.c（CST816S@0x15，共享 I2C）。接口与 216 板
+      touch_cst9220 同构；坐标方向映射待真机校准（当前原始值透传）。
+      关闭 = drivers 组件整文件剔除（bring-up 隔离开关）；board216 构建
+      树不含本驱动，不受影响。
+
 config MP_ASSET_HEAP_GATE_KB
     int "素材绑定内部堆门（KB）"
     default 6

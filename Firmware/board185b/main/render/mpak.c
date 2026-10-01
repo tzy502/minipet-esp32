@@ -234,31 +234,94 @@ static int envelope_check(mpak_t *m, uint64_t expect_hash, uint64_t expect_kind)
         return MPAK_ERR_LEN;
     }
 
-    /* crc32c 流式覆盖 header+payload（MAGIC 至 payload 全量） */
-    uint32_t crc = mpak_crc32c(0, hdr, sizeof hdr);
-    if (fseek(m->f, (long)sizeof hdr, SEEK_SET) != 0) return MPAK_ERR_IO;
+    /* ══════════════ 尾部 CRC32C：大包策略（2026-10-01）══════════════
+     * 【问题】旧实现无条件对 MAGIC..payload 全量算 CRC32C。整图 BGMAP
+     * payload=16,924,968 B ⇒ 每次 open 要把 16.9MB 从 TF 读一遍。
+     * 真机实测基线（同一台 216 板，SDSPI/FATFS，日志时间戳直读）：
+     *   font 287,569B → 259/265/260 ms；526,049B → 512/514 ms；
+     *   1,070,401B → 982/1010 ms（`font_lazy_init open` → `mpak: opened` 两条日志之差）
+     *   ⇒ 拟合 ≈ 9ms 固定 + 0.94 ms/KB ≈ **1.06 MB/s**
+     *   ⇒ 16.9MB 全量 CRC ≈ **16 秒/次 open**（地图每次切换/重载都要付一次）。
+     *
+     * 【策略】payload_len > MPAK_CRC_SKIP_BYTES(4MB) 时**跳过全量 CRC**：
+     *   · 仍然校验：magic / version / kind / 文件长度恰为 40+payload_len+8 /
+     *     尾部 zero 字段，并读入 payload 头 4KB 算出头段 CRC32C 作为**指纹**打日志；
+     *   · 头段指纹**不能**与尾部 crc 比对（尾部是覆盖全 payload 的**单个**滚动值，
+     *     任何前缀/抽样 CRC 都没有可比的存储值）——所以这里诚实地说：它不是校验，
+     *     只是给"怀疑包损坏"时留着与导出端/服务端对表用的一枚指纹，同时把尾部
+     *     存储 crc 一并打出来供人工核对。
+     *
+     * 【为什么跳过是安全的】（不是"省事"，是有替代保障）
+     *   1. 落盘前已全量校验：net/asset_dl.c `verify_and_commit()`（asset_dl.c:814-846）
+     *      在 rename 提交前做 **流式全量 crc32c == 尾部 crc** + `env_hash == manifest hash`
+     *      + `total == payload_len+48` + 尾部 zero==0，四道全过才提交，且 rename 原子。
+     *      即：TF 上出现过的 .mpk 都已经被逐字节验过一次；open 再验只能发现"提交之后"
+     *      的介质损坏/截断，而这由文件长度校验 + 严格的 payload 结构校验兜住。
+     *   2. 解析期结构校验很硬：BGMAP 的 static/tile 偏移必须**恰好等于**由
+     *      「56+14n 补 4B」「static 长度」「tile 长度」推出的实际布局，否则告警并按实际
+     *      布局校正；长度必须是合法集合之一；扩展块 magic+ground 偏移必须自洽。
+     *      头部/索引任一字节被破坏 → 偏移恒等式几乎必然崩 → MPAK_ERR_FMT。
+     *   3. 阈值 4MB：现网所有非整图包的 payload 都远小于它（PARTS ~237KB、
+     *      LAYOUT ≤512KB、FONT 32px ~1.8MB、AUDIO_META ~126KB、窗口 BGMAP ~237KB）
+     *      ⇒ **旧包 CRC 行为逐字节不变**（照旧全量算、照旧比对）。
+     *   4. 逃生阀：-DMPAK_CRC_SKIP_BYTES=0 即恢复"永远全量 CRC"（取证/恢复用）。 */
     uint8_t chunk[2048];
-    uint32_t remain = payload_len;
-    while (remain) {
-        uint32_t n = remain > sizeof chunk ? (uint32_t)sizeof chunk : remain;
-        if (rd_exact(m->f, chunk, n)) return MPAK_ERR_IO;
-        crc = mpak_crc32c(crc, chunk, n);
-        remain -= n;
-    }
-    uint8_t trailer[MPAK_TRAILER_LEN];
-    if (rd_exact(m->f, trailer, sizeof trailer)) return MPAK_ERR_IO;
-    cur_t tc = { trailer, sizeof trailer, 0 };
-    uint32_t crc_stored = 0, zero = 0;
-    cur_u32(&tc, &crc_stored);
-    cur_u32(&tc, &zero);
-    if (crc != crc_stored) {
-        ESP_LOGE(TAG, "crc32c mismatch stored=%08" PRIx32 " calc=%08" PRIx32,
-                 crc_stored, crc);
-        return MPAK_ERR_CRC;
-    }
-    if (zero != 0) {
-        ESP_LOGE(TAG, "trailer zero field != 0");
-        return MPAK_ERR_FMT;
+    bool skip_full_crc = (MPAK_CRC_SKIP_BYTES != 0u) && (payload_len > MPAK_CRC_SKIP_BYTES);
+    if (skip_full_crc) {
+        uint32_t head_n = payload_len < MPAK_CRC_HEAD_BYTES ? payload_len : MPAK_CRC_HEAD_BYTES;
+        if (fseek(m->f, (long)sizeof hdr, SEEK_SET) != 0) return MPAK_ERR_IO;
+        uint32_t head_crc = mpak_crc32c(0, hdr, sizeof hdr);
+        uint32_t got = 0;
+        while (got < head_n) {
+            uint32_t n = head_n - got;
+            if (n > sizeof chunk) n = (uint32_t)sizeof chunk;
+            if (rd_exact(m->f, chunk, n)) return MPAK_ERR_IO;
+            head_crc = mpak_crc32c(head_crc, chunk, n);
+            got += n;
+        }
+        uint8_t trailer0[MPAK_TRAILER_LEN];
+        if (fseek(m->f, (long)MPAK_HEADER_LEN + (long)payload_len, SEEK_SET) != 0)
+            return MPAK_ERR_IO;
+        if (rd_exact(m->f, trailer0, sizeof trailer0)) return MPAK_ERR_IO;
+        cur_t tc0 = { trailer0, sizeof trailer0, 0 };
+        uint32_t crc_stored0 = 0, zero0 = 0;
+        cur_u32(&tc0, &crc_stored0);
+        cur_u32(&tc0, &zero0);
+        if (zero0 != 0) {
+            ESP_LOGE(TAG, "trailer zero field != 0");
+            return MPAK_ERR_FMT;
+        }
+        ESP_LOGW(TAG, "大包 payload=%" PRIu32 "B > %uB：跳过全量 CRC32C"
+                      "（下载侧 asset_dl 已校验 content_hash+全量 crc）；"
+                      "仅信封+头 %" PRIu32 "B 指纹 head_crc=%08" PRIx32
+                      " 尾部存储 crc=%08" PRIx32 "（未比对，供人工对表）",
+                 payload_len, (unsigned)MPAK_CRC_SKIP_BYTES, head_n, head_crc, crc_stored0);
+    } else {
+        /* crc32c 流式覆盖 header+payload（MAGIC 至 payload 全量） */
+        uint32_t crc = mpak_crc32c(0, hdr, sizeof hdr);
+        if (fseek(m->f, (long)sizeof hdr, SEEK_SET) != 0) return MPAK_ERR_IO;
+        uint32_t remain = payload_len;
+        while (remain) {
+            uint32_t n = remain > sizeof chunk ? (uint32_t)sizeof chunk : remain;
+            if (rd_exact(m->f, chunk, n)) return MPAK_ERR_IO;
+            crc = mpak_crc32c(crc, chunk, n);
+            remain -= n;
+        }
+        uint8_t trailer[MPAK_TRAILER_LEN];
+        if (rd_exact(m->f, trailer, sizeof trailer)) return MPAK_ERR_IO;
+        cur_t tc = { trailer, sizeof trailer, 0 };
+        uint32_t crc_stored = 0, zero = 0;
+        cur_u32(&tc, &crc_stored);
+        cur_u32(&tc, &zero);
+        if (crc != crc_stored) {
+            ESP_LOGE(TAG, "crc32c mismatch stored=%08" PRIx32 " calc=%08" PRIx32,
+                     crc_stored, crc);
+            return MPAK_ERR_CRC;
+        }
+        if (zero != 0) {
+            ESP_LOGE(TAG, "trailer zero field != 0");
+            return MPAK_ERR_FMT;
+        }
     }
 
     /* hash 比对（manifest 期望值） */
@@ -334,7 +397,22 @@ static int parse_parts(mpak_t *m)
         rc |= cur_u16(&c, &pad20);   /* 索引项 20B 尾填充 */
         if (rc) break;
 
-        if (w == 0 || h == 0 || w > 1024 || h > 1024) {
+        /* 【PARTS 单件尺寸上限 1024 → 8192（R2 整图配套，2026-10-01）】
+         * 契约 §1 的 000010000 里，**带宽 == vw 的两条整幅带**（丘陵段带
+         * 2270×260、远景段带 2270×508）是独立 PARTS 小包；旧上限 1024 让它们
+         * 全被这里拒（MPAK_ERR_FMT，真机日志实证 "part 1 size 2270x508 invalid"、
+         * 且 200000000 那版地图的 1300x392 / 1100x222 带同样一直在被拒）。
+         * 契约 §3.2 明确要求「带宽==vw 的条带按世界对齐层整幅绘制」——不放开
+         * 这一条，4 条带里就有 2 条永远装不上。
+         * 旧包不受影响：判据是上界，w/h ≤ 1024 的件走完全相同的分支（所有
+         * 现网宠物件 ≤1024：实测 /tmp 真包 850×222、613×125 等）；此处只放宽
+         * 「接受更大」。
+         * 内存：位图不进解析器（本解析器只建索引 + 懒读）。消费侧
+         * （compositor 的整图条带加载）按窗口缓存切片持有，不整幅常驻；
+         * 若将来有消费侧整幅分配（2270×508 → 508×4540 ≈ 2.2MB PSRAM），
+         * 分配失败时既有代码路径已是"跳过该条带"降级。
+         * 乘积不溢出：w*2 ≤ 16384、w*h ≤ 8192×8192，u32 内（×2 = 134MB）。 */
+        if (w == 0 || h == 0 || w > MPAK_MAX_BGMAP_DIM || h > MPAK_MAX_BGMAP_DIM) {
             ESP_LOGE(TAG, "part %" PRIu32 " size %ux%u invalid", part_id, w, h);
             rc = MPAK_ERR_FMT;
             break;
@@ -600,6 +678,7 @@ static int parse_bgmap(mpak_t *m)
     mpak_bgmap_t *bg = psram_alloc(sizeof *bg);
     if (!bg) { heap_caps_free(buf); return MPAK_ERR_NOMEM; }
     memset(bg, 0, sizeof *bg);
+    bg->ext_off = -1;                 /* <0 = 无扩展块（旧包） */
 
     int rc = MPAK_OK;
     rc |= cur_name(&c, bg->map_id, sizeof bg->map_id);
@@ -613,18 +692,42 @@ static int parse_bgmap(mpak_t *m)
     heap_caps_free(buf);
     if (rc) { heap_caps_free(bg); return MPAK_ERR_FMT; }
 
+    /* 先卡尺寸上限，再算 px（上限卡死后 vw*vh*2 ≤ 134MB，u32 内安全） */
+    if (bg->vw == 0 || bg->vh == 0 ||
+        bg->vw > MPAK_MAX_BGMAP_DIM || bg->vh > MPAK_MAX_BGMAP_DIM) {
+        ESP_LOGE(TAG, "bgmap %s dim invalid (vw=%u vh=%u max=%u)",
+                 bg->map_id, bg->vw, bg->vh, (unsigned)MPAK_MAX_BGMAP_DIM);
+        heap_caps_free(bg);
+        return MPAK_ERR_FMT;
+    }
+
     uint64_t px = (uint64_t)bg->vw * bg->vh;
-    /* tile 层长度：RGB565 行 + 1bit mask，编码端【整块补齐 4B】——
-     * 180 宽时 68850→补 2=68852，
-     * 旧公式严格相等会把 360 档素材全拒（MPAK_ERR_FMT，真机实证）。 */
-    uint32_t tile_expect = (uint32_t)(px * 2u) + (uint32_t)((px + 7u) / 8u);
-    tile_expect = (tile_expect + 3u) & ~3u;
-    if (bg->vw == 0 || bg->vh == 0 || bg->vw > 512 || bg->vh > 512 ||
-        bg->static_back_len != (uint32_t)(px * 2u) ||
+    /* 【行距口径 2026-10-01】整图包（R2）的 static/tile 按**行 4B 对齐**写：
+     *   static = vh × align4(vw×2)；tile  = vh × align4(vw×2)（RGB565）+ align4(掩码)
+     * 旧窗口包是紧打包：static = vw*vh*2。两者在**偶数宽**下数值完全相同
+     * （vw 偶 ⇒ vw*2 已 4B 对齐 ⇒ align4(vw*2) == vw*2）——
+     * 240×240（480B 行）、180×180（360B 行）、360 档全部命中"两式相等"，
+     * 故旧包的接受集合**逐字节不变**；放宽只新增"奇数宽 + 行对齐"这一种以前
+     * 必被拒的组合。tile 的旧公式（先算 px*2+掩码再整体补 4B）与编码端公式
+     * （RGB 行对齐 + 掩码单独补 4B）同理：偶数宽等值，奇数宽才分叉，两个值都收。 */
+    uint32_t stride_al = (uint32_t)align4((size_t)bg->vw * 2u);   /* 行 4B 对齐 */
+    uint32_t static_tight   = (uint32_t)(px * 2u);                /* 旧：紧打包 */
+    uint32_t static_aligned = (uint32_t)bg->vh * stride_al;       /* 整图：行对齐 */
+    uint32_t tile_rgb       = (uint32_t)bg->vh * stride_al;
+    uint32_t tile_mask_al   = (uint32_t)align4((size_t)((px + 7u) / 8u));
+    uint32_t tile_expect    = (uint32_t)(px * 2u) + (uint32_t)((px + 7u) / 8u);
+    tile_expect = (tile_expect + 3u) & ~3u;                       /* 旧公式 */
+    uint32_t tile_expect_enc = tile_rgb + tile_mask_al;           /* 编码端公式 */
+
+    if ((bg->static_back_len != static_tight &&
+         bg->static_back_len != static_aligned) ||
         (bg->tile_layer_len != 0 &&
-         bg->tile_layer_len != tile_expect) ||
+         bg->tile_layer_len != tile_expect &&
+         bg->tile_layer_len != tile_expect_enc) ||
         bg->strip_count > MPAK_BGMAP_MAX_STRIPS) {
-        ESP_LOGE(TAG, "bgmap %s geometry invalid (vw=%u vh=%u)", bg->map_id, bg->vw, bg->vh);
+        ESP_LOGE(TAG, "bgmap %s geometry invalid (vw=%u vh=%u static=%" PRIu32
+                      " tile=%" PRIu32 ")",
+                 bg->map_id, bg->vw, bg->vh, bg->static_back_len, bg->tile_layer_len);
         heap_caps_free(bg);
         return MPAK_ERR_FMT;
     }
@@ -679,6 +782,90 @@ static int parse_bgmap(mpak_t *m)
         heap_caps_free(buf);
     }
 
+    /* ══════════ 整图扩展块（R2，可选；2026-10-01）══════════
+     * 位置：ext_off = align4(tile_layer_off + tile_layer_len)（**用自愈后的**偏移）。
+     * 旧包此处 ext_off 已 ≥ payload_len（旧 payload 正好在 tile 末尾结束，最多几个
+     * 4B 填充字节）⇒ 直接判"无扩展块"，full_map=false，一切照旧；
+     * 即便尾部填充里凑巧出现 magic（概率 ≈2^-32，且填充通常为 0），后面 ground 偏移
+     * 自洽性校验也会把它否掉——不会把旧包误判成整图包。 */
+    {
+        uint32_t ext_off = (uint32_t)align4((size_t)bg->tile_layer_off + bg->tile_layer_len);
+        if (ext_off <= m->payload_len &&
+            m->payload_len - ext_off >= MPAK_BGMAP_EXT_HDR_LEN) {
+            uint8_t *eb = payload_read(m, ext_off, MPAK_BGMAP_EXT_HDR_LEN);
+            if (!eb) { if (bg->strips) heap_caps_free(bg->strips);
+                       heap_caps_free(bg); return MPAK_ERR_IO; }
+            cur_t ec = { eb, MPAK_BGMAP_EXT_HDR_LEN, 0 };
+            uint32_t magic = 0, glen = 0, goff = 0, eflags = 0;
+            cur_u32(&ec, &magic);
+            cur_u32(&ec, &glen);
+            cur_u32(&ec, &goff);
+            cur_u32(&ec, &eflags);
+            heap_caps_free(eb);
+
+            if (magic == MPAK_BGMAP_EXT_MAGIC) {
+                /* magic 命中 = 新格式。字段必须自洽，否则包确实坏了 → 硬失败
+                 * （整图包 16.9MB，下载侧已全量校验，出现坏字段只可能是介质损坏）。 */
+                uint64_t g_end = (uint64_t)goff + glen;
+                if (glen == 0 || glen != (uint32_t)bg->vw * 2u ||
+                    goff < ext_off + MPAK_BGMAP_EXT_HDR_LEN ||
+                    g_end > m->payload_len) {
+                    ESP_LOGE(TAG, "bgmap %s 扩展块非法（ground_len=%" PRIu32
+                                  " 期望=%u ground_off=%" PRIu32 " ext_off=%" PRIu32
+                                  " payload=%" PRIu32 ")",
+                             bg->map_id, glen, (unsigned)((uint32_t)bg->vw * 2u), goff,
+                             ext_off, m->payload_len);
+                    if (bg->strips) heap_caps_free(bg->strips);
+                    heap_caps_free(bg);
+                    return MPAK_ERR_FMT;
+                }
+                bg->ext_off    = (int32_t)ext_off;
+                bg->ext_flags  = eflags;
+                bg->ground_off = goff;
+                bg->ground_len = glen;
+                bg->full_map   = (eflags & MPAK_BGMAP_FLAG_FULL_MAP) != 0;
+
+                /* 地面表缓存取舍（契约 §3.1 允许"整块读"或"按需 2B 读"）：
+                 * 选**open 时整块缓存**，理由：
+                 *  1) 调用频次：地面线在相机每次移动/角色每次换地图都要重算，
+                 *     按需读 = 每列一次 TF fseek+fread（真机随机读 ≈ms 级），
+                 *     而缓存后是一次数组访存；
+                 *  2) 体量可控：上限 MPAK_BGMAP_GROUND_CACHE_MAX = 16KB
+                 *     （8192 列 × 2B），相对 1.2MB PSRAM 预算可忽略；
+                 *  3) 失败面收敛：读失败发生在 open（可判可拒），而不是渲染任务
+                 *     深处的每个调用点；LE→host 也只需转一次。
+                 * 超过 16KB（vw > 8192，已被维度上限挡住）时不缓存，
+                 * mpak_bgmap_ground_y 自动退回"按需读 2B"路径。 */
+                if (glen <= MPAK_BGMAP_GROUND_CACHE_MAX) {
+                    uint8_t *raw = payload_read(m, goff, glen);
+                    if (!raw) { if (bg->strips) heap_caps_free(bg->strips);
+                                heap_caps_free(bg); return MPAK_ERR_IO; }
+                    uint16_t *tbl = psram_alloc(glen);
+                    if (tbl) {
+                        uint32_t n = glen / 2u;
+                        for (uint32_t i = 0; i < n; i++)   /* u16 小端 → host 序 */
+                            tbl[i] = (uint16_t)(raw[i * 2u] | ((uint16_t)raw[i * 2u + 1u] << 8));
+                        bg->ground = tbl;
+                    } else {
+                        ESP_LOGW(TAG, "地面表缓存分配失败（%uB）→ 退回按需读", glen);
+                    }
+                    heap_caps_free(raw);
+                }
+                if (!bg->full_map)
+                    ESP_LOGW(TAG, "bgmap %s 有扩展块但 flags=0x%08" PRIx32
+                                  "（bit0=0）→ 不按整图包处理", bg->map_id, eflags);
+            }
+        }
+    }
+
+    /* 装载日志（验收锚点）：整图包 `full_map=1 ground=NNNNB`；旧包 `full_map=0 ground=0B` */
+    ESP_LOGI(TAG, "bgmap %s vw=%u vh=%u full_map=%d ground=%" PRIu32 "B"
+                  " ext_off=%" PRId32 " static=%" PRIu32 "@%" PRIu32
+                  " tile=%" PRIu32 "@%" PRIu32 " strips=%" PRIu32,
+             bg->map_id, bg->vw, bg->vh, bg->full_map ? 1 : 0, bg->ground_len,
+             bg->ext_off, bg->static_back_len, bg->static_back_off,
+             bg->tile_layer_len, bg->tile_layer_off, bg->strip_count);
+
     m->u.bgmap = bg;
     return MPAK_OK;
 }
@@ -698,6 +885,198 @@ int mpak_bgmap_read_tile(const mpak_t *m, uint8_t *dst, size_t cap)
     if (cap < m->u.bgmap->tile_layer_len) return MPAK_ERR_ARG;
     return mpak_read_at((mpak_t *)m, m->payload_off + m->u.bgmap->tile_layer_off,
                         dst, m->u.bgmap->tile_layer_len);
+}
+
+/* ------------------------------------------------------------------ */
+/* BGMAP 分块读（整图 R2，契约 §3.1）                                   */
+/*                                                                     */
+/* 三件事必须钉死，否则"看起来对、图上错位"：                            */
+/*  1) 源行距按**包内真实布局**反推，不是凭窗口宽：static 可能紧打包     */
+/*     也可能行 4B 对齐；tile RGB 区固定行 4B 对齐（编码端 Align4）。    */
+/*  2) tile 掩码是**全局逐行 tight 位打包**（bit = y*vw + x，MSB 先出）， */
+/*     行与行之间**不**做字节对齐 ⇒ vw%8 != 0 时一个字节会同时装下上一行 */
+/*     结尾和下一行开头。按"整块线性"或"每行各自对齐"都会错位；这里按    */
+/*     全局 bit 号算字节区间，天然跨行正确。                             */
+/*  3) 世界矩形 → 文件偏移用 **vw**（整图宽）算行距，跟窗口宽 w 无关；    */
+/*     窗口越界部分补 0（调用方自己按 vw/vh 裁剪），不报错。             */
+/* ------------------------------------------------------------------ */
+
+/* static_back 源行距（字节）：由 static_back_len 反推实际布局（见 parse_bgmap）。
+ * 偶数宽两式等值（旧包）→ 结果与旧口径一致；奇数宽才分叉。 */
+static uint32_t bg_static_stride(const mpak_bgmap_t *bg)
+{
+    uint32_t al = (uint32_t)align4((size_t)bg->vw * 2u);
+    if (bg->static_back_len == (uint32_t)bg->vh * al) return al;   /* 行 4B 对齐（整图） */
+    return (uint32_t)bg->vw * 2u;                                  /* 旧：紧打包 */
+}
+
+/* tile 层 RGB565 源行距：编码端固定 Align4(vw*2)（PartPackWriter.EncodeCore） */
+static uint32_t bg_tile_stride(const mpak_bgmap_t *bg)
+{
+    return (uint32_t)align4((size_t)bg->vw * 2u);
+}
+
+/* 掩码区首字节（payload 相对）= tile RGB 区之后 */
+static uint32_t bg_tile_mask_off(const mpak_bgmap_t *bg)
+{
+    return bg->tile_layer_off + (uint32_t)bg->vh * bg_tile_stride(bg);
+}
+
+static int bg_rect_args(const mpak_t *m, int32_t w, int32_t h,
+                        const void *dst, int32_t dst_stride_px)
+{
+    if (!m || !m->u.bgmap || !dst) return MPAK_ERR_ARG;
+    if (w < 0 || h < 0 || dst_stride_px < w) return MPAK_ERR_ARG;
+    if (w > (int32_t)MPAK_MAX_BGMAP_DIM || h > (int32_t)MPAK_MAX_BGMAP_DIM)
+        return MPAK_ERR_ARG;
+    return MPAK_OK;
+}
+
+/* 通用 RGB565 世界矩形读（static 与 tile 共用；stride_b = 源行距字节） */
+static int bg_read_rect_rgb(const mpak_t *m, uint32_t layer_off, uint32_t layer_len,
+                            uint32_t stride_b, int32_t x, int32_t y, int32_t w, int32_t h,
+                            uint16_t *dst, int32_t dst_stride_px)
+{
+    const mpak_bgmap_t *bg = m->u.bgmap;
+    const int32_t vw = (int32_t)bg->vw, vh = (int32_t)bg->vh;
+
+    if ((uint64_t)layer_len < (uint64_t)vh * stride_b) return MPAK_ERR_FMT;
+
+    /* 目标整体清零：越界区域 = 0（不报错，调用方按 vw/vh 自行裁剪） */
+    for (int32_t dy = 0; dy < h; dy++)
+        memset(dst + (size_t)dy * dst_stride_px, 0, (size_t)w * 2u);
+    if (w == 0 || h == 0) return MPAK_OK;
+
+    /* 世界矩形 ∩ [0,vw)×[0,vh)（64 位中间量，避免 x+w 溢出） */
+    const int64_t wx0 = x, wy0 = y;
+    const int64_t cx0 = wx0 < 0 ? 0 : (wx0 > vw ? vw : wx0);
+    const int64_t cx1 = (wx0 + w) > vw ? vw : (wx0 + w);
+    const int64_t cy0 = wy0 < 0 ? 0 : (wy0 > vh ? vh : wy0);
+    const int64_t cy1 = (wy0 + h) > vh ? vh : (wy0 + h);
+    if (cx0 >= cx1 || cy0 >= cy1) return MPAK_OK;      /* 完全越界 → 全 0 */
+
+    const uint32_t row_bytes = (uint32_t)(cx1 - cx0) * 2u;
+    const int32_t  row_px    = (int32_t)(cx1 - cx0);
+    const int32_t  dy0       = (int32_t)(cy0 - wy0);
+    const int32_t  dx0       = (int32_t)(cx0 - wx0);
+
+    /* 快路径：源相邻行首尾相接（行距 == 需求宽度）且目标行也连续
+     * ⇒ 一次 mpak_read_at 读完，避免 h 次 seek+fread（整幅/整列带读时很值）。 */
+    if (stride_b == row_bytes && dst_stride_px == row_px) {
+        uint8_t *d0 = (uint8_t *)(dst + (size_t)dy0 * dst_stride_px + dx0);
+        return mpak_read_at((mpak_t *)m,
+                            m->payload_off + layer_off + (uint32_t)cy0 * stride_b, d0,
+                            (size_t)(cy1 - cy0) * row_bytes);
+    }
+
+    /* 慢路径：逐行 seek+read（h 次；h = 窗口高，典型 ≤ 512）。*/
+    for (int64_t r = cy0; r < cy1; r++) {
+        uint16_t *drow = dst + (size_t)(int32_t)(r - wy0) * dst_stride_px + dx0;
+        uint32_t off = m->payload_off + layer_off + (uint32_t)r * stride_b +
+                       (uint32_t)cx0 * 2u;
+        int rc = mpak_read_at((mpak_t *)m, off, drow, row_bytes);
+        if (rc) return rc;
+    }
+    return MPAK_OK;
+}
+
+int mpak_bgmap_read_static_rect(const mpak_t *m, int32_t x, int32_t y,
+                                int32_t w, int32_t h, uint16_t *dst, int32_t dst_stride_px)
+{
+    int rc = bg_rect_args(m, w, h, dst, dst_stride_px);
+    if (rc) return rc;
+    const mpak_bgmap_t *bg = m->u.bgmap;
+    return bg_read_rect_rgb(m, bg->static_back_off, bg->static_back_len,
+                            bg_static_stride(bg), x, y, w, h, dst, dst_stride_px);
+}
+
+int mpak_bgmap_read_tile_rect(const mpak_t *m, int32_t x, int32_t y,
+                              int32_t w, int32_t h, uint16_t *dst, int32_t dst_stride_px)
+{
+    int rc = bg_rect_args(m, w, h, dst, dst_stride_px);
+    if (rc) return rc;
+    const mpak_bgmap_t *bg = m->u.bgmap;
+    if (bg->tile_layer_len == 0) return MPAK_ERR_RANGE;     /* 该图无 tile 层 */
+    uint32_t stride_b = bg_tile_stride(bg);
+    /* layer_len 只给 RGB 区（= vh×行距），掩码区不会被误读进来 */
+    return bg_read_rect_rgb(m, bg->tile_layer_off, (uint32_t)bg->vh * stride_b,
+                            stride_b, x, y, w, h, dst, dst_stride_px);
+}
+
+int mpak_bgmap_read_tile_mask_rect(const mpak_t *m, int32_t x, int32_t y,
+                                   int32_t w, int32_t h, uint8_t *dst,
+                                   int32_t dst_stride_px)
+{
+    int rc = bg_rect_args(m, w, h, dst, dst_stride_px);
+    if (rc) return rc;
+    const mpak_bgmap_t *bg = m->u.bgmap;
+    if (bg->tile_layer_len == 0) return MPAK_ERR_RANGE;
+
+    const int32_t vw = (int32_t)bg->vw, vh = (int32_t)bg->vh;
+    const uint32_t stride_b = bg_tile_stride(bg);
+    const uint32_t rgb_bytes = (uint32_t)vh * stride_b;
+    if (bg->tile_layer_len < rgb_bytes) return MPAK_ERR_FMT;
+    const uint32_t mask_off   = bg_tile_mask_off(bg);
+    const uint32_t mask_bytes = bg->tile_layer_len - rgb_bytes;
+    const uint32_t mask_need  = (uint32_t)(((uint64_t)vw * vh + 7u) / 8u);
+    if (mask_bytes < mask_need) return MPAK_ERR_FMT;   /* 掩码区长度不足（包损坏） */
+
+    /* 目标清零：越界/未覆盖 = 0（"无 tile"，与掩码位 0 同语义） */
+    for (int32_t dy = 0; dy < h; dy++)
+        memset(dst + (size_t)dy * dst_stride_px, 0, (size_t)w);
+    if (w == 0 || h == 0) return MPAK_OK;
+
+    const int64_t wx0 = x, wy0 = y;
+    const int64_t cx0 = wx0 < 0 ? 0 : (wx0 > vw ? vw : wx0);
+    const int64_t cx1 = (wx0 + w) > vw ? vw : (wx0 + w);
+    const int64_t cy0 = wy0 < 0 ? 0 : (wy0 > vh ? vh : wy0);
+    const int64_t cy1 = (wy0 + h) > vh ? vh : (wy0 + h);
+    if (cx0 >= cx1 || cy0 >= cy1) return MPAK_OK;
+
+    const int32_t dx0 = (int32_t)(cx0 - wx0);
+    const uint32_t nbits = (uint32_t)(cx1 - cx0);
+    /* 每行最多涉及 (nbits+7)/8 + 1 字节（首位/末位可能落在同一字节、也可能跨行） */
+    uint8_t *tmp = psram_alloc((size_t)((nbits + 7u) / 8u) + 2u);
+    if (!tmp) return MPAK_ERR_NOMEM;
+
+    for (int64_t r = cy0; r < cy1; r++) {
+        /* 全局 bit 号（行间不补位）⇒ 跨行字节自动正确 */
+        uint64_t bit0 = (uint64_t)r * (uint64_t)vw + (uint64_t)cx0;
+        uint32_t fb = (uint32_t)(bit0 >> 3);
+        uint32_t lb = (uint32_t)((bit0 + nbits - 1u) >> 3);
+        uint32_t n  = lb - fb + 1u;
+        int rc2 = mpak_read_at((mpak_t *)m, m->payload_off + mask_off + fb, tmp, n);
+        if (rc2) { heap_caps_free(tmp); return rc2; }
+        uint8_t *drow = dst + (size_t)(int32_t)(r - wy0) * dst_stride_px + dx0;
+        for (uint32_t i = 0; i < nbits; i++) {
+            uint64_t bit = bit0 + i;
+            uint32_t bi  = (uint32_t)((bit >> 3) - fb);
+            drow[i] = (uint8_t)((tmp[bi] >> (7u - (uint32_t)(bit & 7u))) & 1u);
+        }
+    }
+    heap_caps_free(tmp);
+    return MPAK_OK;
+}
+
+int32_t mpak_bgmap_ground_y(const mpak_t *m, int32_t world_x)
+{
+    if (!m || !m->u.bgmap) return INT32_MIN;
+    const mpak_bgmap_t *bg = m->u.bgmap;
+    if (bg->ground_len == 0) return INT32_MIN;                     /* 旧包：无地面表 */
+    if (world_x < 0 || world_x >= (int32_t)bg->vw) return INT32_MIN;
+    uint32_t byte_off = bg->ground_off + (uint32_t)world_x * 2u;
+    uint16_t gy;
+    if (bg->ground) {
+        gy = bg->ground[world_x];                                  /* 常驻缓存（host 序） */
+    } else {
+        /* 未缓存（>16KB，已被维度上限挡住，理论上到不了）→ 按需读 2B，u16 小端 */
+        uint8_t b[2];
+        if (mpak_read_at((mpak_t *)m, m->payload_off + byte_off, b, 2) != MPAK_OK)
+            return INT32_MIN;
+        gy = (uint16_t)(b[0] | ((uint16_t)b[1] << 8));
+    }
+    if (gy == MPAK_BGMAP_GROUND_NONE) return INT32_MIN;            /* 该列无 foothold */
+    return (int32_t)gy;
 }
 
 /* ------------------------------------------------------------------ */
@@ -911,6 +1290,8 @@ static void free_kind_data(mpak_t *m)
     case MPAK_KIND_BGMAP:
         if (m->u.bgmap) {
             if (m->u.bgmap->strips) heap_caps_free(m->u.bgmap->strips);
+            /* 地面表常驻缓存（R2 整图包；旧包恒 NULL） */
+            if (m->u.bgmap->ground) heap_caps_free((void *)m->u.bgmap->ground);
             heap_caps_free(m->u.bgmap);
         }
         m->u.bgmap = NULL;

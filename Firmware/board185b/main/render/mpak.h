@@ -38,7 +38,28 @@ extern "C" {
 #define MPAK_HEADER_LEN      40u         /* magic 块 16 + kind 8 + hash 8   */
                                          /* + payload_len 4 + reserved 4    */
 #define MPAK_TRAILER_LEN     8u          /* crc32c u32 + zero u32           */
-#define MPAK_MAX_PAYLOAD     (8u * 1024u * 1024u) /* FONT 32px 全量 ~1.8MB 上限 */
+
+/* 包能力上限。唯一改动 = 8MB → 64MB：
+ *   旧上限 8MB 的依据是「FONT 32px 全量 ~1.8MB」；R2 整图 BGMAP payload
+ *   = 16,924,968 B（16.9MB）会被旧上限直接 MPAK_ERR_LEN 拒收。
+ *   放宽只影响「接受更长的 payload」，不改任何字段口径/校验序；
+ *   ≤8MB 的旧包在新上限下走完全相同的代码路径（长度校验是上界判断）。 */
+#define MPAK_MAX_PAYLOAD     (64u * 1024u * 1024u)
+
+/* BGMAP 世界尺寸上限（vw/vh）。旧硬编码 512（= 240 屏窗口口径的 2× 余量）；
+ * 整图包 vw=2270/vh=1807 需要放过。放宽只影响上界判断，240×240 旧包不受影响。 */
+#define MPAK_MAX_BGMAP_DIM   8192u
+
+/* 大包 CRC 策略阈值（详见 mpak.c envelope_check 注释）：
+ * payload_len > MPAK_CRC_SKIP_BYTES 时跳过全量 CRC32C（否则 16.9MB 每次 open
+ * 都要把整包读一遍，真机实测 ≈ 1.06MB/s ⇒ ≈ 16 秒/次）。
+ * 逃生阀：编译期 -DMPAK_CRC_SKIP_BYTES=0 覆盖（#ifndef 包裹，命令行优先生效）
+ * 即恢复"永远全量 CRC"的旧语义。 */
+#ifndef MPAK_CRC_SKIP_BYTES
+#define MPAK_CRC_SKIP_BYTES  (4u * 1024u * 1024u)
+#endif
+/* 跳过大包 CRC 时仍读入的 payload 头部字节数（指纹，不是可与尾部比对的校验和） */
+#define MPAK_CRC_HEAD_BYTES  4096u
 
 typedef enum {
     MPAK_OK          = 0,
@@ -129,6 +150,27 @@ typedef struct __attribute__((packed)) {
     uint32_t tile_layer_off;
     uint32_t strip_count;
 } mpak_wire_bgmap_hdr_t;
+
+/* BGMAP 整图扩展块（R2；**可选**，位于 tile 数据之后 4B 对齐处）：
+ *   ext_off = align4(tile_layer_off + tile_layer_len)
+ *   [u32 magic = 0x4D504745（文件字节 45 47 50 4D）]
+ *   [u32 ground_len = vw*2（字节）]
+ *   [u32 ground_off = payload 相对地面表首字节]
+ *   [u32 flags] bit0 = 1 = 整图包（vw/vh = 整图世界尺寸、strip.y = 世界系 y）
+ *   之后紧跟 ground_len 字节的 u16 小端地面表（每列 = 世界系地面 y）。
+ * 旧包此处越界/无 magic ⇒ 按无扩展块处理（full_map=false），行为与改动前一致。
+ * 服务端权威定义：Server/MinipetServer/Export/BgmapPackWriter.cs。 */
+#define MPAK_BGMAP_EXT_MAGIC      0x4D504745u
+#define MPAK_BGMAP_EXT_HDR_LEN    16u
+#define MPAK_BGMAP_FLAG_FULL_MAP  0x1u
+/* 地面表「该列无 foothold」哨兵 */
+#define MPAK_BGMAP_GROUND_NONE    0xFFFFu
+/* 地面表常驻缓存的字节上限（= MPAK_MAX_BGMAP_DIM × 2 = 16KB；见 mpak.c 取舍说明）。
+ * 逃生阀：-DMPAK_BGMAP_GROUND_CACHE_MAX=0 即完全不缓存 → mpak_bgmap_ground_y
+ * 逐列按需读 2B（PSRAM 更紧时可用；两条路径都实测过）。 */
+#ifndef MPAK_BGMAP_GROUND_CACHE_MAX
+#define MPAK_BGMAP_GROUND_CACHE_MAX (MPAK_MAX_BGMAP_DIM * 2u)
+#endif
 
 /* FONT payload 头：8B（size_px + bpp + 2B 填充保 4 对齐） */
 typedef struct __attribute__((packed)) {
@@ -224,11 +266,23 @@ typedef struct {
 
 typedef struct {
     char     map_id[MPAK_NAME_LEN + 1];
-    uint16_t vw, vh;                /* 导出视口（profile 定制） */
+    uint16_t vw, vh;                /* 导出视口（profile 定制）；整图包 = 整图世界尺寸 */
     uint32_t static_back_len, static_back_off;
     uint32_t tile_layer_len, tile_layer_off;
     uint32_t strip_count;
     mpak_strip_t *strips;           /* [strip_count] */
+
+    /* ══ 整图扩展（R2 2026-10-01）——**只增字段，现有字段语义/顺序一律不动**，
+     *    并行的 compositor 读者按原字段读取不受影响。契约 §3.1 把这组字段
+     *    描述为 `mpak_bgmap_ext_t`；此处按契约的字段清单**平铺**在 mpak_bgmap_t 上
+     *    （少一层嵌套，避免同一状态两处存放）。无扩展块的旧包：全为 0/NULL。 ══ */
+    bool     full_map;              /* ext flags bit0：整图包（vw/vh=世界尺寸、strip.y=世界系 y） */
+    uint32_t ground_off;            /* payload 相对地面表首字节；0=无 */
+    uint32_t ground_len;            /* 地面表字节数（= vw*2）；0=无 */
+    int32_t  ext_off;               /* payload 相对扩展块首字节；<0 = 无扩展块 */
+    uint32_t ext_flags;             /* 扩展块 flags 原值（诊断用） */
+    const uint16_t *ground;         /* 地面表常驻缓存（**host 序** u16[vw]，MPAK_BGMAP_GROUND_NONE=无）；
+                                     * NULL = 未缓存（>16KB 或旧包）→ 逐列按需读 */
 } mpak_bgmap_t;
 
 typedef struct {
@@ -320,6 +374,26 @@ int mpak_part_read_mask(const mpak_t *m, const mpak_part_t *p, uint8_t *dst, siz
 /* ---- BGMAP ---- */
 int mpak_bgmap_read_static(const mpak_t *m, uint8_t *dst, size_t cap);
 int mpak_bgmap_read_tile(const mpak_t *m, uint8_t *dst, size_t cap);
+
+/* ══ 整图（R2）分块读原语 + 世界系地面表（契约 §3.1；2026-10-01）══
+ * 语义：把**世界矩形** [x, x+w) × [y, y+h) 读到 dst。
+ *   · dst 行距由调用方给出（**像素**计，必须 ≥ w；越界区域补 0，不报错）；
+ *   · 源行距与 tile 掩码位序按包内真实布局解析（奇数宽整图 = 行 4B 对齐），
+ *     调用方**不需要**知道 vw 是否为偶数；
+ *   · layer 选择靠函数名：static（RGB565）/ tile（RGB565）/ tile 掩码（1B/像素 0|1）；
+ *   · tile 掩码与 tile 颜色**分开读**（一次调用只碰一层，避免多读一倍字节）。
+ * 返回 MPAK_OK 或 MPAK_ERR_*（ARG/FMT/RANGE/IO）。窗口完全越界 = 全 0 + MPAK_OK。 */
+int mpak_bgmap_read_static_rect(const mpak_t *m, int32_t x, int32_t y,
+                                int32_t w, int32_t h, uint16_t *dst, int32_t dst_stride_px);
+int mpak_bgmap_read_tile_rect(const mpak_t *m, int32_t x, int32_t y,
+                              int32_t w, int32_t h, uint16_t *dst, int32_t dst_stride_px);
+int mpak_bgmap_read_tile_mask_rect(const mpak_t *m, int32_t x, int32_t y,
+                                   int32_t w, int32_t h, uint8_t *dst /*每像素 1B，0/1*/,
+                                   int32_t dst_stride_px);
+
+/* 世界系地面 Y：world_x 越界 / 无地面表 / 该列为 0xFFFF → INT32_MIN（调用方回落通用线）。
+ * 有地面表时返回原始世界 y（不夹取；调用方自行判断是否在 [0,vh) 内）。 */
+int32_t mpak_bgmap_ground_y(const mpak_t *m, int32_t world_x);
 
 /* ---- FONT ---- */
 /* unicode 二分查找；找到填充 *g_out 并返回 MPAK_OK */

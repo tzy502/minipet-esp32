@@ -38,6 +38,22 @@
 static const char *TAG = "bridge";
 
 static void touch_indev_read_cb(lv_indev_t *indev, lv_indev_data_t *data);
+static int  utf8_step(const char *s, uint32_t *cp);   /* 定义在气泡段；菜单缺字判定复用 */
+
+/* ══ 【契约 §3.2 相机接口】═══════════════════════════════════════════════════
+ * render_cam_supported/range/set/get/center + render_ground_screen_y 的声明在
+ * compositor.h（compositor.h 明示"相机 UX 层（F3）请 #include compositor.h，
+ * render.h 不转出本组接口"）；本文件是 §3.3 相机 UX 层，直接消费这组接口。
+ * 命名与 render.h 的 render_* 同前缀，勿与 state_machine.c 的 NVS（sm_cam_*）混淆。 */
+#include "compositor.h"
+
+/* state_machine.c 提供的 NVS per-map 相机持久化 + 横幅收尾（契约 §3.3 的"NVS"）
+ * + 相机入口专用内部通道（MENU→POKER，不吃 MENU_KEY 的 400ms 限速，见其注释） */
+extern bool sm_cam_nvs_get(const char *key, int32_t *x, int32_t *y);
+extern bool sm_cam_nvs_set(const char *key, int32_t x, int32_t y);
+extern bool sm_cam_nvs_erase(const char *key);
+extern void state_machine_banner_restore(void);
+extern bool state_machine_cam_enter_poker(void);
 
 #define BR_BUBBLE_PAD    8
 #define BR_BUBBLE_BORDER 2
@@ -70,6 +86,7 @@ static struct {
 typedef enum {
     MENU_PAGE_ROOT = 0,
     MENU_PAGE_MAPS,          /* BGMAP 本地清单（asset_dl_bgmap_list） */
+    MENU_PAGE_MAP_FN,        /* 地图功能子页：①设为背景 ②改相机 ③删除 ④返回列表（§4.1） */
     MENU_PAGE_PAPERDOLL,     /* 换装 PARTS 清单（asset_dl_parts_list） */
     MENU_PAGE_ACTIONS,       /* 动作演示（MP_ACTION_*，真实指令通道） */
     MENU_PAGE_NPC,           /* Monsters：NPC 素材清单（asset_dl_npc_list，T2） */
@@ -81,6 +98,8 @@ typedef enum {
 #define MENU_LIST_MAX   6       /* 列表页真实条目上限（+Back(+空态行) ≤ 8） */
 #define MENU_COLLECT_MAX (MENU_LIST_MAX + 1)  /* 多收 1 条用于探测「还有更多」 */
 #define MENU_DL_TIMEOUT_MS 30000  /* T4：单包下载轮询超时（tick 100ms 轮询落盘） */
+#define MENU_MAP_FN_CNT 4       /* 地图功能子页选项数（3 功能 + 返回地图列表） */
+#define MENU_STATUS_FLASH_MS 2500 /* 状态行一次性提示驻留时长（动作反馈/相机占位） */
 
 /* ---------------- 羊皮纸滚筒主题常量（2026-09-30 定稿，色彩对照原型 HTML） ---------------- */
 #define MENU_SCR_BORDER_W  12       /* 整屏棕金描边框宽（内圈再叠 2px #43331F 细线） */
@@ -144,6 +163,20 @@ typedef struct {
     mp_cmd_type_t dl_cmd;       /* 落盘后要发的指令（MP_CMD_NONE = 只下载） */
     int64_t       dl_deadline_ms;
     char          hint_once[40];/* 一次性提示（下载完成 → 重建后显示一格） */
+    /* 下载完成后回哪一页：列表页=原地重建（保持选中），地图功能子页=回地图列表 */
+    menu_page_t   dl_back;
+    bool          dl_goto_back;
+
+    /* 地图功能子页（MENU_PAGE_MAP_FN）目标地图：进子页时快照，独立于列表重建
+     * （隐藏后列表条目会消失，子页操作对象不能跟着丢） */
+    char          fn_hash[20];  /* 目标图内容 hash（MP_CMD_* 的 s 通道） */
+    char          fn_key[16];   /* per-map 键（asset_dl_map_key：map_id 或 h+hash14） */
+    char          fn_label[32]; /* 目标图显示名（标题/状态行回显） */
+
+    /* 状态行一次性提示（动作反馈/占位提示）：到期前优先于「选中：」回显 */
+    char          flash_msg[48];
+    int64_t       flash_until_ms;
+    bool          flash_shown;  /* 本次 tick 状态行是否正显示提示（到期要还原） */
 
     bool     offline;           /* 本页构建时的网络态（T3 置灰判据） */
     bool     offline_shown;     /* 本次构建时的网络态（置灰依据；tick 比对重建） */
@@ -331,9 +364,17 @@ int bridge_mode_poker(void)
  *   右侧自绘滚动条 + 底部 OK/Back 蓝色渐变按钮（根页 Back=退出，子页 Back=回根页）。
  *   NPC/BGM/RESET 控制/缓存页保留行式布局，只统一羊皮纸/棕金配色。
  * 数据面（全部保留，仅呈现改造）：
- *   Maps     子页：asset_dl_bgmap_list() 真实 BGMAP 条目（hash + ASCII label）
- *            [v]=已缓存 [ ]=未缓存（确认→按 hash 拉包→落盘后 MP_CMD_SET_MAP）
- *            [x]=未缓存且离线 → row_enabled=false 拒绝确认（T3）
+ *   Maps     子页：asset_dl_bgmap_list() 真实 BGMAP 条目（hash + label）
+ *            label 口径见 asset_dl.h：真中文名原样（服务端 L1 修好后）、
+ *            ^map_\\d+$ 剥前缀显示数字；缺字（烘焙子集覆盖不到）→ 回落数字键。
+ *            [v]=已缓存 [ ]=未缓存 [x]=未缓存且离线（T3 拒绝确认）。
+ *            **点条目 = 进地图功能子页**（§4.1，不再立即切图）：
+ *              ①选择此地图为背景 = 原切图行为（含 T4 未缓存先下载再派发）
+ *              ②修改当前地图的摄像头 = 相机 agent 接手点
+ *                （menu_map_fn_camera_hook，占位只提示"摄像机开发中"）
+ *              ③删除此地图 = §4.4 本地隐藏标识（asset_dl NVS per-map；
+ *                隐藏当前图/全部图 → 立即切回默认图；服务端重推自动解除）
+ *              ④返回地图列表 = 返回上级（menu_parent_page；底键长按仍=退出菜单）
  *   Paperdoll 子页：asset_dl_parts_list() 真实 PARTS 装扮条目 → MP_CMD_SET_PARTS
  *            （hash 通道，state_machine.dispatch_set_parts_by_hash → render_set_parts）
  *   Actions  子页：五个真实动作（MP_CMD_SET_ACTION），[v] 由
@@ -344,6 +385,8 @@ int bridge_mode_poker(void)
  *            纸娃娃布局渲染出乱码）。空清单显示明确空态。
  *   BGM      子页：状态行（曲目数/bgm_get_state/get_source）+ 播放暂停/
  *            上一首/下一首三按钮（bgm_toggle_pause/prev/next，audio_q 异步）
+ * 反馈通道：底部状态行既有「选中：xxx」回显，另有 menu_status_flash() 一次性
+ * 提示（2.5s，压过选中回显后自动还原）——子页动作结果/相机占位/下载进度可见。
  *
  * 网络态：state_machine_offline_mode() 每 500ms 轮询（state_machine.c 明示
  * 「查询型状态由渲染层轮询」）；离线且未缓存的行 LV_STATE_DISABLED 置灰。
@@ -500,7 +543,45 @@ static void menu_items_cached_first(void)
     memcpy(s_menu.items, tmp, sizeof(menu_item_t) * (size_t)n);
 }
 
-/* Maps 页：本地清单里的 BGMAP 条目（hash + ASCII label + 缓存标记） */
+/* 菜单字体（menu_font_cn = regen.sh 按源码用字烘焙的 CJK 子集）覆盖判定：
+ * UTF-8 逐码点取字形，任一码点无字形即 false。 */
+static bool menu_font_covers(const char *s)
+{
+    const lv_font_t *f = s_menu.f_item ? s_menu.f_item : &menu_font_cn;
+    const char *p = s;
+    while (p && *p) {
+        uint32_t cp = 0;
+        int step = utf8_step(p, &cp);
+        if (step <= 0) { p++; continue; }      /* 非法字节：不判缺字，交 LVGL 原样处理 */
+        lv_font_glyph_dsc_t dsc;
+        if (!lv_font_get_glyph_dsc(f, &dsc, cp, 0)) return false;
+        p += step;
+    }
+    return true;
+}
+
+/* 【动态中文名缺字兜底】asset_dl 已放行 UTF-8 label 并把它落库（服务端 L1 修好后
+ * 地图名就是中文原名）。烘焙子集覆盖不到该名字时回落 fallback（地图=数字 id、
+ * 装扮/怪物=entity 或 hash 前 8 位）——宁可显示编号，也不出整行空白/方块。
+ * F2 TF 全量字库上线后覆盖判定自然放行，中文名无需再改代码。 */
+static void menu_label_font_safe(const char *label, const char *fallback,
+                                 char *out, size_t cap)
+{
+    if (!label || !label[0]) {
+        strlcpy(out, (fallback && fallback[0]) ? fallback : "?", cap);
+        return;
+    }
+    if (menu_font_covers(label)) {
+        strlcpy(out, label, cap);
+        return;
+    }
+    strlcpy(out, (fallback && fallback[0]) ? fallback : "?", cap);
+    ESP_LOGW(TAG, "menu: label \"%.24s\" 烘焙子集缺字 → 回落显示 %s", label, out);
+}
+
+/* Maps 页：本地清单里的 BGMAP 条目（hash + label + 缓存标记）
+ * label 由 asset_dl 给：真中文名原样、^map_\\d+$ 已剥前缀显示数字；
+ * 用户隐藏（"删除"）的图已被 asset_dl 过滤，不在此列。 */
 static void menu_maps_collect(void)
 {
     char hashes[MENU_COLLECT_MAX][20] = { { 0 } };
@@ -513,7 +594,11 @@ static void menu_maps_collect(void)
     s_menu.item_cnt = n;
     for (int i = 0; i < n; i++) {
         strlcpy(s_menu.items[i].hash, hashes[i], sizeof(s_menu.items[i].hash));
-        strlcpy(s_menu.items[i].label, labels[i], sizeof(s_menu.items[i].label));
+        /* 缺字兜底回落 per-map 键（= 数字 id）；"map_" 前缀已在 asset_dl 剥除 */
+        char key[16];
+        if (!asset_dl_map_key(hashes[i], key, sizeof(key))) snprintf(key, sizeof(key), "%.8s", hashes[i]);
+        menu_label_font_safe(labels[i], key, s_menu.items[i].label,
+                             sizeof(s_menu.items[i].label));
         s_menu.items[i].entity[0] = 0;
         s_menu.items[i].action[0] = 0;
         s_menu.items[i].cached = cached[i];
@@ -534,7 +619,12 @@ static void menu_parts_collect(void)
     s_menu.item_cnt = n;
     for (int i = 0; i < n; i++) {
         strlcpy(s_menu.items[i].hash, hashes[i], sizeof(s_menu.items[i].hash));
-        strlcpy(s_menu.items[i].label, labels[i], sizeof(s_menu.items[i].label));
+        /* 服务端装扮名若为中文且烘焙子集缺字 → 回落 hash 前 8 位（asset_dl 原 ③ 兜底），
+         * 保持既有"每行都有可读文本"的观感，不出整行空白 */
+        char fb[12];
+        snprintf(fb, sizeof(fb), "%.8s", hashes[i]);
+        menu_label_font_safe(labels[i], fb, s_menu.items[i].label,
+                             sizeof(s_menu.items[i].label));
         s_menu.items[i].entity[0] = 0;
         s_menu.items[i].action[0] = 0;
         s_menu.items[i].cached = cached[i];
@@ -557,7 +647,9 @@ static void menu_npc_collect(void)
     s_menu.item_cnt = n;
     for (int i = 0; i < n; i++) {
         strlcpy(s_menu.items[i].hash, hashes[i], sizeof(s_menu.items[i].hash));
-        strlcpy(s_menu.items[i].label, labels[i], sizeof(s_menu.items[i].label));
+        /* 同装扮页：中文名缺字 → 回落 entity（如 "npc:2100000"，asset_dl 原 ② 兜底） */
+        menu_label_font_safe(labels[i], entities[i], s_menu.items[i].label,
+                             sizeof(s_menu.items[i].label));
         strlcpy(s_menu.items[i].entity, entities[i], sizeof(s_menu.items[i].entity));
         s_menu.items[i].action[0] = 0;
         s_menu.items[i].cached = cached[i];
@@ -658,58 +750,531 @@ static void menu_hint_set(const char *text)
     if (s_menu.hint_label) lv_label_set_text(s_menu.hint_label, text);
 }
 
-/* T4：列表页条目激活。
- *   已缓存 → 直接 post 既有指令（state_machine 查路径/条带后落地）；
- *   未缓存 → asset_dl_request_one(hash) 入队 → 提示「下载中」→ 菜单 tick
- *            轮询 asset_dl_file_cached() 落盘 → 成功再 post 同一指令。
- * cmd == MP_CMD_NONE = 只下载不派发（NPC 页：固件无 NPC 渲染通道）。 */
-static void menu_activate_item(int idx, mp_cmd_type_t cmd)
+/* 【返回上级 2026-10-01】上级页映射：地图功能子页 → 地图列表；其余子页 → 根页。
+ * 「返回」语义统一走这里（滚筒末行 < 返回 / 返回地图列表 / 底部 Back 按钮），
+ * 底键长按=退出整个菜单的既有语义不变。 */
+static menu_page_t menu_parent_page(menu_page_t p)
 {
-    const menu_item_t *it = &s_menu.items[idx];
+    return (p == MENU_PAGE_MAP_FN) ? MENU_PAGE_MAPS : MENU_PAGE_ROOT;
+}
 
+/* 状态行一次性提示（子页动作反馈/相机占位/下载进度）：MENU_STATUS_FLASH_MS 内
+ * 压过「选中：xxx」回显，到期由 menu_apply_selection 自动还原。
+ * 状态行是各页 chrome 都有的可见控件（hint_label 历来为 NULL，旧提示肉眼看
+ * 不到——此处用它做可见反馈通道）。 */
+static void menu_status_flash(const char *text)
+{
+    strlcpy(s_menu.flash_msg, text, sizeof(s_menu.flash_msg));
+    s_menu.flash_until_ms = mp_now_ms() + MENU_STATUS_FLASH_MS;
+    s_menu.flash_shown = true;
+    if (s_menu.status_label) lv_label_set_text(s_menu.status_label, s_menu.flash_msg);
+    ESP_LOGI(TAG, "menu: 状态行提示：%s", s_menu.flash_msg);
+}
+
+static bool menu_status_flash_active(void)
+{
+    return (s_menu.flash_msg[0] && mp_now_ms() < s_menu.flash_until_ms);
+}
+
+/* T4：条目激活（hash 版）。列表页 items[idx] 与地图功能子页的 fn_hash 共用同一
+ * 条路径（避免两份下载/派发逻辑漂移）。
+ *   已缓存 → 直接 post 既有指令（state_machine 查路径/条带后落地）→ 回 back 页；
+ *   未缓存 → asset_dl_request_one(hash) 入队 → 提示「下载中」→ 菜单 tick
+ *            轮询 asset_dl_file_cached() 落盘 → 成功再 post 同一指令 + 回 back 页。
+ * cmd == MP_CMD_NONE = 只下载不派发（NPC 页：固件无 NPC 渲染通道）。 */
+static void menu_dispatch_hash(const char *hash, const char *label, bool cached,
+                               int log_idx, mp_cmd_type_t cmd, menu_page_t back)
+{
     /* 【派发探针 2026-09-27】用户报"无论怎么点选中的都是第一个 map"：
      * 记录 行号→hash→cmd→cached，用于区分「选中索引没生效」与「派发静默失败」。 */
-    ESP_LOGI(TAG, "menu: activate idx=%d cmd=%d cached=%d hash=%.16s label=%.24s",
-             idx, (int)cmd, (int)it->cached, it->hash, it->label);
+    ESP_LOGI(TAG, "menu: activate idx=%d cmd=%d cached=%d hash=%.16s label=%.24s back=%d",
+             log_idx, (int)cmd, (int)cached, hash ? hash : "",
+             label ? label : "", (int)back);
 
-    if (it->cached) {
+    if (cached) {
         if (cmd != MP_CMD_NONE) {
             mp_cmd_t c = { .type = cmd };
-            strlcpy(c.s, it->hash, sizeof(c.s));
+            strlcpy(c.s, hash, sizeof(c.s));
             mp_post_cmd(&c);
-            ESP_LOGI(TAG, "menu: 已缓存直接派发 cmd=%d hash=%.16s", (int)cmd, it->hash);
+            ESP_LOGI(TAG, "menu: 已缓存直接派发 cmd=%d hash=%.16s", (int)cmd, hash);
         } else {
-            ESP_LOGI(TAG, "menu: 已缓存（NPC 页无渲染通道，不派发）%.16s", it->hash);
+            ESP_LOGI(TAG, "menu: 已缓存（NPC 页无渲染通道，不派发）%.16s", hash);
         }
-        menu_goto(MENU_PAGE_ROOT);
+        menu_goto(back);
         return;
     }
 
     /* 未缓存：离线已被置灰（双保险再挡一次）；在线则拉包 */
     if (state_machine_offline_mode()) {
         menu_hint_set("OFFLINE: NOT CACHED");
-        ESP_LOGW(TAG, "menu: 离线且未缓存，拒绝下载 %.16s", it->hash);
+        menu_status_flash("离线且未缓存");
+        ESP_LOGW(TAG, "menu: 离线且未缓存，拒绝下载 %.16s", hash);
         return;
     }
     if (s_menu.dl_active) {                    /* 同屏只挂一个下载：避免请求互相覆盖 */
         menu_hint_set("BUSY: DOWNLOAD IN PROGRESS");
-        ESP_LOGW(TAG, "menu: 已有下载在途，忽略 %.16s", it->hash);
+        menu_status_flash("已有下载在途");
+        ESP_LOGW(TAG, "menu: 已有下载在途，忽略 %.16s", hash);
         return;
     }
-    if (!asset_dl_request_one(it->hash)) {
+    if (!asset_dl_request_one(hash)) {
         menu_hint_set("REQ FAILED (NOT IN MANIFEST)");
-        ESP_LOGW(TAG, "menu: request_one 被拒 %.16s", it->hash);
+        menu_status_flash("下载请求被拒");
+        ESP_LOGW(TAG, "menu: request_one 被拒 %.16s", hash);
         return;
     }
     s_menu.dl_active     = true;
     s_menu.dl_cmd        = cmd;
-    strlcpy(s_menu.dl_hash, it->hash, sizeof(s_menu.dl_hash));
+    strlcpy(s_menu.dl_hash, hash, sizeof(s_menu.dl_hash));
     s_menu.dl_deadline_ms = mp_now_ms() + MENU_DL_TIMEOUT_MS;
+    s_menu.dl_back       = back;
+    s_menu.dl_goto_back  = (back != s_menu.page);
     if (s_menu.hint_label) {
         lv_label_set_text_fmt(s_menu.hint_label, "DOWNLOADING %.8s ... WAIT",
                               s_menu.dl_hash);
     }
-    ESP_LOGI(TAG, "menu: 下载中 %.16s → cmd=%d", s_menu.dl_hash, (int)cmd);
+    menu_status_flash("下载中，请稍候");
+    ESP_LOGI(TAG, "menu: 下载中 %.16s → cmd=%d（完成后回页 %d）",
+             s_menu.dl_hash, (int)cmd, (int)back);
+}
+
+/* 列表页条目激活（Maps/Paperdoll 执行后回根页=既有行为；NPC 只下载） */
+static void menu_activate_item(int idx, mp_cmd_type_t cmd)
+{
+    const menu_item_t *it = &s_menu.items[idx];
+    menu_dispatch_hash(it->hash, it->label, it->cached, idx, cmd, MENU_PAGE_ROOT);
+}
+
+/* ---------------- 地图功能子页（§4.1：三个功能 + 返回地图列表） ----------------
+ * 进子页不再"立即切图"（旧行为）——切图降为子页①，②相机入口占位、③删除=隐藏。
+ * 目标地图快照进 s_menu.fn_*（列表可能因隐藏而变短，子页操作对象不能丢）。 */
+static void menu_map_fn_open(int idx)
+{
+    const menu_item_t *it = &s_menu.items[idx];
+    strlcpy(s_menu.fn_hash, it->hash, sizeof(s_menu.fn_hash));
+    strlcpy(s_menu.fn_label, it->label, sizeof(s_menu.fn_label));
+    if (!asset_dl_map_key(it->hash, s_menu.fn_key, sizeof(s_menu.fn_key))) {
+        snprintf(s_menu.fn_key, sizeof(s_menu.fn_key), "%.8s", it->hash);
+    }
+    ESP_LOGI(TAG, "menu: 进地图功能子页 hash=%.16s key=%s label=%.24s cached=%d",
+             s_menu.fn_hash, s_menu.fn_key, s_menu.fn_label, (int)it->cached);
+    /* 目标图回显（状态行提示）：动态中文名可能缺字，不进标题栏防方块 */
+    if (s_menu.fn_label[0]) {
+        char t[48];
+        snprintf(t, sizeof(t), "目标地图：%s", s_menu.fn_label);
+        menu_status_flash(t);
+    }
+    menu_goto(MENU_PAGE_MAP_FN);
+}
+
+/* 子页①选择此地图为背景 = 原"点列表项立即切图"的行为（MP_CMD_SET_MAP +
+ * asset_dl_touch LRU 在 state_machine dispatch_map 内），完成后回地图列表。 */
+static void menu_map_fn_background(void)
+{
+    bool cached = asset_dl_file_cached(s_menu.fn_hash);
+    ESP_LOGI(TAG, "menu: 子页①选择背景 hash=%.16s cached=%d", s_menu.fn_hash, (int)cached);
+    menu_dispatch_hash(s_menu.fn_hash, s_menu.fn_label, cached, -1,
+                       MP_CMD_SET_MAP, MENU_PAGE_MAPS);
+}
+
+/* ============================================================================
+ * 【契约 §3.3 相机 UX 层】子页②：修改当前地图的摄像头 → 相机调参态
+ * ----------------------------------------------------------------------------
+ * 状态机与任务归属（跨任务纪律见本文件头）：
+ *   ① 进入（**渲染任务**·菜单 100ms tick 内）：menu_map_fn_camera_hook()
+ *        · 校验 render_cam_supported()（旧窗口包 → 状态行提示，不进调参态）
+ *        · 校验目标图 = 当前已渲染的图（render_cam_supported 只反映已装载图）
+ *        · 快照进入前相机（取消/中断的复原基准）→ 状态行提示
+ *        · state_machine_cam_enter_poker()（MENU→POKER 内部通道，**不吃** MENU_KEY 的
+ *          400ms 限速）→ 迁到 POKER 后才置 s_cam.on（顺序红线，见函数内注释）
+ *        · 入队常驻横幅（POKER 态唯一文字通道 = 5x7 ASCII 横幅）
+ *   ② 平移（**input 任务**·touch_tick）：bridge_cam_adjust_drag_begin/move/end
+ *        · 拖动 = 相机跟手：屏位移 Δ → 相机反向 Δ/2（屏 2× = 世界 1×）
+ *        · 夹取在 render_cam_set 内部（§3.2，越界永不出图）；本层只算目标值
+ *        · 66ms 节流（与宠物拖拽同口径）；抬指补最后一帧（节流窗内位移不丢）
+ *   ③ 确认/取消（**input 任务**·key0_tick/key_tick）：
+ *        · 中键短按 / 顶键短按 = 确认 → NVS 写入（ns=cam）+ 重合成
+ *        · 中键长按 / 顶键长按 = 取消 → 复原进入前相机
+ *   ④ 收尾（确认或取消都走）：宠物水平偏移归零（render_set_drag_off(0) = 锚点回屏心 x）
+ *        + 重新派发当前图（→ render_set_map → 既有 ent_stand_on_ground_locked 站位链）
+ *        + **置 settle_pending**：等重派发落地、站位链跑完、NVS 相机重新应用之后，
+ *          才结算「脚踩地面线」（bridge_cam_settle_after_reload → cam_settle_on_ground）——
+ *          这就是契约 §5.2「固定回归屏幕正中间、脚踩该处地面线（x=屏心）」的落点：
+ *          x=屏心（drag_x=0）+ 脚底=render_ground_screen_y(屏心 x)（越界/无表 → 不落，
+ *          沿用站位链口径=锚点回屏心）。实现细节与两种口径的辨析见 cam_settle_on_ground()。
+ *   ⑤ 兜底（**input 任务**主循环·bridge_cam_adjust_poll）：状态机离开
+ *        POKER/OFFLINE（待机时钟/OTA/配网…）→ 未确认即取消并复原相机；
+ *        另兼 settle 超时兜底（重投一次地图 / 二次超时明确放弃并报 ERROR）
+ *
+ * 宠物策略：**冻结**（不隐藏）——调参期整段触摸手势归相机，宠物既不响应拖动
+ *   也不响应抚摸/长按控制条，"拖动=拖宠物 vs 拖相机"的歧义在输入路由上一刀切断；
+ *   相机平移只动背景与视差条带，宠物当前站位保持不动，收尾时统一回屏心
+ *   （需求 §5.2「屏中回归制」）。选冻结而非隐藏的原因：渲染层没有"隐藏实体"的
+ *   公开接口（compositor.c 由另一 agent 独占，本层不得改），冻结零依赖且可逆。
+ *
+ * 可见反馈：POKER 态文字通道只有 5x7 ASCII 横幅（render.h §横幅，中文经
+ *   compose 会被替换成 '?'）；菜单状态行的中文受烘焙子集（182 字）限制——
+ *   「相机调整中：拖动平移 / 中键短按确认 · 长按取消」里的 调/整/短/按/长/移/平/
+ *   ：/· 均不在子集内（硬写会渲染成空白），故屏上用全字形覆盖的短句 + ASCII
+ *   横幅（语义完全等价），完整中文串打在串口日志里可查。若要上原串，需跑
+ *   main/render/font_cn/regen.sh 重烘子集（不在本 agent 的 3 文件边界内）。
+ * ========================================================================== */
+
+#define CAM_PAN_SCALE        2      /* 屏 = 世界 1x ×2（compositor.h RC_SCALE，勿改口径） */
+#define CAM_PAN_THROTTLE_MS  66     /* 拖动节流：与宠物拖拽同口径（15fps 下发） */
+#define CAM_SETTLE_TIMEOUT_MS 3000  /* 「脚踩地面线」结算等待重派发落地的上限（超时重投一次） */
+#define CAM_BANNER_HINT      "CAM: DRAG=MOVE MID=OK HOLD=CANCEL"  /* 33 字符 ×12px = 396 ≤ 480 */
+#define CAM_BANNER_SAVED     "CAM SAVED"
+#define CAM_BANNER_CANCELED  "CAM CANCELED"
+/* 状态行中文提示：只用烘焙子集内字形（见上"可见反馈"说明） */
+#define CAM_FLASH_HINT       "CAM: DRAG=MOVE MID=OK HOLD=CANCEL"
+#define CAM_FLASH_NO_FULLMAP "此图相机不可用 (FULLMAP PKG)"
+#define CAM_FLASH_NEED_BG    "请选择此图为背景"
+
+static struct {
+    volatile bool on;           /* 调参态激活（渲染任务写、input 任务读/清，单字旗标） */
+    char     hash[20];          /* 目标图内容 hash（收尾重派发用） */
+    char     key[16];           /* per-map NVS 键（asset_dl_map_key 口径，≤15 字符） */
+    int32_t  cx0, cy0;          /* 进入前相机（世界 px）：取消/中断复原基准 */
+    int32_t  dx0, dy0;          /* 本次拖拽起点的相机（跟手换算基准） */
+    int32_t  fx0, fy0;          /* 本次拖拽起点的手指位置（屏幕 px） */
+    int32_t  lx, ly;            /* 最近一次手指位置（抬指补最后一帧） */
+    int64_t  last_apply_ms;     /* 节流时刻（CAM_PAN_THROTTLE_MS） */
+    bool     dragging;          /* 本次手势是否在拖动中 */
+    /* 收尾「脚踩地面线」结算（§5.2）：站位链只在 render_set_map 里跑，故结算必须等
+     * 重派发**落地**——这里只置 pending，结算点见 bridge_cam_settle_after_reload() */
+    bool     settle_pending;
+    bool     settle_retried;    /* 兜底只重投一次地图 */
+    int64_t  settle_by_ms;      /* 结算 deadline（超时重投/放弃） */
+} s_cam;
+
+/* 跟手换算（纯函数，无副作用）：手指位移 Δ → 相机反向 Δ/2。
+ * 不在此夹取——越界夹取由 render_cam_set 内部按 §3.2 负责（"永不出图边界"）。 */
+static void cam_pan_target(int32_t dx0, int32_t dy0, int32_t fx0, int32_t fy0,
+                           int32_t sx, int32_t sy, int32_t *wx, int32_t *wy)
+{
+    *wx = dx0 - (sx - fx0) / CAM_PAN_SCALE;
+    *wy = dy0 - (sy - fy0) / CAM_PAN_SCALE;
+}
+
+/* 立即下发一次相机（跟手）；记录节流时刻与最后手指位置 */
+static void cam_apply_pan(int32_t sx, int32_t sy)
+{
+    int32_t wx = 0, wy = 0;
+    cam_pan_target(s_cam.dx0, s_cam.dy0, s_cam.fx0, s_cam.fy0, sx, sy, &wx, &wy);
+    render_cam_set(wx, wy);
+    s_cam.last_apply_ms = mp_now_ms();
+    s_cam.lx = sx;
+    s_cam.ly = sy;
+}
+
+bool bridge_cam_adjust_active(void) { return s_cam.on; }
+
+/* 触摸按下沿：记手指起点 + 快照当前相机（跟手基准；相机未变时 Δ=0 → 无位移） */
+void bridge_cam_adjust_drag_begin(int32_t sx, int32_t sy)
+{
+    if (!s_cam.on) return;
+    s_cam.fx0 = sx;
+    s_cam.fy0 = sy;
+    s_cam.lx  = sx;
+    s_cam.ly  = sy;
+    s_cam.dragging = true;
+    s_cam.last_apply_ms = 0;                 /* 首个 move 立即生效（跟手零迟滞） */
+    render_cam_get(&s_cam.dx0, &s_cam.dy0);
+}
+
+/* 拖动中：跟手平移（66ms 节流）。返回 true = 本次真的下发了相机（调用方据此
+ * 决定是否刷新交互活动计时，避免 50Hz 无谓调用）。 */
+bool bridge_cam_adjust_drag_move(int32_t sx, int32_t sy)
+{
+    if (!s_cam.on || !s_cam.dragging) return false;
+    s_cam.lx = sx;
+    s_cam.ly = sy;
+    int64_t now = mp_now_ms();
+    if (s_cam.last_apply_ms != 0 &&
+        (now - s_cam.last_apply_ms) < CAM_PAN_THROTTLE_MS) {
+        return false;
+    }
+    cam_apply_pan(sx, sy);
+    return true;
+}
+
+/* 抬起：补最后一帧（节流窗内松手的位移不丢），本次手势结束 */
+void bridge_cam_adjust_drag_end(void)
+{
+    if (!s_cam.on) return;
+    if (s_cam.dragging) {
+        s_cam.dragging = false;
+        cam_apply_pan(s_cam.lx, s_cam.ly);
+    }
+}
+
+/* ══ 【§5.2「脚踩地面线」接线】═══════════════════════════════════════════════
+ * 现状能力盘点（读了 compositor.c 的站位链后下的结论）：
+ *   · ent_stand_on_ground_locked()（compositor.c:742）只做一件事——把**锚点(=脚底基准)**
+ *     钉到屏心（drag_y = −(CENTER_OFF_Y + base_wy×2)），**完全不看地面表**；
+ *     即"屏中回归制"只兑现了"屏中"，`ground_line_y_at()` 那个内部函数没有任何调用者。
+ *   · 能接的公开接口有两个：render_ground_screen_y(screen_x)（该列脚踩线屏 y，
+ *     -1=越界/无表）与 render_set_drag_off_y(py)（锚点 y 偏移，内部 drag_clamp 夹取）。
+ * 接线方式（x=屏心 + 脚底=该处地面线，是需求 §5.2「固定回归屏幕正中间、脚踩该处
+ * 地面线（…x=屏心）」唯一几何自洽的读法）：
+ *   ① 收尾已把水平偏移归零（render_set_drag_off(0)）→ 锚点 x=屏心；
+ *   ② 重派发落地时站位链刚把锚点 y 钉到屏心（= s_br.sh/2，这是本函数的前置假设）；
+ *   ③ 取 gy = render_ground_screen_y(屏心x)，把锚点平移 Δ = gy − 屏心 y：
+ *      render_set_drag_off_y(drag0 + Δ) → 脚底落到该处地面线，水平仍是屏心。
+ *   ④ gy < 0（越界/非整图无地面表）→ **不动**，沿用站位链口径（锚点=屏心），只打日志。
+ * 为什么不在 finish 里直接采：地面线随相机变，而相机要等重派发把 NVS 值重新应用；
+ * 且站位链只在 render_set_map 内跑 → 早采会拿到"重载前"的旧值（对抗审查 P1-2 指出）。
+ * 越界保护：drag_clamp 优先（整只宠物不出屏），夹取发生时日志标注实际落点。
+ * ⚠️ 若主线程最终判定"宠物必须钉在屏心、不要落地面线"，删掉 cam_settle_on_ground()
+ *    的 render_set_drag_off_y() 一行即可（其余取证日志保留）。 */
+static void cam_settle_on_ground(const char *why)
+{
+    int32_t cx = s_br.sw / 2;                     /* 屏心 x（§5.2 指定用屏心列） */
+    int32_t anchor0 = s_br.sh / 2;                /* 前置：站位链刚把锚点钉在屏心 */
+    int32_t drag0 = render_get_drag_off_y();      /* 站位链写下的 drag_y（视为"屏心"基准） */
+    int32_t gy = render_ground_screen_y(cx);      /* 该处脚踩线（-1=越界/无表） */
+
+    if (gy < 0) {
+        ESP_LOGW(TAG, "相机收尾结算（%s）：屏心 x=%d 无地面线（越界/非整图无地面表）→ 不落地面线，"
+                      "沿用站位链口径（锚点=屏心 y=%d, drag_y=%d）",
+                 why, (int)cx, (int)anchor0, (int)drag0);
+        return;
+    }
+    int32_t delta = gy - anchor0;
+    render_set_drag_off_y(drag0 + delta);         /* 内部 drag_clamp 夹取（越界保护优先） */
+    int32_t drag1 = render_get_drag_off_y();
+    int32_t anchor1 = anchor0 + (drag1 - drag0);
+    /* 位置改在 cmd 排空期（render_tick 的"drag 变化检测"这一帧还没跑），而上一拍的
+     * full_recompose 已按站位链的屏心位画过一帧 → 若入口时宠物不在屏心（drag_y≠0），
+     * 新旧两矩形未必覆盖那一帧 → 强制一次全屏重合成彻底清残影（一次性代价 ~10ms）。 */
+    render_force_redraw();
+    if (drag1 == drag0 + delta) {
+        ESP_LOGW(TAG, "相机收尾结算（%s）：脚踩地面线 → 屏心 x=%d 处 screen_y=%d；"
+                      "锚点 y %d→%d（drag_y %d→%d）",
+                 why, (int)cx, (int)gy, (int)anchor0, (int)anchor1, (int)drag0, (int)drag1);
+    } else {
+        ESP_LOGW(TAG, "相机收尾结算（%s）：脚踩地面线 screen_y=%d 超出可动行程 → drag_clamp 夹到"
+                      " drag_y=%d（锚点 y=%d；「整只宠物不出屏」优先）",
+                 why, (int)gy, (int)drag1, (int)anchor1);
+    }
+}
+
+/* 地图重派发落地回调（state_machine.c dispatch_map 装载成功路径调用；唯一结算点）。
+ * pending 未置位时是空操作 → 常规切图（菜单子页①/服务端推送）行为零变化。 */
+void bridge_cam_settle_after_reload(void)
+{
+    if (!s_cam.settle_pending) return;
+    s_cam.settle_pending = false;
+    cam_settle_on_ground("地图重派发落地");
+}
+
+/* 收尾核心：confirm=写 NVS（失败自动降级为取消）；full=false = 被外部状态打断
+ * （待机时钟/OTA…）只复原相机与横幅，**不**重派发地图（避免在待机/升级里重载包）。 */
+static void cam_finish_core(bool confirm, bool full, const char *why)
+{
+    if (!s_cam.on) return;
+    s_cam.on = false;
+    s_cam.dragging = false;
+
+    bool saved = false;
+    if (confirm) {
+        int32_t cx = s_cam.cx0, cy = s_cam.cy0;
+        render_cam_get(&cx, &cy);                           /* 当前（= 最终）相机 */
+        saved = sm_cam_nvs_set(s_cam.key, cx, cy);
+        if (saved) {
+            ESP_LOGW(TAG, "相机确认保存：key=%s (x=%d,y=%d) ns=cam ← %s",
+                     s_cam.key, (int)cx, (int)cy, why);
+        } else {
+            ESP_LOGE(TAG, "相机确认：NVS 写入失败（key=%s）→ 撤销本次调整", s_cam.key);
+        }
+    }
+    if (!saved) {
+        render_cam_set(s_cam.cx0, s_cam.cy0);               /* 取消 / 中断 / NVS 失败 */
+        ESP_LOGW(TAG, "相机复原进入前状态：key=%s (x=%d,y=%d) ← %s",
+                 s_cam.key, (int)s_cam.cx0, (int)s_cam.cy0, why);
+    }
+
+    if (full) {
+        /* 宠物回归屏幕正中间 + 脚踩地面线（§5.2）：
+         *   · 水平：drag 偏移归零 → 锚点回屏心（锚点即脚底基准），立即生效；
+         *   · 垂直：重新派发当前图 → render_set_map → 既有站位链
+         *     ent_stand_on_ground_locked()（compositor.c 内，唯一外部可达触发点；
+         *     同时把 NVS 相机按「全局加载」口径再应用一次）；
+         *   · 地面线：**不能在这里采**——站位链要等重派发落地才跑，相机也要等 NVS
+         *     重新应用，此刻采样拿到的是重载前的旧值（对抗审查 P1-2）。故只置 pending，
+         *     结算点 = dispatch_map 成功路径的 bridge_cam_settle_after_reload()。 */
+        render_set_drag_off(0);
+        mp_cmd_t c = { .type = MP_CMD_SET_MAP };
+        strlcpy(c.s, s_cam.hash, sizeof(c.s));
+        if (c.s[0]) {
+            s_cam.settle_pending = true;
+            s_cam.settle_retried = false;
+            s_cam.settle_by_ms   = mp_now_ms() + CAM_SETTLE_TIMEOUT_MS;
+            mp_post_cmd(&c);
+            ESP_LOGI(TAG, "相机收尾：重派发地图 %s（宠物回屏心 + 站位链复算；"
+                          "落地后结算「脚踩地面线」）", c.s);
+        } else {
+            s_cam.settle_pending = false;
+            ESP_LOGW(TAG, "相机收尾：目标图 hash 为空 → 跳过重派发（站位链与地面线均无法结算）");
+        }
+    }
+
+    /* 可见反馈收尾：已配网 → 1.5s 定时横幅；未配网 → 恢复常驻配网横幅 */
+    if (provision_has_config()) {
+        render_banner_show_for(saved ? CAM_BANNER_SAVED : CAM_BANNER_CANCELED, 1500);
+    } else {
+        state_machine_banner_restore();
+    }
+    s_cam.hash[0] = 0;
+    s_cam.key[0]  = 0;
+}
+
+/* 用户确认/取消（input 任务：中键短按/长按、顶键短按/长按） */
+void bridge_cam_adjust_finish(bool confirm)
+{
+    cam_finish_core(confirm, true, confirm ? "按键确认" : "按键取消");
+}
+
+/* 调参态兜底（input 任务主循环 ~20ms）：
+ *   ① 「脚踩地面线」结算超时兜底——重派发没落地（清单未就绪/cmd_q 满/路径查询失败）
+ *      时站位链不会跑：先重投一次地图；再超时则明确放弃（绝不猜锚点位置乱放宠物，
+ *      宁可维持现状并留 ERROR，等下次装载该图自然归位）；
+ *   ② 状态机离开 POKER/OFFLINE（待机时钟/OTA/配网/FATAL）→ 未确认即取消并复原相机，
+ *      杜绝"模式悬空"（横幅留屏、相机半套用）。 */
+void bridge_cam_adjust_poll(void)
+{
+    if (s_cam.settle_pending && mp_now_ms() > s_cam.settle_by_ms) {
+        if (!s_cam.settle_retried && s_cam.hash[0]) {
+            s_cam.settle_retried = true;
+            s_cam.settle_by_ms = mp_now_ms() + CAM_SETTLE_TIMEOUT_MS;
+            mp_cmd_t c = { .type = MP_CMD_SET_MAP };
+            strlcpy(c.s, s_cam.hash, sizeof(c.s));
+            mp_post_cmd(&c);
+            ESP_LOGW(TAG, "相机收尾结算超时 → 重投地图 %s（站位链/地面线再试一次）", c.s);
+        } else {
+            s_cam.settle_pending = false;
+            ESP_LOGE(TAG, "相机收尾结算放弃：地图 %s 两次未装载落地 → 宠物未归屏心、未落地面线"
+                          "（下次装载该图会自然归位）", s_cam.hash);
+        }
+    }
+    if (!s_cam.on) return;
+    mp_state_t st = state_machine_current();
+    if (st == MP_ST_POKER || st == MP_ST_OFFLINE) return;
+    char why[32];
+    snprintf(why, sizeof(why), "状态机=%s", state_machine_name(st));
+    cam_finish_core(false, false, why);
+}
+
+/* 子页②入口：真正进入相机调参态。返回 true = 已进入（菜单随即被收起）。 */
+static bool menu_map_fn_camera_enter(void)
+{
+    ESP_LOGW(TAG, "menu: 子页②相机入口 hash=%.16s key=%s label=%.24s",
+             s_menu.fn_hash, s_menu.fn_key, s_menu.fn_label);
+
+    /* ① 能力门（§3.3）：render_cam_supported()==false = 非整图包（无可平移余量）
+     *    → 状态行提示、**不进入调参态**（旧包视觉与交互逐字节不变）。 */
+    if (!render_cam_supported()) {
+        ESP_LOGW(TAG, "menu: 相机不可用——当前图非整图包（需整图包才能平移相机）");
+        menu_status_flash(CAM_FLASH_NO_FULLMAP);
+        return false;
+    }
+    /* ② 调参对象必须是**当前正在渲染的图**：render_cam_supported() 只反映已装载图，
+     *    且用户必须看得见它才能调（相机=可见窗口左上角）。不满足 → 引导走子页① */
+    if (!asset_dl_map_is_active(s_menu.fn_hash)) {
+        ESP_LOGW(TAG, "menu: %.24s 不是当前背景图 → 拒绝调参（先走子页①「选择此地图为背景」）",
+                 s_menu.fn_label);
+        menu_status_flash(CAM_FLASH_NEED_BG);
+        return false;
+    }
+    if (!s_menu.fn_key[0]) {
+        ESP_LOGW(TAG, "menu: 目标图无 per-map 键（清单未登记？）→ 拒绝调参");
+        menu_status_flash(CAM_FLASH_NO_FULLMAP);
+        return false;
+    }
+
+    /* ③ 快照进入前相机（取消/中断复原基准）+ 范围取证（契约 §五 验收锚点） */
+    s_cam.cx0 = s_cam.cy0 = 0;
+    s_cam.dx0 = s_cam.dy0 = 0;
+    render_cam_get(&s_cam.cx0, &s_cam.cy0);
+    strlcpy(s_cam.hash, s_menu.fn_hash, sizeof(s_cam.hash));
+    strlcpy(s_cam.key,  s_menu.fn_key,  sizeof(s_cam.key));
+    s_cam.dragging = false;
+    s_cam.last_apply_ms = 0;
+    s_cam.settle_pending = false;      /* 新一轮调参：清上一轮可能残留的结算旗标 */
+    s_cam.settle_retried = false;
+    int32_t mdx = 0, mdy = 0;
+    render_cam_range(&mdx, &mdy);
+    ESP_LOGW(TAG, "相机调参态进入：hash=%.16s key=%s 进入前相机=(%d,%d) 支持=1 范围 dx[0,%d] dy[0,%d]",
+             s_cam.hash, s_cam.key, (int)s_cam.cx0, (int)s_cam.cy0, (int)mdx, (int)mdy);
+    /* 需求原文（串口可查）：相机调整中：拖动平移 / 中键短按确认 · 长按取消 */
+    ESP_LOGW(TAG, "menu: 相机调整中：拖动平移 / 中键短按确认 · 长按取消（此串含烘焙子集外"
+                  "字形，屏上用 " CAM_BANNER_HINT " 等价呈现）");
+
+    /* ④ 菜单内可见提示（状态行）+ 收菜单：MENU→POKER 让出全屏，露出地图/宠物。
+     * 【顺序红线】s_cam.on 必须在状态机切到 POKER **之后**才置位——input 任务的
+     * bridge_cam_adjust_poll() 判据是"调参态开着但状态不在 POKER/OFFLINE 就取消"，
+     * 若先置位再切态（本函数在渲染任务里可能与 input 任务抢 state_machine 的锁），
+     * 会被 poll 误判成"悬空态"当场取消。
+     * 【限速红线】走内部通道 state_machine_cam_enter_poker()，**不吃** MP_SM_EV_MENU_KEY
+     * 的 400ms 硬限速（那条限速防的是实体键抖动把菜单关了又开；菜单里点②是显式 UI
+     * 动作，被吞掉的表现就是屏上 CAM BUSY - RETRY 且调参态进不去）。 */
+    menu_status_flash(CAM_FLASH_HINT);
+    if (!state_machine_cam_enter_poker()) {
+        ESP_LOGW(TAG, "menu: 收菜单未生效（MENU→POKER 失败）→ 不进入调参态");
+        menu_status_flash("CAM BUSY - RETRY");
+        return false;
+    }
+    s_cam.on = true;
+
+    /* ⑤ 调参态常驻横幅：入队放在 MENU_EXIT/POKER on_enter 之后，保证压过未配网
+     *    横幅（cmd_q FIFO，同一渲染任务帧内顺序落地） */
+    mp_cmd_t c = { .type = MP_CMD_BANNER, .a = 1 };
+    strlcpy(c.s, CAM_BANNER_HINT, sizeof(c.s));
+    if (!mp_post_cmd(&c)) ESP_LOGW(TAG, "cmd_q 满：调参横幅未入队（模式仍生效）");
+    return true;
+}
+
+static void menu_map_fn_camera_hook(void)
+{
+    (void)menu_map_fn_camera_enter();   /* 失败路径已在状态行给出可见提示，留在菜单 */
+}
+
+/* 子页③删除此地图 = §4.4 本地隐藏标识（不物理删文件）：
+ *   · asset_dl_map_set_hidden(true) → NVS per-map 置位（重启保持）；
+ *   · 列表立即不再显示该图（asset_dl_bgmap_list 过滤）；
+ *   · 隐藏的是**当前正在渲染的图**、或隐藏后**已无可见图** → 立即切回默认图
+ *     MP_DEFAULT_MAP_ID（000010000）；
+ *   · 服务端再次推送该图 → poller 自动解除隐藏（列表恢复）。 */
+static void menu_map_fn_delete(void)
+{
+    bool was_active = asset_dl_map_is_active(s_menu.fn_hash);
+    bool ok = asset_dl_map_set_hidden(s_menu.fn_hash, true);
+    int visible = asset_dl_bgmap_visible_count();
+    ESP_LOGW(TAG, "menu: 子页③删除(隐藏) hash=%.16s key=%s nvs=%d was_active=%d 剩余可见=%d",
+             s_menu.fn_hash, s_menu.fn_key, (int)ok, (int)was_active, visible);
+    /* 【契约 §3.3】隐藏/删除该图 → 清它的 per-map 相机键（与隐藏标识同一处收尾，
+     * 见 state_machine.c sm_cam_nvs_* 的注释："删除地图时清除"）。 */
+    if (sm_cam_nvs_erase(s_menu.fn_key)) {
+        ESP_LOGW(TAG, "menu: 子页③已清相机键 key=%s（ns=cam）", s_menu.fn_key);
+    } else {
+        ESP_LOGW(TAG, "menu: 子页③相机键清除失败 key=%s（ns=cam，残留不影响渲染）",
+                 s_menu.fn_key);
+    }
+    /* 边界（§4.4）：隐藏当前图 / 隐藏全部图 → 立即切回默认图。
+     * 默认图自身被隐藏时同样切（等于保持渲染默认图）：隐藏只是"列表不显示"，
+     * 默认图仍是兜底渲染源，不做黑屏。 */
+    if (was_active || visible == 0) {
+        mp_cmd_t c = { .type = MP_CMD_SET_MAP };
+        strlcpy(c.s, MP_DEFAULT_MAP_ID, sizeof(c.s));
+        mp_post_cmd(&c);
+        ESP_LOGW(TAG, "menu: 隐藏的是当前图/已无可见图 → 切回默认图 %s（was_active=%d visible=%d）",
+                 MP_DEFAULT_MAP_ID, (int)was_active, visible);
+        menu_status_flash("已隐藏，切回默认图");
+    } else {
+        menu_status_flash("已隐藏，推送可恢复");
+    }
+    menu_goto(MENU_PAGE_MAPS);
 }
 
 static void menu_activate(int idx)
@@ -720,9 +1285,10 @@ static void menu_activate(int idx)
         return;
     }
 
-    /* 列表页 Back 行（各页共用） */
+    /* 列表页 Back 行（各页共用）：回**上级页**（地图功能子页 → 地图列表；
+     * 其余子页 → 根页），语义见 menu_parent_page */
     if (s_menu.back_idx >= 0 && idx == s_menu.back_idx) {
-        menu_goto(MENU_PAGE_ROOT);
+        menu_goto(menu_parent_page(s_menu.page));
         return;
     }
 
@@ -743,7 +1309,17 @@ static void menu_activate(int idx)
         break;
 
     case MENU_PAGE_MAPS:
-        if (idx < s_menu.item_cnt) menu_activate_item(idx, MP_CMD_SET_MAP);
+        /* 【§4.1 2026-10-01】点列表项不再"立即切图"，改为进功能子页
+         * （①选为背景 ②改相机 ③删除 ④返回地图列表） */
+        if (idx < s_menu.item_cnt) menu_map_fn_open(idx);
+        break;
+
+    case MENU_PAGE_MAP_FN:
+        /* 地图功能子页三项；末行「返回地图列表」= back_idx，已在上面按上级页
+         * （menu_parent_page）处理，这里不再重复分支 */
+        if      (idx == 0) menu_map_fn_background();
+        else if (idx == 1) menu_map_fn_camera_hook();      /* ← 相机 agent 接手点 */
+        else if (idx == 2) menu_map_fn_delete();
         break;
 
     case MENU_PAGE_PAPERDOLL:
@@ -821,15 +1397,22 @@ static void menu_dl_poll(void)
         }
         if (s_menu.dl_cmd != MP_CMD_NONE) {
             snprintf(s_menu.hint_once, sizeof(s_menu.hint_once),
-                     "DL OK %.8s -> APPLIED", s_menu.dl_hash);
+                     "下载完成，已应用");
         } else {
             snprintf(s_menu.hint_once, sizeof(s_menu.hint_once),
-                     "DL OK %.8s -> CACHED", s_menu.dl_hash);
+                     "下载完成，已缓存");
         }
         ESP_LOGI(TAG, "menu: 下载完成 %.16s → cmd=%d", s_menu.dl_hash, (int)s_menu.dl_cmd);
         s_menu.dl_active = false;
-        s_menu.pend_page = s_menu.page;      /* 原地重建：cached 标记刷新 */
-        s_menu.pend_sel  = s_menu.sel;
+        /* 回页：列表页=原地重建（保持选中，既有行为）；地图功能子页=回地图列表 */
+        if (s_menu.dl_goto_back) {
+            s_menu.pend_page = s_menu.dl_back;
+            s_menu.pend_sel  = 0;
+            s_menu.dl_goto_back = false;
+        } else {
+            s_menu.pend_page = s_menu.page;
+            s_menu.pend_sel  = s_menu.sel;
+        }
         s_menu.req_rebuild = true;
         return;
     }
@@ -837,7 +1420,9 @@ static void menu_dl_poll(void)
     if (mp_now_ms() > s_menu.dl_deadline_ms) {
         ESP_LOGW(TAG, "menu: 下载超时 %.16s", s_menu.dl_hash);
         s_menu.dl_active = false;
+        s_menu.dl_goto_back = false;
         menu_hint_set("DL TIMEOUT (SERVER?)");
+        menu_status_flash("下载超时");
     }
 }
 
@@ -1096,12 +1681,12 @@ static void menu_btn_ok_cb(lv_event_t *e)
 }
 
 /* 底部 Back 按钮：根页=退出菜单（req_exit 走状态机 MENU_KEY 通道）；
- * 子页=回根页（menu_goto 只落旗标，tick 重建，不在此动控件树） */
+ * 子页=回上级页（menu_goto 只落旗标，tick 重建，不在此动控件树） */
 static void menu_btn_back_cb(lv_event_t *e)
 {
     (void)e;
     if (s_menu.page == MENU_PAGE_ROOT) s_menu.req_exit = true;
-    else menu_goto(MENU_PAGE_ROOT);
+    else menu_goto(menu_parent_page(s_menu.page));
 }
 
 /* 蓝色渐变操作按钮（OK/Back），白字 f_small */
@@ -1339,6 +1924,31 @@ static void menu_rebuild(void)
         menu_build_selection_page(scr, "NO MAP IN LOCAL MANIFEST",
                                   "TAP: SWITCH/DL   [v] CACHED");
         break;
+    case MENU_PAGE_MAP_FN: {
+        /* 地图功能子页（§4.1）：滚筒三项 + 「返回地图列表」。
+         * 目标地图身份/名字在 menu_map_fn_open 已快照（进页时状态行提示一次），
+         * 这里只建控件——重复重建（离线/rev 翻转）不重复刷提示。 */
+        menu_chrome_build(scr, "地图功能");
+        static char opts[MENU_MAP_FN_CNT * 48];
+        static bool en[MENU_MAP_FN_CNT];
+        static const char *const fn_rows[MENU_MAP_FN_CNT] = {
+            "选择此地图为背景",
+            "修改当前地图的摄像头",
+            "删除此地图",
+            "返回地图列表",
+        };
+        size_t o = 0;
+        for (int i = 0; i < MENU_MAP_FN_CNT; i++) {
+            en[i] = true;                      /* 相机项也保持可点：占位提示可见（hook 可测） */
+            o += (size_t)snprintf(opts + o, sizeof(opts) - o, "%s%s",
+                                  i ? "\n" : "", fn_rows[i]);
+        }
+        s_menu.row_cnt = MENU_MAP_FN_CNT;
+        menu_build_roller(scr, opts, MENU_MAP_FN_CNT, en, NULL);
+        /* 末行「返回地图列表」走 back_idx 分支 → menu_parent_page(MAP_FN)=MAPS */
+        s_menu.back_idx = MENU_MAP_FN_CNT - 1;
+        break;
+    }
     case MENU_PAGE_PAPERDOLL:
         menu_parts_collect();
         menu_chrome_build(scr, "纸娃娃");
@@ -1397,9 +2007,11 @@ static void menu_rebuild(void)
     if (s_menu.sel >= s_menu.row_cnt) s_menu.sel = 0;   /* 页内行数变化（截断/空态） */
     s_menu.sel_applied = -1;   /* 交下一 tick 统一重贴高亮（与夹取后的 sel 严格一致） */
 
-    /* T4 一次性提示（下载完成）：本次重建消费后清空 */
+    /* T4 一次性提示（下载完成）：本次重建消费后清空。hint_label 现为 NULL
+     * （UI 精简后无页脚提示行）→ 同时走状态行可见通道 */
     if (s_menu.hint_once[0]) {
         menu_hint_set(s_menu.hint_once);
+        menu_status_flash(s_menu.hint_once);
         s_menu.hint_once[0] = 0;
     }
 
@@ -1419,7 +2031,11 @@ static void menu_rebuild(void)
  * 行式页：逐行贴高亮 + "> " 文字光标（样式之外的光标兜底通道） */
 static void menu_apply_selection(void)
 {
-    if (s_menu.sel_applied == s_menu.sel) return;
+    /* 提示态翻转也要走一遍（否则提示到期后状态行永远停在提示文本上）。
+     * 未选中变化且提示态未翻转 = 无事可做（防 10Hz 无谓失效） */
+    bool flash = menu_status_flash_active();
+    if (s_menu.sel_applied == s_menu.sel && flash == s_menu.flash_shown) return;
+    s_menu.flash_shown = flash;
 
     if (s_menu.roller) {
         if (s_menu.sel < 0 || s_menu.sel >= s_menu.row_cnt) s_menu.sel = 0;
@@ -1437,9 +2053,13 @@ static void menu_apply_selection(void)
                          (s_menu.row_cnt > 1 ? s_menu.row_cnt - 1 : 1));
         }
         if (s_menu.status_label) {
-            char opt[48];
-            lv_roller_get_selected_str(s_menu.roller, opt, sizeof(opt));
-            lv_label_set_text_fmt(s_menu.status_label, "选中：%s", opt);
+            if (flash) {
+                lv_label_set_text(s_menu.status_label, s_menu.flash_msg);
+            } else {
+                char opt[48];
+                lv_roller_get_selected_str(s_menu.roller, opt, sizeof(opt));
+                lv_label_set_text_fmt(s_menu.status_label, "选中：%s", opt);
+            }
         }
         s_menu.sel_applied = s_menu.sel;
         return;
@@ -1555,6 +2175,14 @@ int bridge_mode_menu(void)
         return RENDER_OK;
     }
 
+    /* 【契约 §3.3 兜底】进菜单时若相机调参态还开着（顶键已被调参态拦截，正常不可达；
+     * 防御状态机侧的其他入口）→ 强制取消：留在地图画面里的是"半套用"的相机状态，
+     * 不能带进菜单。这里在渲染任务，复原相机是安全的。 */
+    if (s_cam.on) {
+        ESP_LOGW(TAG, "mode_menu: 相机调参态未收尾 → 强制取消");
+        cam_finish_core(false, false, "进菜单");
+    }
+
     ESP_LOGI(TAG, "mode_menu: enter (%dx%d DIRECT buf=%u B)",
              (int)s_br.sw, (int)s_br.sh,
              (unsigned)((size_t)s_br.sw * s_br.sh * 2u));
@@ -1579,7 +2207,14 @@ int bridge_mode_menu(void)
     s_menu.dl_active = false;         /* T4：上一轮残留的下载轮询不带进新菜单 */
     s_menu.dl_hash[0] = 0;
     s_menu.dl_cmd = MP_CMD_NONE;
+    s_menu.dl_goto_back = false;
     s_menu.hint_once[0] = 0;
+    s_menu.fn_hash[0] = 0;            /* 地图功能子页目标图快照：进菜单即清 */
+    s_menu.fn_key[0] = 0;
+    s_menu.fn_label[0] = 0;
+    s_menu.flash_msg[0] = 0;          /* 状态行提示：不带上一轮的残留 */
+    s_menu.flash_until_ms = 0;
+    s_menu.flash_shown = false;
     s_menu.back_idx = -1;
     s_menu.roller = NULL;             /* 滚筒/滚动条指针随 rebuild 重建（防悬挂引用） */
     s_menu.roller_track = NULL;

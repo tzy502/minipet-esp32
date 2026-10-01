@@ -1,14 +1,21 @@
 /**
- * input_dispatch.c — 交互分发（E6 按键/重力/力度 + E10 表情状态机）
+ * input_dispatch.c — 交互分发（E6 触摸/重力/力度/按键 + E10 表情状态机）
  *
- * 采样拓扑（4.1：APP 核 input 任务）——本板（LCD-1.85B）无触摸/无音频/无 PMU，
- * 触摸与电源巡检链路已随 216 专属驱动一并拆除：
+ * 采样拓扑（4.1：APP 核 input 任务）：
+ *   - 触摸 ~20ms 轮询（CST816S@0x15 直读帧 + ×4/3 上采样到 480 UI 空间）：
+ *     MENU/时钟/配网态把帧喂 LVGL indev；POKER/OFFLINE 态走宠物手势
+ *     （轻点=抚摸 · 拖动=视差 · 长按=BGM 控制条）
  *   - IMU wait_event() DRDY 中断唤醒 + 20ms 超时兜底轮询（~50Hz，中断没通
  *     也不影响采样）；任务启动时读回 CTRL7 自愈使能位（见 imu_link_selfcheck）
- *   - 菜单键 = BOOT(GPIO0)（key_gpio0）纯轮询同口径消抖：短按=菜单开关、
- *     长按 ≥700ms=待机时钟（与原 GPIO18 菜单键口径一致，无 ISR——
- *     GPIO0 与复位时序相关）
- *   - 1s 慢速节拍：闲置→DOZE 计时（state_machine_tick_1hz）
+ *   - 按键：**本板只有 BOOT=GPIO0 一个固件可用键**（官方 BSP 按键表只有
+ *     BSP_BUTTONS_IO_0=GPIO0；PWR 键是硬件电源通路，固件读不到）。
+ *     GPIO0 纯轮询消抖（无 ISR——与复位时序相关），一键承担全部语义：
+ *       短按=菜单开关 · 长按≥700ms=待机时钟 · 菜单内短按=下移/长按=退出 ·
+ *       控制条内短按=光标左移/长按=收起 · 相机调参态短按=确认/长按=取消
+ *     （216 的 GPIO18 顶键与 AXP2101 PWRON 底键在本板**硬件不存在**，
+ *      其 key_tick 已整段删除、pwron_tick 保留但恒无事件——见文件内注释）
+ *   - 1s 慢速节拍：闲置→DOZE 计时（state_machine_tick_1hz）、电池/温度巡检
+ *     （本板电量计 = BQ27220@0x55，接口与 216 的 AXP2101 同名同签名）
  *   - 静置随机稀有表情（E10：wink/chu/qBlue 低频）
  */
 #include "input_dispatch.h"
@@ -32,6 +39,20 @@
 
 static const char *TAG = "input";
 
+/* ══ 【契约 §3.3 相机 UX】调参态接口（lvgl_bridge.c 实现；跨任务可调）══════════
+ * 状态与快照都在渲染层（见 lvgl_bridge.c 文件头"相机 UX 层"），本文件只做**路由**：
+ *   active      —— 调参态激活（触摸/按键归属判据）
+ *   drag_begin/move/end —— 触摸按下/拖动/抬起 = 相机跟手平移（move 返回是否已下发）
+ *   finish      —— 中键或顶键：短按=确认保存(true) / 长按=取消(false)
+ *   poll        —— 主循环兜底：状态机离开 POKER/OFFLINE → 未确认即取消
+ * 命名沿用本工程既有的跨模块前向声明惯例（render_menu_* / render_bgm_bar_* 同款）。 */
+extern bool bridge_cam_adjust_active(void);
+extern void bridge_cam_adjust_drag_begin(int32_t sx, int32_t sy);
+extern bool bridge_cam_adjust_drag_move(int32_t sx, int32_t sy);
+extern void bridge_cam_adjust_drag_end(void);
+extern void bridge_cam_adjust_finish(bool confirm);
+extern void bridge_cam_adjust_poll(void);
+
 /* ------------------------------------------------------------------ */
 /* 参数（默认值；阈值可被服务端下发覆盖——E6「阈值全部 Web 可配」）       */
 /* ------------------------------------------------------------------ */
@@ -44,12 +65,17 @@ static const char *TAG = "input";
 #define SHAKE_MIN_G         1.6f    /* 翻转计数的幅度门槛 */
 #define PICKUP_ANGLE_DEG    25.0f   /* 拿起/翻转：姿态偏离水平面 >25°（E6 拿起/翻转） */
 #define PICKUP_HOLD_MS      600
+#define BATTERY_CHK_S       60
+#define TEMP_CHK_S          60
+#define TEMP_HOT_C          45.0f
 #define IDLE_RARE_EXPR_S    30      /* 静置时稀有表情的滚动窗口（E10） */
 
 /* 日志节流 / 键盘硬化 */
 #define KEY_RELEASE_QUIET_MS 80    /* 菜单键：确认释放后需再静止 80ms 才重新上膛（门闩） */
 #define IMU_FAIL_LOG_N      40      /* IMU 连续失败 ≈1s（50Hz）→ 首报 */
 #define IMU_ERR_RELOG_MS    5000    /* IMU 持续失败时每 5s 重复一条 */
+#define TOUCH_FAIL_LOG_N    40      /* 触摸连续读失败 ≈1s → 首报 */
+#define TOUCH_ERR_RELOG_MS  5000    /* 触摸持续失败时每 5s 重复一条 */
 
 /* QMI8658 CTRL7（0x08）：bit0=aEN bit1=gEN（QMI8658A 手册 Register Map 口径；
  * 加速度+陀螺同开=0x03）。驱动 imu_qmi8658.c 写了 0xC0（bit7/6=自测位），
@@ -89,7 +115,8 @@ static bool     s_pickup_latched;
 /* ------------------------------------------------------------------ */
 /* 巡检                                                                 */
 /* ------------------------------------------------------------------ */
-static int64_t  s_last_rare_s;
+static int64_t  s_last_battery_s, s_last_temp_s, s_last_rare_s;
+static bool     s_battery_low_reported;
 static int64_t  s_last_interaction_ms;
 
 /* 渲染层线规约（render.h）：渲染 API 只许 render 任务调 →
@@ -370,7 +397,435 @@ static void force_tick(const imu_accel_t *a)
 }
 
 /* ================================================================== */
-/* 菜单键（本板 = BOOT GPIO0；原 216 板的 GPIO18 独立菜单键已随板拆除）    */
+/* 触摸（E6：轻点=抚摸；水平拖动=倾斜视差（问题6）；长按=BGM 控制条；
+ * MENU 态全部归菜单）                                                     */
+/* ================================================================== */
+/* 【185B 2026-10-01 从 216 移植：驱动换 CST816S，帧格式与坐标空间均不同】
+ *
+ * 与 216（CST9220）的两处**硬差别**（照抄会读出垃圾坐标；协议见本板
+ * components/drivers/touch_cst816.c 文件头）：
+ *   ① 帧布局：CST816S = d0 低 4 位触点数、d1 手势、d3=X[11:4]、
+ *      d4={X[3:0]<<4 | Y[11:8]}、d5=Y[7:0]；**没有 0xAB 帧对齐/status 门**
+ *      （216 的 d[6]==0xAB + d[0]&0xF==0x06 判据在本板会把每帧都判成无效帧）；
+ *   ② 坐标空间：CST816S 上报**面板原生 0..359**，而 UI/合成器空间恒 480×480
+ *      （480→360 的取样只发生在显示驱动 display_st77916.c 一处）→ 必须 ×4/3
+ *      上采样，否则右侧/底部 25% 的控件点不到。
+ * 设备名 "cst816"（touch_cst816.c 注册名；I2C 地址 0x15 由驱动内部处理）。
+ * 方向：官方 BSP 对 CST816S 的默认 touch_flags = {swap_xy=0, mirror_x=0,
+ * mirror_y=0}（esp32_s3_touch_lcd_1_85B.c bsp_display_start）→ raw 即面板原生
+ * 坐标，映射表默认恒等（候选 0）。真机若方向不符，照 216 的口径改 s_tmap_k
+ * 初值或 NVS calib/tmap，不要退回"点屏自动漂移"。
+ * 自校目标：面板中心 → UI (240,240)；四角 → 对应角（按下沿日志给 raw/映射对）。 */
+#define TOUCH_RANGE_PX     480     /* UI/合成器空间 480×480（≠ 面板原生 360） */
+#define TOUCH_PANEL_PX     360     /* 面板原生分辨率（CST816S 上报 0..359） */
+#define TOUCH_FRAME_REG    0x00    /* 数据帧起始寄存器（同 touch_cst816.c） */
+#define TOUCH_FRAME_LEN    6       /* CST816S 帧长（d[6] 起为触点 ID，本层不用） */
+
+typedef struct {
+    bool    touched;
+    int16_t x, y;           /* 映射后屏幕坐标（已 clamp 到 0..479） */
+    int16_t raw_x, raw_y;   /* 上采样到 UI 空间的 12 位值（映射表输入/校准日志） */
+    uint8_t count;          /* 触点数（d[5]&0x7F） */
+    uint8_t d[TOUCH_FRAME_LEN];
+} touch_frame_t;
+
+/* 触摸映射（raw→屏幕）。
+ * 【2026-09-27 定稿依据】显示已固化为面板原生方向（display_init：swap=false +
+ * 无镜像，见 technical-reference §三.5）。触摸 IC 与面板同体安装，其上报的
+ * raw 坐标即面板原生坐标 → 正确映射 = 【恒等映射（候选 0）】，与显示严格同向。
+ * 此前默认候选 4/6 = (ry,rx) 交换 X/Y 轴（转置），与原生方向差 90°——这就是
+ * "触摸方向与显示不同向"、菜单按钮点不中的直接原因。
+ *
+ * 旧"点屏轮播自校准"（MP_TOUCH_CALIB）已废弃：它在 POKER 态把【每一次点击】
+ * 都当成切候选，导致映射每次触摸都自我漂移、永远无法稳定（菜单按钮因此彻底
+ * 不可用）。现改为固定恒等映射 + 手动覆盖：若日后换面板/换安装方向，只改
+ * s_tmap_k 初值或写 NVS calib/tmap 即可，不再自动漂移。 */
+#define MP_TOUCH_CALIB 0   /* 0=映射固定（默认）；1=恢复点屏轮播（仅产线标定用） */
+
+/* 8 种轴变换候选（raw→屏幕）。0=恒等（与原生方向显示同向，当前定稿） */
+static uint8_t s_tmap_k = 0;   /* 恒等映射：raw 即屏幕坐标 */
+
+static void tmap_apply(int rx, int ry, int *sx, int *sy)
+{
+    int x, y;
+    switch (s_tmap_k & 7) {
+    case 0: x = rx;                  y = ry;                  break;
+    case 1: x = TOUCH_RANGE_PX - rx; y = ry;                  break;
+    case 2: x = rx;                  y = TOUCH_RANGE_PX - ry; break;
+    case 3: x = TOUCH_RANGE_PX - rx; y = TOUCH_RANGE_PX - ry; break;
+    case 4: x = ry;                  y = rx;                  break;
+    case 5: x = TOUCH_RANGE_PX - ry; y = rx;                  break;
+    default: x = ry;                 y = TOUCH_RANGE_PX - rx; break;   /* 6=旧映射 */
+    case 7: x = TOUCH_RANGE_PX - ry; y = TOUCH_RANGE_PX - rx; break;
+    }
+    if (x < 0) x = 0;
+    if (x > TOUCH_RANGE_PX - 1) x = TOUCH_RANGE_PX - 1;
+    if (y < 0) y = 0;
+    if (y > TOUCH_RANGE_PX - 1) y = TOUCH_RANGE_PX - 1;
+    *sx = x;
+    *sy = y;
+}
+
+static void tmap_init(void)
+{
+    nvs_handle_t h;
+    if (nvs_open("calib", NVS_READWRITE, &h) == ESP_OK) {
+        uint8_t ver = 0;
+        nvs_get_u8(h, "tmapv", &ver);
+        if (ver < 3) {
+            /* 迁移 v3（2026-09-27 定稿）：显示已固化面板原生方向 → 触摸必须
+             * 恒等映射（候选 0）。旧版 v1/v2 存的候选（5/6 或用户点屏残留的
+             * 4）都是交换 X/Y 的转置映射，会让触摸与显示差 90°、菜单按钮点不中
+             * → 一律强制迁移到 0，并置 tmapv=3 防再次被旧值覆盖。 */
+            s_tmap_k = 0;
+            nvs_set_u8(h, "tmap", s_tmap_k);
+            nvs_set_u8(h, "tmapv", 3);
+            nvs_commit(h);
+        } else {
+            uint8_t k;
+            if (nvs_get_u8(h, "tmap", &k) == ESP_OK) s_tmap_k = k & 7;
+        }
+        nvs_close(h);
+    }
+    ESP_LOGW("tmap", "触摸映射组合 %d/7（0=恒等，与显示同向）", s_tmap_k & 7);
+}
+
+/* 触摸 down 沿调用：切下一候选并把当前帧按新候选重映射（白点即新落点） */
+static void tmap_tap_advance(touch_frame_t *f) __attribute__((unused));
+static void tmap_tap_advance(touch_frame_t *f)
+{
+#if MP_TOUCH_CALIB
+    s_tmap_k = (s_tmap_k + 1) & 7;
+    nvs_handle_t h;
+    if (nvs_open("calib", NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_u8(h, "tmap", s_tmap_k);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+    int sx, sy;
+    tmap_apply(f->raw_x, f->raw_y, &sx, &sy);
+    f->x = (int16_t)sx;
+    f->y = (int16_t)sy;
+    ESP_LOGW("tmap", "组合 %d/7 raw=(%d,%d) → 屏幕(%d,%d)", s_tmap_k & 7,
+             f->raw_x, f->raw_y, f->x, f->y);
+#else
+    (void)f;
+#endif
+}
+
+static bool touch_read_frame(touch_frame_t *f)
+{
+    static i2c_master_dev_handle_t s_dev;   /* 懒解析（touch init 在 input 任务开头先行） */
+    static int16_t s_last_x, s_last_y;      /* 最后有效坐标：抬起帧沿用（同 esp_lcd_touch 语义） */
+    static int16_t s_last_rx, s_last_ry;
+
+    if (!s_dev) {
+        s_dev = i2c_bus_find("cst816");     /* touch_cst816_init 注册的设备名（185B） */
+        if (!s_dev) return false;
+    }
+    if (i2c_bus_read_reg8v(s_dev, TOUCH_FRAME_REG, f->d, sizeof(f->d)) != ESP_OK) {
+        return false;
+    }
+
+    /* 【CST816S 帧布局】d0 低 4 位 = 触点数（不是 216/CST9220 的 d[5]，
+     * 且本芯片**没有** ACK/status 有效性字节——216 的 d[6]==0xAB 门在此恒假） */
+    f->count = f->d[0] & 0x0F;
+    if (f->count == 0) {                    /* 抬起：坐标回填最后有效值（LVGL 同款） */
+        f->touched = false;
+        f->x = s_last_x;  f->y = s_last_y;
+        f->raw_x = s_last_rx;  f->raw_y = s_last_ry;
+        return true;
+    }
+
+    /* 12 位重组（与 touch_cst816.c 逐位一致）：X=XH:d4 高 nibble，Y=d4 低 nibble:YL */
+    int rx = ((int)f->d[3] << 4) | (f->d[4] >> 4);      /* 面板原生 0..359 */
+    int ry = (((int)f->d[4] & 0x0F) << 8) | f->d[5];    /* 面板原生 0..359 */
+    /* 【360 → 480 上采样】面板原生坐标 → UI/合成器空间（×4/3，四舍五入）。
+     * 不做这一步：屏幕右侧/底部 25% 的控件永远点不到（UI 是 480 空间）。 */
+    rx = (rx * TOUCH_RANGE_PX + TOUCH_PANEL_PX / 2) / TOUCH_PANEL_PX;
+    ry = (ry * TOUCH_RANGE_PX + TOUCH_PANEL_PX / 2) / TOUCH_PANEL_PX;
+    /* 映射走 8 候选表（默认恒等=面板原生方向，见文件头）；越界夹取 */
+    int sx, sy;
+    tmap_apply(rx, ry, &sx, &sy);
+    if (sx < 0) sx = 0;
+    if (sx > TOUCH_RANGE_PX - 1) sx = TOUCH_RANGE_PX - 1;
+    if (sy < 0) sy = 0;
+    if (sy > TOUCH_RANGE_PX - 1) sy = TOUCH_RANGE_PX - 1;
+
+    f->touched = true;
+    f->raw_x = (int16_t)rx;  f->raw_y = (int16_t)ry;
+    f->x = (int16_t)sx;      f->y = (int16_t)sy;
+    s_last_x = f->x;  s_last_y = f->y;
+    s_last_rx = f->raw_x;  s_last_ry = f->raw_y;
+    return true;
+}
+
+/* 【四向判定】映射后落点所在象限（屏幕中线 240 分界） */
+static const char *touch_quadrant_name(int16_t x, int16_t y)
+{
+    if (x < TOUCH_RANGE_PX / 2) {
+        return (y < TOUCH_RANGE_PX / 2) ? "左上" : "左下";
+    }
+    return (y < TOUCH_RANGE_PX / 2) ? "右上" : "右下";
+}
+
+/* 【契约 §3.3】相机调参态触摸：按下=记基准+相机快照，拖动=跟手平移，抬起=补最后一帧。
+ * 手势状态独立于宠物手势（下面的 down/drag_active）——调参期宠物冻结、不抚摸、
+ * 不长按呼出控制条，退出调参态不留残余手势。
+ * downp 由调用方持有（touch_tick 内的 cam_down），调参态不在时清零：调参被按键收尾
+ * 或被状态机打断时手指可能还按着，残留的"按下中"会让下次进入调参态的首个手势走错分支。 */
+static void cam_touch_tick(const touch_frame_t *f, bool *downp)
+{
+    if (f->touched && !*downp) {
+        *downp = true;
+        bridge_cam_adjust_drag_begin(f->x, f->y);
+        note_interaction();
+    } else if (f->touched && *downp) {
+        if (bridge_cam_adjust_drag_move(f->x, f->y)) note_interaction();
+    } else if (!f->touched && *downp) {
+        *downp = false;
+        bridge_cam_adjust_drag_end();
+        note_interaction();
+    }
+}
+
+static void touch_tick(void)
+{
+    static bool down = false;
+    static bool cam_down = false;         /* 【§3.3】相机调参态手势（独立于宠物手势） */
+    static int16_t down_x, down_y;
+    static int64_t down_ms;
+    static bool longpress_fired;
+    static bool drag_active;              /* 问题6：本次按住已进入水平拖动 */
+    /* 【E6 半屏控制条】手势归属：按下沿定格本次手势是否归控制条（控制条是叠加层，
+     * 不冻结宠物态，中途改判会与拖拽/抚摸语义打架）；bar_item_fired = 本次按压
+     * 已触发过某个按钮（按住不放不重复执行）。 */
+    static bool gesture_on_bar;
+    static bool bar_item_fired;
+
+    /* 菜单/时钟/配网态：触摸全归 LVGL，宠物交互（抚摸/拖拽/长按）不穿透
+     * （真机：菜单里的长按再发 MENU_KEY → 菜单"关了又出现"） */
+    {
+        mp_state_t tst = state_machine_current();
+        if (tst != MP_ST_POKER && tst != MP_ST_OFFLINE) {
+            down = false; drag_active = false; longpress_fired = false;
+            /* 【菜单触摸总根因 2026-09-29】菜单态必须在这里读帧喂 LVGL——
+             * 旧代码此块直接 return，下方的 menu_open 喂入分支是死代码，
+             * 菜单触摸从未生效（滚筒拖拽/点选全灭）。 */
+            if (state_machine_menu_open()) {
+                touch_frame_t mf;
+                if (touch_read_frame(&mf)) {
+                    lv_bridge_touch_feed(mf.x, mf.y, mf.touched);
+                } else {
+                    lv_bridge_touch_feed(0, 0, false);
+                }
+            }
+            return;
+        }
+    }
+    static int fail_cnt;                  /* 触摸 I2C 连续读失败计数 */
+    static int64_t fail_last_log_ms;
+    static bool frame_fmt_logged;         /* 首帧字节转储（只打一次，防 count 位置翻车无据可查） */
+
+    touch_frame_t f;
+    bool read_ok = touch_read_frame(&f);
+
+    /* 时钟/配网等其它态：触摸全归 LVGL（读帧后经 feed 注入 indev），
+     * 宠物交互不穿透（真机：菜单里的长按再发 MENU_KEY → 菜单"关了又出现"） */
+    {
+        mp_state_t tst = state_machine_current();
+        if (tst != MP_ST_POKER && tst != MP_ST_OFFLINE) {
+            if (read_ok) lv_bridge_touch_feed(f.x, f.y, f.touched);
+            down = false; drag_active = false; longpress_fired = false;
+            return;
+        }
+    }
+    if (!read_ok) {
+        /* 问题3 兜底：读失败显式报错不静默（首报 ≈1s，之后每 5s 一条） */
+        fail_cnt++;
+        if (fail_cnt == TOUCH_FAIL_LOG_N ||
+            (fail_cnt > TOUCH_FAIL_LOG_N &&
+             mp_now_ms() - fail_last_log_ms >= TOUCH_ERR_RELOG_MS)) {
+            fail_last_log_ms = mp_now_ms();
+            ESP_LOGE(TAG, "触摸读取失败（I2C 连续 %d 次）——轻点/拖拽不可用", fail_cnt);
+        }
+        return;
+    }
+    if (fail_cnt >= TOUCH_FAIL_LOG_N) {
+        ESP_LOGI(TAG, "触摸读取恢复");
+    }
+    fail_cnt = 0;
+
+    if (!frame_fmt_logged) {
+        frame_fmt_logged = true;
+        /* 【185B】CST816S 帧 = 6 字节（d0 触点数/d3 XH/d4 XY/d5 YL），
+         * 没有 216/CST9220 的 d[6]=0xAB 对齐字节 → 只打 6 字节。 */
+        ESP_LOGI(TAG, "触摸首帧 [%02X %02X %02X %02X %02X %02X] n=%d",
+                 f.d[0], f.d[1], f.d[2], f.d[3], f.d[4], f.d[5], f.count);
+    }
+    /* 帧流诊断已完成（格式定稿：status=d[0]&0xF==0x06 有效） */
+
+    /* 【契约 §3.3】相机调参态：整段触摸手势归相机平移（宠物**冻结**——不拖拽/
+     * 不抚摸/不长按呼出控制条）。宠物手势状态在这里一并清掉，防止调参结束后
+     * 用一份陈旧手势继续跑（"按着拖相机→退出→松手"变成抚摸宠物之类的串味）。 */
+    if (bridge_cam_adjust_active()) {
+        cam_touch_tick(&f, &cam_down);
+        down = false;
+        drag_active = false;
+        longpress_fired = false;
+        return;
+    }
+    cam_down = false;    /* 调参态已结束（按键收尾/状态机打断）：清相机手势残留 */
+
+    if (f.touched && !down) {
+        down = true;
+        down_x = f.x; down_y = f.y;
+        down_ms = mp_now_ms();
+        longpress_fired = false;
+        drag_active = false;
+        /* 【E6 半屏控制条】本次手势是否起于控制条已显示时。整个手势的路由在
+         * 按下沿定格：控制条是叠加层（不冻结宠物态），若中途判定会与宠物
+         * 拖拽/抚摸语义打架。 */
+        gesture_on_bar = render_bgm_bar_showing();
+        bar_item_fired = false;
+        /* 【四角标定】raw 与映射后成对输出（500ms 限频防连点刷屏）：真机依次
+         * 按四角+中心，对照白点回显位置读本日志，据实测改 touch_read_frame
+         * 里的两行映射（现口径 sx=raw_y, sy=480−raw_x，见上方分析） */
+        {
+            static int64_t calib_log_ms;
+            int64_t t_now = mp_now_ms();
+            if (t_now - calib_log_ms >= 500) {
+                calib_log_ms = t_now;
+                ESP_LOGI("touch", "down raw=(%d,%d) map=(%d,%d)",
+                         f.raw_x, f.raw_y, f.x, f.y);
+            }
+        }
+        /* 校准日志（每次按下沿一条）：原始帧 + 重组 raw + 映射值。
+         * 核对目标：屏幕中心 → (240,240)、四角 → 对应角；不符时按
+         * touch_read_frame 上方注释改两行映射即可 */
+        ESP_LOGI(TAG, "触摸按下 raw(%d,%d)->屏幕(%d,%d) 帧[%02X %02X %02X %02X %02X %02X] n=%d",
+                 f.raw_x, f.raw_y, f.x, f.y,
+                 f.d[0], f.d[1], f.d[2], f.d[3], f.d[4], f.d[5], f.count);
+        /* 【四向判定提示】（标定收尾，等真机数据，本层不改映射）：
+         * 真机依次按屏幕左上/右上/左下/右下四个角，看每条按下沿日志的
+         * 「落点象限」是否与按角一致，主线程据此二选一修正：
+         *   四角全部一致                     → 现映射正确，无需修改；
+         *   落点随按角旋转 90°（对角互换）    → swap_xy 取反；
+         *   仅左右镜像或仅上下镜像           → 对应 mirror_x / mirror_y 取反。
+         * 现口径：sx=raw_y, sy=480−raw_x（BSP swap_xy=1+mirror_y=1）。 */
+        ESP_LOGI(TAG, "四向判定: 按角→落点象限【%s】 屏幕(%d,%d)",
+                 touch_quadrant_name(f.x, f.y), f.x, f.y);
+        extern void mp_orient_calib_tap(void);   /* main.c（MP_ORIENT_CALIB 期切换方向组合） */
+        mp_orient_calib_tap();
+        /* 【用户定稿 2026-09-27】辅助线默认【不再出现】：此前每次触摸都调
+         * render_calib_set(true,...) 且全工程无关闭路径 → 红线/蓝线/三角/白点
+         * 一旦首触就永久常驻盖住画面（用户口径"辅助线删了"）。
+         * 现仅保留编译期标定开关 MP_TOUCH_CALIB=1 时的回显；正常固件完全不碰校准层。 */
+#if MP_TOUCH_CALIB
+        tmap_tap_advance(&f);                /* 标定期：点屏切换映射候选 */
+        render_calib_set(true, f.x, f.y);    /* 标定期：落点回显（白点=当前候选落点） */
+#endif
+    } else if (f.touched && down) {
+        /* 【E6 半屏控制条】手势起于控制条 → 触摸全部归控制条：
+         * 点中按钮=立刻执行（不等抬起，按压反馈更跟手）；拖动/点空白=收起。
+         * 不穿透到宠物区（需求：「菜单/控制层内所有触摸都归它，不穿透」）。 */
+        if (gesture_on_bar) {
+            int item = render_bgm_bar_item_at(f.x, f.y);
+            if (item >= 0) {
+                if (!bar_item_fired) {
+                    bar_item_fired = true;
+                    render_bgm_bar_activate(item);
+                }
+            } else if (abs((int)f.x - (int)down_x) >= TAP_MOVE_PX ||
+                       abs((int)f.y - (int)down_y) >= TAP_MOVE_PX) {
+                render_bgm_bar_hide();
+                gesture_on_bar = false;   /* 已收起：剩余手势交回宠物语义 */
+            }
+            note_interaction();
+            return;
+        }
+        int dx = (int)f.x - (int)down_x;
+        int dy = (int)f.y - (int)down_y;
+        /* 【拖拽判定补垂直方向 2026-09-27】用户报障「人物没法拖到屏幕最底下」：
+         * 此前起拖判据只看**水平**位移（`abs(dx) >= TAP_MOVE_PX`）——竖直向下拖
+         * （dx≈0、|dy| 很大）永远进不了 drag_active，手势被当成轻点/长按，
+         * 于是"往下拖不动"。现改为任一轴超阈值即起拖；
+         * 跟手定位本来就是二维绝对定位（f.x/f.y - 屏心），无需额外改动。 */
+        if (!drag_active && !longpress_fired &&
+            (abs(dx) >= TAP_MOVE_PX || abs(dy) >= TAP_MOVE_PX)) {
+            drag_active = true;
+        }
+        if (drag_active) {
+            /* 拖拽跟手（绝对定位，免累计漂移）：人物偏移 = 手指位置 - 屏心
+             * 66ms 节流降压（拖动期丢帧真机根因之一） */
+            static int64_t last_apply;
+            int64_t now = mp_now_ms();
+            if (now - last_apply >= 66) {
+                last_apply = now;
+                render_set_drag_off((int)f.x - 240);
+                render_set_drag_off_y((int)f.y - 240);
+                note_interaction();
+            }
+            return;
+        }
+        if (!longpress_fired && !drag_active &&
+            (mp_now_ms() - down_ms) >= LONGPRESS_MS &&
+            abs((int)f.x - (int)down_x) < TAP_MOVE_PX &&
+            abs((int)f.y - (int)down_y) < TAP_MOVE_PX) {
+            /* 【E6 定稿 2026-09-27】宠物区长按 = 呼出 BGM【半屏控制条】
+             * （需求原文：「半屏控制条：播放/暂停/切歌/音量」，由选择器内 BGM
+             * 入口或宠物区长按呼出）。此前实现是"长按 → 打开全屏菜单"，属于
+             * 功能可达但形态不符，E6 缺口核对里记为未实现——改为直接呼出
+             * 下半屏控制条：上半屏照常显示宠物，3s 无操作自动收起。
+             * 离线（BGM 静音降级）时无意义 → 不呼出。 */
+            longpress_fired = true;
+            ESP_LOGI(TAG, "宠物区长按 → 呼出 BGM 半屏控制条");
+            if (!state_machine_offline_mode()) {
+                render_bgm_bar_show();
+            } else {
+                ESP_LOGW(TAG, "离线：BGM 已静音降级，控制条不呼出");
+            }
+            note_interaction();
+        }
+    } else if (!f.touched && down) {
+        down = false;
+        int64_t dur = mp_now_ms() - down_ms;
+        int dx = abs((int)f.x - (int)down_x);
+        int dy = abs((int)f.y - (int)down_y);
+        /* 【E6 半屏控制条】手势起于控制条：短点空白/面板外 = 收起（不抚摸宠物）；
+         * 点中按钮已按下沿执行（bar_item_fired）。*/
+        if (gesture_on_bar) {
+            gesture_on_bar = false;
+            if (!bar_item_fired && !drag_active &&
+                dur < TAP_MAX_MS && dx < TAP_MOVE_PX && dy < TAP_MOVE_PX) {
+                ESP_LOGI(TAG, "控制条：点空白 → 收起");
+                render_bgm_bar_hide();
+            }
+            drag_active = false;
+            note_interaction();
+            return;
+        }
+        if (drag_active) {
+            /* 拖动结束 → 人物保持原地（跟手语义）。用户口径：只要**初始化**看起来
+             * 站在地上，拖拽后不需要任何额外归位（不要求"松手落回地面线"）。 */
+            drag_active = false;
+            note_interaction();
+        } else if (!longpress_fired && dur < TAP_MAX_MS && dx < TAP_MOVE_PX && dy < TAP_MOVE_PX) {
+            /* 轻点 = 抚摸：smile/love 随机 + 短气泡可见反馈（问题6）。
+             * 气泡走 FONT 包渲染，字形缺失时 bridge_bubble_render 报错跳过
+             * → 自动降级为只做表情 */
+            mp_post_event_simple(MP_EVT_TOUCH_PET, f.x, f.y, NULL);
+            input_trigger_expression((rand() % 2) ? MP_EXPR_SMILE : MP_EXPR_LOVE, 1500);
+            mp_cmd_t bc = { .type = MP_CMD_BUBBLE };
+            strlcpy(bc.s, "hello", sizeof(bc.s));
+            mp_post_cmd(&bc);
+            note_interaction();
+        }
+    }
+}
+
+/* ================================================================== */
+/* 菜单键（GPIO18，E6：任何可用物理键=菜单键）                           */
 /* ================================================================== */
 /* 菜单键按下沿：POKER/OFFLINE→MENU，MENU→POKER（DOZE 下=先唤醒）。
  * 状态机内部锁竞争时会静默丢事件（handle 里 take 失败直接 return），
@@ -378,6 +833,14 @@ static void force_tick(const imu_accel_t *a)
 static void key_fire_menu_toggle(void)
 {
     mp_state_t before = state_machine_current();
+
+    /* 【契约 §3.3 相机调参态】顶键短按 = 确认保存（与菜单内"顶键=确认"同构）。
+     * 调参态绝不能在这里打开菜单：全屏菜单会盖住地图，调参就没得看了。 */
+    if (bridge_cam_adjust_active()) {
+        ESP_LOGI(TAG, "顶键短按 → 相机确认保存（NVS 写入 + 重合成）");
+        bridge_cam_adjust_finish(true);
+        return;
+    }
 
     /* 【E6 半屏控制条】控制条显示时，顶键=确认当前控件（侧键口径与菜单一致：
      * 顶=OK 中=移光标 底=收起），不打开菜单。 */
@@ -409,12 +872,19 @@ static void key_fire_menu_toggle(void)
     }
 }
 
+/* 【185B 2026-10-01】原 216 的 key_tick()（GPIO18 独立菜单键，状态门闩版）
+ * 在本板**整段删除**：1.85B 硬件只有 BOOT=GPIO0 一个固件可用键
+ * （官方 BSP 按键表只有 BSP_BUTTONS_IO_0=GPIO0；PWR 是硬件电源通路，
+ * 固件读不到）。菜单开关/待机时钟/菜单内导航全部由 key0_tick 一族承担，
+ * 见下方 key0_menu_key_long_tick 的注释。 */
+
 static int64_t s_k0_pressed_ms;      /* 菜单内该键按下时刻（长按判定） */
 static bool    s_k0_long_fired;      /* 本次按压已触发长按 */
 static bool    s_k0_wait_release;    /* 正在等释放（短按=下移在释放时执行） */
 static bool    s_k0_bar_mode;        /* 【E6】本次按压归 BGM 控制条（否则归菜单） */
-/* 【185B 菜单键 2026-10-01】声明提前到首个使用（key0_tick 的菜单键分支）之前，
- * 否则 C 文件作用域声明后置 = 编译错误（板A构建实证）。
+static bool    s_k0_cam_mode;        /* 【§3.3】本次按压归相机调参态（确认/取消） */
+
+/* 【185B 菜单键 2026-10-01】BOOT=GPIO0 兼菜单键（本板无 GPIO18 顶键）。
  * 一次按压只产生一个动作：按下沿只上闩不动作，key0_menu_key_long_tick 里
  * 「持续 ≥700ms → 待机时钟」或「释放且未转时钟 → 菜单开关」二选一——
  * clock_fired 保证互斥（原 GPIO18 菜单键同口径）。 */
@@ -428,15 +898,17 @@ static void key0_menu_key_long_tick(void);
 static void key0_tick(void)
 {
     key0_menu_hold_tick();               /* 菜单内：按住时长状态机（长按退出/短按下移） */
-    key0_menu_key_long_tick();           /* 185B：BOOT=菜单键的长按转时钟 */
+    /* 【185B 键位合并 2026-10-01】本板只有 BOOT=GPIO0 一个键（无 GPIO18 顶键、
+     * 无 AXP2101 PWRON 底键，BQ27220 也没有按键引脚）→ 216 的"顶键=菜单键、
+     * 中键=音量/确认"两种角色在本板合并到 BOOT 上：
+     *   · 相机调参态：短按=确认保存 / 长按(≥700ms)=取消（原顶键语义，见下方长按判定）
+     *   · 其余态：短按=菜单开关 / 长按=待机时钟（185B 定稿，key0_menu_key_long_tick） */
+    key0_menu_key_long_tick();           /* 185B：BOOT=菜单键的长按转时钟（+相机确认/取消） */
     if (!key_gpio0_tick()) return;       /* 消抖后的按下沿事件（一次/按压） */
     ESP_LOGI(TAG, "底键（GPIO0）按下沿");
     /* 【唤醒前快照】下方 note_interaction() 在 CLOCK_DOZE 态会同步唤醒回
-     * POKER，其后 state_machine_current() 恒读到 POKER（原 DOZE 分支只在
-     * 唤醒事件被锁竞争丢弃时才可达）。185B 菜单键分支用该快照识别
-     * 「本次按下沿已承担唤醒」：唤醒沿只唤醒、不再当菜单键（菜单键事件在
-     * CLOCK_DOZE=仅唤醒，同原 GPIO18 MENU_KEY 口径），否则在时钟态按一下 BOOT 会
-     * 连菜单一起带出来、按住则唤醒后又被拉回时钟。 */
+     * POKER，其后 state_machine_current() 恒读到 POKER——按下沿时刻的
+     * 状态机状态用本快照留存（下方取证 k0st 记录用）。 */
     mp_state_t st_before = state_machine_current();
     {
         /* 【中键取证】NVS 累计计数 + 按下时状态机状态：计数证明通路，
@@ -454,6 +926,18 @@ static void key0_tick(void)
     }
     note_interaction();
     mp_state_t st = state_machine_current();
+    /* 【契约 §3.3 相机调参态】中键（GPIO0）：短按=确认保存、长按(≥800ms)=取消。
+     * 与菜单内「短按动作 · 长按退出」同构：按下沿不动作，交按住时长判定，
+     * 长按不会顺带触发确认。放在菜单分支之前——调参态跑在 POKER 态（菜单已收起），
+     * 但即便状态机侧出现 MENU 与调参态并存，也以调参态优先（防误改菜单选中项）。 */
+    if (bridge_cam_adjust_active()) {
+        s_k0_pressed_ms = mp_now_ms();
+        s_k0_long_fired = false;
+        s_k0_wait_release = true;
+        s_k0_bar_mode = false;
+        s_k0_cam_mode = true;
+        return;
+    }
     if (st == MP_ST_MENU) {
         /* 【用户定稿 2026-09-27】这个键（红框底键，走 GPIO0 通路）在菜单里：
          *   短按 → 光标【下移】（此前是上移，用户明确要求改向下）
@@ -468,6 +952,7 @@ static void key0_tick(void)
         s_k0_long_fired = false;
         s_k0_wait_release = true;
         s_k0_bar_mode = false;
+        s_k0_cam_mode = false;
         (void)render_menu_nav;
         return;
     }
@@ -482,14 +967,13 @@ static void key0_tick(void)
         s_k0_long_fired = false;
         s_k0_wait_release = true;
         s_k0_bar_mode = true;
+        s_k0_cam_mode = false;
         return;
     }
-    /* POKER/OFFLINE：BOOT(GPIO0) = 菜单键（【185B 2026-10-01 定稿】本板无
-     * GPIO18 且音频关闭，BOOT 升级为菜单键：短按（释放时）=菜单开关，
-     * 长按 ≥700ms=待机时钟。动作【不在按下沿】执行：若按下沿就 toggle，
-     * 长按会「先开菜单再转时钟」两个都触发；改在上闩后由
-     * key0_menu_key_long_tick 按时长/释放二选一。本板 profile key.menu 恒
-     * -1，原 216 板的「menu>=0 → 音量减」分支已随板拆除。 */
+    /* 【185B 键位合并】POKER/OFFLINE：BOOT(GPIO0) = 菜单键（本板无 GPIO18 顶键）。
+     * 短按（释放时）=菜单开关、长按 ≥700ms=待机时钟——由 key0_menu_key_long_tick
+     * 按时长/释放二选一执行（动作**不在按下沿**，否则长按会"先开菜单再转时钟"）。
+     * 216 在此处的"音量减"语义属 GPIO18 存在时的角色分工，本板无此分工。 */
     if (st_before == MP_ST_CLOCK_DOZE) return;   /* 唤醒沿：只唤醒（见上） */
     s_k0_menu_latch = true;                      /* 上闩：动作延到释放/700ms */
     s_k0_menu_press_ms = mp_now_ms();
@@ -498,15 +982,31 @@ static void key0_tick(void)
 
 /* 185B 菜单键（BOOT）短按/长按分辨，key0_tick 每轮驱动（不看状态机状态，
  * 故闩在任何态下都有出路：释放或 700ms 二者必至其一，不会卡死）：
- *   - 持续 ≥700ms → 待机时钟（IDLE_TIMEOUT），闩清；
- *   - 释放且未转时钟 → 菜单开关一次（key_fire_menu_toggle，含控制条确认/
- *     菜单内确认语义）。
- * clock_fired 保证长按转时钟后释放不再补发
- * 菜单开关（互斥）；按下沿不动作，故短按/长按天然只出其一。
+ *   - 相机调参态：短按=确认保存 / 长按=取消（216 顶键语义搬到本板合并键上）
+ *   - 其余：持续 ≥700ms → 待机时钟（IDLE_TIMEOUT），闩清；
+ *           释放且未转时钟 → 菜单开关一次（key_fire_menu_toggle）
+ * clock_fired 保证长按转时钟后释放不再补发菜单开关（互斥）；按下沿不动作，
+ * 故短按/长按天然只出其一。
  * 释放判定用原始电平（同 key0_menu_hold_tick 口径）；驱动 key_gpio0_tick
  * 的「释放+80ms 静止再上膛」闩保证释放弹回不会产生第二次按下沿。 */
 static void key0_menu_key_long_tick(void)
 {
+    /* 【契约 §3.3 相机调参态】本板键位合并：调参期 BOOT 改当"确认/取消"。
+     * 走 s_k0_wait_release 那套（key0_menu_hold_tick 的 on_cam 分支）——
+     * 与菜单/控制条复用同一"按住时长"状态机，不另起一套；
+     * 这里只负责把**按下沿**转成该状态机的入口（key_gpio0_tick 是一次性事件）。 */
+    if (bridge_cam_adjust_active()) {
+        s_k0_menu_latch = false;                     /* 相机态不参与菜单键闩 */
+        if (!s_k0_wait_release && key_gpio0_tick()) {
+            s_k0_pressed_ms = mp_now_ms();
+            s_k0_long_fired = false;
+            s_k0_wait_release = true;
+            s_k0_bar_mode = false;
+            s_k0_cam_mode = true;
+        }
+        return;
+    }
+
     if (!s_k0_menu_latch) return;
     if (!key_gpio0_pressed()) {              /* 释放沿 */
         s_k0_menu_latch = false;
@@ -525,15 +1025,17 @@ static void key0_menu_key_long_tick(void)
 }
 
 /* 菜单内该键的"按住时长"状态机（key0_tick 每次调用都跑，含无按下沿的轮询帧）。
- * 【E6】BGM 半屏控制条复用同一套：短按=光标左移，长按=收起控制条。 */
+ * 【E6】BGM 半屏控制条复用同一套：短按=光标左移，长按=收起控制条。
+ * 【§3.3】相机调参态复用同一套：短按=确认保存，长按=取消（复原进入前相机）。 */
 #define K0_LONG_MS 800
 static void key0_menu_hold_tick(void)
 {
     if (!s_k0_wait_release) return;
     mp_state_t st = state_machine_current();
     bool on_bar = render_bgm_bar_showing();
-    /* 菜单态与"控制条显示中"两种归属，都不在则清状态 */
-    if (st != MP_ST_MENU && !on_bar) {
+    bool on_cam = bridge_cam_adjust_active();
+    /* 菜单态 / 控制条显示中 / 相机调参态三种归属，都不在则清状态 */
+    if (st != MP_ST_MENU && !on_bar && !on_cam) {
         s_k0_wait_release = false;
         return;
     }
@@ -542,7 +1044,10 @@ static void key0_menu_hold_tick(void)
 
     if (still_down && !s_k0_long_fired && held >= K0_LONG_MS) {
         s_k0_long_fired = true;
-        if (on_bar) {
+        if (on_cam) {
+            ESP_LOGI(TAG, "中键长按（≥%dms）→ 相机取消（复原进入前状态）", K0_LONG_MS);
+            bridge_cam_adjust_finish(false);
+        } else if (on_bar) {
             ESP_LOGI(TAG, "底键长按（≥%dms）→ 收起 BGM 控制条", K0_LONG_MS);
             render_bgm_bar_hide();
         } else {
@@ -555,7 +1060,10 @@ static void key0_menu_hold_tick(void)
     if (!still_down) {                      /* 释放 */
         s_k0_wait_release = false;
         if (!s_k0_long_fired) {
-            if (s_k0_bar_mode) {
+            if (s_k0_cam_mode) {
+                ESP_LOGI(TAG, "中键短按 → 相机确认保存（NVS 写入 + 重合成）");
+                bridge_cam_adjust_finish(true);
+            } else if (s_k0_bar_mode) {
                 ESP_LOGI(TAG, "底键短按 → 控制条光标左移");
                 render_bgm_bar_nav(0);
             } else {
@@ -565,6 +1073,7 @@ static void key0_menu_hold_tick(void)
             }
         }
         s_k0_long_fired = false;
+        s_k0_cam_mode = false;
     }
 }
 
@@ -576,12 +1085,13 @@ static void key0_menu_hold_tick(void)
  * 上拉，与 key_gpio0 同款），任一脚电平跳变即 ESP_LOGI（每脚 1s 限频防刷屏）。常驻不退出。
  *
  * 候选集 = ESP32-S3 全脚（0-21,26-48）排除后剩下的空闲脚：
- *   - 板上外设已占（profile + wiki GPIO 表）：SDMMC 12/13/14/15/16、
- *     LCD 3/5/21/40/41/42/45/46、I2C 10/11、RTC INT 6；
+ *   - 板上外设已占（profile_amoled216 + wiki GPIO 表）：SD 1/2/3/41、
+ *     LCD 4/5/6/7/12/38/39、音频 8/9/10/42/45/46、触摸 11/40、RTC 13、
+ *     I2C 14/15、IMU 17/21、菜单键 18；
  *   - 系统用途不可碰：26-32（Flash）、35-37（S3R8 Octal PSRAM）、
  *     19/20（原生 USB=烧录/日志口）、43/44（UART0 控制台）；
- *   → 剩余：GPIO0（BOOT，strapping 只能输入正合适）、GPIO16（板卡
- *     wiki 列为 SD 用途，防走线存疑）、GPIO47/48（S3 空脚，wiki 表
+ *   → 剩余：GPIO0（Key2/BOOT，strapping 只能输入正合适）、GPIO16（板上
+ *     SYS_OUT，wiki 列为板上网络、用途存疑）、GPIO47/48（S3 空脚，wiki 表
  *     未列出，防板上另有走线；未连时上拉读 1 恒定，无害）。
  */
 #define MP_KEY_SCAN_PROBE 0   /* 诊断期结束：常驻扫描探针占内部堆，已定位按键归属 */
@@ -592,8 +1102,8 @@ static void key0_menu_hold_tick(void)
 /* 【2026-09-27 扩表】中键实测不在 GPIO0（GPIO0 恒 1、按下沿恒 0）→ 扩到
  * ESP32-S3 上所有"可能空闲"的脚，逐一上拉监听跳变，用户按一下即可定位。
  * 排除项（踩过的坑必须写清）：
- *   - 板上外设：SDMMC 12/13/14/15/16、LCD 3/5/21/40/41/42/45/46、
- *     I2C 10/11、RTC INT 6；
+ *   - 板上外设：SD 1/2/3/41、LCD 4/5/6/7/12/38/39、音频 8/9/10/42/45/46、
+ *     触摸 11/40、RTC 13、I2C 14/15、IMU 17/21、菜单键 18；
  *   - 系统：26-32 Flash、**33/34 也是 Octal PSRAM 数据脚**（本板 8MB Octal
  *     PSRAM；配成 GPIO 输入会打断 PSRAM 总线 → 立刻 WDT 复位，实测踩过）、
  *     35-37 PSRAM、19/20 USB、43/44 UART0。 */
@@ -677,14 +1187,85 @@ static inline void keyscan_probe_retry(void) {}   /* 探针关闭：主循环调
 #endif /* MP_KEY_SCAN_PROBE */
 
 /* ================================================================== */
-/* 慢速巡检：RTC 校时重试（E10/E11 的电池/温度巡检随 PMU 驱动一并移除：
- * 本板 has_pmu=false，原轮询恒空转）                                     */
+/* 底键（216 = AXP2101 PWRON 短按；【185B 本板无此硬件】）               */
+/* ================================================================== */
+/* 【185B 2026-10-01 板级裁剪】1.85B 没有 AXP2101，电量计是纯 I2C 的 BQ27220
+ * ——它**没有任何按键输入引脚**（官方 BSP 按键表只有 GPIO0 一个脚；PWR 键是
+ * 硬件电源通路，固件读不到）。因此 pmu_pwron_short_press()/long_press() 在
+ * 本板是恒 false 的内联桩（见 pmu_bq27220.h），本函数整段保留但**永不触发**
+ * ——保留的理由：① 代码与 216 同构，日后若换板只改驱动；② 相机调参态等
+ * 分支的语义在阅读上完整。BOOT=GPIO0 是唯一实体键，其菜单/时钟/确认语义
+ * 见 key0_menu_key_long_tick。
+ * 原 216 接线口径（存档）：底键接 AXP2101 PWRON，PMU IRQ 引脚未接线 →
+ * 驱动侧走 IRQ 状态寄存器轮询（事件锁存 + 写 1 清除，慢轮询不丢短按）。
+ *
+ * 功能绑定：手动进/出待机时钟。state_machine.h 无专用「时钟切换」事件，
+ * 用既有接口组合实现（无新增枚举/接口）：
+ *   - CLOCK_DOZE → state_machine_notify_activity()（任意交互唤醒回 POKER，E9）；
+ *   - 其余态 → state_machine_handle(MP_SM_EV_IDLE_TIMEOUT)
+ *     （POKER/MENU/OFFLINE → CLOCK_DOZE；BOOT/OTA/FATAL 状态机本就忽略）。 */
+#define PWRON_POLL_MS 100    /* 巡检节拍：100ms 一查（短按响应足够快） */
+
+static void pwron_tick(void)
+{
+    static int64_t last_poll_ms;
+    int64_t now = mp_now_ms();
+    if (now - last_poll_ms < PWRON_POLL_MS) return;
+    last_poll_ms = now;
+
+    /* 【底键语义定稿 2026-09-27（用户口径）】
+     *   短按：菜单内 = 光标下移；POKER/OFFLINE = 音量+
+     *   长按（≥800ms）：菜单内 = 退出菜单
+     * 长按由驱动侧累计按下持续时间判定（AXP2101 的 short-press 只在释放时
+     * 上报，固件无法用它区分长短按），见 pmu_pwron_long_press()。 */
+    if (pmu_pwron_long_press()) {
+        ESP_LOGI(TAG, "底键（PWRON 长按）");
+        mp_state_t st = state_machine_current();
+        if (st == MP_ST_MENU) {
+            /* 用户定稿：底部长按 = 退出菜单（复用状态机 MENU→POKER 通道） */
+            state_machine_handle(MP_SM_EV_MENU_KEY);
+            ESP_LOGI(TAG, "底键长按 → 退出菜单");
+            return;
+        }
+        note_interaction();
+        return;
+    }
+
+    if (!pmu_pwron_short_press()) return;
+    ESP_LOGI(TAG, "底键（PWRON 短按）");
+    mp_state_t st = state_machine_current();
+    if (st == MP_ST_MENU) {
+        extern void render_menu_nav(int dir);
+        render_menu_nav(1);              /* 菜单内：选中项下移 */
+        return;
+    }
+    if (st == MP_ST_CLOCK_DOZE) {
+        state_machine_notify_activity();           /* 出时钟 → POKER */
+        return;
+    }
+    note_interaction();
+    /* POKER/OFFLINE：音量加 */
+    mp_audio_msg_t m = { .type = MP_AUDIO_VOLUME, .a = +10 };
+    if (!mp_post_audio(&m)) ESP_LOGW(TAG, "audio_q 满，音量+丢失");
+    /* 【§3.3】相机调参态：音量照调，但不弹 VOL 横幅——调参提示横幅是那个态下唯一
+     * 可见的操作提示（POKER 态无中文文字通道），不能被 1.5s 定时横幅顶掉。 */
+    if (bridge_cam_adjust_active()) {
+        ESP_LOGI(TAG, "相机调参态：音量+ 已执行（不弹横幅，保住调参提示）");
+    } else {
+        render_banner_show_for("VOL +", 1500);
+    }
+}
+
+/* ================================================================== */
+/* 慢速巡检：电池 / 温度（E10/E11）                                     */
 static bool    s_rtc_retry_done;
 static int64_t s_rtc_retry_s;
 
 static void slow_tick(int64_t idle_ms)
 {
     int64_t now_s = mp_now_ms() / 1000;
+
+    pwron_tick();                 /* 底键（PWRON 短按）慢速巡检（内部 100ms 节流） */
 
     /* 【真机修复 2026-09-27】校时任务创建失败时重试（内部堆挤压是启动期常见，
      * 几秒后往往就能分配）；幂等：已成功启动则内部直接返回。 */
@@ -693,6 +1274,38 @@ static void slow_tick(int64_t idle_ms)
         provision_rtc_resync_start();
         extern bool provision_rtc_task_running(void);
         if (provision_rtc_task_running()) s_rtc_retry_done = true;
+    }
+
+    if (now_s - s_last_battery_s >= BATTERY_CHK_S) {
+        s_last_battery_s = now_s;
+        uint8_t pct = mp_pmu_battery_pct();
+        bool charging = mp_pmu_charging();
+
+        if (charging) {
+            state_machine_handle(MP_SM_EV_BATTERY_OK);
+            s_battery_low_reported = false;
+        } else if (pct <= 10) {
+            /* <10% 强制睡眠保电（E11） */
+            mp_post_event_simple(MP_EVT_BATTERY_LOW, pct, 0, NULL);
+            state_machine_handle(MP_SM_EV_BATTERY_CRIT);
+        } else if (pct <= 20 && !s_battery_low_reported) {
+            /* <20% 宠物打哈欠 troubled（E11）；despair 留给 BGM failover（E8） */
+            s_battery_low_reported = true;
+            mp_post_event_simple(MP_EVT_BATTERY_LOW, pct, 0, NULL);
+            input_trigger_expression(MP_EXPR_TROUBLED, 2500);
+        } else if (pct > 25) {
+            s_battery_low_reported = false;
+        }
+    }
+
+    if (now_s - s_last_temp_s >= TEMP_CHK_S) {
+        s_last_temp_s = now_s;
+        float c = mp_pmu_temp_c();
+        if (c >= TEMP_HOT_C) {
+            /* 过温 = hot（E10） */
+            mp_post_event_simple(MP_EVT_ERROR, 1001 /* overtemp */, (int32_t)c, NULL);
+            input_trigger_expression(MP_EXPR_HOT, 2000);
+        }
     }
 
     state_machine_tick_1hz();     /* 闲置 → CLOCK_DOZE（E9） */
@@ -757,7 +1370,10 @@ void input_dispatch_task(void *arg)
     }
 
     (void)arg;
-    key_gpio0_init();             /* 菜单键 BOOT=GPIO0（输入+上拉+轮询消抖，绝不输出） */
+    /* 【185B】本板无 GPIO18 独立菜单键（官方 BSP 按键表只有 GPIO0）→
+     * key_gpio18_init() 已按板删除；BOOT=GPIO0 兼菜单键。 */
+    key_gpio0_init();             /* BOOT=GPIO0 菜单键（输入+上拉+轮询消抖，绝不输出） */
+    tmap_init();                  /* 触摸映射自校准：恢复上次选中候选 */
 #if MP_KEY_SCAN_PROBE
     /* 【临时探针】中键引脚扫描：低优先级 core0，60s 自删（定稿后随
      * MP_KEY_SCAN_PROBE 一起移除） */
@@ -818,7 +1434,12 @@ void input_dispatch_task(void *arg)
             render_bgm_bar_show();
             note_interaction();
         }
-        key0_tick();              /* 菜单键 BOOT=GPIO0：短按菜单开关 / 长按待机时钟 */
+        touch_tick();
+        /* 【185B 键位】原 216 的 key_tick()（GPIO18 顶键）在本板整段删除：
+         * 1.85B 只有 BOOT=GPIO0 一个固件可用键，菜单开关/时钟/菜单内导航/
+         * 控制条/相机确认全部由 key0_tick 一族承担（见其注释）。 */
+        key0_tick();
+        bridge_cam_adjust_poll(); /* 【§3.3】调参态兜底：离开 POKER/OFFLINE → 未确认即取消 */
         expr_fsm_tick();
 
         int64_t idle_ms = (s_last_interaction_ms == 0)

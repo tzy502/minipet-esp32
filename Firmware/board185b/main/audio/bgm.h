@@ -8,8 +8,8 @@
  *     failover 事件上报 + despair 表情；手动切类型才换源
  *   - 断网 = 静音降级（不做本地曲库缓存）
  *
- * 控制入口：audio_q（控制条 / poll 指令），控制回传 POST /api/device/bgm/cmd。
- * PA 使能：有声才开（mp_pa_enable；本板 has_audio=false 时 BGM 不启动）。
+ * 控制入口：audio_q（触摸控制条 / poll 指令），控制回传 POST /api/device/bgm/cmd。
+ * PA_CTRL（GPIO46）：有声才开（pa_ctrl_enable）。
  * 音量：线性（feeder 出口统一缩放，立即生效）。
  */
 #ifndef MP_BGM_H
@@ -42,6 +42,8 @@ mp_bgm_state_t bgm_get_state(void);
 mp_bgm_source_t bgm_get_source(void);
 uint8_t bgm_get_volume(void);
 bool bgm_source_greyed(mp_bgm_source_t src);
+/** 当前流采样率（Hz；0=未定）——仅供遥测/探针打印用。 */
+uint32_t bgm_rate_get(void);
 
 /* 源显示名（菜单标签用）："wz"/"qq"。 */
 const char *bgm_source_name(void);

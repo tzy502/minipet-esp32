@@ -177,6 +177,14 @@ static void handle_cmd(cJSON *jc)
         strlcpy(c.s, v, sizeof(c.s));
         mp_post_cmd(&c);
     } else if (strcmp(t, "map") == 0 && v) {
+        /* 【§4.4 解除隐藏 2026-10-01】服务端推送地图（push 端点 switch 指令）
+         * = 用户又想要这张图了 → 若本地打过"删除/隐藏"标识，推送到达即自动
+         * 解除（列表恢复显示）。**只在服务端指令路径调**——设备自身开机重投
+         * 默认图（state_machine）不得解除用户的隐藏。 */
+        if (asset_dl_map_hidden(v)) {
+            asset_dl_map_set_hidden(v, false);
+            ESP_LOGW(TAG, "服务端重推地图 %s → 解除本地隐藏（菜单列表恢复显示）", v);
+        }
         c.type = MP_CMD_SET_MAP;
         strlcpy(c.s, v, sizeof(c.s));
         mp_post_cmd(&c);
@@ -344,8 +352,14 @@ static bool do_poll_once(void)
                     mp_cmd_t c = { 0 }; c.type = MP_CMD_BUBBLE;
                     strlcpy(c.s, vitem->valuestring, sizeof(c.s)); mp_post_cmd(&c);
                 } else if (strcmp(tbuf, "map") == 0 && cJSON_IsString(pid)) {
+                    /* 现代口径地图指令：同 handle_cmd 的 §4.4 解除隐藏语义 */
+                    const char *mid = pid->valuestring;
+                    if (asset_dl_map_hidden(mid)) {
+                        asset_dl_map_set_hidden(mid, false);
+                        ESP_LOGW(TAG, "服务端重推地图 %s → 解除本地隐藏（菜单列表恢复显示）", mid);
+                    }
                     mp_cmd_t c = { 0 }; c.type = MP_CMD_SET_MAP;
-                    strlcpy(c.s, pid->valuestring, sizeof(c.s)); mp_post_cmd(&c);
+                    strlcpy(c.s, mid, sizeof(c.s)); mp_post_cmd(&c);
                 } else if (strcmp(tbuf, "brightness") == 0 && pn) {
                     mp_cmd_t c = { 0 }; c.type = MP_CMD_BRIGHTNESS;
                     c.a = (int32_t)cJSON_GetNumberValue(pn); mp_post_cmd(&c);

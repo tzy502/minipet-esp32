@@ -9,7 +9,7 @@
  *   [feeder 任务 PRO 核]
  *     ring_read(1152 帧, 100ms 超时) → 线性音量缩放
  *     → codec_write（I2S DMA，48k/16bit 档随 MP3 帧采样率重配）
- *     → PA 有声才开（mp_pa_enable）
+ *     → PA_CTRL 有声才开（pa_ctrl_enable）
  *
  * E8 短路状态机（同源内）：
  *   曲内失败重试 2 → 跳下一首（仍是同源）→ 连续 3 曲失败
@@ -53,6 +53,11 @@ static const char *TAG = "bgm";
 #define TRACK_FAIL_LIMIT   3                /* 连续 3 曲失败 → 源置灰 */
 #define STALL_NOFRAME_MAX  64               /* 连续空帧判失联（喂错流/占位解码器） */
 #define UNDERRUN_PA_OFF    20               /* 静音 2s → 关 PA */
+/* 起播预缓冲（治"卡顿"）：攒够 PRIME_MS 毫秒的 PCM 再开声；超时 PRIME_TIMEOUT_MS
+ * 兜底（慢流/坏流不能让 feeder 永久等待）。数值取 400ms：本板 ring=128KB
+ * （22.05kHz 立体声 ≈1.45s），400ms ≈ 28% 水位，足够跨过一次网络/解码抖动。 */
+#define PRIME_MS           400
+#define PRIME_TIMEOUT_MS   2500
 
 /* ------------------------------------------------------------------ */
 /* 状态（feeder/外部读）                                                 */
@@ -593,13 +598,36 @@ volatile int32_t  g_bgm_state_probe;
 /* PLAY 分支逐点标记：1 入口 / 2 bgm_cmd 后 / 3 codec_start 后 / 4 表情后 /
  * 5 取到表锁 / 6 tbl_ensure 后 / 7 play_session 后 —— 卡在哪一步看它 */
 volatile uint32_t g_bgm_step;
+/* 【静默丢弃取证 2026-10-01】bgm_task 三处 continue/return 全无日志：
+ * 解码器缺失 / 断网降级 / 源置灰 —— 用户侧表现都是"点了播放毫无反应"。
+ * 计数由 main.c 的 tprobe 打印，判定"命令到了但被谁吃掉"。 */
+volatile uint32_t g_bgm_drop_nodec, g_bgm_drop_offline, g_bgm_drop_greyed;
+/* feeder 侧 codec 写失败次数（未初始化/句柄空 → 此前完全静默） */
+volatile uint32_t g_bgm_wr_err;
+/* 【卡顿取证 2026-10-01】环形缓冲断供次数（I2S 被抽干=可听断音）+
+ * 打印周期内最低水位（int16 样本；rate*2=1 秒）+ 单次 I2S 写最长耗时（µs）。
+ * 判读：underruns 持续涨 = 解码/网络供不上（查 HTTP 读速与 decode）；
+ *       水位长期贴着 0 = ring 太小或读端节流；wr_max_us > 50ms = I2S 侧被阻塞。 */
+volatile uint32_t g_bgm_underruns;
+volatile uint32_t g_bgm_ring_min = 0xFFFFFFFFu;
+volatile uint32_t g_bgm_wr_max_us;
+/* 【节律性卡顿取证 2026-10-01】用户口径：BGM"隔几秒卡一下，像断帧"。
+ * ring 侧无断供（underruns=0）+ 水位 1.2s 满 ⇒ 只可能是 **feeder 被抢占**：
+ * I2S DMA 只有 ~139ms 余量，feeder 晚到 >139ms 就抽干 → 可听断音。
+ * 这里记录两次 I2S 写之间的最大间隔（µs）与超阈值次数，用于和串口里
+ * "谁在那个时刻跑"（WiFi 重连/素材同步/NVS 提交/字体装载）对表。
+ * 判据：gap_max > 139000µs（22.05kHz 下 DMA 深度）即实锤欠载；
+ *       gap_over 每 10s 涨 = 卡顿频次。 */
+volatile uint32_t g_bgm_gap_max_us;
+volatile uint32_t g_bgm_gap_over;
+volatile uint32_t g_bgm_gap_at_ms;
 
 static void handle_audio_msg(const mp_audio_msg_t *m)
 {
     switch (m->type) {
     case MP_AUDIO_PLAY: {
         g_bgm_step = 1;
-        if (s_greyed[s_source]) return;                 /* 置灰源禁播（E8） */
+        if (s_greyed[s_source]) { g_bgm_drop_greyed++; return; }   /* 置灰源禁播（E8） */
         int id = m->a;                              /* 0=服务端决定；负数=高位 u32 id 的位型 */
         if (id == 0) {
             if (bgm_cmd("play", 0, &id) != 0 || id == 0) {
@@ -748,11 +776,15 @@ static void handle_audio_msg(const mp_audio_msg_t *m)
 static void bgm_task(void *arg)
 {
     (void)arg;
-    /* 解码器状态 ≈6.7KB（float 合成器），内部 RAM 优先；紧张时退 PSRAM
-     * （float 访存变慢但仍可解，好过无声） */
-    s_dec = heap_caps_malloc(sizeof(mp3dec_t), MALLOC_CAP_8BIT);
+    /* 解码器状态 ≈6.7KB（float 合成器）。
+     * 【内部堆让位 2026-10-01】原先"内部 RAM 优先、紧张才退 PSRAM"——但本板
+     * 内部 DRAM 只有 ~133KB，真机实测整图包（17MB）分块下载期间内部堆会掉到
+     * 几百字节，连 SDMMC 的 512B DMA 缓冲都拿不到（`sdmmc_read_sectors:
+     * not enough mem` → 地图包 open 失败 → 黑屏）。解码器放 PSRAM 只损失少量
+     * 访存速度，换回 6.7KB 内部堆是划算的：**改为 PSRAM 优先，失败才退内部**。 */
+    s_dec = heap_caps_malloc(sizeof(mp3dec_t), MALLOC_CAP_8BIT | MALLOC_CAP_SPIRAM);
     if (!s_dec) {
-        s_dec = heap_caps_malloc(sizeof(mp3dec_t), MALLOC_CAP_8BIT | MALLOC_CAP_SPIRAM);
+        s_dec = heap_caps_malloc(sizeof(mp3dec_t), MALLOC_CAP_8BIT);
     }
     if (s_dec) {
         mp3dec_init(s_dec);
@@ -763,16 +795,25 @@ static void bgm_task(void *arg)
     uint32_t src = 0;
     if (mp_nvs_get_u32("bgm_src", &src)) s_source = (mp_bgm_source_t)src;
 
+    /* 【取证 2026-10-01】此前任务起步完全静默：解码器分配失败时任务照跑但
+     * 每条消息都被丢弃，串口/Web 日志里看不出任何异常（"点了播放毫无反应"）。
+     * 这里把起步状态一次打全：dec/ring 指针 + 起始源/音量。 */
+    ESP_LOGI(TAG, "bgm 任务起步：dec=%p(%uB) ring=%p 源=%s 音量=%u 栈=%d",
+             (void *)s_dec, (unsigned)sizeof(mp3dec_t), (void *)s_ring,
+             source_str((mp_bgm_source_t)s_source), (unsigned)s_vol,
+             (int)MP_BGM_TASK_STACK);
+
     for (;;) {
         mp_audio_msg_t m;
         if (xQueueReceive(mp_audio_q, &m, portMAX_DELAY) == pdTRUE) {
             g_bgm_msgs++;
             g_bgm_state_probe = (int32_t)s_state;
-            if (!s_dec) continue;                       /* 解码器不可用 */
+            if (!s_dec) { g_bgm_drop_nodec++; continue; }   /* 解码器不可用（计数取证） */
             if (m.type == MP_AUDIO_VOL || m.type == MP_AUDIO_VOLUME) {
                 handle_audio_msg(&m); continue;     /* 音量本地可用，断网也不拦 */
             }
             if (s_offline && m.type != MP_AUDIO_SOURCE) {
+                g_bgm_drop_offline++;
                 continue;                               /* 断网静音降级（E8）；切源仍可 */
             }
             handle_audio_msg(&m);
@@ -802,6 +843,9 @@ static void feeder_task(void *arg)
     static int16_t out[FEED_FRAMES * 2];
     bool pa_on = false;
     int underruns = 0;
+    bool primed = false;             /* 起播预缓冲已完成 */
+    int64_t prime_deadline = 0;      /* 预缓冲等待上限（防慢流死等） */
+    int64_t s_last_wr_end_us = 0;    /* 上次 I2S 写结束时刻（卡顿取证） */
 
     for (;;) {
         g_feeder_loops++;
@@ -815,12 +859,39 @@ static void feeder_task(void *arg)
         if (!s_playing) {
             if (pa_on) { mp_pa_enable(false); pa_on = false; }
             underruns = 0;
+            prime_deadline = 0;
+            primed = false;
             vTaskDelay(pdMS_TO_TICKS(50));
             continue;
         }
 
+        /* ══ 【起播预缓冲 2026-10-01：治"卡顿"】════════════════════════════
+         * 原实现"环形缓冲里有一帧就往 I2S 送"：起播瞬间 HTTP 首包 + 首帧解码
+         * 都还没跟上，I2S DMA 几毫秒内就被抽干 → 开头必有一串断音；流中途
+         * 网络/解码抖动同样直接漏到喇叭（ring 只有 1.4s 余量，浅水位就断）。
+         * 现在：等 ring 攒到 PREBUF_MS 的水位再开声（带超时兜底，防慢流死等），
+         * 期间 PA 保持关闭 → 用户听到的是"干净起播"而不是"先咔哒几声"。 */
+        if (!primed) {
+            uint32_t rate = s_rate ? s_rate : 44100;
+            size_t need = (size_t)((uint64_t)rate * 2u * PRIME_MS / 1000u);   /* int16 计 */
+            size_t have = pcm_ring_count(s_ring);
+            int64_t now_us = esp_timer_get_time();
+            if (prime_deadline == 0) prime_deadline = now_us + PRIME_TIMEOUT_MS * 1000;
+            if (have < need && now_us < prime_deadline) {
+                if (have < g_bgm_ring_min) g_bgm_ring_min = (uint32_t)have;
+                vTaskDelay(pdMS_TO_TICKS(10));
+                continue;
+            }
+            primed = true;
+        }
+
         size_t n = pcm_ring_read(s_ring, out, FEED_FRAMES * 2, 100);
+        {
+            size_t lvl = pcm_ring_count(s_ring);
+            if (lvl < g_bgm_ring_min) g_bgm_ring_min = (uint32_t)lvl;   /* 水位取证 */
+        }
         if (n == 0) {
+            g_bgm_underruns++;
             if (++underruns > UNDERRUN_PA_OFF && pa_on) {
                 mp_pa_enable(false);                 /* 空载关 PA（防底噪） */
                 pa_on = false;
@@ -842,7 +913,32 @@ static void feeder_task(void *arg)
             mp_pa_enable(true);                      /* 有声才开 PA（GPIO46） */
             pa_on = true;
         }
-        mp_codec_write(out, n / 2);                        /* 立体声帧数 */
+        /* 【静默无声根因取证 2026-10-01】此前 codec_write 返回值被丢弃：
+         * codec 未初始化（s_tx=NULL）时每笔都返回 ESP_ERR_INVALID_ARG，串口零日志
+         * → 现象就是"解码在跑、PA 开了、就是没声音"。计数交 tprobe，前几笔另行报错。 */
+        int64_t wr_t0 = esp_timer_get_time();
+        /* 【节律性卡顿取证】上一次写结束 → 本次写开始的最大间隔。
+         * 正常节奏 = FEED_FRAMES/rate ≈ 52ms（22.05kHz）；> DMA 深度（6×512 帧
+         * ≈139ms@22.05k / 70ms@44.1k）即已欠载（可听断音）。 */
+        if (s_last_wr_end_us) {
+            uint32_t gap = (uint32_t)(wr_t0 - s_last_wr_end_us);
+            if (gap > g_bgm_gap_max_us) {
+                g_bgm_gap_max_us = gap;
+                g_bgm_gap_at_ms = (uint32_t)(wr_t0 / 1000);
+            }
+            if (gap > 150000u) g_bgm_gap_over++;          /* 150ms 保守阈值 */
+        }
+        esp_err_t werr = mp_codec_write(out, n / 2);        /* 立体声帧数 */
+        uint32_t wr_us = (uint32_t)(esp_timer_get_time() - wr_t0);
+        s_last_wr_end_us = wr_t0 + wr_us;
+        if (wr_us > g_bgm_wr_max_us) g_bgm_wr_max_us = wr_us;   /* DMA 侧被拖住的取证 */
+        if (werr != ESP_OK) {
+            g_bgm_wr_err++;
+            if (g_bgm_wr_err <= 3) {
+                ESP_LOGE(TAG, "codec_write 失败：%s（codec 未初始化？见 mp_codec_init）",
+                         esp_err_to_name(werr));
+            }
+        }
     }
 }
 
@@ -861,7 +957,7 @@ static volatile bool s_task_up;   /* bgm 任务是否已就绪（自愈重试判
  * 取流/曲目表，因此只能用**内部 DRAM 栈**。
  * 内部栈 24KB 的可行性：真机日志 `@bgm 任务后（渲染任务未创建）最大块=24564`
  * 说明建立之前最大连续块 ≈34.8KB —— 只要**在其它内部堆客户之前**建栈就能成。
- * 本函数因此把建栈提到渲染任务之前（解码器 scratch ≈16KB 必须在调用栈上，
+ * 本函数因此把建栈提到 mp_codec_init 之前（解码器 scratch ≈16KB 必须在调用栈上，
  * 见 minimp3.h 文件头栈核算）。 */
 static BaseType_t bgm_task_create(void)
 {
@@ -885,9 +981,9 @@ static void bgm_task_retry_cb(void *arg)
 
 void bgm_start(void)
 {
-    /* 【能力位门控 2026-09-29】无音频板（185B has_audio=false）：BGM 任务栈
-     * 24KB + feeder 4KB 全是内部 DRAM——省给 RAMless 刷新。hal_contract.h 已
-     * include（MINIPET_ACTIVE_PROFILE 可用）。 */
+    /* 【能力位门控 2026-09-29】无音频板（has_audio=false）：BGM 任务栈
+     * 24KB + feeder 4KB 全是内部 DRAM，直接省下。hal_contract.h 已
+     * include（MINIPET_ACTIVE_PROFILE 可用）。216 板 has_audio=true 行为不变。 */
     if (!MINIPET_ACTIVE_PROFILE.has_audio) {
         ESP_LOGW(TAG, "本板无音频（has_audio=false）：BGM/feeder 不启动（降级）");
         return;
@@ -903,7 +999,7 @@ void bgm_start(void)
         return;
     }
     /* 【建栈顺序 + 栈大小 2026-09-27 真机实证】
-     * ① 必须在渲染任务之前建栈：真机日志显示这之后的内部堆
+     * ① 必须在 mp_codec_init / 渲染任务之前建栈：真机日志显示这两步之后的内部堆
      *    最大连续块只剩 ~24.5KB，24KB 栈建不起来；此刻（刚过 WiFi 初始化）还有
      *    ~34KB 连续块，一次成功。
      * ② 24KB 不是拍脑袋：minimp3.h 文件头写明 `mp3dec_decode_frame` 的
@@ -927,7 +1023,42 @@ void bgm_start(void)
             esp_timer_start_periodic(s_task_retry_timer, 10ULL * 1000000ULL);
         }
     }
-    xTaskCreatePinnedToCore(feeder_task, "i2s_feed", 4096, NULL, 4, NULL, 0 /* PRO */);
+
+    /* ══ 【BGM 全程无声的真根因 2026-10-01：codec 从未初始化】══════════════════
+     * 证据链：
+     *   · 全仓 `codec_es8311_init()` 只有定义，**零调用点**（hal_contract 的
+     *     mp_codec_init 同样零调用）；git 取证：051ff84 的 bgm_start 里有
+     *     `mp_codec_init(44100);`，feb1360 重排建栈顺序时被删，此后从未恢复
+     *     （main.c 注释"codec_init 在内"成了过期承诺）。
+     *   · 后果：s_tx/s_dev 恒为 NULL →
+     *       codec_es8311_set_sample_rate() 返回 ESP_ERR_INVALID_STATE，
+     *       codec_es8311_write()          返回 ESP_ERR_INVALID_ARG，
+     *     而 feeder_task 两处返回值原先都被丢弃 → 解码/环形缓冲/PA 全在正常跑，
+     *     就是没有一字节进 I2S，串口零日志（真机：命令消费、曲目表建好、无下文）。
+     * 位置纪律（feb1360 的教训）：**必须在 bgm 任务建栈之后**——mp_codec_init 会
+     * 吃掉内部堆连续块（I2S 通道 + 中断 + DMA 描述符），先建 codec 会让 8KB 的
+     * bgm 栈再也建不起来（"bgm 任务首建失败"每 10s 重试、永不成功）。 */
+    esp_err_t cerr = mp_codec_init(44100);
+    if (cerr != ESP_OK) {
+        ESP_LOGE(TAG, "codec 初始化失败：%s → BGM 将无声（I2S/ES8311 未就绪）",
+                 esp_err_to_name(cerr));
+    } else {
+        ESP_LOGI(TAG, "codec 初始化完成（ES8311 + I2S TX 就绪，PA 默认关）");
+    }
+
+    /* 【卡顿修复 2026-10-01 · 第二轮：换核（关键）+ 加厚 DMA】
+     * 用户口径：「隔几秒卡一下，像断帧」——节律与**轮询/网络突发**同量级。
+     * 机理：feeder 原先与 WiFi(prio 23)/TCP-IP(prio 18) 同在 **PRO 核**，
+     * 每次 poll 的收发突发都把 prio 6 的 feeder 压住；I2S DMA（6×512 帧，
+     * 22.05kHz ≈139ms）一被压过 139ms 就抽干 → 可听断音。
+     * 修法：
+     *   ① **feeder 移到 APP 核（core 1）**——那里只有 render(prio 5)/
+     *      input(prio 4)，无网络栈；feeder prio 6 只在"该喂 DMA"时短暂抢占
+     *      渲染（每次 ~1ms 量级，30fps 无感），却再不会被 WiFi 突发压住。
+     *   ② DMA 6×512 → **6×768**（4608 帧：22.05kHz ≈209ms / 44.1kHz ≈104ms），
+     *      内部 DMA 多 6KB（本波次已把解码器 6.7KB 挪去 PSRAM，账平）。
+     * 栈 4096 不变（feeder 无解码）。 */
+    xTaskCreatePinnedToCore(feeder_task, "i2s_feed", 4096, NULL, 6, NULL, 1 /* APP */);
 }
 
 /* ---------------- 曲目表 / 播放控制（任意任务上下文，异步生效）--------- */
@@ -1025,5 +1156,6 @@ void bgm_set_offline(bool offline)
 
 mp_bgm_state_t bgm_get_state(void)  { return s_state; }
 mp_bgm_source_t bgm_get_source(void){ return (mp_bgm_source_t)s_source; }
+uint32_t bgm_rate_get(void)         { return s_rate; }
 uint8_t bgm_get_volume(void)        { return (uint8_t)s_vol; }
 bool bgm_source_greyed(mp_bgm_source_t src) { return s_greyed[src]; }

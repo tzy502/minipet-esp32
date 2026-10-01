@@ -110,7 +110,8 @@ static void refresh_task(void *arg)
     (void)arg;
     uint8_t *stage = s_refr_stage;
     const int rows = s_refr_rows;
-    const int chunk_sz = SW * rows * 2u;
+    /* chunk_sz = SW*rows*2u 曾用于 stage 分块，现分块由 rows/chunks 表达 →
+     * 该式无消费者（保留会触发 -Wunused-variable），故移除。 */
     const int chunks = SH / rows;
     TickType_t last_wake = xTaskGetTickCount();
     uint32_t frames = 0, fails = 0, last_report = 0;
@@ -344,6 +345,27 @@ esp_err_t display_init(void)
     s_inited = true;
     ESP_LOGI(TAG, "ST77916(LCD) 就绪 %ux%u QSPI BL=GPIO%d PCLK=%dMHz",
              SW, SH, BL_GPIO, CONFIG_MP_LCD_PCLK_HZ / 1000000);
+
+    /* 【面板通路自测 2026-10-01】绕过一切采样/刷新逻辑，直接推三色全屏。
+     * 这测试的是 ST77916 面板+esp_lcd 通路本身（与 CO5300/216 板同构）。
+     * 【2026-10-01 收口】加 Kconfig 开关（main/Kconfig.projbuild 的
+     * CONFIG_MP_LCD_BRINGUP_TEST，本来就为这个测试而设、原默认 n 没人用）：
+     * 开着 = 每次开机多 4.5s 三色条纹（bring-up 判读用）；验收后置 n 即消失，
+     * 不必删代码。 */
+#if CONFIG_MP_LCD_BRINGUP_TEST
+    {
+        static uint16_t test_buf[720];   /* 360×2 = 720 u16 */
+        const uint16_t colors[3] = { 0xF800, 0x07E0, 0x001F };  /* R G B */
+        const char *cn[3] = { "红", "绿", "蓝" };
+        for (int ci = 0; ci < 3; ci++) {
+            for (int i = 0; i < SW * 2; i++) test_buf[i] = colors[ci];
+            esp_err_t e = esp_lcd_panel_draw_bitmap(s_panel, 0, 0, SW, 2, test_buf);
+            ESP_LOGW(TAG, "面板自测 %s：draw=%d", cn[ci], e);
+            vTaskDelay(pdMS_TO_TICKS(1500));
+        }
+        ESP_LOGW(TAG, "面板通路自测完成——如屏上未出现红绿蓝条纹则面板/esp_lcd 有问题");
+    }
+#endif
 
     return ESP_OK;
 }

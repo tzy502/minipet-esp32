@@ -4,12 +4,15 @@
  *
  * ============================ 初始化顺序（必须） ============================
  *
- *   1. i2c_bus_init()            共享 I2C（IMU/RTC 的公共前置）
+ *   1. i2c_bus_init()            共享 I2C（IMU/RTC/触摸/PMU/Codec 的公共前置）
  *   2. display_init()            ST77916 QSPI（SPI2_HOST；render_init 内部调用）
- *   3. imu_qmi8658_init()        IMU（依赖 I2C；缺失不阻断启动，app 层有降级路径）
- *   4. rtc_pcf85063_init()       RTC（依赖 I2C；未校时 get_time 返回 INVALID_STATE）
- *   5. sd_mount()                TF 卡（SDMMC，返回 errno，失败可降级）
- *   6. key_gpio0_init()          BOOT 键（GPIO0，输入+上拉+轮询消抖）
+ *   3. touch_cst816_init()       触摸（CST816S@0x15；缺失降级，input 任务内调）
+ *   4. imu_qmi8658_init()        IMU（依赖 I2C；缺失不阻断启动，app 层有降级路径）
+ *   5. rtc_pcf85063_init()       RTC（依赖 I2C；未校时 get_time 返回 INVALID_STATE）
+ *   6. pmu_bq27220_init()        电量计（依赖 I2C；探测失败仅降级，返回 ESP_OK）
+ *   7. sd_mount()                TF 卡（SDMMC，返回 errno，失败可降级）
+ *   8. key_gpio0_init()          BOOT 键（GPIO0，输入+上拉+轮询消抖）
+ *   （codec_es8311_init 由 bgm_start 在任务建栈**之后**调用，见 bgm.c 顺序纪律）
  *
  * 各 init 均幂等；顺序违背时 I2C 器件会因总线未初始化返回 INVALID_STATE。
  *
@@ -37,3 +40,6 @@
 #include "rtc_pcf85063.h"
 #include "sd_tf.h"
 #include "key_gpio0.h"
+#include "touch_cst816.h"
+#include "pmu_bq27220.h"
+#include "codec_es8311.h"

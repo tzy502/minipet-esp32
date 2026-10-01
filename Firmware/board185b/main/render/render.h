@@ -26,7 +26,7 @@
 
 #include <lvgl.h>                  /* lv_font_t / lv_display_t（菜单 UI 用） */
 
-#include "lcd185b.h"               /* profiles 组件根目录导出（与 drivers.h 同约） */
+#include "lcd185b.h"             /* profiles 组件根目录导出（与 drivers.h 同约） */
 
 #ifdef __cplusplus
 extern "C" {
@@ -54,7 +54,7 @@ int  render_init(const minipet_profile_t *profile);
 /* 帧节拍（30fps 定时器驱动；内部完成合成/脏区/display_blit/LVGL） */
 void render_tick(void);
 
-/* 帧数据锁（RAMless 面板刷新拷贝帧缓冲前持锁；185B 持续刷新用） */
+/* 帧数据锁（RAMless 面板刷新拷贝帧缓冲前持锁；216 无消费者） */
 void compositor_frame_lock(void);
 void compositor_frame_unlock(void);
 

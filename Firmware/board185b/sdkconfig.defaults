@@ -28,8 +28,16 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 # LVGL 内存走系统堆（IDF 堆含 PSRAM 池），弃内置 64KB 池（启动崩溃：tlsf 空池）
 CONFIG_LV_USE_STDLIB_MALLOC=1
 
-# LVGL malloc → C 库（IDF 堆，含 PSRAM）；内置 64KB 池启动崩溃\ nCONFIG_LV_USE_CLIB_MALLOC=y
-# CONFIG_LV_USE_BUILTIN_MALLOC is not set
+# LVGL malloc → C 库（IDF 堆，含 PSRAM）
+# 【2026-10-01 真机对账修复】本行原为转义写坏的一行（`...崩溃\ nCONFIG_LV_USE_CLIB_MALLOC=y`
+# 把 CLIB 那行整个吞进注释），而下一行的 BUILTIN=n 写法对 kconfig 无效（`is not set`
+# 只在已启用项上生效，未设置项不会因此变 n）→ 185B 的 active sdkconfig 落成
+# BUILTIN=y + 内置池 64KB 常驻 BSS（map 实证 lv_mem_core_builtin.c.obj @0x10000），
+# 白吃 64KB 内部 DRAM——这正是本板"内部堆 120KB / 最大块 3KB"与 216（186KB）
+# 差距的 96%。现写法：显式三连（STDLIB=1 选 C 库档 + CLIB=y + BUILTIN=n）。
+CONFIG_LV_USE_CLIB_MALLOC=y
+CONFIG_LV_USE_BUILTIN_MALLOC=n
+CONFIG_LV_MEM_SIZE_KILOBYTES=0
 
 # 堆破坏排查：全面毒化 + 分配失败即 abort
 CONFIG_HEAP_POISONING_COMPREHENSIVE=y

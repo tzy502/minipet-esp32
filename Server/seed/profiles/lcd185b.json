@@ -2,9 +2,9 @@
   "name": "lcd185b",
   "w": 480,
   "h": 480,
-  "shape": "square",
+  "shape": "round",
   "psramMb": 8,
-  "audio": false,
-  "touch": false,
+  "audio": true,
+  "touch": true,
   "strips": true
 }
