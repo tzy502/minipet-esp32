@@ -57,6 +57,11 @@ export function getDevice(id) {
 export function updateDevice(id, payload) {
   return http.put(`/admin/devices/${encodeURIComponent(id)}`, payload).then((r) => r.data)
 }
+// DELETE /admin/devices/{id}：从服务端删除已链接的硬件（仅摘登记条目；
+// 在线设备下一次 poll 即被拒 → 立刻掉线，要重新接入必须重新 hello 配对）
+export function deleteDevice(id) {
+  return http.delete(`/admin/devices/${encodeURIComponent(id)}`).then((r) => r.data)
+}
 // POST /admin/pair：6 位配对码入册（10 分钟有效）
 export function pair(code, name = '') {
   return http.post('/admin/pair', { code: String(code).trim(), name }).then((r) => r.data)

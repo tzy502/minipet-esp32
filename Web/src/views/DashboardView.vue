@@ -3,9 +3,10 @@ import { onMounted, onBeforeUnmount, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import {
   NGrid, NGridItem, NCard, NButton, NBadge, NEmpty, NResult, NSpin, NAlert,
-  NModal, NForm, NFormItem, NInput, NTag, NSpace, useMessage,
+  NModal, NForm, NFormItem, NInput, NTag, NSpace, NPopconfirm, useMessage,
 } from 'naive-ui'
 import { useDevicesStore } from '../stores/devices'
+import { deleteDevice } from '../api/client'
 import DevicePetThumb from '../components/DevicePetThumb.vue'
 import { fmtAgo } from '../utils/format'
 
@@ -14,6 +15,18 @@ const message = useMessage()
 const store = useDevicesStore()
 
 // ── 配对码入册（E13：屏显 6 位码 → Web 输入绑定命名，10 分钟有效）──────────
+/* 删除设备（用户口径："服务端运行删除链接过的硬件"）：
+ * 走 DELETE /admin/devices/{id} → 成功后刷新列表（失败把服务端错误原样提示）。 */
+async function removeDevice(d) {
+  try {
+    await deleteDevice(d.deviceId)
+    message.success(`已删除设备 ${d.name || d.deviceId}`)
+    await store.fetchAll({ silent: true })
+  } catch (e) {
+    message.error(e?.serverError || '删除失败')
+  }
+}
+
 const pairVisible = ref(false)
 const pairCode = ref('')
 const pairName = ref('')
@@ -133,6 +146,13 @@ function goDetail(id) {
           <template #action>
             <n-space justify="end">
               <n-button size="small" secondary @click.stop="goDetail(d.deviceId)">换宠换装</n-button>
+              <n-popconfirm @positive-click="removeDevice(d)" @click.stop>
+                <template #trigger>
+                  <n-button size="small" tertiary type="error" @click.stop>删除</n-button>
+                </template>
+                从服务端删除「{{ d.name || d.deviceId }}」？<br />
+                设备若在线会**立刻掉线**，需重新 hello 才能再接入（素材缓存保留）。
+              </n-popconfirm>
             </n-space>
           </template>
         </n-card>
