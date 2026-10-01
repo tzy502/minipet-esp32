@@ -3623,7 +3623,12 @@ static void flush_dirty(void)
  * 行数**（见下方 rows_per 计算），让每块恒为整行高，快速通道恒命中、驱动零分配。 */
 /* 【3 缓冲流水 2026-10-01】见 blit_be 注释：单块会让 SPI 串行化（满屏 63ms）。
  * 块大小沿用已验证值 12288B（早前 24KB 版本与"脸部分割线"报障同期，不要动）。 */
-#define RC_BLIT_STAGES 3
+/* 【内部 RAM 红线 2026-10-01】曾设 3（36KB 内部 RAM）⇒ 真机内部堆掉到
+ * 15KB/最大块 7.6KB ⇒ 素材绑定被门限跳过（**纸娃娃消失**）+ 60s 内 5 次重启。
+ * 本板内部 RAM 只有 ~133KB 动态可用，blit 暂存必须是**内部**（PSRAM 源会让
+ * esp_lcd 每次传输 malloc 内部 DMA 拷贝，更糟）。定稿 2 块（24KB，比原来多 12KB）：
+ * 双缓冲已足够让 SPI 连续（填 B 与传 A 重叠），第 3 块只平滑抖动、不值 12KB。 */
+#define RC_BLIT_STAGES 2
 static uint8_t s_blit_stage[RC_BLIT_STAGES][12288] __attribute__((aligned(64)));
 static int     s_blit_stage_idx;
 

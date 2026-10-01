@@ -1224,6 +1224,33 @@ static void dispatch_manifest_synced(void)
         strlcpy(mc.s, want, sizeof(mc.s));
         mp_post_cmd(&mc);
         ESP_LOGW(TAG, "清单就绪 → 投活动地图 %s（NVS 记忆，缺省 %s）", want, MP_DEFAULT_MAP_ID);
+
+        /* ══ 【地图兜底装载 2026-10-01（自 1.85B 迁移）】════════════════════════
+         * 现象（185B 真机实证，216 同构风险）：活动地图 id 是按"地图 id"下发的，
+         * 而服务端给本设备登记的 BGMAP **完全可能是另一张图**（真机 185B：
+         * 固件要 000010000，服务器只登记了 mapId=2「枫叶路：香格里拉号」）→
+         * set_active_map 按 id 查路径永远失败 → **背景全黑到底**，日志只有
+         *   `set_active_map：M 无对应 BGMAP 条目（清单未就绪？）`
+         * 而"补投"补的还是同一个不存在的 id，永远补不上。
+         * 本兜底：投完用 `asset_dl_map_exists(want)`（语义 = 该 map_id 是否还在
+         * 当前清单里，见 asset_dl.h）判一次；若清单里有 BGMAP 但目标图不在，
+         * 就**直接用清单里第一张已缓存 BGMAP 的 content hash 再投一次**
+         * （绕过 id→hash 映射），保证"有图就一定有背景"。
+         * 用户从菜单选图时照旧按 id 走，不受影响。 */
+        static char hs[8][20]; static char lb[8][32]; static bool ca[8];
+        int n = asset_dl_bgmap_list(hs, lb, ca, 8);
+        if (n > 0 && !asset_dl_map_exists(want)) {
+            int pick = -1;
+            for (int i = 0; i < n; i++) if (ca[i]) { pick = i; break; }   /* 已缓存优先 */
+            if (pick < 0) pick = 0;                                       /* 都没有就选第一张（触发下载） */
+            mp_cmd_t fc = { .type = MP_CMD_SET_MAP };
+            strlcpy(fc.s, hs[pick], sizeof(fc.s));
+            mp_post_cmd(&fc);
+            ESP_LOGW(TAG, "活动图 %s（id 口径）不在清单 → 兜底装载清单首图 %.16s（%s）",
+                     want, hs[pick], lb[pick]);
+        } else if (n == 0) {
+            ESP_LOGW(TAG, "清单里没有任何 BGMAP（服务端未登记地图？）—— 背景保持黑底");
+        }
     }
 
     /* 素材全量重绑后强制一次全屏重绘：清除面板自检色块/旧画面残留
