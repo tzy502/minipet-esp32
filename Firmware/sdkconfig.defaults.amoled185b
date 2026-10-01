@@ -1,5 +1,0 @@
-# LCD-1.85B 板构建默认值（与 sdkconfig.defaults 叠加使用）：
-#   idf.py -B build-185b -DSDKCONFIG=sdkconfig.185b \
-#          -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.amoled185b" build
-# 独立 sdkconfig/构建目录 → 默认（build/，AMOLED-2.16）构建完全不受影响。
-CONFIG_MP_BOARD_LCD185B=y

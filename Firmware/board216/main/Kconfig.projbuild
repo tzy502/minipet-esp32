@@ -1,0 +1,26 @@
+menu "MiniPet 固件配置"
+
+config MP_ASSET_HEAP_GATE_KB
+    int "素材绑定内部堆门（KB）"
+    default 24
+    help
+      fopen/fread TF 素材包前要求的最低内部堆空闲（state_machine 绑定门
+      heap_ok_for_asset_load 与 asset_dl FONT px 读取门共用，防低堆期
+      newlib 锁分配失败 abort）。默认 24KB = AMOLED-2.16 板既有保护值
+      （行为不变）。
+
+config MINIPET_DEFAULT_SRV_URL
+    string "默认服务器地址（NVS srv_url 为空时的兜底）"
+    default ""
+    help
+        设备从 NVS 读服务器地址（配网页写入）。该键为空时（首次上电 / NVS 被清 /
+        未配网）用本项作为兜底，避免"WiFi 已连上、却不知道服务器在哪"而永远不上线
+        （真机实测：srv_url 丢失后设备静默卡在 OFFLINE，日志里连一条 hello 都没有）。
+
+        留空 = 旧行为：必须先在配网页里填写服务器地址。
+
+        例：http://192.168.1.10:38090
+
+        注意：配网页写入的值始终优先，本项只在 NVS 为空时生效。
+
+endmenu

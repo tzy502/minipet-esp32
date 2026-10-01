@@ -1,0 +1,4 @@
+# LCD-1.85B 板构建默认值（与 sdkconfig.defaults 叠加使用）。
+# 185B 单板分支：活动配置 = Firmware/sdkconfig（原 sdkconfig.185b 更名），
+# 构建命令：idf.py -B build build
+# （SDKCONFIG_DEFAULTS 已固定在 Firmware/CMakeLists.txt：defaults + 本文件）。

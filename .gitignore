@@ -72,7 +72,8 @@ Server/MinipetServer/data/
 Server/MinipetServer/wwwroot/*
 !Server/MinipetServer/wwwroot/.gitkeep
 
-# 【例外】固件内嵌素材：地面带（相机下移实验用，见 main/CMakeLists.txt
+# 【例外】固件内嵌素材：地面带（相机下移实验用，见 board*/main/CMakeLists.txt
 # target_add_binary_data）。*.bin 是全仓忽略规则，这里必须显式放行，
 # 否则全新 clone / CI 会因为找不到该文件而构建失败（v0.1.0 曾踩过）。
-!Firmware/main/render/data/*.bin
+!Firmware/board216/main/render/data/*.bin
+!Firmware/board185b/main/render/data/*.bin

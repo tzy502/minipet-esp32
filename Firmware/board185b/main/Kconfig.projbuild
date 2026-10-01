@@ -1,0 +1,45 @@
+menu "MiniPet 固件配置（LCD-1.85B 单板分支）"
+
+config MP_LCD_PCLK_HZ
+    int "LCD QSPI 时钟（Hz）"
+    default 40000000
+    range 1000000 80000000
+    help
+      ST77916 面板 QSPI 时钟。花屏 bring-up 期先降 20MHz 排除信号完整性；
+      确认后调回 40MHz。
+
+config MP_LCD_CONTINUOUS_REFRESH
+    bool "持续全帧刷新（185B RAMless 面板必需；关=一次性写入模式）"
+    default y
+
+config MP_LCD_BRINGUP_TEST
+    bool "开机全屏色块自检（红→绿→蓝，1.85B bring-up 用，验收后关闭）"
+    default n
+    help
+      display_init 末尾连推三张全屏纯色（各 ~0.7s），与渲染管线完全解耦：
+      颜色正确=传输/像素格式通，花屏=格式/线序问题，不亮=背光/复位问题。
+
+config MP_ASSET_HEAP_GATE_KB
+    int "素材绑定内部堆门（KB）"
+    default 6
+    help
+      fopen/fread TF 素材包前要求的最低内部堆空闲（state_machine 绑定门
+      heap_ok_for_asset_load 与 asset_dl FONT px 读取门共用，防低堆期
+      newlib 锁分配失败 abort）。本板内部堆紧张，6KB 为实测绑定成功
+      多轮零 abort 的安全值。
+
+config MINIPET_DEFAULT_SRV_URL
+    string "默认服务器地址（NVS srv_url 为空时的兜底）"
+    default ""
+    help
+        设备从 NVS 读服务器地址（配网页写入）。该键为空时（首次上电 / NVS 被清 /
+        未配网）用本项作为兜底，避免"WiFi 已连上、却不知道服务器在哪"而永远不上线
+        （真机实测：srv_url 丢失后设备静默卡在 OFFLINE，日志里连一条 hello 都没有）。
+
+        留空 = 旧行为：必须先在配网页里填写服务器地址。
+
+        例：http://192.168.1.10:38090
+
+        注意：配网页写入的值始终优先，本项只在 NVS 为空时生效。
+
+endmenu

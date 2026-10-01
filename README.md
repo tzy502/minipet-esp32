@@ -9,10 +9,16 @@
 minipet-esp32/
 ├── Server/       # PC 服务端（C# / .NET）：复用桌面版 Services 核心（WZ解析/纸娃娃/地图烘焙/BGM）
 ├── Web/          # 配置前端（Vue 3 + Naive UI）：设置中心/素材浏览/纸娃娃编辑/曲库/设备管理
-├── Firmware/     # ESP32-S3 固件（ESP-IDF + LVGL）：哑终端，只做渲染/播放/事件上报
+├── Firmware/     # 双板固件（ESP-IDF + LVGL）：两套完全独立的工程，零共享文件
+│   ├── board216/   # AMOLED-2.16 板（CO5300 480×480）：cd Firmware/board216 && idf.py -B build build
+│   └── board185b/  # LCD-1.85B 板（ST77916 360×360）：cd Firmware/board185b && idf.py -B build build
 └── docs/         # 文档
-    └── ai/       # 决策文档、算法规格
+    └── ai/       # 需求/规格/参考资料（板级工作文档随板放在 Firmware/board*/docs/）
 ```
+
+> **双板并行开发纪律**：两块板的代码物理隔离在两个目录，没有任何共享文件——
+> 改哪块板只进哪个目录，同一分支上两边同时开发互不影响；板级差异直接改本目录文件，
+> 不再需要 profile 字段/Kconfig 门控；任何一侧的修复都不会自动出现在另一侧（需手动对照移植）。
 
 ## 架构一句话
 
