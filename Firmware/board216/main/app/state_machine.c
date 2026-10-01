@@ -85,6 +85,28 @@ static const char *active_map_get(char *buf, size_t cap);
  *       个别步尖峰（跨瓦片列那一拍）⇒ 瓶颈在 SD 补块。
  * 触发通道：服务端 `{"type":"camtest"}`（需服务端白名单）**或**
  * 气泡魔数 `::camtest <步数>,<步长>`（走已有 bubble 通道，无需部署服务端）。 */
+/* 【服务端相机挂起】见 MP_CMD_CAM_SET：地图没装好时先记住，装载成功后补上 */
+bool sm_cam_nvs_set(const char *key, int32_t x, int32_t y);   /* 定义在后段 */
+static bool    s_cam_pending;
+static int32_t s_cam_pending_x, s_cam_pending_y;
+
+static void cam_pending_apply(void)
+{
+    if (!s_cam_pending || !render_cam_supported()) return;
+    s_cam_pending = false;
+    render_cam_set(s_cam_pending_x, s_cam_pending_y);
+    int32_t gx = 0, gy = 0;
+    render_cam_get(&gx, &gy);
+    char key[16];
+    const char *ah = asset_dl_active_map_hash();
+    if (ah && asset_dl_map_key(ah, key, sizeof key)) {
+        sm_cam_nvs_set(key, gx, gy);
+        ESP_LOGW(TAG, "挂起的服务端相机已补上 (%d,%d)，已写入 NVS[key=%s]", (int)gx, (int)gy, key);
+    } else {
+        ESP_LOGW(TAG, "挂起的服务端相机已补上 (%d,%d)（无活动地图键，未持久化）", (int)gx, (int)gy);
+    }
+}
+
 static void cam_pan_test_run_ex(int steps, int step, int level);
 
 static void cam_pan_test_run(int steps, int step)
@@ -1021,6 +1043,7 @@ static void dispatch_map(const char *hash)
     ESP_LOGW(TAG, "地图装载 %s（条带 %d）rc=%d", hash, n, mrc);
     if (mrc == 0) {
         g_map_loaded = true;
+        cam_pending_apply();          /* 服务端相机若在地图装载前到达，这里补上 */
         /* 装载成功即记忆（含服务端推送/菜单选择/开机重投三条路径）：下次开机仍用它 */
         char mid[32];
         if (asset_dl_map_id_of(hash, mid, sizeof mid)) active_map_save(mid);
@@ -1386,9 +1409,17 @@ void app_cmd_dispatch(const mp_cmd_t *cmd)
         bubble_show(cmd->s, RENDER_FONT_24);   /* 协议传 UTF-8（E12） */
         break;
     case MP_CMD_CAM_SET: {
-        /* 服务端"选镜头"界面下发：应用到渲染层并写入该图 NVS（重启/断网后仍生效） */
+        /* 服务端"选镜头"界面下发：应用到渲染层并写入该图 NVS（重启/断网后仍生效）。
+         * 【时序兜底 2026-10-01】真机：指令常在**地图尚未装载完**时到达（长轮询
+         * 与启动/换图重叠）→ render_cam_supported() 还是 false → 之前直接丢弃，
+         * 用户在 Web 点了"上送"却没反应。改为**挂起记忆**：地图一装载成功就补上
+         * （见 dispatch_map 成功分支的 cam_pending_apply）。 */
         if (!render_cam_supported()) {
-            ESP_LOGW(TAG, "服务端相机 %d,%d：当前图非整图包 → 忽略", (int)cmd->a, (int)cmd->b);
+            s_cam_pending_x = cmd->a;
+            s_cam_pending_y = cmd->b;
+            s_cam_pending = true;
+            ESP_LOGW(TAG, "服务端相机 %d,%d：当前图非整图包 → 挂起，待整图装载后自动补上",
+                     (int)cmd->a, (int)cmd->b);
             break;
         }
         render_cam_set(cmd->a, cmd->b);
