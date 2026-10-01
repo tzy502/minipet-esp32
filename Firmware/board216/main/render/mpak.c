@@ -1155,10 +1155,14 @@ static int bg_rect_args(const mpak_t *m, int32_t w, int32_t h,
  * ══════════════════════════════════════════════════════════════════════════ */
 
 #ifndef MPAK_TILE_PX_SLOTS
-#define MPAK_TILE_PX_SLOTS 16       /* 像素块槽数（每槽 tile*tile*2 = 32KB @128） */
+/* 【2026-10-01 16→32】用户真机报"进入选镜头后屏上大片黑、只有一小块亮"：
+ * 满屏合成要覆盖 4×4=16 块/层，叠加多带地图（天空之城 14 条带）时 16 槽会频繁淘汰，
+ * 一旦有人在两次取块之间仍持旧指针就会画错/留黑。内部堆已释放 84.6KB、PSRAM 富裕，
+ * 直接翻倍到 32 槽（512KB→1MB PSRAM）把淘汰概率压到最低。 */
+#define MPAK_TILE_PX_SLOTS 32       /* 像素块槽数（每槽 tile*tile*2 = 32KB @128） */
 #endif
 #ifndef MPAK_TILE_CV_SLOTS
-#define MPAK_TILE_CV_SLOTS 16       /* 掩码块槽数（每槽 tile*tile/8 = 2KB @128）  */
+#define MPAK_TILE_CV_SLOTS 32       /* 掩码块槽数（每槽 tile*tile/8 = 2KB @128）  */
 #endif
 
 typedef struct {

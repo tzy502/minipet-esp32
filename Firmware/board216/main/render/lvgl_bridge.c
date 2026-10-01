@@ -1239,8 +1239,11 @@ void bridge_cam_adjust_poll(void)
  * 半屏黑与秒级等待），改为提示去服务端「选镜头」卡片（Web → 选图 → 拖框 →
  * 上送 `{"type":"cam","value":"x,y"}`；固件已实现该指令：应用 + 写该图 NVS）。
  * 代码保留（置 MP_CAM_ONDEVICE_ADJUST=1 可恢复板端拖动），默认关闭。 */
+/* 【用户口径 2026-10-01 最终版】板端拖动**保留作兜底**，服务端「选镜头」为主路径：
+ *   "设备上的拖动调参入口不关闭 作为兜底添加服务器操作"
+ * （此前一版按"我希望直接服务端选择"把它关了，现按本条恢复。） */
 #ifndef MP_CAM_ONDEVICE_ADJUST
-#define MP_CAM_ONDEVICE_ADJUST 0
+#define MP_CAM_ONDEVICE_ADJUST 1
 #endif
 
 static bool menu_map_fn_camera_enter(void)
