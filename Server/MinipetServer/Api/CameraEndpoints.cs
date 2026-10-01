@@ -2,6 +2,7 @@ using System.IO;
 using MinipetServer.Config;
 using MinipetServer.Device;
 using MinipetServer.Health;
+using MinipetServer.Manifest;
 using MinipetServer.Services;
 
 namespace MinipetServer.Api;
@@ -130,7 +131,9 @@ public static class CameraEndpoints
         /// 返回落盘后的实际值，前端以返回值回显（不乐观看待自己发出去的数）。
         /// </summary>
         g.MapPut("/devices/{id}/camera", (string id, CameraSaveRequest body, DeviceRegistry reg, CameraService camera,
-            CameraPlanStore store, DeviceEventLog eventLog) =>
+            CameraPlanStore store, DeviceEventLog eventLog,
+            DeviceAssetService assets, DeviceManifestService mfst, CommandQueue queue,
+            MinipetServer.Config.ServerPaths paths, HealthReport health) =>
         {
             if (reg.Get(id) == null) return NotFoundDevice(id);
             var mapId = body?.MapId?.Trim();
@@ -145,12 +148,91 @@ public static class CameraEndpoints
                 error = $"设备 {id} 未登记地图 {mapId}（先到「素材推送」把地图推到该设备）",
             }, statusCode: 400);
 
-            var (cx, cy) = CameraService.ClampCamera(map, body.X.Value, body.Y.Value);
+            /* ══ 【窗口包不夹取 2026-10-01 · 真机 bug 修复】══════════════════════════
+             * 现象（本地实例实测）：对 240×240 窗口包上送 (1377,286)，ClampCamera 用的是
+             * maxX = max(0, vw-240) = 0 → **用户坐标被夹成 (0,0)**，随后即使自动整图重推成功，
+             * 下发的也是 (0,0) —— 用户要的机位直接丢失（日志："请求值 1377,286 已按图尺寸夹取"）。
+             * 修法：窗口包（viewport != full）**先原样保存用户坐标**（此时地图还没有可平移
+             * 余量，夹取没有意义）；等自动整图重推完成、拿到真实 vw/vh 后，在后台任务里
+             * 重新夹取 → 更新记录 → 下发设备。整图包照旧即时夹取（行为不变）。 */
+            bool isWindowMap = !string.Equals(map.Viewport, "full", StringComparison.OrdinalIgnoreCase);
+            var (cx, cy) = isWindowMap
+                ? (body.X.Value, body.Y.Value)             // 窗口包：原样保留，重推后再夹
+                : CameraService.ClampCamera(map, body.X.Value, body.Y.Value);
             var saved = store.Save(id, mapId, cx, cy, map.Vw, map.Vh);
-            eventLog.Append(id, $"机位记录：地图 {mapId} x={cx} y={cy}（范围 x[0,{map.MaxX}] y[0,{map.MaxY}]）");
+            eventLog.Append(id, isWindowMap
+                ? $"机位记录（窗口包原样保留）：地图 {mapId} x={cx} y={cy} —— 待整图重推后按真实尺寸夹取"
+                : $"机位记录：地图 {mapId} x={cx} y={cy}（范围 x[0,{map.MaxX}] y[0,{map.MaxY}]）");
             Console.WriteLine($"[Camera] 设备 {id} 地图 {mapId} 机位已记录 → ({cx},{cy})"
-                              + (cx != body.X.Value || cy != body.Y.Value
-                                  ? $"（请求值 {body.X},{body.Y} 已按图尺寸夹取）" : ""));
+                              + (isWindowMap
+                                  ? "（窗口包：原样保留，不夹取；整图重推后再夹取下发）"
+                                  : (cx != body.X.Value || cy != body.Y.Value
+                                      ? $"（请求值 {body.X},{body.Y} 已按图尺寸夹取）" : "")));
+            /* ══ 【窗口包自动整图覆盖 2026-10-01 · 用户口径】══════════════════════════
+             * 用户："非整图包 的直接给我覆盖了" —— 上送机位时若该图还是 240×240 窗口包，
+             * 自动按**整图口径**重推覆盖（设备侧相机只对整图包可用，窗口包会被能力门拒绝，
+             * 现象就是"上送了但没反应"）。此前只记坐标、不发包，用户必须自己再去「素材推送」
+             * 手动按整图重推一次，没人知道要做这一步。
+             * 顺序铁律（与 /devices/{id}/push 一致，勿颠倒）：
+             *   ① EnsureMapAsync(fullMap:true) 登记资产（覆盖同 map_id 旧窗口条目）
+             *   ② BumpRev 唤醒设备长轮询 → 设备拉到新 manifest
+             *   ③ 等设备下完包（大图十几 MB，真机实测 4MB≈8s / 19MB≈26s）再发相机指令，
+             *      否则 cam 先到 = 仍按旧窗口包判定 → 又被拒
+             *   ④ 若本来就在整图包上 → 不重推，直接下发（省一次打包与下载）。
+             * ⚠️ 若设备正好渲染着这张图，重推会触发一次切图重载（屏上短暂 loading），
+             *    这是覆盖口径的必然代价；返回体用 repushed 字段告知 Web 侧。 */
+            bool isWindow = !string.Equals(map.Viewport, "full", StringComparison.OrdinalIgnoreCase);
+            string bgHash = isWindow ? "" : (FindBgmapHash(paths, id, mapId) ?? "");
+            if (isWindow)
+            {
+                var aid = id; var amid = mapId;
+                _ = Task.Run(async () =>
+                {
+                    try
+                    {
+                        Console.WriteLine($"[Camera] 设备 {aid} 地图 {amid} 当前为窗口包 → 自动按整图口径重推覆盖");
+                        bool gen = assets.EnsureMapAsync(aid, amid, fullMap: true, tiled: true);
+                        mfst.BumpRev(aid, $"相机上送：地图 {amid} 整图口径覆盖（窗口包不可平移）");
+                        string? hash = FindBgmapHash(paths, aid, amid);
+                        if (hash == null)
+                        {
+                            Console.Error.WriteLine($"[Camera] 设备 {aid} 地图 {amid} 整图重推后仍找不到 BGMAP 条目 → 未下发机位");
+                            return;
+                        }
+                        var st = store.Get(aid, amid);
+                        // 等设备下完包再发机位；按包体量估算（下限 8s，上限 40s）
+                        int waitMs = (int)Math.Clamp(map.Vw * (long)map.Vh / 900, 8000, 40000);
+                        await Task.Delay(waitMs);
+                        if (st == null) return;
+                        /* 重推已完成 → 重新读该图的**整图口径**尺寸，把当时原样保留的用户坐标
+                         * 按真实 maxX/maxY 夹取并落盘，再下发（否则会把 0,0 或越界坐标发出去）。 */
+                        var fresh = camera.FindMap(aid, amid) ?? map;
+                        var (fx, fy) = CameraService.ClampCamera(fresh, st.X, st.Y);
+                        bool reclamped = fx != st.X || fy != st.Y;
+                        var saved2 = store.Save(aid, amid, fx, fy, fresh.Vw, fresh.Vh);
+                        queue.Enqueue(aid, "cam", new { x = fx, y = fy });
+                        eventLog.Append(aid, $"相机重推整图后下发机位：地图 {amid} ({fx},{fy})"
+                                             + (reclamped ? $"（原送 {st.X},{st.Y} 按整图尺寸夹取）" : "")
+                                             + $"（等 {waitMs}ms）");
+                        Console.WriteLine($"[Camera] 设备 {aid} 地图 {amid} 机位 ({fx},{fy}) 已在整图重推后下发"
+                                          + $"（hash={hash} 等 {waitMs}ms，整图 {fresh.Vw}x{fresh.Vh}"
+                                          + (reclamped ? $"，原送 {st.X},{st.Y} 已夹取" : "") + $"，记录 {saved2.UpdatedUtc:HH:mm:ss}）");
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.Error.WriteLine($"[Camera] 设备 {aid} 地图 {amid} 整图重推失败: {ex.Message}");
+                        health.RecordEvent(aid, "camera_repush_error",
+                            System.Text.Json.JsonSerializer.SerializeToElement(new { mapId = amid, error = ex.Message }));
+                        eventLog.Append(aid, $"相机整图重推失败：{amid}（{ex.Message}）");
+                    }
+                });
+            }
+            else if (!string.IsNullOrEmpty(bgHash))
+            {
+                queue.Enqueue(id, "cam", new { x = cx, y = cy });
+                eventLog.Append(id, $"机位下发设备：地图 {mapId} ({cx},{cy})");
+            }
+
             return Results.Json(new
             {
                 ok = true,
@@ -159,16 +241,48 @@ public static class CameraEndpoints
                 x = cx,
                 y = cy,
                 requested = new { x = body.X.Value, y = body.Y.Value },
-                clamped = cx != body.X.Value || cy != body.Y.Value,
+                /** 窗口包时为 false（坐标原样保留，等整图重推后再夹取），整图包时为常规夹取结果 */
+                clamped = !isWindowMap && (cx != body.X.Value || cy != body.Y.Value),
                 maxX = map.MaxX,
                 maxY = map.MaxY,
                 vw = map.Vw,
                 vh = map.Vh,
                 updatedUtc = saved.UpdatedUtc,
-                note = "已写入 data/camera-positions.json（服务端为主口径）；下发设备请再调 POST "
-                       + $"/api/admin/devices/{id}/command {{\"type\":\"cam\",\"value\":\"{cx},{cy}\"}}",
+                viewport = map.Viewport,
+                /** true = 该图原是窗口包，已自动按整图口径重推并在下载完成后下发机位 */
+                repushed = isWindow,
+                note = isWindow
+                    ? "此图原为 240×240 窗口包（设备侧相机不可用）→ 已自动按整图口径重推覆盖；"
+                      + "你送的坐标已**原样保留**，待整图下完后按真实尺寸夹取并下发"
+                      + "（大图约 10~40s，屏上会短暂 loading）"
+                    : "已写入 data/camera-positions.json 并直接下发设备（整图包，相机可用）",
             });
         });
+    }
+
+    /// <summary>
+    /// 查该设备 manifest 里某张地图的 BGMAP content_hash（下发切图/相机指令用的身份）。
+    /// 与 AdminEndpoints.FindBgmapHash 同口径（按 selector=map + map=mapId + kind=BGMAP 匹配）；
+    /// 这里复制一份而不跨类调用，是为了让相机端点自成一体、不依赖 AdminEndpoints 的私有实现。
+    /// </summary>
+    private static string? FindBgmapHash(ServerPaths paths, string deviceId, string mapId)
+    {
+        try
+        {
+            var indexPath = Path.Combine(paths.ExportDirFor(deviceId), "manifest-assets.json");
+            if (!File.Exists(indexPath)) return null;
+            var root = System.Text.Json.Nodes.JsonNode.Parse(File.ReadAllText(indexPath)) as System.Text.Json.Nodes.JsonObject;
+            if (root?["assets"] is not System.Text.Json.Nodes.JsonObject assets) return null;
+            foreach (var kv in assets)
+            {
+                if (kv.Value is not System.Text.Json.Nodes.JsonObject e) continue;
+                if (!string.Equals(e["selector"]?.GetValue<string>(), "map", StringComparison.OrdinalIgnoreCase)) continue;
+                if (!string.Equals(e["kind"]?.GetValue<string>(), "BGMAP", StringComparison.OrdinalIgnoreCase)) continue;
+                if (string.Equals(e["map"]?.GetValue<string>(), mapId, StringComparison.Ordinal)) return kv.Key;
+            }
+        }
+        catch (Exception ex) { Console.Error.WriteLine($"[Camera] 查 BGMAP hash 失败: {ex.Message}"); }
+        return null;
     }
 
     /// <summary>预览图服务端实际输出宽度（等比缩放到长边 maxW；不放大）。</summary>

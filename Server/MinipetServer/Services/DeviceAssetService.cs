@@ -91,6 +91,34 @@ public sealed class DeviceAssetService
             // 口径切换（window ↔ full）时替换：先摘掉该地图的旧 BGMAP 条目，否则 manifest 里
             // 会同时存在两条同 map 的 selector=map 条目（设备列表出现重复项/切图 hash 取错）。
             RemoveMapEntries(root, mapId);
+            /* 【同图多版本去重 2026-10-01 · 真机根因】清单是按 **content hash** 合并的，而
+             * 「整图 vs 窗口」是同一张 map_id 的两种导出 → 重推整图包会生成**新 hash**，
+             * 老窗口包条目仍留在 manifest 里 → 服务端 FindMap / 设备 asset_dl 命中哪条看顺序，
+             * 真机表现 = 「按整图重推了，但相机仍报非整图包 / 背景还是小窗口」（用户报障：
+             * 「非整图包 的直接给我覆盖了」）。修法：登记整图包后，把同 map_id 的**旧 BGMAP
+             * 条目从 manifest 剔除**（磁盘文件保留不删，避免误伤他人缓存）。 */
+            if (fullMap)
+            {
+                if (root["assets"] is JsonObject assetsObj)
+                {
+                    var newHashes = new HashSet<string>(assets.Select(a => $"{a.Hash:x16}"), StringComparer.Ordinal);
+                    var drop = new List<string>();
+                    foreach (var kv in assetsObj)
+                    {
+                        if (newHashes.Contains(kv.Key)) continue;                 // 本次新写入的，别删
+                        if (kv.Value is not JsonObject e) continue;
+                        if (!string.Equals(e["selector"]?.GetValue<string>(), "map", StringComparison.OrdinalIgnoreCase)) continue;
+                        if (!string.Equals(e["kind"]?.GetValue<string>(), "BGMAP", StringComparison.OrdinalIgnoreCase)) continue;
+                        if (!string.Equals(e["map"]?.GetValue<string>(), mapId, StringComparison.Ordinal)) continue;
+                        drop.Add(kv.Key);
+                    }
+                    foreach (var h in drop)
+                    {
+                        assetsObj.Remove(h);
+                        Console.WriteLine($"[DeviceAsset] 设备 {deviceId} 地图 {mapId}：剔除旧口径条目 {h}（整图覆盖窗口）");
+                    }
+                }
+            }
             MergeAndWrite(deviceDir, root, assets);
             return true;
         }
