@@ -1192,6 +1192,30 @@ public sealed class AssetExporter
         return asset;
     }
 
+    /// <summary>
+    /// 设备级入口：烘一份曲库元数据（AUDIO_META）。为什么需要独立入口——
+    /// AUDIO_META 原先只在 Run(ExportOptions)（全量导出，CLI 用）里生成，
+    /// 走 Web/push 通道接入的设备只跑 ExportMapAssets/ExportNpcAssets/装扮包，
+    /// 永远拿不到曲目表 → 设备端 `曲目表构建：命中 0 首` → BGM 点播放无效
+    /// （2026-10-01 真机定位）。返回资产（不写盘；写盘与 manifest 合并由
+    /// DeviceAssetService 负责，与其它设备级入口同模式）。
+    /// </summary>
+    public ExportedAsset ExportAudioMetaAsset()
+    {
+        var tracks = _music.GetCatalogAsync(CancellationToken.None).GetAwaiter().GetResult()
+                     ?? new List<MusicTrack>();
+        var metas = tracks.Select(t => new AudioMetaWriter.AudioTrackMeta
+        {
+            Id = AudioMetaWriter.TrackIdForKey(t.Key),
+            Title = t.Track,
+            Source = 0,                                  // 0=WZ
+            DurationS = (uint)Math.Max(0, t.Ms / 1000),
+        }).ToList();
+        var payload = AudioMetaWriter.Build(metas);
+        var summary = new ExportSummary();
+        return AddAsset(summary, MpakKind.AudioMeta, payload, $"曲库元数据（{metas.Count} 曲）", selector: null);
+    }
+
     // ═══════════════════════════════════════════
     // 设备资产登记入口（DeviceAssetService 用，2026-09-26 E7 地图/怪物NPC tab 补链）
     // 模式对齐 ExportAppearanceAssets：只产出资产（不写盘、不动 manifest）——写盘与

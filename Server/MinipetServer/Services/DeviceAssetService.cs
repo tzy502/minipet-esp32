@@ -124,6 +124,23 @@ public sealed class DeviceAssetService
     /// 写 mpak + 合并索引（**不删旧条目**——地图/NPC 累积收藏语义，与装扮替换语义不同；
     /// 同 hash 覆盖无害）。调用方须已持有该设备的锁。
     /// </summary>
+    /// <summary>
+    /// 按需登记曲库元数据（AUDIO_META）：写 {hash}.mpak 到设备导出目录并合并 manifest。
+    /// 为什么单独一条：全量导出（CLI）才会生成 AUDIO_META，设备级导出只按需烘地图/
+    /// NPC/装扮 → 走 Web 接入的设备没有曲目表（BGM 点播放无效）。见 AdminEndpoints
+    /// 的 /devices/{id}/audio-meta 注释。
+    /// </summary>
+    public (string hash, long bytes) WriteAudioMeta(string deviceId)
+    {
+        var deviceDir = DeviceDir(deviceId);
+        Directory.CreateDirectory(deviceDir);
+        var a = new AssetExporter(_wz).ExportAudioMetaAsset();
+        File.WriteAllBytes(Path.Combine(deviceDir, a.FileName), a.Bytes);
+        var root = ReadIndex(Path.Combine(deviceDir, ManifestBuilder.AssetsManifestFileName));
+        MergeAndWrite(deviceDir, root, new List<ExportedAsset> { a });
+        return ($"{a.Hash:x16}", a.Bytes.Length);
+    }
+
     private static void MergeAndWrite(string deviceDir, JsonObject root, List<ExportedAsset> assets)
     {
         Directory.CreateDirectory(deviceDir);

@@ -43,6 +43,31 @@ public static class AdminEndpoints
             return Results.Json(new { ok = removed, deviceId = id, removed }, statusCode: removed ? 200 : 404);
         });
 
+        /// <summary>
+        /// 给设备登记**曲库元数据（AUDIO_META）**——BGM 能播的前提（2026-10-01 新增）。
+        /// 背景（真机根因）：设备级导出只按需烘「地图/NPC/装扮」，而 AUDIO_META 只在
+        /// `AssetExporter.Run`（全量导出，CLI 用）的 §5 段生成 → 走 Web/push 通道接入的
+        /// 设备永远拿不到曲目表，设备侧日志是 `曲目表构建：命中 0 首` → 点播放无效。
+        /// 本端点按需补一份：取曲库目录 → AudioMetaWriter.Build → 写盘 + 合并 manifest。
+        /// 返回 { ok, tracks, hash, bytes }。
+        /// </summary>
+        g.MapPost("/devices/{id}/audio-meta", (string id, DeviceRegistry reg,
+            DeviceAssetService assets) =>
+        {
+            if (reg.Get(id) == null) return NotFoundDevice(id);
+            try
+            {
+                var written = assets.WriteAudioMeta(id);
+                Console.WriteLine($"[AudioMeta] 设备 {id}：登记曲库元数据（{written.bytes} B, hash={written.hash}）");
+                return Results.Json(new { ok = true, hash = written.hash, bytes = written.bytes });
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[AudioMeta] 设备 {id} 导出失败: {ex.Message}");
+                return Results.Json(new { error = ex.Message }, statusCode: 500);
+            }
+        });
+
         g.MapGet("/devices/{id}", (string id, DeviceRegistry reg, ConfigService cfg, HealthReport health)
             => Detail(id, reg, cfg, health) ?? NotFoundDevice(id));
 

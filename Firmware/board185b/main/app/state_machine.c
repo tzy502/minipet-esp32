@@ -1055,6 +1055,31 @@ static void dispatch_manifest_synced(void)
         strlcpy(mc.s, MP_DEFAULT_MAP_ID, sizeof(mc.s));
         mp_post_cmd(&mc);
         ESP_LOGW(TAG, "清单就绪 → 重投默认地图 %s", MP_DEFAULT_MAP_ID);
+
+        /* ══ 【默认图缺失兜底 2026-10-01 · 真机根因】══════════════════════════
+         * 现象：TF 上有地图包、娃娃也渲染，但**背景全黑**，日志只有一句
+         *   `set_active_map：000010000 无对应 BGMAP 条目（清单未就绪？）`
+         * 根因：默认图是编译期硬编码 MP_DEFAULT_MAP_ID="000010000"，而服务端给
+         * 本设备登记的 BGMAP 完全可能是**另一张图**（真机：mapId=2「枫叶路：
+         * 香格里拉号」，hash 5875dbb5…）→ 按 id 查路径永远失败 → 从不装载
+         * → 黑底；而"清单就绪补投"补的还是同一个不存在的 id，永远补不上。
+         * 修法：默认图投完后再查一次是否真的装载；没装上就从清单里挑**第一张
+         * 已缓存**的 BGMAP（用内容 hash 直接投，绕过 id→hash 映射）兜底，
+         * 保证"有图就一定有背景"。用户后续从菜单选图时照旧按 id 走。 */
+        static char hs[8][20]; static char lb[8][32]; static bool ca[8];
+        int n = asset_dl_bgmap_list(hs, lb, ca, 8);
+        if (n > 0) {
+            int pick = -1;
+            for (int i = 0; i < n; i++) if (ca[i]) { pick = i; break; }   /* 已缓存优先 */
+            if (pick < 0) pick = 0;                                       /* 都没有就选第一张（触发下载） */
+            mp_cmd_t fc = { .type = MP_CMD_SET_MAP };
+            strlcpy(fc.s, hs[pick], sizeof(fc.s));
+            mp_post_cmd(&fc);
+            ESP_LOGW(TAG, "默认图 %s 不在清单 → 兜底装载清单首图 %.16s（%s）",
+                     MP_DEFAULT_MAP_ID, hs[pick], lb[pick]);
+        } else {
+            ESP_LOGW(TAG, "清单里没有任何 BGMAP（服务端未登记地图？）—— 背景保持黑底");
+        }
     }
 
     /* 素材全量重绑后强制一次全屏重绘：清除面板自检色块/旧画面残留
