@@ -55,6 +55,10 @@ static bool       s_mdns_fallback_done;   /* E14：手输地址失败后的 mDNS
 static int64_t    s_last_activity_ms;
 static SemaphoreHandle_t s_lock;
 
+/* 【活动地图持久化】NVS 助手定义在文件后段，boot 段先用 → 这里前置声明 */
+static void active_map_save(const char *map_id);
+static const char *active_map_get(char *buf, size_t cap);
+
 /* ------------------------------------------------------------------ */
 /* E11 降级事件上报：离线态进出（Web 可见设备健康）                        */
 /* ------------------------------------------------------------------ */
@@ -263,12 +267,19 @@ static void self_test(bool sd_ok, bool psram_ok)
      * 出厂素材分区（sd_tf.c 的 fallback）：此时渲染的是出厂默认形象与默认地图，
      * 内容不会随 Web 换装变化。需求（胶水）：没有 TF 卡就渲染默认，
      * 地图默认 000010000，并且**屏上明确提示没有 TF 卡**，别让用户以为坏了。 */
+    /* 【开机加载提示 2026-10-01】用户口径"启动的时候渲染卡住"。整图包装载 +
+     * 窗口缓存填充在 1-bit SDMMC 上是秒级（真机曾 9.4s），这段时间屏上什么都没有，
+     * 看起来就是"卡死"。这里先挂一条常驻横幅，地图/形象落地后立即撤掉
+     * （见 dispatch_map 成功分支与 dispatch_manifest_synced 收尾）。 */
+    render_banner_show_for("LOADING ASSETS...", 20000);   /* 20s 自动撤，避免踩掉后续常驻横幅 */
+
     if (sd_tf_is_flash_fallback()) {
-        ESP_LOGW(TAG, "无 TF 卡（内部 Flash 出厂素材模式）→ 渲染出厂默认形象 + 默认地图 %s",
-                 MP_DEFAULT_MAP_ID);
+        char mid[32];
+        const char *want = active_map_get(mid, sizeof mid);
+        ESP_LOGW(TAG, "无 TF 卡（内部 Flash 出厂素材模式）→ 渲染出厂默认形象 + 地图 %s", want);
         render_banner_show("NO TF CARD - FACTORY ASSETS");   /* 常驻横幅（配网页横幅同通道） */
         mp_cmd_t mc = { .type = MP_CMD_SET_MAP };
-        strlcpy(mc.s, MP_DEFAULT_MAP_ID, sizeof(mc.s));
+        strlcpy(mc.s, want, sizeof(mc.s));
         mp_post_cmd(&mc);
     }
 
@@ -623,12 +634,65 @@ static bool heap_ok_for_asset_load(void)
     return heap_caps_get_free_size(MALLOC_CAP_INTERNAL) >= CONFIG_MP_ASSET_HEAP_GATE_KB * 1024;
 }
 
-static esp_timer_handle_t s_bind_retry_timer;   /* 低堆跳过绑定后的自愈重试 */
+static esp_timer_handle_t s_bind_retry_timer;   /* 低堆跳过绑定/字体后的自愈重试 */
+static bool s_font_pending;                     /* 字体还没装上（跳过或装载失败） */
 static void bind_retry_cb(void *arg)
 {
     (void)arg;
     mp_cmd_t c = { .type = MP_CMD_MANIFEST_SYNCED };   /* 重跑绑定段（内部堆守卫会再拦） */
     mp_post_cmd(&c);
+}
+
+/* 字体未就绪时的兜底重试：复用同一个 10s 周期定时器（幂等，已在跑就不重开）。
+ * 触发一次 MANIFEST_SYNCED 重跑绑定段：堆够就装字，不够就再等一轮。 */
+/* ------------------------------------------------------------------ */
+/* 【活动地图持久化 2026-10-01】用户口径：设置成某张图（如神之子神殿）并调好
+ * 相机后，**重启必须还是这张图**，不能重置回默认 000010000。
+ * 存 map_id（不是 hash：重导会换 hash）；开机校验它仍在清单里，不在才回默认。 */
+#define MP_ACTIVE_MAP_NVS_NS  "uimap"
+#define MP_ACTIVE_MAP_NVS_KEY "active"
+
+static void active_map_save(const char *map_id)
+{
+    if (!map_id || !map_id[0]) return;
+    nvs_handle_t h;
+    if (nvs_open(MP_ACTIVE_MAP_NVS_NS, NVS_READWRITE, &h) != ESP_OK) return;
+    char cur[32] = "";
+    size_t len = sizeof cur;
+    bool same = (nvs_get_str(h, MP_ACTIVE_MAP_NVS_KEY, cur, &len) == ESP_OK &&
+                 strcmp(cur, map_id) == 0);
+    if (!same) {
+        if (nvs_set_str(h, MP_ACTIVE_MAP_NVS_KEY, map_id) == ESP_OK) {
+            nvs_commit(h);
+            ESP_LOGW(TAG, "活动地图已记入 NVS：%s（重启后仍用这张）", map_id);
+        }
+    }
+    nvs_close(h);
+}
+
+/* 取出"上次用的图"：不在清单里（被删/被摘）→ 回默认图，避免开机黑屏 */
+static const char *active_map_get(char *buf, size_t cap)
+{
+    nvs_handle_t h;
+    buf[0] = 0;
+    if (nvs_open(MP_ACTIVE_MAP_NVS_NS, NVS_READONLY, &h) == ESP_OK) {
+        size_t len = cap;
+        if (nvs_get_str(h, MP_ACTIVE_MAP_NVS_KEY, buf, &len) != ESP_OK) buf[0] = 0;
+        nvs_close(h);
+    }
+    if (buf[0] && asset_dl_map_exists(buf)) return buf;
+    if (buf[0]) ESP_LOGW(TAG, "上次使用的地图 %s 已不在清单 → 回默认 %s", buf, MP_DEFAULT_MAP_ID);
+    return MP_DEFAULT_MAP_ID;
+}
+
+static void font_retry_arm(void)
+{
+    if (s_bind_retry_timer) return;
+    const esp_timer_create_args_t t = {
+        .callback = bind_retry_cb, .name = "bind_retry",
+    };
+    if (esp_timer_create(&t, &s_bind_retry_timer) == ESP_OK)
+        esp_timer_start_periodic(s_bind_retry_timer, 10ULL * 1000000ULL);
 }
 
 static void dispatch_action(const char *action)
@@ -825,7 +889,12 @@ static void dispatch_map(const char *hash)
     if (n > 0)
         ESP_LOGI(TAG, "地图条带 %d 条：%s | %s", n, strips[0], (n > 1) ? strips[1] : "-");
     ESP_LOGW(TAG, "地图装载 %s（条带 %d）rc=%d", hash, n, mrc);
-    if (mrc == 0) g_map_loaded = true;
+    if (mrc == 0) {
+        g_map_loaded = true;
+        /* 装载成功即记忆（含服务端推送/菜单选择/开机重投三条路径）：下次开机仍用它 */
+        char mid[32];
+        if (asset_dl_map_id_of(hash, mid, sizeof mid)) active_map_save(mid);
+    }
 
     /* 【契约 §3.3 全局加载】装载成功 → 应用该图 NVS 相机（非整图包自动跳过）。
      * 放在 render_set_map 之后：render_cam_* 的"当前图"口径以刚装入的包为准。 */
@@ -909,16 +978,33 @@ static void dispatch_manifest_synced(void)
      * 不会缺字），10s 后随 sync 重试；下载完、堆回稳后自然装上。 */
     bool heap_ok_font = heap_ok_for_asset_load();
     if (!heap_ok_font) {
-        ESP_LOGW(TAG, "内部堆不足（%uB < %dKB）→ 跳过本轮字体装载（保上轮字体），随下轮 sync 重试",
+        /* 【2026-10-01 气泡/菜单全是占位框的真因】跳过后**不是**"随下轮 sync 重试"
+         * 那么轻——实测开机整图装载期内部堆 22.8KB < 24KB 门限，这一跳之后
+         * font_lazy 的实例根本没 open：fl_glyph_dsc 直接 return false →
+         * LVGL 对每个字都画 placeholder ⇒ 用户看到"气泡是空的没字"、菜单变方框。
+         * 而下一轮 sync 可能要等几十秒甚至几分钟（还有可能再次被门限拦）。
+         * 修法：① 一旦发现"字体未就绪"，用既有的 10s 重试定时器兜底（与 parts
+         * 绑定同一个 timer，见下）；② 让"是否已就绪"可查（render_font_ready()），
+         * 只有真的还缺才重试，堆回稳后 10s 内自动补上，不必等 sync。 */
+        ESP_LOGW(TAG, "内部堆不足（%uB < %dKB）→ 跳过本轮字体装载（屏上暂为占位框），10s 重试",
                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
                  (int)CONFIG_MP_ASSET_HEAP_GATE_KB);
+        s_font_pending = true;
+        font_retry_arm();                 /* 见下：与 bind 重试共用一个周期定时器 */
     }
-    for (size_t i = 0; heap_ok_font && i < sizeof(fonts) / sizeof(fonts[0]); i++) {
-        if (asset_dl_font_path(fonts[i].px, path, sizeof(path))) {
-            ESP_LOGW(TAG, "set_font px=%d 开始 %s", fonts[i].px, path);
-            render_set_font(fonts[i].id, path);
-            ESP_LOGW(TAG, "set_font px=%d 完成", fonts[i].px);
+    if (heap_ok_font) {
+        bool all_ok = true;
+        for (size_t i = 0; i < sizeof(fonts) / sizeof(fonts[0]); i++) {
+            if (asset_dl_font_path(fonts[i].px, path, sizeof(path))) {
+                ESP_LOGW(TAG, "set_font px=%d 开始 %s", fonts[i].px, path);
+                if (render_set_font(fonts[i].id, path) != 0) all_ok = false;
+                ESP_LOGW(TAG, "set_font px=%d 完成", fonts[i].px);
+            } else {
+                all_ok = false;                 /* 清单里没有这档字体 */
+            }
         }
+        if (all_ok) s_font_pending = false;
+        else        { s_font_pending = true; font_retry_arm(); }
     }
 
     /* 默认纸娃娃部件 + 站立布局（E13：每设备独立装扮） */
@@ -939,7 +1025,7 @@ static void dispatch_manifest_synced(void)
             ESP_LOGW(TAG, "parts 首开失败（TF 争用?）重试 rc=%d", prc);
         }
         ESP_LOGW(TAG, "parts 路径=%s rc=%d", path, prc);
-        if (s_bind_retry_timer) {   /* 绑定成功：停自愈重试 */
+        if (s_bind_retry_timer && !s_font_pending) {   /* 绑定+字体都好了：停自愈重试 */
             esp_timer_stop(s_bind_retry_timer);
             esp_timer_delete(s_bind_retry_timer);
             s_bind_retry_timer = NULL;
@@ -1056,10 +1142,12 @@ static void dispatch_manifest_synced(void)
      * → 背景全黑到底（真机实证：parts rc=0 宠物在、背景黑）。改为只要
      * 本轮没装载过地图就补投（g_map_loaded 门保证只补一次）。 */
     if (!g_map_loaded) {
+        char mid[32];
+        const char *want = active_map_get(mid, sizeof mid);
         mp_cmd_t mc = { .type = MP_CMD_SET_MAP };
-        strlcpy(mc.s, MP_DEFAULT_MAP_ID, sizeof(mc.s));
+        strlcpy(mc.s, want, sizeof(mc.s));
         mp_post_cmd(&mc);
-        ESP_LOGW(TAG, "清单就绪 → 重投默认地图 %s", MP_DEFAULT_MAP_ID);
+        ESP_LOGW(TAG, "清单就绪 → 投活动地图 %s（NVS 记忆，缺省 %s）", want, MP_DEFAULT_MAP_ID);
     }
 
     /* 素材全量重绑后强制一次全屏重绘：清除面板自检色块/旧画面残留

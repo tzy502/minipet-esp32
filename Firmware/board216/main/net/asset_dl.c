@@ -269,6 +269,32 @@ static int find_bgmap_locked(const char *hash_or_id)
     return -1;
 }
 
+/* 【活动地图持久化 2026-10-01】hash/id → 地图 id（BGMAP 条目的 map_id）。
+ * 用户口径："我设置成神之子神殿调整了位置，重启以后应该还是我选择的地图，
+ * 不要重置成默认地图"。持久化必须存 **map_id 而不是 hash**：服务端重导
+ * 同一张图会换 hash（同 map_id、不同包），存 hash 的话重启就找不到条目。 */
+bool asset_dl_map_id_of(const char *hash_or_id, char *out, size_t cap)
+{
+    if (!out || cap == 0) return false;
+    out[0] = 0;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    int idx = find_bgmap_locked(hash_or_id);
+    if (idx >= 0 && s_files[idx].map_id[0]) {
+        strlcpy(out, s_files[idx].map_id, cap);
+    }
+    xSemaphoreGive(s_lock);
+    return out[0] != 0;
+}
+
+/* 地图 id 在当前清单里是否存在（启动时校验"上次用的图"是否还可用） */
+bool asset_dl_map_exists(const char *map_id)
+{
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    bool ok = find_bgmap_locked(map_id) >= 0;
+    xSemaphoreGive(s_lock);
+    return ok;
+}
+
 /* 隐藏标识读取（NVS 单键 u8；键不存在/命名空间不存在 = 未隐藏） */
 static bool map_hidden_locked(const local_file_t *lf)
 {

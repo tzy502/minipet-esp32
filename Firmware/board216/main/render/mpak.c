@@ -933,6 +933,27 @@ static int bg_rect_args(const mpak_t *m, int32_t w, int32_t h,
 }
 
 /* 通用 RGB565 世界矩形读（static 与 tile 共用；stride_b = 源行距字节） */
+/* 整图窗口读的预读块（PSRAM 单例，懒分配）。64KB 在"命令数下降"与
+ * "读放大浪费"之间取平衡：static 层 stride 4540 ⇒ 覆盖 14 行；条带层
+ * stride 1700 ⇒ 覆盖 38 行。 */
+#define BG_RA_CAP_DEFAULT (64u * 1024u)
+#define BG_RA_CAP_MIN     (8u * 1024u)
+static uint8_t *s_bg_ra;
+static size_t   s_bg_ra_cap;
+
+static uint8_t *bg_ra_buf(void)
+{
+    if (s_bg_ra) return s_bg_ra;
+    size_t cap = BG_RA_CAP_DEFAULT;
+    uint8_t *p = heap_caps_malloc(cap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!p) { cap = BG_RA_CAP_MIN; p = heap_caps_malloc(cap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT); }
+    if (!p) return NULL;
+    s_bg_ra = p;
+    s_bg_ra_cap = cap;
+    return s_bg_ra;
+}
+static size_t bg_ra_cap(void) { return s_bg_ra_cap; }
+
 static int bg_read_rect_rgb(const mpak_t *m, uint32_t layer_off, uint32_t layer_len,
                             uint32_t stride_b, int32_t x, int32_t y, int32_t w, int32_t h,
                             uint16_t *dst, int32_t dst_stride_px)
@@ -969,15 +990,71 @@ static int bg_read_rect_rgb(const mpak_t *m, uint32_t layer_off, uint32_t layer_
                             (size_t)(cy1 - cy0) * row_bytes);
     }
 
-    /* 慢路径：逐行 seek+read（h 次；h = 窗口高，典型 ≤ 512）。*/
-    for (int64_t r = cy0; r < cy1; r++) {
-        uint16_t *drow = dst + (size_t)(int32_t)(r - wy0) * dst_stride_px + dx0;
-        uint32_t off = m->payload_off + layer_off + (uint32_t)r * stride_b +
-                       (uint32_t)cx0 * 2u;
-        int rc = mpak_read_at((mpak_t *)m, off, drow, row_bytes);
-        if (rc) return rc;
+    /* ── 慢路径：行跨度 ≠ 需求宽度（窗口读）─────────────────────────────
+     * 【2026-10-01 真机性能根因】原实现"每行一次 fseek+fread"：整图装载时
+     * `窗口读 3144 行 / 1112 KB（9409 ms）`＝每行 3ms（每行才 672~800 B）。
+     * 开销不在带宽（1-bit SDMMC@20MHz 理论 2.5MB/s），而在**每次读的
+     * FATFS+SD 命令往返**（fseek → 簇链定位 → 2 个 512B 扇区事务）。
+     * 修法：**预读块**——一次连读 RA 字节（覆盖若干整行），再从块内
+     * memcpy 出每行需要的列窗口。读放大（读进来的行距部分丢弃）换来命令数
+     * 下降 1~2 个数量级：典型 static 层 stride 4540 / 行需 672B，64KB 覆盖
+     * 14 行 ⇒ 336 行从 336 次读降到 24 次。
+     * 缓冲走 PSRAM 单例（懒分配；失败则退回逐行，不影响正确性）。 */
+    {
+        uint8_t *ra = bg_ra_buf();
+        if (ra) {
+            int64_t r = cy0;
+            while (r < cy1) {
+                uint32_t base = (uint32_t)r * stride_b;
+                /* 覆盖上限：缓冲大小 / 剩余行跨度 / 该层剩余字节 */
+                size_t span = bg_ra_cap();
+                size_t remain_span = (size_t)(cy1 - r) * stride_b;
+                if (span > remain_span) span = remain_span;
+                uint32_t col_off = (uint32_t)cx0 * 2u;
+                size_t need = (size_t)row_bytes + col_off;      /* 至少覆盖一行 */
+                if (span < need) span = need;
+                if (layer_len > base) {
+                    size_t avail = layer_len - base;
+                    if (span > avail) span = avail;
+                } else {
+                    break;                                      /* 越界：剩余行按 0 处理 */
+                }
+                int rc = mpak_read_at((mpak_t *)m,
+                                      m->payload_off + layer_off + base, ra, span);
+                if (rc) return rc;
+                int64_t nrows = 0;
+                while (r + nrows < cy1) {
+                    size_t in_off = (size_t)nrows * stride_b + col_off;
+                    if (in_off + row_bytes > span) break;
+                    uint16_t *drow = dst +
+                        (size_t)(int32_t)(r + nrows - wy0) * dst_stride_px + dx0;
+                    memcpy(drow, ra + in_off, row_bytes);
+                    nrows++;
+                }
+                if (nrows == 0) {          /* 缓冲异常小：保底逐行，绝不死循环 */
+                    uint16_t *drow = dst +
+                        (size_t)(int32_t)(r - wy0) * dst_stride_px + dx0;
+                    int rc2 = mpak_read_at((mpak_t *)m,
+                                           m->payload_off + layer_off + base + col_off,
+                                           drow, row_bytes);
+                    if (rc2) return rc2;
+                    r++;
+                } else {
+                    r += nrows;
+                }
+            }
+            return MPAK_OK;
+        }
+        /* 预读缓冲分配失败：退回逐行（慢但正确） */
+        for (int64_t r = cy0; r < cy1; r++) {
+            uint16_t *drow = dst + (size_t)(int32_t)(r - wy0) * dst_stride_px + dx0;
+            uint32_t off = m->payload_off + layer_off + (uint32_t)r * stride_b +
+                           (uint32_t)cx0 * 2u;
+            int rc = mpak_read_at((mpak_t *)m, off, drow, row_bytes);
+            if (rc) return rc;
+        }
+        return MPAK_OK;
     }
-    return MPAK_OK;
 }
 
 int mpak_bgmap_read_static_rect(const mpak_t *m, int32_t x, int32_t y,
