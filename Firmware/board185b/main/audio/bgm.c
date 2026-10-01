@@ -52,6 +52,19 @@ static const char *TAG = "bgm";
 #define RETRY_SAME_TRACK   2                /* 同曲重试 2 次 */
 #define TRACK_FAIL_LIMIT   3                /* 连续 3 曲失败 → 源置灰 */
 #define STALL_NOFRAME_MAX  64               /* 连续空帧判失联（喂错流/占位解码器） */
+/* 【BGM "变快+顿卡"根因修复 2026-10-01】minimp3 的 mp3dec_decode_frame 只有在缓冲里
+ * **同时拿到"当前帧 + 下一帧头"** 时才走快路径；否则走慢路径，而慢路径开头就是
+ * `memset(dec, 0, sizeof(mp3dec_t))`（清掉 bit reservoir），并且 mp3d_find_frame
+ * 找不到"可验证的完整帧"时返回 mp3_bytes → 调用方 `info.frame_bytes` 拿到整缓冲长度
+ * → 把**未解码的完整帧当垃圾丢掉**。
+ * 设备按 2048B/块喂流，块边界上永远是"半帧"，于是每块都可能触发这条路：
+ *   host 复现（同一 minimp3 源码 + 同一缓冲管理）：
+ *     整文件一次解码 = 5269 帧 / 137.6s（= 源，正确）
+ *     2048B 分块     = 3930 帧 / 102.7s（丢 25% ← 真机实测同样 3930 帧！）
+ *   本宏修法：**缓冲里不足 2 帧就不解**（等下一块拼齐），流结束时再 force 冲一次：
+ *     512/1024/2048/4096B 分块 = 全部 5269 帧 / 137.6s ✓
+ * 本曲 80kbps@22.05kHz ≈ 261B/帧，2048B ≈ 7 帧，余量充足。 */
+#define MP3_DEC_MIN_BYTES  2048
 #define UNDERRUN_PA_OFF    20               /* 静音 2s → 关 PA */
 /* 起播预缓冲（治"卡顿"）：攒够 PRIME_MS 毫秒的 PCM 再开声；超时 PRIME_TIMEOUT_MS
  * 兜底（慢流/坏流不能让 feeder 永久等待）。数值取 400ms：本板 ring=128KB
@@ -280,23 +293,42 @@ typedef struct {
     uint8_t  *in;
     size_t    in_len;
     mp3dec_t *dec;
-    int16_t   pcm[MINIMP3_MAX_SAMPLES_PER_FRAME];
-    int16_t   stereo[MINIMP3_MAX_SAMPLES_PER_FRAME * 2];
+    /* ══ 【内部 RAM 腾挪 2026-10-02】pcm/stereo 由内联数组改指针（PSRAM）══
+     * 原内联 int16_t[2304] + int16_t[4608] = 13,824B **常驻内部 .bss**。
+     * 为什么可以搬：
+     *   · pcm 是 minimp3 的输出暂存（mp3dec_decode_frame 写、本函数读）；
+     *   · stereo 是"单声道→双声道复制"的成形缓冲，只被 pcm_ring_write()
+     *     **逐样本 memcpy** 进 PSRAM 环形缓冲（pcm_ring.c 的实现就是逐元素赋值）；
+     *   · 真正交给 I2S DMA 的是 feeder_task 的静态 out[FEEDER_FRAMES*2]
+     *     （pcm_ring_read 逐元素拷进去）—— 那份**仍在内部 DRAM**，DMA 可及性不变。
+     * 所以这两个数组全程只在 CPU 侧流转，PSRAM 只换存储位置，零语义变化。
+     * 分配在每曲开头、失败即本轮播放失败（与 s_sc.in 同一失败口径）。 */
+    int16_t  *pcm;
+    int16_t  *stereo;
     int       frames;          /* 本会话解出的帧数 */
     int       stall;           /* 连续无帧计数 */
+    uint32_t  bytes_in;        /* 已接收的码流字节（断点续流用；跨续传累加） */
 } stream_ctx_t;
 
 static stream_ctx_t s_sc;
 
 static mp3dec_t *s_dec;   /* 解码器常驻（bgm 任务启始分配；play_track 每曲 mp3dec_init 复位） */
 
+/* 【丢数据取证 2026-10-01】"缓冲满 → 整缓冲丢弃重同步"这条支路原先完全静默，
+ * 而它正是"曲子变短/听着变快"的现场：丢掉的是**未解码的完整 MP3 帧**。
+ * 计数交 tprobe 打印（>0 = 音乐被跳过）。 */
+volatile uint32_t g_bgm_drop_bytes;
+volatile uint32_t g_bgm_drops;
+
 /* 前向：流中控制队列排空（定义见「控制消息」节） */
 static void drain_audio_q_nonblock(void);
 
 /* 解码 in 缓冲内所有完整帧 → 环形缓冲；false=外部要求停 */
-static bool decode_pending(stream_ctx_t *c)
+static bool decode_pending(stream_ctx_t *c, bool force)
 {
     while (c->in_len > 0) {
+        /* 不足 2 帧且非收尾 → 保留缓冲等下一块（见 MP3_DEC_MIN_BYTES 注释） */
+        if (!force && c->in_len < MP3_DEC_MIN_BYTES) break;
         mp3dec_frame_info_t info;
         int samples = mp3dec_decode_frame(c->dec, c->in, (int)c->in_len,
                                           c->pcm, &info);
@@ -354,10 +386,14 @@ static bool stream_chunk(void *ctx, const char *data, size_t len)
 
     /* 追加进码流缓冲（满则先解码腾空） */
     if (c->in_len + len > MP3_INBUF_LEN) {
-        if (!decode_pending(c)) return false;
+        if (!decode_pending(c, false)) return false;
     }
     size_t take = len;
     if (c->in_len + take > MP3_INBUF_LEN) {
+        /* 【丢数据取证 2026-10-01】这一支原先完全静默，而它正是"曲子变短"的现场：
+         * 整缓冲（含未解码的完整 MP3 帧）被丢弃 = 音乐被跳过一截。打点计数。 */
+        g_bgm_drop_bytes += (uint32_t)c->in_len;
+        g_bgm_drops++;
         /* 缓冲仍满且解不出帧（16KB 无同步头：坏流/超长垃圾前缀）。
          * 上游 find_frame 已证明整缓冲无可解码帧 → 整段丢弃重同步，
          * 保证流的前向推进（否则后续数据会被永久丢弃）。 */
@@ -366,8 +402,9 @@ static bool stream_chunk(void *ctx, const char *data, size_t len)
     }
     memcpy(c->in + c->in_len, data, take);
     c->in_len += take;
+    c->bytes_in += (uint32_t)take;          /* 断点续流的续传位置 */
 
-    return decode_pending(c);
+    return decode_pending(c, false);
 }
 
 /* 播放一首：返回 true=自然播完（可续下一首），false=失败/中止 */
@@ -382,7 +419,20 @@ static bool play_track(uint32_t track_id)
     snprintf(url, sizeof(url), "/api/device/bgm/stream?deviceId=%s&id=%u&source=%s",
              mp_http_device_id(), (unsigned)track_id, source_str((mp_bgm_source_t)s_source));
 
+    /* pcm/stereo（共 13.8KB，原来是内部 .bss 内联数组）一次分配、跨曲复用：
+     * 反复 malloc/free 大块是 PSRAM 碎片源（与 mpak 窗口缓存同一条纪律）。 */
+    if (!s_sc.pcm)    s_sc.pcm    = heap_caps_malloc(MINIMP3_MAX_SAMPLES_PER_FRAME * sizeof(int16_t),
+                                                     MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!s_sc.stereo) s_sc.stereo = heap_caps_malloc(MINIMP3_MAX_SAMPLES_PER_FRAME * 2 * sizeof(int16_t),
+                                                     MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!s_sc.pcm || !s_sc.stereo) {
+        ESP_LOGE(TAG, "解码暂存分配失败（pcm=%p stereo=%p）→ 本轮播放放弃", s_sc.pcm, s_sc.stereo);
+        return false;
+    }
+    int16_t *pcm_keep = s_sc.pcm, *stereo_keep = s_sc.stereo;
     memset(&s_sc, 0, sizeof(s_sc));
+    s_sc.pcm = pcm_keep;                        /* memset 后回填（跨曲复用） */
+    s_sc.stereo = stereo_keep;
     mp3dec_init(s_dec);                         /* 每曲复位解码器（清 bit reservoir/合成
                                                  * 残态；上游 mp3dec_init 仅清头缓存，开销极小。
                                                  * 流内逐帧调用间则必须保持状态，勿在此之外重置） */
@@ -391,9 +441,58 @@ static bool play_track(uint32_t track_id)
     if (!s_sc.in) return false;
 
     s_playing = true;
-    int status = mp_http_get(url, 15000, stream_chunk, &s_sc);
-
-    bool natural = (status == 200);              /* 200+读尽 = 服务端结束本曲 */
+    /* 【播放速率取证 2026-10-01】用户口径"比本地快了很多很多"。
+     * 一边是 I2S 侧（tprobe 的 feeder 计数 ×1152/秒）已实测 ≈22.0k 帧/s（= 源
+     * 22.05kHz，速率正确），另一边是听感——若解码/读流环节**丢过数据**，
+     * 音乐会"跳着播"（既快又顿）。这里记下每曲的墙钟时长与解出帧数：
+     *   · 解出帧数 × 576 / 22050 ≈ 源音频秒数（MPEG2 LSF 每帧 576 样本）
+     *   · 两者若接近 → 播放速率正常，问题在别处（编解码/听感）；
+     *   · 墙钟 << 源秒数 → 确实丢数据/跳播。 */
+    int64_t t_start_us = esp_timer_get_time();
+    /* ══ 【BGM "变快+顿卡"根因修复 2026-10-01】══════════════════════════════
+     * 症状：曲子在设备上比源文件快 1.36×（实测 137.6s 的曲子在 101.1s 内"播完"，
+     * 解码帧数 3930 vs 源 5269），且隔几秒顿一下。
+     * 根因：**流被网络中断截断，但调用方把截断当成"本曲自然播完"**：
+     *   · mp_http_get 只回 HTTP 状态码，读中断（真机 errno=113 ECONNABORTED /
+     *     读超时）与正常读完同为 status=200；
+     *   · play_track 见 200 即 natural=true → 直接跳下一首 ⇒ 少掉的那 25% 音乐
+     *     被"跳过"，听感就是**又快又顿**（不是时钟/采样率问题：I2S 侧实测
+     *     22.0k 帧/s 与源一致，解码器 host 侧逐帧复核 5269 帧/137.6s 全对）。
+     * 修法：**断点续流**——用 count 到的字节数做 Range 续传（服务端 asset/bgm
+     * 已支持 206），只有"干净读到 EOF"才算自然播完；中断则原地续，最多 8 次，
+     * 仍失败按失败处理（走既有重试/跳曲逻辑）。用户侧听感 = 不再跳段。 */
+    bool natural = false;
+    int  resumes = 0;
+    /* （续流循环见下：每轮结束后 force 冲一次缓冲尾巴） */
+    for (;;) {
+        bool clean = false;
+        int status = mp_http_get_range(url, s_sc.bytes_in, 15000, stream_chunk, &s_sc, &clean);
+        if (status == 200 || status == 206) {
+            if (clean) { natural = true; break; }        /* 服务端读完 = 本曲结束 */
+            if (!s_playing || s_offline) break;          /* 控制中止：不算失败 */
+            if (s_sc.bytes_in == 0) break;               /* 一字节没拿到：交给失败路径 */
+            if (++resumes > 8) {
+                ESP_LOGW(TAG, "曲 %u 续流 8 次仍未读完（已收 %u KB）→ 放弃本曲",
+                         (unsigned)track_id, (unsigned)(s_sc.bytes_in / 1024));
+                break;
+            }
+            ESP_LOGW(TAG, "码流中断（已收 %u KB）→ Range 续流第 %d 次",
+                     (unsigned)(s_sc.bytes_in / 1024), resumes);
+            vTaskDelay(pdMS_TO_TICKS(200));              /* 稍候再续，避开瞬时抖动 */
+            continue;
+        }
+        break;                                            /* 连接失败：走失败路径 */
+    }
+    if (s_playing) decode_pending(&s_sc, true);           /* 冲掉缓冲尾巴的最后一帧 */
+    {
+        uint32_t ms = (uint32_t)((esp_timer_get_time() - t_start_us) / 1000);
+        uint32_t rate = s_rate ? s_rate : 44100;
+        ESP_LOGW(TAG, "播放速率取证：曲 %u 收到 %u B / 解出 %d 帧 → 源≈%u s；墙钟 %u.%us（%s）",
+                 (unsigned)track_id, (unsigned)s_sc.bytes_in, s_sc.frames,
+                 (unsigned)((uint64_t)s_sc.frames * 576u / rate),
+                 (unsigned)(ms / 1000), (unsigned)((ms % 1000) / 100),
+                 natural ? "自然播完" : "中止/失败");
+    }
     free(s_sc.in);
     s_sc.in = NULL;
 

@@ -922,12 +922,23 @@ static void menu_map_fn_background(void)
 
 #define CAM_PAN_SCALE        2      /* 屏 = 世界 1x ×2（compositor.h RC_SCALE，勿改口径） */
 #define CAM_PAN_THROTTLE_MS  66     /* 拖动节流：与宠物拖拽同口径（15fps 下发） */
+#define CAM_PAN_SNAP_PX      8      /* 【极限档吸附】拖动期相机位移吸附到 8 世界 px 的整数倍
+                                     * （= 屏上 16px 步进）：一次整屏重合成才换一次画面，
+                                     * 避免"每个世界 px 都整屏重合成"把 15Hz 节流吃掉。
+                                     * 松手（drag_end）时**不带吸附**再下发一次精确值，
+                                     * 所以最终保存的相机仍是用户手指的精确位置。 */
 #define CAM_SETTLE_TIMEOUT_MS 3000  /* 「脚踩地面线」结算等待重派发落地的上限（超时重投一次） */
-#define CAM_BANNER_HINT      "CAM: DRAG=MOVE MID=OK HOLD=CANCEL"  /* 33 字符 ×12px = 396 ≤ 480 */
+/* 【调参横幅 2026-10-01】用户要求"内容明确告诉用户：调整中：拖动移动 · 顶键短按保存 ·
+ * 长按取消"。5x7 横幅字库只有 ASCII（中文会被画成 '?'），故用等价英文；完整中文串
+ * 同时打在串口日志与菜单状态行（后者走烘焙中文子集）。37 字符 ×12px = 444 ≤ 480。 */
+#define CAM_BANNER_HINT      "CAM: DRAG=MOVE TAP=SAVE HOLD=CANCEL"
 #define CAM_BANNER_SAVED     "CAM SAVED"
 #define CAM_BANNER_CANCELED  "CAM CANCELED"
+/* 收尾重派发地图（>5s 装载）期间的 loading 横幅：这段时间按键/触摸被丢弃（见
+ * bridge_cam_busy 与 input_dispatch 的忙判定）。 */
+#define CAM_BANNER_LOADING   "CAM SAVING - PLEASE WAIT"
 /* 状态行中文提示：只用烘焙子集内字形（见上"可见反馈"说明） */
-#define CAM_FLASH_HINT       "CAM: DRAG=MOVE MID=OK HOLD=CANCEL"
+#define CAM_FLASH_HINT       "CAM: DRAG=MOVE TAP=SAVE HOLD=CANCEL"
 #define CAM_FLASH_NO_FULLMAP "此图相机不可用 (FULLMAP PKG)"
 #define CAM_FLASH_NEED_BG    "请选择此图为背景"
 
@@ -957,15 +968,40 @@ static void cam_pan_target(int32_t dx0, int32_t dy0, int32_t fx0, int32_t fy0,
     *wy = dy0 - (sy - fy0) / CAM_PAN_SCALE;
 }
 
-/* 立即下发一次相机（跟手）；记录节流时刻与最后手指位置 */
-static void cam_apply_pan(int32_t sx, int32_t sy)
+/* 吸附到 CAM_PAN_SNAP_PX 的整数倍（四舍五入；世界 px）。
+ * 只在拖动**进行中**用（极限档），松手那次不带吸附 → 精确落点。 */
+static int32_t cam_snap_world(int32_t v)
+{
+    const int32_t h = CAM_PAN_SNAP_PX / 2;
+    if (v >= 0) return ((v + h) / CAM_PAN_SNAP_PX) * CAM_PAN_SNAP_PX;
+    return -(((-v + h) / CAM_PAN_SNAP_PX) * CAM_PAN_SNAP_PX);
+}
+
+/* 立即下发一次相机（跟手）；记录节流时刻与最后手指位置。
+ * snap=true = 拖动进行中（步长吸附 + 进/续极限档）；false = 松手补精确位置。
+ * 返回 true = 相机**真的动了**（调用方据此判定"本拍有运动"并刷新交互计时）。 */
+static bool cam_apply_pan(int32_t sx, int32_t sy, bool snap)
 {
     int32_t wx = 0, wy = 0;
     cam_pan_target(s_cam.dx0, s_cam.dy0, s_cam.fx0, s_cam.fy0, sx, sy, &wx, &wy);
+    if (snap) {
+        wx = cam_snap_world(wx);
+        wy = cam_snap_world(wy);
+    }
+    int32_t ox = 0, oy = 0, nx = 0, ny = 0;
+    render_cam_get(&ox, &oy);              /* 下发前读回：判断"是否真的动了"（夹取后） */
     render_cam_set(wx, wy);
+    render_cam_get(&nx, &ny);
     s_cam.last_apply_ms = mp_now_ms();
     s_cam.lx = sx;
     s_cam.ly = sy;
+    if (nx == ox && ny == oy) return false;   /* 吸附后同格/已到边界：本拍无运动 */
+    /* 【极限档】真的动了才进/续 level 2：拖动期只画 static 底图 + 零窗口缓存 IO，
+     * 松手 200ms 后由渲染层自动回 level 1 → level 0（"松手出全图"）。 */
+    /* 拖动期维持 level 1（static+tile 全渲染、仅跳条带层），不再往下推到
+     * level 2（那会连 tile 都不画，用户明确要"单纯的 tile"）。 */
+    render_cam_adjust_motion_notify();
+    return true;
 }
 
 bool bridge_cam_adjust_active(void) { return s_cam.on; }
@@ -983,8 +1019,8 @@ void bridge_cam_adjust_drag_begin(int32_t sx, int32_t sy)
     render_cam_get(&s_cam.dx0, &s_cam.dy0);
 }
 
-/* 拖动中：跟手平移（66ms 节流）。返回 true = 本次真的下发了相机（调用方据此
- * 决定是否刷新交互活动计时，避免 50Hz 无谓调用）。 */
+/* 拖动中：跟手平移（66ms 节流 + 极限档步长吸附）。返回 true = 本次真的下发了相机
+ * （调用方据此决定是否刷新交互活动计时，避免 50Hz 无谓调用）。 */
 bool bridge_cam_adjust_drag_move(int32_t sx, int32_t sy)
 {
     if (!s_cam.on || !s_cam.dragging) return false;
@@ -995,18 +1031,32 @@ bool bridge_cam_adjust_drag_move(int32_t sx, int32_t sy)
         (now - s_cam.last_apply_ms) < CAM_PAN_THROTTLE_MS) {
         return false;
     }
-    cam_apply_pan(sx, sy);
-    return true;
+    return cam_apply_pan(sx, sy, /*snap=*/true);
 }
 
-/* 抬起：补最后一帧（节流窗内松手的位移不丢），本次手势结束 */
+/* 抬起：补最后一帧（节流窗内松手的位移不丢；**不带吸附** = 精确落点），本次手势结束 */
 void bridge_cam_adjust_drag_end(void)
 {
     if (!s_cam.on) return;
     if (s_cam.dragging) {
         s_cam.dragging = false;
-        cam_apply_pan(s_cam.lx, s_cam.ly);
+        cam_apply_pan(s_cam.lx, s_cam.ly, /*snap=*/false);
     }
+}
+
+/* 【忙判定】input 任务在按键/触摸入口调用：true = 丢弃本次输入（不排队、不延后）。
+ * 三个来源：
+ *   ① render_busy()：重活（整屏重合成/窗口缓存补读/地图装载）+ 忙尾 + 拖动极限档；
+ *   ② settle_pending：相机确认/取消后的**地图重派发窗口**（>5s 装载，屏上
+ *      loading 横幅" CAM SAVING - PLEASE WAIT"）——期间按键一律丢弃，用户的
+ *      "多按几下"不会攒成装完地图后的一串动作。
+ * ② 额外带**超时上限**：重派发若 3s 没落地（清单缺失/路径查询失败/cmd_q 满），
+ *    输入必须恢复，否则"地图没装成"会连带把设备变成整段不响应（poll 侧的重投
+ *    与放弃逻辑照旧，只是不再无限期扣着输入）。 */
+bool bridge_cam_busy(void)
+{
+    if (render_busy()) return true;
+    return s_cam.settle_pending && mp_now_ms() < s_cam.settle_by_ms;
 }
 
 /* ══ 【§5.2「脚踩地面线」接线】═══════════════════════════════════════════════
@@ -1066,6 +1116,7 @@ void bridge_cam_settle_after_reload(void)
 {
     if (!s_cam.settle_pending) return;
     s_cam.settle_pending = false;
+    render_busy_banner(NULL, false);   /* 装载落地：撤 loading 横幅（忙尾再兜 200ms） */
     cam_settle_on_ground("地图重派发落地");
 }
 
@@ -1073,6 +1124,10 @@ void bridge_cam_settle_after_reload(void)
  * （待机时钟/OTA…）只复原相机与横幅，**不**重派发地图（避免在待机/升级里重载包）。 */
 static void cam_finish_core(bool confirm, bool full, const char *why)
 {
+    /* 收尾先撤性能降级：后面要重合成完整画面（含条带）。
+     * level 0 = 正常全层合成（与进调参态之前的渲染路径逐像素一致）。 */
+    render_cam_adjust_set(RC_CAM_ADJ_OFF);
+
     if (!s_cam.on) return;
     s_cam.on = false;
     s_cam.dragging = false;
@@ -1111,9 +1166,18 @@ static void cam_finish_core(bool confirm, bool full, const char *why)
             s_cam.settle_pending = true;
             s_cam.settle_retried = false;
             s_cam.settle_by_ms   = mp_now_ms() + CAM_SETTLE_TIMEOUT_MS;
-            mp_post_cmd(&c);
-            ESP_LOGI(TAG, "相机收尾：重派发地图 %s（宠物回屏心 + 站位链复算；"
-                          "落地后结算「脚踩地面线」）", c.s);
+            /* 【loading 横幅 + 忙窗】重派发 = 一次完整地图装载（>5s）。横幅必须在
+             * 入队前就亮（渲染任务下一拍画上），忙窗同时把按键/触摸全丢掉——
+             * 这就是用户口径"地图装载窗口内不接受按钮信息"的落点。 */
+            render_busy_banner(CAM_BANNER_LOADING, true);
+            if (!mp_post_cmd(&c)) {
+                s_cam.settle_pending = false;
+                render_busy_banner(NULL, false);
+                ESP_LOGE(TAG, "相机收尾：cmd_q 满 → 重派发未入队（站位链/地面线不结算）");
+            } else {
+                ESP_LOGI(TAG, "相机收尾：重派发地图 %s（宠物回屏心 + 站位链复算；"
+                              "落地后结算「脚踩地面线」）", c.s);
+            }
         } else {
             s_cam.settle_pending = false;
             ESP_LOGW(TAG, "相机收尾：目标图 hash 为空 → 跳过重派发（站位链与地面线均无法结算）");
@@ -1154,6 +1218,7 @@ void bridge_cam_adjust_poll(void)
             ESP_LOGW(TAG, "相机收尾结算超时 → 重投地图 %s（站位链/地面线再试一次）", c.s);
         } else {
             s_cam.settle_pending = false;
+            render_busy_banner(NULL, false);   /* 放弃结算：撤 loading 横幅、解忙窗 */
             ESP_LOGE(TAG, "相机收尾结算放弃：地图 %s 两次未装载落地 → 宠物未归屏心、未落地面线"
                           "（下次装载该图会自然归位）", s_cam.hash);
         }
@@ -1226,6 +1291,17 @@ static bool menu_map_fn_camera_enter(void)
         return false;
     }
     s_cam.on = true;
+    /* 【2026-10-01 用户定稿（第二次更正）】在"选择/调整摄像机这个流程"里
+     * **不渲染 bac（背景装饰条带层）**，只画 static + tile：
+     *   "拖动的时候还是卡住，还是把 bac 渲染了；单纯的 tile 应该是不消耗性能"
+     *   "应该是在选择摄像头这个流程的时候不进行渲染 bac"
+     * 因此进流程即落 level 1（跳条带层）：
+     *   · **地形本体（static+tile）照常全渲染** —— 相机要对准的是地形，够用；
+     *   · 条带层（天空之城的 14 条视差装饰带）既不合成也不补缓存 ⇒ 拖动期间
+     *     不再有"每 2~3s 一次 2~3s 的条带重填"（那是"卡住"的主因）；
+     *   · 保存/取消（cam_finish_core）立即回 level 0，全层恢复。
+     * 注：不改 level 2（只画 static）——tile 是地形，必须画。 */
+    render_cam_adjust_set(RC_CAM_ADJ_NO_STRIP);
 
     /* ⑤ 调参态常驻横幅：入队放在 MENU_EXIT/POKER on_enter 之后，保证压过未配网
      *    横幅（cmd_q FIFO，同一渲染任务帧内顺序落地） */

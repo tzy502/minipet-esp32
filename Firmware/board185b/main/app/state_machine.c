@@ -649,12 +649,94 @@ static bool heap_ok_for_asset_load(void)
     return heap_caps_get_free_size(MALLOC_CAP_INTERNAL) >= CONFIG_MP_ASSET_HEAP_GATE_KB * 1024;
 }
 
-static esp_timer_handle_t s_bind_retry_timer;   /* 低堆跳过绑定后的自愈重试 */
+static esp_timer_handle_t s_bind_retry_timer;   /* 低堆跳过绑定/字体后的自愈重试 */
 static void bind_retry_cb(void *arg)
 {
     (void)arg;
     mp_cmd_t c = { .type = MP_CMD_MANIFEST_SYNCED };   /* 重跑绑定段（内部堆守卫会再拦） */
     mp_post_cmd(&c);
+}
+
+/* ══ 【绑定窗口逐段内部堆取证 2026-10-02 · 从 216 同步】════════════════════
+ * 216 真机现象（胶水抓串口）：@联网后 空闲=32819 → 一段"地图装载（6 个 mpak
+ * opened）+ 字体 + parts + layout"之后 → @@素材全绑后 只剩 1307（掉 ~31KB），
+ * 直接把 24KB 门限踩穿 →「跳过本轮素材绑定/字体装载」= 纸娃娃消失。
+ * 但"这 31KB 到底是谁吃的"此前只能靠猜（每个包的 open 日志不带水位）。
+ * 本探针在每个子阶段后打一行，配合 mpak.c 的 `opened ... 内部堆(此包后)`
+ * 与 asset_dl 的 sync 日志，能**逐段算出净增量**，把嫌疑锁死到一个包/一步。
+ * 常态只多 5 行启动日志，无需开关。 */
+static void bind_heap_probe(const char *stage)
+{
+    ESP_LOGW(TAG, "· 绑定水位[%s] 内部堆 空闲=%u 最大块=%u",
+             stage,
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+}
+
+static bool s_font_pending;                     /* 字体还没装上（跳过或装载失败） */
+
+/* 【字体装载重试定时器 2026-10-02 · 从 216 同步】字体未就绪时的兜底重试：
+ * 复用同一个 10s 周期定时器（幂等，已在跑就不重开）。触发一次 MANIFEST_SYNCED
+ * 重跑绑定段：堆够就装字，不够就再等一轮。
+ * 216 的根因（185B 同构）：整图装载期内部堆 22.8KB < 24KB 门限 → 跳过字体装载，
+ * 而 font_lazy 实例根本没 open → fl_glyph_dsc 直接 return false → LVGL 对每个字
+ * 都画 placeholder ⇒ 菜单变方框。下一轮 sync 可能要等几十秒甚至几分钟，
+ * 故用"10s 自愈"把等待压到最小（且只有真的还缺才重试）。 */
+static void font_retry_arm(void)
+{
+    if (s_bind_retry_timer) return;
+    const esp_timer_create_args_t t = {
+        .callback = bind_retry_cb, .name = "bind_retry",
+    };
+    if (esp_timer_create(&t, &s_bind_retry_timer) == ESP_OK)
+        esp_timer_start_periodic(s_bind_retry_timer, 10ULL * 1000000ULL);
+}
+
+/* 【相机拖动压测】连续平移相机 steps 次、每次 step 世界 px，逐次打点。
+ * 判读：每步耗时 ≈ 整屏合成/上屏成本 ⇒ 瓶颈在合成或 blit；
+ *       个别步尖峰（跨瓦片列那一拍）⇒ 瓶颈在 SD 补块。
+ * 触发通道：216 走服务端 `{"type":"camtest"}`（需白名单）+ 气泡魔数两条；
+ * 【已补 2026-10-01】app_core.h 已加 MP_CMD_CAM_PAN_TEST/CAM_SET 枚举，
+ *   下方 case 已接（原注释保留作历史记录）：185B 的 app_core.h 曾无该枚举，走**气泡魔数**
+ * `::camtest <步数>,<步长>[,<档位>]`（已有 bubble 通道，无需部署服务端）。
+ * ⚠️ 待 app_core.h 同步出 MP_CMD_CAM_PAN_TEST/CAM_SET 后，在此补回
+ *    `case MP_CMD_CAM_PAN_TEST: cam_pan_test_run(...)`（见交付报告清单）。 */
+static void cam_pan_test_run_ex(int steps, int step, int level);
+
+static void cam_pan_test_run(int steps, int step)
+{
+    cam_pan_test_run_ex(steps, step, -1);
+}
+
+static void cam_pan_test_run_ex(int steps, int step, int level)
+{
+    /* 真实拖动节奏：每步之间让渲染帧跑一次（约 60ms），否则 20 次 set 会被
+     * 批成一次大平移，测出的不是"每步成本"。level 参数用于对比"摄像机流程内
+     * （level 1，不画条带）"与"常态（level 0，全层）"。 */
+    if (!render_cam_supported()) { ESP_LOGW(TAG, "相机压测：当前图非整图包"); return; }
+    int32_t x0 = 0, y0 = 0;
+    render_cam_get(&x0, &y0);
+    int lvl_save = render_cam_adjust_get();
+    if (level >= 0) render_cam_adjust_set(level);
+    ESP_LOGW(TAG, "相机压测开始：起点 (%d,%d) 步数 %d 步长 %d 档位 %d→%d",
+             (int)x0, (int)y0, steps, step, lvl_save, level >= 0 ? level : lvl_save);
+    int64_t t_all = esp_timer_get_time();
+    int64_t t_max = 0;
+    for (int i = 1; i <= steps; i++) {
+        int64_t t0 = esp_timer_get_time();
+        render_cam_set(x0 + i * step, y0);
+        int64_t dt = esp_timer_get_time() - t0;
+        vTaskDelay(pdMS_TO_TICKS(60));        /* 让出一帧：模拟手指移动的真实节奏 */
+        if (dt > t_max) t_max = dt;
+        ESP_LOGW(TAG, "相机压测 步 %d/%d → x=%d 耗时 %lld ms",
+                 i, steps, (int)(x0 + i * step), (long long)(dt / 1000));
+    }
+    int64_t all = (esp_timer_get_time() - t_all) / 1000;
+    ESP_LOGW(TAG, "相机压测结束：%d 步共 %lld ms（均 %lld ms，最大 %lld ms）"
+                  "—— 判据：均 ≤30ms 为流畅；个别尖峰=补块；每步都百毫秒级=合成/上屏",
+             steps, (long long)all, (long long)(all / (steps ? steps : 1)),
+             (long long)(t_max / 1000));
+    if (level >= 0) render_cam_adjust_set(lvl_save);   /* 复原档位 */
 }
 
 static void dispatch_action(const char *action)
@@ -880,8 +962,29 @@ static void dispatch_map(const char *hash)
     }
     int n = asset_dl_map_strips(bg, strips, 16);
     if (n < 0) n = 0;
-    if (n > 8) n = 8;
+    /* 【条带数上限修正 2026-10-02 · 从 216 同步】原写死 8：整图新导出里
+     * 神秘岛 14 条、明珠港 12 条、时空裂缝 1 条……被截到 8 → 渲染层判"条带不全"
+     * → **缺段不绘制**（背景少层、看着就是"背景不对"）。缓冲区本就是 16
+     * （strips[16]/strip_ptrs[16]），渲染层 g_strips 也是按 strip_count 动态分配
+     * （compositor.c: g_strips = psram(strip_count * sizeof(rc_strip_t))）
+     * ⇒ 上限放开到 16 即可。
+     * 判据日志：`地图装载 <id>（条带 N）rc=0` 的 N 应等于 BGMAP 声明条带数。 */
+    if (n > 16) n = 16;
     for (int i = 0; i < n; i++) strip_ptrs[i] = strips[i];
+    /* 【装载期直落相机 2026-10-02 · 从 216 同步】把该图的 NVS 相机在装载**之前**
+     * 交给渲染层，让它第一次填窗口缓存就落在正确位置（否则置中填一遍、应用相机
+     * 再整窗重填一遍，216 真机实测开机 10.7s + 14.2s ≈ 25s）。
+     * 取不到记忆就显式清 pending（防止上一张图的 pending 残留到本张）。 */
+    {
+        char ckey[16];
+        int32_t cx = 0, cy = 0;
+        if (asset_dl_map_key(hash, ckey, sizeof(ckey)) && sm_cam_nvs_get(ckey, &cx, &cy)) {
+            render_cam_set_pending(cx, cy);
+            ESP_LOGI(TAG, "地图 %s：装载期直落 NVS 相机 (%d,%d)", hash, (int)cx, (int)cy);
+        } else {
+            render_cam_clear_pending();
+        }
+    }
     int mrc = render_set_map(bg, (n > 0) ? strip_ptrs : NULL, n);
     if (n > 0)
         ESP_LOGI(TAG, "地图条带 %d 条：%s | %s", n, strips[0], (n > 1) ? strips[1] : "-");
@@ -956,6 +1059,7 @@ static void dispatch_manifest_synced(void)
      * display_refresh_resume() 再退出，漏一条 = 屏幕永久冻结。
      * 216 板（GRAM）该 API 为空操作，本段零行为变化。 */
     display_refresh_suspend();
+    bind_heap_probe("绑定段入口");
 
     /* 字体三档（气泡 24 / 列表 16 / 标题 32，E12） */
     static const struct { render_font_t id; int px; } fonts[] = {
@@ -976,17 +1080,35 @@ static void dispatch_manifest_synced(void)
      * 不会缺字），10s 后随 sync 重试；下载完、堆回稳后自然装上。 */
     bool heap_ok_font = heap_ok_for_asset_load();
     if (!heap_ok_font) {
-        ESP_LOGW(TAG, "内部堆不足（%uB < %dKB）→ 跳过本轮字体装载（保上轮字体），随下轮 sync 重试",
+        /* 【2026-10-02 从 216 同步 · 菜单全是方框的真因】跳过后**不是**"随下轮 sync
+         * 重试"那么轻——实测开机整图装载期内部堆低于门限时跳过，font_lazy 的实例
+         * 根本没 open：fl_glyph_dsc 直接 return false → LVGL 对每个字都画
+         * placeholder ⇒ 菜单/列表变方框。而下一轮 sync 可能要等几十秒甚至几分钟
+         * （还有可能再次被门限拦）。
+         * 修法：① 一旦"字体未就绪"，用既有 10s 重试定时器兜底（与 parts 绑定共用
+         * 同一个 timer，见 font_retry_arm）；② 只有真的还缺才重试，堆回稳后 10s
+         * 内自动补上，不必等 sync。 */
+        ESP_LOGW(TAG, "内部堆不足（%uB < %dKB）→ 跳过本轮字体装载（屏上暂为占位框），10s 重试",
                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
                  (int)CONFIG_MP_ASSET_HEAP_GATE_KB);
+        s_font_pending = true;
+        font_retry_arm();                 /* 见上：与 bind 重试共用一个周期定时器 */
     }
-    for (size_t i = 0; heap_ok_font && i < sizeof(fonts) / sizeof(fonts[0]); i++) {
-        if (asset_dl_font_path(fonts[i].px, path, sizeof(path))) {
-            ESP_LOGW(TAG, "set_font px=%d 开始 %s", fonts[i].px, path);
-            render_set_font(fonts[i].id, path);
-            ESP_LOGW(TAG, "set_font px=%d 完成", fonts[i].px);
+    if (heap_ok_font) {
+        bool all_ok = true;
+        for (size_t i = 0; i < sizeof(fonts) / sizeof(fonts[0]); i++) {
+            if (asset_dl_font_path(fonts[i].px, path, sizeof(path))) {
+                ESP_LOGW(TAG, "set_font px=%d 开始 %s", fonts[i].px, path);
+                if (render_set_font(fonts[i].id, path) != 0) all_ok = false;
+                ESP_LOGW(TAG, "set_font px=%d 完成", fonts[i].px);
+            } else {
+                all_ok = false;                 /* 清单里没有这档字体 */
+            }
         }
+        if (all_ok) s_font_pending = false;
+        else        { s_font_pending = true; font_retry_arm(); }
     }
+    bind_heap_probe("字体三档之后");      /* 门拦截时也要打（否则看不到"未装"的对照） */
 
     /* 默认纸娃娃部件 + 站立布局（E13：每设备独立装扮） */
     if (!heap_ok_for_asset_load()) {
@@ -1006,7 +1128,7 @@ static void dispatch_manifest_synced(void)
             ESP_LOGW(TAG, "parts 首开失败（TF 争用?）重试 rc=%d", prc);
         }
         ESP_LOGW(TAG, "parts 路径=%s rc=%d", path, prc);
-        if (s_bind_retry_timer) {   /* 绑定成功：停自愈重试 */
+        if (s_bind_retry_timer && !s_font_pending) {   /* 绑定+字体都好了：停自愈重试 */
             esp_timer_stop(s_bind_retry_timer);
             esp_timer_delete(s_bind_retry_timer);
             s_bind_retry_timer = NULL;
@@ -1014,6 +1136,7 @@ static void dispatch_manifest_synced(void)
     } else {
         ESP_LOGE(TAG, "parts 路径查询失败（清单里没有 PARTS）");
     }
+    bind_heap_probe("parts 绑定之后");
     /* 加载失败不黑屏：屏显文字提示（E11 素材故障 → dam 语义的文本版） */
     /* 【TF 并发争用重试 2026-09-30】dispatch（渲染任务）与 sync_once（asset_dl
      * 任务）并发读 TF：SDMMC 1-bit 下偶发 open 失败（真机：同文件 60s 前
@@ -1029,6 +1152,7 @@ static void dispatch_manifest_synced(void)
         }
         ESP_LOGW(TAG, "layout 路径=%s rc=%d", path, lrc);
     }
+    bind_heap_probe("layout 绑定之后");
     if (!l_ok || lrc != 0 ||
         !asset_dl_parts_path(NULL, path, sizeof(path))) {
         /* 【拉取失败降级 2026-09-29，用户定稿】TF 在位但素材没下全（链路/堆
@@ -1144,7 +1268,12 @@ static void dispatch_manifest_synced(void)
          * 保证"有图就一定有背景"。用户后续从菜单选图时照旧按 id 走。 */
         static char hs[8][20]; static char lb[8][32]; static bool ca[8];
         int n = asset_dl_bgmap_list(hs, lb, ca, 8);
-        if (n > 0) {
+        /* 【2026-10-02 从 216 同步 · 兜底前提】只有"目标图确实不在清单里"才兜底。
+         * 旧口径无条件走兜底：开机时 asset_dl 的"当前激活图"尚未建立（SET_MAP 还在
+         * cmd_q 里没被渲染任务消费）→ 三级优先会落到 ②"第一张已缓存"，把 NVS 记着的
+         * 用户选图**顶掉**成另一张（与"重启还是这张图"口径冲突）。
+         * 加这一道门后：目标图在清单里就一切照旧（不兜底、不覆盖）。 */
+        if (n > 0 && !asset_dl_map_exists(want)) {
             /* 【挑选优先级 2026-10-01 真机修正】原先只挑"第一张已缓存"，真机暴露
              * 真实场景：NVS 记着 004000032（另一个会话/服务端推过的图），但本设备
              * 清单里只有另一张 → 兜底会随便挑一张，与用户当前想看的图不符。
@@ -1165,7 +1294,7 @@ static void dispatch_manifest_synced(void)
                      want,
                      asset_dl_map_is_active(hs[pick]) ? "当前激活图 " : "",
                      hs[pick], lb[pick]);
-        } else {
+        } else if (n == 0) {
             ESP_LOGW(TAG, "清单里没有任何 BGMAP（服务端未登记地图？）—— 背景保持黑底");
         }
     }
@@ -1196,6 +1325,18 @@ void app_cmd_dispatch(const mp_cmd_t *cmd)
         render_set_expression(cmd->s);
         break;
     case MP_CMD_BUBBLE:
+        /* 【相机拖动压测魔数 2026-10-02 · 从 216 同步】与 `::shot` 同款：
+         * 不需要服务端白名单即可触发相机拖动压测。
+         * 例：气泡文本 "::camtest 12,8" = 连续平移 12 步、每步 8 世界像素；
+         * 第三个数 = 渲染档位（可选，-1/缺省 = 不改档）。 */
+        if (strncmp(cmd->s, "::camtest", 9) == 0) {
+            int st = 12, sp = 8, lv = -1;
+            sscanf(cmd->s + 9, "%d,%d,%d", &st, &sp, &lv);
+            if (st <= 0) st = 12;
+            if (lv < 0) cam_pan_test_run(st, sp);
+            else        cam_pan_test_run_ex(st, sp, lv);
+            break;
+        }
         /* 【远程取证魔数 2026-10-01】bubble 文本 "::shot" → UDP 帧倾倒（不走
          * TF，不需白名单放行 screenshot）。帧里不含本气泡——在显示前截走。 */
         if (strncmp(cmd->s, "::shot", 6) == 0) {
@@ -1213,8 +1354,34 @@ void app_cmd_dispatch(const mp_cmd_t *cmd)
         }
         bubble_show(cmd->s, RENDER_FONT_24);   /* 协议传 UTF-8（E12） */
         break;
+    case MP_CMD_CAM_SET: {
+        /* 服务端"选镜头"界面下发：应用到渲染层并写入该图 NVS（重启/断网后仍生效）。
+         * 与 216 同口径；非整图包（无平移余量）时明确拒绝并记日志。 */
+        if (!render_cam_supported()) {
+            ESP_LOGW(TAG, "服务端相机 %d,%d：当前图非整图包 → 忽略", (int)cmd->a, (int)cmd->b);
+            break;
+        }
+        render_cam_set(cmd->a, cmd->b);
+        int32_t gx = 0, gy = 0;
+        render_cam_get(&gx, &gy);
+        char key[16];
+        const char *ah = asset_dl_active_map_hash();
+        if (ah && asset_dl_map_key(ah, key, sizeof key)) {
+            sm_cam_nvs_set(key, gx, gy);
+            ESP_LOGW(TAG, "服务端相机已应用并记忆：(%d,%d) key=%s", (int)gx, (int)gy, key);
+        } else {
+            ESP_LOGW(TAG, "服务端相机已应用：(%d,%d)（无活动图/无 per-map 键 → 未记忆）",
+                     (int)gx, (int)gy);
+        }
+        break;
+    }
+    case MP_CMD_CAM_PAN_TEST:
+        cam_pan_test_run(cmd->a > 0 ? cmd->a : 20, cmd->b != 0 ? cmd->b : 8);
+        break;
     case MP_CMD_SET_MAP:
+        bind_heap_probe("地图装载之前");
         dispatch_map(cmd->s);
+        bind_heap_probe("地图装载之后");
         /* 【E7 补齐 2026-09-27】需求：「切换完成后宠物反应 = 随机表情」。
          * 此前切换路径无任何 render_set_expression 调用（核对报告列为缺口）。 */
         switch_random_expression();

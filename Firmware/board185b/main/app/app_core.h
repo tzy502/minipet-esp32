@@ -169,6 +169,11 @@ typedef enum {
     MP_CMD_BGM_PREV,        /* 上一首（本地曲目表循环）→ bgm_prev            */
     MP_CMD_BGM_PLAYID,      /* s=数字串曲目 id → bgm_play_id 选曲播放        */
     MP_CMD_SCREENSHOT,      /* 调试取证：framebuffer 存 BMP 到 TF（服务端字符串命令触发） */
+    MP_CMD_CAM_SET,         /* a=x b=y（世界坐标）：服务端"选镜头"界面下发 → 应用相机
+                             * 并写入该图 NVS（服务端口径 = 主，本地卡为辅助）。 */
+    MP_CMD_CAM_PAN_TEST,    /* 【压测钩子】a=步数 b=步长（世界 px）→ 渲染任务连续平移相机并
+                             * 打点每步耗时（只看日志，不改持久化）。用于真机量化"拖动卡在哪
+                             * 一层"：缓存补读 vs 整屏合成 vs 上屏。仅 admin API 可达。 */
 } mp_cmd_type_t;
 
 typedef struct {

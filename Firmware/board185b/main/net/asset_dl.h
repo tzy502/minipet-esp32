@@ -141,14 +141,15 @@ bool asset_dl_request_one(const char *hash);
  * hash_or_id：内容 hash（列表项）或地图 id（服务端指令）两种口径都认
  * （与 asset_dl_map_path 同款双键解析）。 */
 bool asset_dl_map_set_hidden(const char *hash_or_id, bool hidden);   /* true=NVS 落地成功 */
-bool asset_dl_map_hidden(const char *hash_or_id);                     /* 该图当前是否被隐藏 */
-int  asset_dl_bgmap_visible_count(void);                              /* 未被隐藏的 BGMAP 条数 */
-bool asset_dl_map_is_active(const char *hash_or_id);                  /* 是否正在渲染的当前图 */
+bool asset_dl_map_hidden(const char *hash_or_id);
 
-/* 【活动地图持久化 2026-10-01（自 216 迁移）】hash/id → map_id；以及 map_id 是否还在当前清单里。
- * 用途：活动地图存 map_id（不是 hash——重导会换 hash），开机校验它仍在清单，不在才回默认。 */
+/* 【活动地图持久化】hash/id → map_id；以及 map_id 是否还在当前清单里 */
 bool asset_dl_map_id_of(const char *hash_or_id, char *out, size_t cap);
 bool asset_dl_map_exists(const char *map_id);
+/* 当前活动地图 hash（NULL=未设置）；用于派生 per-map NVS 键 */
+const char *asset_dl_active_map_hash(void);                     /* 该图当前是否被隐藏 */
+int  asset_dl_bgmap_visible_count(void);                              /* 未被隐藏的 BGMAP 条数 */
+bool asset_dl_map_is_active(const char *hash_or_id);                  /* 是否正在渲染的当前图 */
 
 /* per-map 键查询（相机 agent 的 NVS per-map 键同口径，见 requirements §5.3）：
  * out = map_id 优先，无则 "h"+hash 前 14 位；找不到该 BGMAP 条目返回 false */

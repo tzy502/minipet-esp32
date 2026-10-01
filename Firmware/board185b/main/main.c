@@ -25,6 +25,7 @@
 
 #include <stdio.h>
 #include <assert.h>
+#include <string.h>      /* 指令合并用的 strcmp（见 render_drain_cmds） */
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -42,6 +43,7 @@
 #include "esp_log.h"
 
 #include "app_core.h"
+#include "mp_psram.h"    /* PSRAM 优先分配（内部 DRAM 紧张，见 render_drain_cmds） */
 #include "mpconf.h"  /* 串口配置通道 MPCONF */
 #include "hal_contract.h"
 #include "watchdog.h"
@@ -76,6 +78,88 @@ mp_app_config_t g_mp_cfg = {
 /* ------------------------------------------------------------------ */
 /* APP 核任务                                                            */
 /* ------------------------------------------------------------------ */
+/* ══ 【指令排空 + 合并 2026-10-02 · 从 216 同步】═════════════════════════════
+ * 用户原话："现在因为卡顿体验比较差 会有一种卡顿了以后在突然好多按钮一口气
+ * 点一遍"。
+ *
+ * 机理：渲染任务被长任务堵住时（整图装载 >5s、整屏重合成 100ms 级），cmd_q
+ * 照常收指令（16 深）。堵完恢复后旧代码是 `while (xQueueReceive(...)) dispatch()`
+ * —— 把攒下的十几条**一次性全执行**：屏上就是一串动作连播（气泡/表情/横幅
+ * 一帧一条）。
+ *
+ * 现在的语义（与"忙时丢弃"配套，见 input_dispatch 的 input_busy 入口）：
+ *   ① 排空整批后再落地，落地前做一次合并；
+ *   ② 合并只对**纯显示、后到覆盖先到**的类型生效（白名单见 cmd_latest_wins）：
+ *      同类只保留最后一次，屏上表现为"直接到最终状态"，不会有中间态连播；
+ *   ③ 其余类型（BGM_TOGGLE 乒乓、MENU_ENTER/EXIT 状态迁移、REBOOT、OTA_*、
+ *      PAIRING_CODE…）**原样按队列顺序执行**——合并它们会改变语义；
+ *   ④ SET_MAP 只做**完全重复**合并（同 hash 的连投 = 一次 5s 装载的重放）。
+ *   ⑤ 与旧写法的唯一行为差异：指令处理函数内部若再投一条新指令（如
+ *      dispatch_manifest_synced 末尾重投默认地图），旧写法会在**同一次排空**里
+ *      继续收走并执行，现在会留到**下一帧**排空（+33ms）。对渲染/横幅类结果无
+ *      影响，且顺带把"处理函数互相投递"造成的同帧长链截断了（对看门狗更友好）。
+ * 批缓冲是静态的（不进渲染任务栈：该任务栈最紧时只有 3584 字节，见下面
+ * render_stacks 的降档表——1.7KB 的栈数组就是一次栈溢出）。 */
+static bool cmd_latest_wins(mp_cmd_type_t t)
+{
+    switch (t) {
+    case MP_CMD_BUBBLE:          /* 气泡文本：后一条覆盖前一条 */
+    case MP_CMD_BANNER:          /* 顶部横幅：同上 */
+    case MP_CMD_SET_ACTION:      /* 动作：只需最终动作 */
+    case MP_CMD_SET_EXPRESSION:  /* 表情：同上 */
+    case MP_CMD_BRIGHTNESS:      /* 亮度：同上 */
+    case MP_CMD_NET_STATE:       /* 在线态：同上 */
+    case MP_CMD_BGM_STATE:       /* BGM 回显态：同上 */
+    case MP_CMD_OTA_BEGIN:       /* 升级进度提示：同上 */
+        return true;
+    default:
+        return false;
+    }
+}
+
+static int render_drain_cmds(void)
+{
+    /* 静态（免占渲染任务 3.5KB 的最紧栈），但**不必占内部 DRAM**：
+     * 【内部 RAM 腾挪 2026-10-02 · 同 216 口径】s_drain（16×108B=1728B）+ s_drop
+     * 原为内部 .bss 常驻。它只是"从 cmd_q 出队的拷贝"，只在渲染任务内被读、
+     * 随后喂给 app_cmd_dispatch；无任何 DMA 直接读它 → PSRAM 懒分配（mp_psram_malloc：
+     * PSRAM 优先、失败退内部堆；首次排空时分配，之后复用）。两边都拿不到则本拍
+     * 不排空、下拍重试，**不丢指令**。 */
+    static mp_cmd_t *s_drain;
+    static bool     *s_drop;
+    if (!s_drain) s_drain = mp_psram_malloc(sizeof(mp_cmd_t) * MP_CMD_Q_LEN);
+    if (!s_drop)  s_drop  = mp_psram_malloc(sizeof(bool) * MP_CMD_Q_LEN);
+    if (!s_drain || !s_drop) return 0;
+    int n = 0;
+    while (n < MP_CMD_Q_LEN && xQueueReceive(mp_cmd_q, &s_drain[n], 0) == pdTRUE) n++;
+    for (int i = 0; i < n; i++) s_drop[i] = false;
+
+    int merged = 0;
+    for (int i = 0; i < n; i++) {
+        for (int j = i + 1; j < n; j++) {
+            bool dup = (s_drain[j].type == s_drain[i].type);
+            if (dup && !cmd_latest_wins(s_drain[i].type)) {
+                /* 非白名单：只合并**完全一样**的条目（同类型同参数同文本）——
+                 * 例：同 hash 的 MP_CMD_SET_MAP 连投。 */
+                dup = (s_drain[j].a == s_drain[i].a && s_drain[j].b == s_drain[i].b &&
+                       strcmp(s_drain[j].s, s_drain[i].s) == 0);
+            }
+            if (dup) { s_drop[i] = true; merged++; break; }
+        }
+    }
+    if (merged > 0) {
+        ESP_LOGW(TAG, "cmd_q 合并：本拍排空 %d 条，丢弃被覆盖的旧条目 %d 条（防卡顿后一口气执行）",
+                 n, merged);
+    }
+    for (int i = 0; i < n; i++) {
+        if (s_drop[i]) continue;
+        ESP_LOGW(TAG, "[取证] cmd 派发 type=%d s='%.16s'", (int)s_drain[i].type, s_drain[i].s);
+        app_cmd_dispatch(&s_drain[i]);
+        watchdog_kick();              /* 单条指令若耗时（素材懒加载），也持续喂狗 */
+    }
+    return n - merged;
+}
+
 /* 渲染任务：30fps 帧循环；每帧先排空 cmd_q（net→render 指令落地），
  * 再 render_tick 一帧，最后喂看门狗（E14 渲染心跳）。 */
 static void render_task(void *arg)
@@ -84,7 +168,6 @@ static void render_task(void *arg)
     watchdog_subscribe_render_task();      /* 本任务上下文订阅 TWDT（E14） */
     ESP_LOGW("rt", "render_task 起步");
 
-    mp_cmd_t cmd;
     for (;;) {
         /* 【看门狗熔断修复 2026-09-27】先喂狗再排空指令队列。
          * 真机实证：启动期一次性涌入几十条指令，而每条都打一条 WARN 日志
@@ -93,11 +176,7 @@ static void render_task(void *arg)
          * ① 每条指令的 WARN 降为 DEBUG（启动期不再刷屏）；
          * ② 喂狗提到排空之前，并在每条指令后补喂一次。 */
         watchdog_kick();
-        while (xQueueReceive(mp_cmd_q, &cmd, 0) == pdTRUE) {
-            ESP_LOGD("rt", "cmd 收到 type=%d", (int)cmd.type);
-            app_cmd_dispatch(&cmd);
-            watchdog_kick();              /* 单条指令若耗时（素材懒加载），也持续喂狗 */
-        }
+        render_drain_cmds();              /* 排空 + 合并（见上"指令排空 + 合并"） */
         render_tick();                    /* 4.2 帧循环（30fps） */
         watchdog_kick();
 
@@ -120,6 +199,7 @@ static void render_task(void *arg)
                                          g_bgm_drop_greyed, g_bgm_wr_err;
                 extern volatile uint32_t g_bgm_underruns, g_bgm_ring_min, g_bgm_wr_max_us;
                 extern volatile uint32_t g_bgm_gap_max_us, g_bgm_gap_over, g_bgm_gap_at_ms;
+                extern volatile uint32_t g_bgm_drop_bytes, g_bgm_drops;
                 extern volatile uint32_t g_pol_stage[10];
                 extern volatile int32_t  g_bgm_state_probe;
                 ESP_LOGW("tprobe", "poller 阶段=[%u %u %u %u %u %u %u %u %u] 门失败=%u 成功=%u 失败=%u | "
@@ -147,6 +227,10 @@ static void render_task(void *arg)
                 ESP_LOGW("tprobe", "bgm 卡顿取证：写间隔最长=%u us @%ums | >150ms 次数=%u（DMA 深度 22.05k≈139ms）",
                          (unsigned)g_bgm_gap_max_us, (unsigned)g_bgm_gap_at_ms,
                          (unsigned)g_bgm_gap_over);
+                /* 【丢数据取证 2026-10-02 · 从 216 同步】环形缓冲满导致的丢弃
+                 * （>0 = 音乐被跳过、曲子会变短），与上面的"断供"是两个不同故障。 */
+                ESP_LOGW("tprobe", "bgm 丢数据取证：缓冲满丢弃 %u B / %u 次（大于 0 = 音乐被跳过，曲子会变短）",
+                         (unsigned)g_bgm_drop_bytes, (unsigned)g_bgm_drops);
                 g_bgm_ring_min = 0xFFFFFFFFu;
                 g_bgm_wr_max_us = 0;
                 g_bgm_gap_max_us = 0;

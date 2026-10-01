@@ -64,6 +64,13 @@ const char *mp_http_pairing_code(void);   /* hello 下发的配对码（未配�
 int mp_http_get(const char *path_or_url, uint32_t timeout_ms,
                 mp_http_chunk_cb cb, void *ctx);
 
+/* 【BGM 断点续流】带 Range 的流式 GET（服务端 asset/bgm 端点已支持 206）。
+ * from_off > 0 → Range: bytes=<from>- ；clean_eof 出参 = 是否干净读到 EOF
+ * （false = 中途被掐断/读超时，调用方应续传而不是当"播完"）。
+ * 返回 HTTP 状态码（200/206）；网络错误 -1。 */
+int mp_http_get_range(const char *path_or_url, uint32_t from_off, uint32_t timeout_ms,
+                      mp_http_chunk_cb cb, void *ctx, bool *clean_eof);
+
 /* POST JSON：body 为序列化好的 JSON；响应（可选）写入 resp_buf。
  * 返回 HTTP 状态码；网络错误 -1。 */
 int mp_http_post_json(const char *path, const char *json_body,

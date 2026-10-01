@@ -56,6 +56,15 @@ void display_set_orientation(bool swap_xy, bool mirror_x, bool mirror_y);
  */
 esp_err_t display_blit(int x, int y, int w, int h, const uint8_t *rgb565_be);
 
+/**
+ * @brief 该缓冲是否仍在飞（合成器多暂存轮转前查；false = 可安全重填）
+ *
+ * 【2026-10-01 自 216 co5300 同步】驱动侧登记"在飞缓冲指针环"（发送顺序 FIFO，
+ * 完成回调按序弹出）；合成器以此实现多块暂存轮转，避免"每块都等上一笔传完"
+ * 导致 SPI 不流水（满屏 blit 明显变慢）。
+ */
+bool display_blit_buf_busy(const void *buf);
+
 /* 等上一笔 color 传输读完调用方缓冲（重填共用暂存前必调）。
  * 返回时保证无在飞传输；display_tx_busy() 供探针判定"填缓冲时是否仍有传输在飞"。 */
 void display_wait_tx_idle(void);

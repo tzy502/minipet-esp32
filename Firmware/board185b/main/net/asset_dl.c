@@ -40,6 +40,7 @@
 
 #include "app_core.h"
 #include "http_client.h"
+#include "mp_psram.h"
 #include "esp_http_client.h"   /* range_get：块化下载需自定义 Range 头 */
 #include "input_dispatch.h"
 
@@ -53,7 +54,14 @@ static const char *TAG = "asset";
  * 143KB 已是万物枯竭的总根源（下载失败/任务创建失败多为连锁反应） */
 /* 24K：rev32 实测 18.6KB（休塔尔克装扮+NPC 后）。旧 16K 在 collect 满
  * 时返回 false 中断流 → sync 静默失败（真机：进入但永无下载）。 */
-#define MANIFEST_RESP_CAP  (24 * 1024)
+/* 【2026-10-01 再爆一次：24K 又不够了】真机实证：整图导出 + 中文名 label 之后
+ * 清单涨到 **27,461 B** > 24,576 → manifest_collect 拒绝续收 → 响应被截断 →
+ * cJSON_Parse 失败 → sync_once **静默 return**（无任何 E 级日志）→ 新登记的地图
+ * 永远下不来、本地清单停在旧 rev（真机表现：推了 5 张整图包，设备一张都不下）。
+ * 教训与 16K→24K 那次同款：**清单体积只增不减，上限必须留足并显式报错**。
+ * 64KB 缓冲走 PSRAM（内部堆此刻只剩 ~50KB，再吃 64KB 会把 SD/newlib 逼死；
+ * PSRAM 有 6MB+，cJSON 解析只读它）。 */
+#define MANIFEST_RESP_CAP  (64 * 1024)
 
 /* ------------------------------------------------------------------ */
 /* 本地清单模型（内存 + TF manifest.json 双写）                          */
@@ -73,15 +81,66 @@ typedef struct {
     int64_t  last_used_ms;
 } local_file_t;
 
-static local_file_t s_files[MAX_FILES];
+/* ══ 【内部 RAM 腾挪 2026-10-02】清单元数据从内部 .bss 搬到 PSRAM ══════════
+ * 现状（真机基线）：本板内部动态 DRAM 只有 ~133KB，而 s_files 一个数组
+ * （256 槽 × 208B = 53,248B）就吃掉 39% 的 .bss；开机"素材全绑后"只剩
+ * 1.3~43KB 空闲、最大块 0.8~9.7KB，直接把 24KB 门限踩穿 →
+ * 「内部堆不足，跳过本轮素材绑定/字体装载」= 用户看到的"纸娃娃消失、
+ * 中文变方框"。
+ * 为什么可以放 PSRAM（不是无脑搬）：
+ *   · 本结构**纯元数据**（hash/kind/label/map_id 等字符串 + 计数 + LRU 时间戳），
+ *     没有任何 SPI/SDMMC/I2S/LCD 的 DMA 会直接读它 —— 换存储位置即可；
+ *   · 并发访问一律在 s_lock 内（见 asset_dl.h 契约），与内存区域无关；
+ *   · 访问频率是"菜单/同步期的字符串比较"，PSRAM 走 dcache，量级无感。
+ * 失败路径（重要）：分配放在 asset_dl_start() 最前（PSRAM 8MB 此刻几乎全空），
+ * PSRAM 失败退内部堆（等价旧静态数组）；两边都失败则保持指向 1 槽兜底数组
+ * 且 s_files_cap=1 —— 所有 `i < s_file_cnt` 遍历天然空转（清单按空处理），
+ * 绝不会越界或空指针。 */
+typedef struct { char map_id[32]; int16_t x, y; } mp_clock_row_t;
+
+static local_file_t    s_files_zero[1];        /* 兜底：任何分配失败时清单=空 */
+static local_file_t   *s_files = s_files_zero;
+static int             s_files_cap = 1;        /* 可写槽位上限（=1 时只读空清单） */
 static int          s_file_cnt;
 static uint32_t     s_local_rev;
 static char         s_active_map[32];          /* 当前地图 id（clock 锚点/LRU） */
 static char         s_active_map_hash[20];     /* 当前地图内容 hash（隐藏判定用，见 map_is_active） */
 
 /* clock_table（E9/R15：[x,y] = 烘焙视口内屏幕坐标，世界 1x 口径下发给渲染层） */
-static struct { char map_id[32]; int16_t x, y; } s_clock_tab[MAX_CLOCK_MAPS];
+static mp_clock_row_t  s_clock_zero[1];
+static mp_clock_row_t *s_clock_tab = s_clock_zero;
+static int             s_clock_cap = 1;
 static int s_clock_cnt;
+
+/* 幂等：asset_dl_start 与 upsert 入口都会调（防任何"更早的调用者"读到空表） */
+static void manifest_arrays_ensure(void)
+{
+    if (s_files != s_files_zero) return;
+    local_file_t *f = heap_caps_calloc(MAX_FILES, sizeof *f,
+                                       MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    mp_clock_row_t *c = heap_caps_calloc(MAX_CLOCK_MAPS, sizeof *c,
+                                         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!f || !c) {
+        /* PSRAM 不可用/耗尽 → 退回内部堆（与旧静态数组同量，行为不变） */
+        if (!f) f = heap_caps_calloc(MAX_FILES, sizeof *f,
+                                     MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        if (!c) c = heap_caps_calloc(MAX_CLOCK_MAPS, sizeof *c,
+                                     MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    }
+    if (!f || !c) {
+        heap_caps_free(f);      /* free(NULL) 安全 */
+        heap_caps_free(c);
+        ESP_LOGE(TAG, "清单元数据分配失败（内部 空闲=%u 最大块=%u）→ 清单按空处理",
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+        return;
+    }
+    s_files = f;      s_files_cap = MAX_FILES;
+    s_clock_tab = c;  s_clock_cap = MAX_CLOCK_MAPS;
+    ESP_LOGW(TAG, "清单元数据 → PSRAM：s_files %uB + clock_tab %uB（内部 DRAM 省 %uB）",
+             (unsigned)(sizeof *f * MAX_FILES), (unsigned)(sizeof *c * MAX_CLOCK_MAPS),
+             (unsigned)(sizeof *f * MAX_FILES + sizeof *c * MAX_CLOCK_MAPS));
+}
 
 static SemaphoreHandle_t s_lock;
 static SemaphoreHandle_t s_sync_req;
@@ -262,6 +321,10 @@ static int find_bgmap_locked(const char *hash_or_id)
     return -1;
 }
 
+/* 【活动地图持久化 2026-10-01】hash/id → 地图 id（BGMAP 条目的 map_id）。
+ * 用户口径："我设置成神之子神殿调整了位置，重启以后应该还是我选择的地图，
+ * 不要重置成默认地图"。持久化必须存 **map_id 而不是 hash**：服务端重导
+ * 同一张图会换 hash（同 map_id、不同包），存 hash 的话重启就找不到条目。 */
 bool asset_dl_map_id_of(const char *hash_or_id, char *out, size_t cap)
 {
     if (!out || cap == 0) return false;
@@ -276,6 +339,12 @@ bool asset_dl_map_id_of(const char *hash_or_id, char *out, size_t cap)
 }
 
 /* 地图 id 在当前清单里是否存在（启动时校验"上次用的图"是否还可用） */
+/* 当前活动地图的内容 hash（相机下发时用来派生 per-map NVS 键） */
+const char *asset_dl_active_map_hash(void)
+{
+    return s_active_map_hash[0] ? s_active_map_hash : NULL;
+}
+
 bool asset_dl_map_exists(const char *map_id)
 {
     xSemaphoreTake(s_lock, portMAX_DELAY);
@@ -525,14 +594,20 @@ static void load_local_manifest(void)
         fclose(f); return;
     }
 
-    char *buf = malloc((size_t)sz + 1);
+    /* 【内部 RAM 腾挪】本地清单 JSON 文本最大 128KB：原 malloc 走默认堆，
+     * 而默认堆对 ≤4KB 的请求一律给内部 RAM（CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL
+     * =4096），实测清单 27~35KB 时就是**一整块 27~35KB 的内部堆占用**，
+     * 正好压在"素材绑定/字体装载"的窗口上。此缓冲只被 cJSON_Parse 顺序读，
+     * 无 DMA，PSRAM 完全安全；PSRAM 失败再退原路径（行为不变）。 */
+    char *buf = heap_caps_malloc((size_t)sz + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!buf) buf = malloc((size_t)sz + 1);
     if (!buf) { fclose(f); return; }
     size_t rd = fread(buf, 1, (size_t)sz, f);
     fclose(f);
     buf[rd] = 0;
 
     cJSON *root = cJSON_Parse(buf);
-    free(buf);
+    heap_caps_free(buf);              /* 区域无关：PSRAM/内部都能还 */
     if (!root) {
         ESP_LOGW(TAG, "本地清单 JSON 解析失败（读 %zu/%ld 字节）→ 弃用", rd, sz);
         return;
@@ -547,7 +622,7 @@ static void load_local_manifest(void)
     if (cJSON_IsArray(files)) {
         cJSON *jf;
         cJSON_ArrayForEach(jf, files) {
-            if (s_file_cnt >= MAX_FILES) break;
+            if (s_file_cnt >= s_files_cap) break;   /* cap=1 兜底时这里立刻退出 */
             local_file_t *lf = &s_files[s_file_cnt];
             const char *h = cJSON_GetStringValue(cJSON_GetObjectItem(jf, "hash"));
             const char *k = cJSON_GetStringValue(cJSON_GetObjectItem(jf, "kind"));
@@ -673,7 +748,7 @@ static void load_local_manifest(void)
     if (cJSON_IsObject(ct)) {
         cJSON *jm;
         cJSON_ArrayForEach(jm, ct) {
-            if (s_clock_cnt >= MAX_CLOCK_MAPS) break;
+            if (s_clock_cnt >= s_clock_cap) break;   /* cap=1 兜底时空转 */
             cJSON *arr = jm->child;
             if (cJSON_IsArray(arr) && cJSON_GetArraySize(arr) == 2) {
                 strlcpy(s_clock_tab[s_clock_cnt].map_id, jm->string,
@@ -903,6 +978,7 @@ static bool upsert_meta(const char *hash, const char *kind, const char *action,
 {
     bool found_file = false;
     char path[MP_MPK_PATH_MAX];
+    manifest_arrays_ensure();               /* 幂等；任何写入前保证表已就位 */
     const char *dir = kind_dir(kind);
     if (dir) {
         snprintf(path, sizeof(path), "%s/%s.mpk", dir, hash);
@@ -913,7 +989,7 @@ static bool upsert_meta(const char *hash, const char *kind, const char *action,
     for (int i = 0; i < s_file_cnt; i++) {
         if (strcmp(s_files[i].hash, hash) == 0) { slot = &s_files[i]; break; }
     }
-    if (!slot && s_file_cnt < MAX_FILES) {
+    if (!slot && s_file_cnt < s_files_cap) {
         slot = &s_files[s_file_cnt++];
         memset(slot, 0, sizeof(*slot));
         strlcpy(slot->hash, hash, sizeof(slot->hash));
@@ -1401,6 +1477,7 @@ static void evict_if_needed(void)
 typedef struct {
     char  *buf;
     size_t len, cap;
+    bool   truncated;      /* 超限截断标记（上层据此明确报错，不再静默解析失败） */
 } manifest_ctx_t;
 
 static bool manifest_collect(void *ctx_, const char *data, size_t len)
@@ -1411,6 +1488,14 @@ static bool manifest_collect(void *ctx_, const char *data, size_t len)
         r->len += len;
         r->buf[r->len] = 0;
         return true;
+    }
+    /* 【禁止静默】截断 = 本轮清单作废（JSON 必不完整）。旧实现只 return false，
+     * 上层见 status=200 仍去 parse → 失败 → 静默 return，故障完全不可见。 */
+    if (!r->truncated) {
+        r->truncated = true;
+        ESP_LOGE(TAG, "清单响应超限（已收 %u B ≥ 上限 %u B）→ 本轮作废；"
+                      "请抬高 MANIFEST_RESP_CAP（清单只增不减）",
+                 (unsigned)(r->len + len), (unsigned)r->cap);
     }
     return false;
 }
@@ -1490,9 +1575,10 @@ static void sync_once(void)
     /* 【堆纪律 2026-09-29】缓冲改为 sync 窗口内临时分配、解析后立刻释放。
      * 旧 static 常驻 16K：本板内部堆 143KB，联网+同步窗口期常驻占用直接把
      * 堆压到 2.4KB——SD 读扇区 0x101、mpak 全灭、降级切分区失败连环炸。 */
-    char *resp = malloc(MANIFEST_RESP_CAP);
+    char *resp = heap_caps_malloc(MANIFEST_RESP_CAP, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!resp) resp = malloc(MANIFEST_RESP_CAP);      /* PSRAM 失败才退内部堆 */
     if (!resp) { ESP_LOGE(TAG, "manifest 缓冲分配失败 %u", (unsigned)MANIFEST_RESP_CAP); s_sync_busy = false; s_sync_attempted = true; return; }
-    manifest_ctx_t ctx = { .buf = resp, .cap = MANIFEST_RESP_CAP };
+    manifest_ctx_t ctx = { .buf = resp, .cap = MANIFEST_RESP_CAP, .truncated = false };
 
     /* manifest 端点服务端必填 deviceId（DeviceEndpoints.cs HandleManifest 签名
      * string deviceId；缺失即 400）——真机实证：不带参永久 400 → 素材包一个
@@ -1511,9 +1597,14 @@ static void sync_once(void)
     }
 
     cJSON *root = cJSON_Parse(resp);
-    free(resp);                            /* cJSON 树自持数据，大缓冲即刻归还堆 */
+    heap_caps_free(resp);                  /* cJSON 树自持数据，大缓冲即刻归还堆 */
     resp = NULL;
-    if (!root) { s_sync_busy = false; return; }
+    if (!root) {
+        ESP_LOGE(TAG, "清单 JSON 解析失败（响应 %u B%s）→ 本轮放弃，保持本地 rev=%u",
+                 (unsigned)ctx.len, ctx.truncated ? "，已截断" : "", (unsigned)s_local_rev);
+        s_sync_busy = false;
+        return;
+    }
 
     uint32_t rev = (uint32_t)jnum(root, "rev", 0);
 
@@ -1545,7 +1636,7 @@ static void sync_once(void)
         s_clock_cnt = 0;
         cJSON *jm;
         cJSON_ArrayForEach(jm, ct) {
-            if (s_clock_cnt >= MAX_CLOCK_MAPS) break;
+            if (s_clock_cnt >= s_clock_cap) break;   /* cap=1 兜底时空转 */
             cJSON *xy = jm->child;
             if (cJSON_IsArray(xy) && cJSON_GetArraySize(xy) == 2) {
                 strlcpy(s_clock_tab[s_clock_cnt].map_id, jm->string,
@@ -1791,6 +1882,7 @@ void asset_dl_start(void)
      * 必须在返回前就绪（否则自检竞态 → 该起播却判空） */
     ensure_dirs();
     crc32c_init_table();
+    manifest_arrays_ensure();   /* 清单元数据 → PSRAM（见该函数注释） */
     load_local_manifest();
     /* 【诊断】TF 素材目录实况：文件数 + 前 5 个文件名（对账清单 vs 磁盘） */
     {

@@ -25,6 +25,7 @@
 #include "app_core.h"
 #include "hal_contract.h"
 #include "http_client.h"
+#include "mp_psram.h"
 #include "asset_dl.h"
 #include "ota.h"
 #include "state_machine.h"
@@ -188,6 +189,25 @@ static void handle_cmd(cJSON *jc)
         c.type = MP_CMD_SET_MAP;
         strlcpy(c.s, v, sizeof(c.s));
         mp_post_cmd(&c);
+    } else if (strcmp(t, "cam") == 0 && v) {
+        /* 【服务端选镜头】{"type":"cam","value":"<x>,<y>"}（世界坐标）→ 应用并落 NVS。
+         * 服务端是主口径，本地卡只是辅助（断网时用 NVS 记忆）。 */
+        int cx = 0, cy = 0;
+        if (sscanf(v, "%d,%d", &cx, &cy) == 2) {
+            c.type = MP_CMD_CAM_SET;
+            c.a = cx; c.b = cy;
+            mp_post_cmd(&c);
+        }
+    } else if (strcmp(t, "camtest") == 0) {
+        /* 【压测钩子】{"type":"camtest","value":"<步数>,<步长>"} → 连续平移相机 */
+        c.type = MP_CMD_CAM_PAN_TEST;
+        c.a = 20; c.b = 8;
+        if (v) {
+            int st = 0, sp = 0;
+            if (sscanf(v, "%d,%d", &st, &sp) >= 1 && st > 0) c.a = st;
+            if (sp != 0) c.b = sp;
+        }
+        mp_post_cmd(&c);
     } else if (strcmp(t, "brightness") == 0) {
         c.type = MP_CMD_BRIGHTNESS;
         c.a = n;
@@ -259,8 +279,19 @@ static bool do_poll_once(void)
     snprintf(path, sizeof(path), "/api/device/poll?deviceId=%s&since=%lu",
              mp_http_device_id(), (unsigned long)s_since);
 
-    static char resp[POLL_RESP_CAP];
-    resp_ctx_t ctx = { .buf = resp, .cap = sizeof(resp) };
+    /* 【内部 RAM 腾挪 2026-10-02】poll 响应文本（4KB）原为内部 .bss。
+     * 它只被 mp_http_get 的 resp_collect 顺序写、随后 cJSON_Parse 只读，
+     * 无任何 DMA；PSRAM 只换存储位置。懒分配 + 常驻复用（每几秒一次 poll，
+     * 反复 malloc/free 是碎片源）。分配失败即本轮 poll 放弃（有界损失）。 */
+    static char *resp;
+    if (!resp) {
+        resp = mp_psram_malloc(POLL_RESP_CAP);
+        /* 旧静态数组初值全 0（空响应时 cJSON_Parse 看到空串而不是残留数据）——
+         * 这里显式清零做**逐字节等价**，不依赖堆的初值。 */
+        if (resp) memset(resp, 0, POLL_RESP_CAP);
+    }
+    if (!resp) { ESP_LOGW(TAG, "poll 响应缓冲分配失败 → 跳过本轮"); return false; }
+    resp_ctx_t ctx = { .buf = resp, .cap = POLL_RESP_CAP };
 
     int status = mp_http_get(path, POLL_TIMEOUT_MS, resp_collect, &ctx);
     if (status != 200) {
@@ -303,7 +334,10 @@ static bool do_poll_once(void)
             }
             cJSON *t = cJSON_GetObjectItem(jc, "type");
             cJSON *payload = cJSON_GetObjectItem(jc, "payload");
-            if (!t) { handle_cmd(jc); continue; }   /* 旧口径直通 */
+            if (!t) { ESP_LOGW(TAG, "[取证] 旧口径指令直通"); handle_cmd(jc); continue; }
+            ESP_LOGW(TAG, "[取证] poll 现代指令 type='%s' payload_is_string=%d payload=%p",
+                     cJSON_GetStringValue(t) ? cJSON_GetStringValue(t) : "?",
+                     cJSON_IsString(payload) ? 1 : 0, (void *)payload);
             /* 构造 {t, v, n, u} 视图：v=字符串 payload 或对象中的字符串字段 */
             cJSON *vitem = NULL;
             if (cJSON_IsString(payload)) vitem = payload;
@@ -349,6 +383,7 @@ static bool do_poll_once(void)
                     mp_cmd_t c = { 0 }; c.type = MP_CMD_SET_EXPRESSION;
                     strlcpy(c.s, vitem->valuestring, sizeof(c.s)); mp_post_cmd(&c);
                 } else if (strcmp(tbuf, "bubble") == 0 && cJSON_IsString(vitem)) {
+                    ESP_LOGW(TAG, "[取证] poll 收到 bubble v='%.16s'", vitem->valuestring);
                     mp_cmd_t c = { 0 }; c.type = MP_CMD_BUBBLE;
                     strlcpy(c.s, vitem->valuestring, sizeof(c.s)); mp_post_cmd(&c);
                 } else if (strcmp(tbuf, "map") == 0 && cJSON_IsString(pid)) {
@@ -672,6 +707,26 @@ static void poller_task(void *arg)
 
         /* 长轮询可能 hold 50s：再补一次日志上报机会（内部节流，不会连发） */
         mp_http_device_log_step();
+
+        /* 【TF 掉卡自愈 2026-10-01】出厂回退态（SD 挂载失败）下每 60s 纯卡层探一次：
+         * 卡回来了就重启一次让启动路径重新按 TF 优先挂载——否则设备会一直停在
+         * 出厂素材（背景默认图/相机不可用/气泡中文全丢），只能人工断电。
+         * 5 分钟节流在 sd_tf 侧（RTC 记忆），防边缘卡把设备拖进重启循环。 */
+        extern bool sd_tf_is_flash_fallback(void);
+        extern bool sd_tf_probe_card(void);
+        extern bool sd_tf_heal_reboot_allowed(void);
+        if (sd_tf_is_flash_fallback()) {
+            static int64_t s_tf_probe_ms;
+            int64_t tnow = mp_now_ms();
+            if (tnow - s_tf_probe_ms > 60000) {
+                s_tf_probe_ms = tnow;
+                if (sd_tf_probe_card() && sd_tf_heal_reboot_allowed()) {
+                    ESP_LOGW(TAG, "TF 卡已恢复 → 3s 后自动重启，切回 TF 素材（相机/中文气泡/整图）");
+                    vTaskDelay(pdMS_TO_TICKS(3000));
+                    esp_restart();
+                }
+            }
+        }
 
         if (ok) {
             s_last_poll_status = 200;

@@ -163,6 +163,15 @@ typedef struct __attribute__((packed)) {
 #define MPAK_BGMAP_EXT_MAGIC      0x4D504745u
 #define MPAK_BGMAP_EXT_HDR_LEN    16u
 #define MPAK_BGMAP_FLAG_FULL_MAP  0x1u
+/* flags bit1 = 瓦片存储（TILED）。契约 docs/ai/map-tiled-format-contract.md §1：
+ * 置位 ⇒ static / tile / 条带三类像素层（及 tile 掩码）按 128×128 世界像素瓦片布局存。
+ * **不作为唯一判据**：瓦片布局还有一条硬证据「层长度恒等式」——逐行口径的长度集合
+ * 与瓦片口径的长度集合不相交（唯一例外是层恰好等于一整块瓦片，此时两种布局逐字节相同），
+ * 所以固件按长度反解瓦片边长，bit1 只用来做一致性交叉校验（见 parse_bgmap）。 */
+#define MPAK_BGMAP_FLAG_TILED     0x2u
+/* 瓦片边长候选表首项（契约 §2 现为 128）。固件**不硬编码**：边长从包内层长度
+ * 恒等式反解（gx*gy*TILE*TILE*2 == 声明的层长度），候选表按 128 优先。 */
+#define MPAK_BGMAP_TILE_DEFAULT   128
 /* 地面表「该列无 foothold」哨兵 */
 #define MPAK_BGMAP_GROUND_NONE    0xFFFFu
 /* 地面表常驻缓存的字节上限（= MPAK_MAX_BGMAP_DIM × 2 = 16KB；见 mpak.c 取舍说明）。
@@ -226,8 +235,15 @@ typedef struct {
     uint32_t offset;                /* 位图数据区内偏移 */
     uint32_t extent;                /* 至下一 part 起点的字节数（推导用） */
     bool     has_alpha;             /* 由 extent 推导：pixels+1bit mask */
-    uint32_t pixel_bytes;           /* h * align4(w*2)                     */
-    uint32_t mask_bytes;            /* (w*h+7)/8（has_alpha 时有效）        */
+    uint32_t pixel_bytes;           /* 行口径：h * align4(w*2)；瓦片口径：gx*gy*TILE*TILE*2 */
+    uint32_t mask_bytes;            /* 行口径：(w*h+7)/8；瓦片口径：gx*gy*(TILE*TILE/8) */
+    /* ── 瓦片（契约 §2；2026-10-01）——只增字段，行口径读者不受影响 ──
+     * 真机上只有"整图条带"（BGMAP 引用的小 PARTS 包，part 0 = 带图）会是瓦片存储：
+     * 服务端把 static/tile/条带三类像素层一起改瓦片，条带像素在独立小包里，
+     * 所以**包自身**必须能自证瓦片布局（不能依赖 BGMAP 的 bit1，那是另一个文件）。 */
+    bool     tiled;                 /* true = 本件像素/掩码按瓦片布局存 */
+    uint16_t tile;                  /* 瓦片边长（世界 px，包内长度反解，128 档） */
+    uint16_t gx, gy;                /* 瓦片网格 = ceil(w/tile) × ceil(h/tile) */
 } mpak_part_t;
 
 typedef struct {
@@ -283,6 +299,15 @@ typedef struct {
     uint32_t ext_flags;             /* 扩展块 flags 原值（诊断用） */
     const uint16_t *ground;         /* 地面表常驻缓存（**host 序** u16[vw]，MPAK_BGMAP_GROUND_NONE=无）；
                                      * NULL = 未缓存（>16KB 或旧包）→ 逐列按需读 */
+    /* ══ 瓦片布局（契约 docs/ai/map-tiled-format-contract.md；2026-10-01）══════
+     * 只增字段；tiled=false 时下面全部为 0，逐行路径逐字节不变。 */
+    bool     tiled;                 /* true = static/tile 层按瓦片存储（长度反解 + bit1 交叉校验） */
+    int32_t  tile;                  /* 瓦片边长（世界 px；从层长度恒等式反解，非硬编码） */
+    int32_t  gx, gy;                /* 网格 = ceil(vw/tile) × ceil(vh/tile)（行主序 idx = ty*gx+tx） */
+    uint32_t tile_px_bytes;         /* 像素区长度 = gx*gy*tile*tile*2（static 与 tile 层同值） */
+    uint32_t tile_mask_bytes;       /* tile 掩码区长度 = gx*gy*(tile*tile/8) */
+    uint32_t tile_mask_off;         /* tile 掩码区 payload 相对偏移（= tile_layer_off + tile_px_bytes；
+                                     * 行口径请继续用 vh*align4(vw*2)，两者不可混用） */
 } mpak_bgmap_t;
 
 typedef struct {
@@ -325,6 +350,9 @@ typedef struct mpak {
     uint64_t kind;
     uint32_t payload_len;
     uint32_t payload_off;
+    uint32_t file_id;               /* 本句柄的文件身份（open 时全局自增分配）。
+                                     * 瓦片缓存键用它而**不是 fd**：fd 会被 close/reopen 复用，
+                                     * 用 fd 做键会把"另一个文件的同号 fd"命中成旧瓦片。 */
     union {
         mpak_layout_t *layout;
         mpak_bgmap_t  *bgmap;
@@ -394,6 +422,59 @@ int mpak_bgmap_read_tile_mask_rect(const mpak_t *m, int32_t x, int32_t y,
 /* 世界系地面 Y：world_x 越界 / 无地面表 / 该列为 0xFFFF → INT32_MIN（调用方回落通用线）。
  * 有地面表时返回原始世界 y（不夹取；调用方自行判断是否在 [0,vh) 内）。 */
 int32_t mpak_bgmap_ground_y(const mpak_t *m, int32_t world_x);
+
+/* ══ 瓦片(tile)整块读原语 + PSRAM 瓦片缓存（契约 §2/§6）═════════════════════
+ * 给两个消费方共用：
+ *   · BGMAP 的 static/tile/掩码层 —— mpak_bgmap_read_*_rect 内部自动分流（见下）；
+ *   · 整图条带（独立小 PARTS 包，compositor 自己 open/pread）—— 用下面三个函数，
+ *     由调用方给出 fd + 层基址 + 层尺寸 + 瓦片边长。
+ * 为什么要有缓存（而不是每次直接 pread 到目标）：相机平移是一小条一小条补的
+ * （补 24 列世界 px），而瓦片是 128×128 —— 同一块瓦片在一次拖动里会被反复需要。
+ * 缓存命中时取像素是**纯 PSRAM memcpy**，一次 SD 命令都不发（契约 §6 硬要求：
+ * 只允许整块 pread，绝不再按行/按像素读）。
+ * 线程契约：只在渲染任务（持 rc_lock 的合成/同步路径）里访问，无锁。
+ * 内存纪律：全部 MALLOC_CAP_SPIRAM（内部堆只剩几十 KB，抢内部堆 = newlib abort）。 */
+typedef struct {
+    uint32_t file_id;               /* 文件身份（mpak_t.file_id 或 mpak_path_id(path)） */
+    int      fd;                    /* 该文件的 fd（pread 用；本模块不 open/close/dup） */
+    uint32_t base_off;              /* 层像素区/掩码区首字节**绝对文件偏移** */
+    int32_t  lw, lh;                /* 层矩形尺寸（世界 px，= 该层自身宽高） */
+    int32_t  tile;                  /* 瓦片边长（世界 px） */
+    int32_t  gx, gy;                /* 网格 = ceil(lw/tile) × ceil(lh/tile) */
+} mpak_tile_src_t;
+
+/* 填 src（gx/gy 由 lw/lh/tile 算）。tile ≤ 0 或 lw/lh ≤ 0 → gx/gy = 0（读取会报 FMT）。
+ * block = tile*tile（像素 2B/px、掩码 1bit/px 的块内行均按 tile 算）。 */
+void mpak_tile_src_init(mpak_tile_src_t *s, uint32_t file_id, int fd, uint32_t base_off,
+                        int32_t lw, int32_t lh, int32_t tile);
+
+/* 取层上 [x,x+w)×[y,y+h)：像素（RGB565）/ 掩码（1B/px，0|1）。
+ * 越界（<0 或 ≥lw/lh）补 0，不报错 —— 与逐行口径的 rect 读语义一致。
+ * 内部：每块一次 pread(tile*tile*2 或 tile*tile/8) → memcpy 出行段。 */
+int mpak_tile_read_px(const mpak_tile_src_t *s, int32_t x, int32_t y, int32_t w, int32_t h,
+                      uint16_t *dst, int32_t dst_stride_px);
+int mpak_tile_read_mask(const mpak_tile_src_t *s, int32_t x, int32_t y, int32_t w, int32_t h,
+                        uint8_t *dst, int32_t dst_stride_px);
+
+/* 预取覆盖 [x,x+w)×[y,y+h) 的全部瓦片到缓存（命中零 IO）。返回 MPAK_OK / MPAK_ERR_*。 */
+int mpak_tile_prefetch(const mpak_tile_src_t *s, int32_t x, int32_t y, int32_t w, int32_t h);
+
+/* BGMAP 层预取（装载期"一次性预取相机窗口覆盖的瓦片"，契约 §6 末条）。
+ * tiled=false 时是 no-op（返回 MPAK_OK），旧包调用安全。 */
+int mpak_bgmap_prefetch_static(const mpak_t *m, int32_t x, int32_t y, int32_t w, int32_t h);
+int mpak_bgmap_prefetch_tile(const mpak_t *m, int32_t x, int32_t y, int32_t w, int32_t h,
+                             bool with_mask);
+
+/* 瓦片缓存统计（渲染侧日志口径：瓦片读 N 块 / 命中 M 块 / N KB）：
+ * blocks = 实际发 SD 命令的整块读次数，hits = 命中缓存的块次数，bytes = 前者字节数。 */
+void mpak_tile_stat_reset(void);
+void mpak_tile_stat_get(uint32_t *blocks, uint32_t *hits, uint32_t *bytes);
+/* 缓存全失效（换图/卸载时调用）：只清键不释放缓冲（下次直接复用，免得反复 malloc）。
+ * 为什么必须清：条带文件身份用 path 哈希，同路径文件被替换（重新下载）后旧键会命中错像素。 */
+void mpak_tile_cache_flush(void);
+
+/* 路径 → 文件身份（FNV-1a 32；条带层用。返回 ≥1，0 保留给"无身份"）。 */
+uint32_t mpak_path_id(const char *path);
 
 /* ---- FONT ---- */
 /* unicode 二分查找；找到填充 *g_out 并返回 MPAK_OK */

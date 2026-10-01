@@ -62,12 +62,15 @@ static void backlight_set(bool on)
 
 #define TX_QUEUE_DEPTH 1
 
+static void inflight_pop(void);   /* 前向：完成回调里弹出在飞登记 */
+
 static bool IRAM_ATTR color_tx_done_cb(esp_lcd_panel_io_handle_t io,
                                        esp_lcd_panel_io_event_data_t *edata,
                                        void *user)
 {
     (void)io; (void)edata; (void)user;
     s_tx_done_cnt++;
+    inflight_pop();                      /* 按序弹出在飞缓冲登记（见 display_blit_buf_busy） */
     BaseType_t hi = pdFALSE;
     xSemaphoreGiveFromISR(s_tx_slots, &hi);
     return hi == pdTRUE;
@@ -89,6 +92,46 @@ static bool tx_slot_take(void)
 }
 
 static void tx_slot_give(void) { xSemaphoreGive(s_tx_slots); }
+
+/* ══ 【在飞缓冲跟踪 2026-10-01（自 216 co5300 同步）】══════════════════════════
+ * 动机（216 实测同款收益）：合成器 blit_be 原来只有**一块**暂存 + 每块前
+ * display_wait_tx_idle() ⇒ 每块都要等上一笔传完才填下一块，SPI 完全不流水。
+ * 驱动侧登记"在飞缓冲指针环"（发送顺序 FIFO，完成回调按序弹出），合成器即可
+ * 用多块暂存轮转，填之前只等**这一块**的上一笔传完 → 传输连续、满屏 blit 提速。
+ * 完成回调在 ISR 上下文 → 环形读写用临界区保护。 */
+#define DISP_INFLIGHT_MAX 4
+static const void *s_inflight[DISP_INFLIGHT_MAX];
+static volatile int s_inf_head, s_inf_tail;
+static portMUX_TYPE s_inf_mux = portMUX_INITIALIZER_UNLOCKED;
+
+static void inflight_push(const void *buf)
+{
+    portENTER_CRITICAL(&s_inf_mux);
+    int nh = (s_inf_head + 1) % DISP_INFLIGHT_MAX;
+    if (nh != s_inf_tail) {            /* 环满（不该发生，队列深度更小）→ 丢弃登记 */
+        s_inflight[s_inf_head] = buf;
+        s_inf_head = nh;
+    }
+    portEXIT_CRITICAL(&s_inf_mux);
+}
+
+static void inflight_pop(void)
+{
+    portENTER_CRITICAL(&s_inf_mux);
+    if (s_inf_tail != s_inf_head) s_inf_tail = (s_inf_tail + 1) % DISP_INFLIGHT_MAX;
+    portEXIT_CRITICAL(&s_inf_mux);
+}
+
+/* 该缓冲是否仍在飞（合成器填暂存前查；false = 可安全重填） */
+bool display_blit_buf_busy(const void *buf)
+{
+    bool busy = false;
+    portENTER_CRITICAL(&s_inf_mux);
+    for (int i = s_inf_tail; i != s_inf_head; i = (i + 1) % DISP_INFLIGHT_MAX)
+        if (s_inflight[i] == buf) { busy = true; break; }
+    portEXIT_CRITICAL(&s_inf_mux);
+    return busy;
+}
 
 static void even_round(int *x1, int *y1, int *x2, int *y2)
 {
@@ -441,6 +484,7 @@ esp_err_t display_blit(int x, int y, int w, int h, const uint8_t *rgb565_be)
     esp_err_t err;
     bool slot = tx_slot_take();
     if (aw == w && ah == h) {
+        inflight_push(rgb565_be);        /* 登记在飞（合成器据此判断暂存可否重填） */
         err = esp_lcd_panel_draw_bitmap(s_panel, x1, y1, x2 + 1, y2 + 1, (void *)rgb565_be);
     } else {
         size_t sz = (size_t)aw * ah * 2u;
@@ -464,6 +508,7 @@ esp_err_t display_blit(int x, int y, int w, int h, const uint8_t *rgb565_be)
         err = esp_lcd_panel_draw_bitmap(s_panel, x1, y1, x2 + 1, y2 + 1, tmp);
         heap_caps_free(tmp);
     }
+    if (err != ESP_OK) inflight_pop();       /* 未入队/失败：撤销在飞登记 */
     if (slot && err != ESP_OK) tx_slot_give();
 
     xSemaphoreGive(s_lock);
