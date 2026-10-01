@@ -42,6 +42,8 @@ builder.Services.AddSingleton<DeviceLogStore>();         // 设备端环形日�
 builder.Services.AddSingleton<PaperdollPackService>();   // petConfig → 设备装扮资产包（换装下发链路）
 builder.Services.AddSingleton<FontPackService>();       // 16/24/32 三档 FONT 包（E12 字体链，hello 自动补）
 builder.Services.AddSingleton<DeviceAssetService>();     // 地图/NPC → 设备资产登记（E7 选择器/推送）
+builder.Services.AddSingleton<CameraPlanStore>();        // 相机机位记录（data/camera-positions.json，Web「选镜头」）
+builder.Services.AddSingleton<CameraService>();          // 「选镜头」：BGMAP 清单 / 整图预览 / 机位视口渲染
 builder.Services.AddSingleton<MdnsAdvertiser>();         // mDNS 服务广告（E14：设备自动发现服务端；IDisposable）
 
 builder.Services.ConfigureHttpJsonOptions(o =>
@@ -165,6 +167,7 @@ DeviceEndpoints.Map(app);
 AdminEndpoints.Map(app);
 AdminCatalogEndpoints.Map(app);
 MaterialsEndpoints.Map(app);
+CameraEndpoints.Map(app);   // Web「选镜头」（整图预览 + 取景框 + 机位落盘）
 
 // ── SPA fallback（E4 问题2 修复 2026-09-26）：Vue Router 用 createWebHistory
 //    （URI 路径模式），直接访问/刷新 /materials 等非根路径时静态文件中间件

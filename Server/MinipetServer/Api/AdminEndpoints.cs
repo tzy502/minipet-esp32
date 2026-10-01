@@ -310,6 +310,9 @@ public static class AdminEndpoints
         //   bgm vol / source             → **不带 type 的旧口径** {t:"bgm",v:"vol"|"source",n:N}
         //                                  （主解析分支的 bgm 没有 vol/source；只有旧口径
         //                                   handle_cmd（poller.c:77-88）实现）
+        //   cam（「选镜头」机位）          → 同上**只能走旧口径** {t:"cam",v:"x,y"}：固件的 cam
+        //                                  分支只在 handle_cmd 里，现代 {type,payload} 分支没有
+        //                                  （写成 {"type":"cam","payload":"1,2"} 会被静默忽略）
         //   ⚠ 写成 {"value":"…"} / {"n":…} 之类的对象会被固件静默忽略（既不报错也不生效）——勿改。
         g.MapPost("/devices/{id}/command", (string id, DeviceCommandRequest body,
             DeviceRegistry reg, CommandQueue queue, DeviceEventLog eventLog) =>
@@ -433,9 +436,32 @@ public static class AdminEndpoints
                 return Results.Json(new { ok = true, seq = cmd.Seq, type }, statusCode: 202);
             }
 
+            // ── 相机机位（「选镜头」界面下发）─────────────────────────────
+            // Web 请求体 {"type":"cam","value":"<x>,<y>"}（x,y = 可见窗口左上角的整图世界坐标，
+            // 0 = 地图 bbox 左上角，范围 x∈[0,vw-240]、y∈[0,vh-240]）。
+            // ⚠ 必须走 EnqueueLegacy（线上形状 {seq,t,v,n} 无 type 字段）：固件的 cam 分支只在
+            //   poller.c 的 handle_cmd（旧口径 `if (!t) handle_cmd(jc)`）里，现代 {type,payload}
+            //   内联分支**没有** cam —— 用 queue.Enqueue(id,"cam",value) 会被设备静默忽略
+            //   （不报错也不动相机）。固件按 sscanf(v,"%d,%d") 解析 → 这里只放行纯整数对，
+            //   越界由设备 render_cam_set 内部夹取（两边夹取口径一致）。
+            if (type == "cam")
+            {
+                var camValue = body?.Value?.Trim();
+                if (!TryParseCameraPosition(camValue, out int camX, out int camY))
+                    return Results.Json(new
+                    {
+                        error = $"cam 需要 value=\"<x>,<y>\"（整图世界坐标，非负整数；收到：{camValue ?? "<null>"}）"
+                    }, statusCode: 400);
+                var normalized = $"{camX},{camY}";
+                var cmd = queue.EnqueueLegacy(id, "cam", normalized, null);
+                eventLog.Append(id, $"指令下发：cam 机位 ({normalized})");
+                return Results.Json(new { ok = true, seq = cmd.Seq, type, value = normalized, x = camX, y = camY },
+                    statusCode: 202);
+            }
+
             return Results.Json(new
             {
-                error = $"type 非法：{body?.Type}（可用：expression/action/bubble/brightness/reboot/bgm）"
+                error = $"type 非法：{body?.Type}（可用：expression/action/bubble/brightness/reboot/bgm/cam）"
             }, statusCode: 400);
         });
 
@@ -881,6 +907,25 @@ public static class AdminEndpoints
 
     private static IResult NotFoundDevice(string deviceId)
         => Results.Json(new { error = $"设备不存在：{deviceId}" }, statusCode: 404);
+
+    /// <summary>
+    /// 解析 cam 指令坐标 "x,y"（固件 poller.c 的 handle_cmd 用 sscanf("%d,%d")，这里同口径，
+    /// 仅额外容忍空白与前后空格）。上限取 BGMAP vw/vh 的 u16 口径（65535）：越界设备虽会夹取，
+    /// 但发出去就是脏数据，宁可 400 让调用方先夹好。
+    /// </summary>
+    private static bool TryParseCameraPosition(string? value, out int x, out int y)
+    {
+        x = 0;
+        y = 0;
+        if (string.IsNullOrWhiteSpace(value)) return false;
+        var parts = value.Split(',', StringSplitOptions.TrimEntries);
+        if (parts.Length != 2) return false;
+        if (!int.TryParse(parts[0], System.Globalization.NumberStyles.Integer,
+                System.Globalization.CultureInfo.InvariantCulture, out x)) return false;
+        if (!int.TryParse(parts[1], System.Globalization.NumberStyles.Integer,
+                System.Globalization.CultureInfo.InvariantCulture, out y)) return false;
+        return x >= 0 && y >= 0 && x <= ushort.MaxValue && y <= ushort.MaxValue;
+    }
 }
 
 /// <summary>

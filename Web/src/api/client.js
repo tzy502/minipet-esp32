@@ -45,6 +45,68 @@ export function health() {
   return http.get('/health').then((r) => r.data)
 }
 
+// ── 选镜头（相机机位）：整图预览 + 取景框 + 机位记录 + 下发 ─────────────────
+// 服务端端点（CameraEndpoints.cs，前缀 /api/admin/devices/{id}/camera）：
+//   GET  …/camera/maps                        → { deviceId, total, lastMapId, maps:[{mapId,label,vw,vh,bytes,
+//                                                  hash,viewport,layout,pannable,winW,winH,maxX,maxY,x,y,saved,
+//                                                  updatedUtc,thumbUrl}] }
+//                                                地图清单 = 该设备 manifest 的 BGMAP 条目；vw/vh 读 BGMAP 包头
+//   GET  …/camera/maps/{mapId}/preview?maxW=  → 整图预览 PNG（磁盘缓存 data/cache/previews）
+//   GET  …/camera/maps/{mapId}/viewport?x&y   → 该机位"设备实际会看到的 240×240"PNG（1x，页面按 2x 显示）
+//   PUT  …/camera  { mapId, x, y }            → 记录坐标（服务端为主口径 → data/camera-positions.json）
+//   GET  …/camera                             → 全部已记录机位（页面重新打开回填）
+// 相机 = 可见窗口左上角的整图世界坐标（0 = 地图 bbox 左上角）；世界 1x、屏 2x ⇒ 可见窗口 = 屏宽/2。
+
+/** 该设备已有 BGMAP 地图清单（含已记录机位）。 */
+export function getCameraMaps(deviceId) {
+  return http.get(`/admin/devices/${encodeURIComponent(deviceId)}/camera/maps`).then((r) => r.data)
+}
+
+/** 全部已记录机位（GET …/camera）。 */
+export function getCameraPositions(deviceId) {
+  return http.get(`/admin/devices/${encodeURIComponent(deviceId)}/camera`).then((r) => r.data)
+}
+
+/** 整图预览 PNG 的 URL（直接喂 <img>，不走 axios；maxW = 长边像素上限）。 */
+export function cameraPreviewUrl(deviceId, mapId, maxW = 1440) {
+  return `/api/admin/devices/${encodeURIComponent(deviceId)}/camera/maps/${encodeURIComponent(mapId)}`
+    + `/preview?maxW=${encodeURIComponent(maxW)}`
+}
+
+/**
+ * 机位视口 PNG 的 URL（设备实际会看到的那一屏）。
+ * cacheKey：把该图 BGMAP 的 content_hash 带上——地图被重推/换口径后 URL 变化，
+ * 浏览器缓存自然失效（否则会拿旧机的画面骗人）。
+ */
+export function cameraViewportUrl(deviceId, mapId, x, y, cacheKey = '') {
+  return `/api/admin/devices/${encodeURIComponent(deviceId)}/camera/maps/${encodeURIComponent(mapId)}`
+    + `/viewport?x=${encodeURIComponent(x)}&y=${encodeURIComponent(y)}`
+    + (cacheKey ? `&h=${encodeURIComponent(cacheKey)}` : '')
+}
+
+/** 记录机位（幂等 upsert）。返回服务端夹取后的实际坐标（前端以返回值回显）。 */
+export function saveCameraPosition(deviceId, mapId, x, y) {
+  return http
+    .put(`/admin/devices/${encodeURIComponent(deviceId)}/camera`, {
+      mapId: String(mapId),
+      x: Number(x),
+      y: Number(y),
+    })
+    .then((r) => r.data)
+}
+
+/** 相机机位下发（设备指令 type=cam，value="x,y"）。 */
+export const DEVICE_COMMAND_CAM = 'cam'
+
+/**
+ * 下发机位到设备：POST /admin/devices/{id}/command { type:"cam", value:"x,y" }
+ * 服务端白名单已放行 cam，并转成固件**旧口径** {t:"cam",v:"x,y"}（固件的 cam 分支只在
+ * handle_cmd 里，现代 {type,payload} 分支没有它）。设备收到即 render_cam_set(x,y) 并写 NVS。
+ */
+export function sendCameraCommand(deviceId, x, y) {
+  return sendDeviceCommand(deviceId, DEVICE_COMMAND_CAM, `${Math.round(Number(x))},${Math.round(Number(y))}`)
+}
+
 // ── 设备（E13）───────────────────────────────────────────────────────────
 // GET /admin/devices → { devices: [...] }（卡片字段：online/hasPetConfig/health 等）
 export function listDevices() {

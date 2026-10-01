@@ -23,6 +23,13 @@ public sealed class ServerPaths
     public string ExportRoot => Path.Combine(DataDir, "cache", "export");
     public string ThumbsDir => Path.Combine(DataDir, "cache", "thumbs");
 
+    /// <summary>整图预览缓存目录（Web「选镜头」用：按 mapId+尺寸落盘的整图 PNG，可随时删）。
+    /// 与 ThumbsDir 分开：那是 64×64 图标，这里是 MB 级整图，清理粒度/生命周期不同。</summary>
+    public string PreviewsDir => Path.Combine(DataDir, "cache", "previews");
+
+    /// <summary>相机机位记录（服务端为主口径；设备 NVS 只是断网辅助）。</summary>
+    public string CameraPositionsFile => Path.Combine(DataDir, "camera-positions.json");
+
     public string MusicRoot => Path.Combine(DataDir, "music", "wz");
     public string PresetsDir => Path.Combine(DataDir, "presets");
     public string FirmwareDir => Path.Combine(DataDir, "firmware");
@@ -38,6 +45,7 @@ public sealed class ServerPaths
         Directory.CreateDirectory(QueuesDir);
         Directory.CreateDirectory(ExportRoot);
         Directory.CreateDirectory(ThumbsDir);
+        Directory.CreateDirectory(PreviewsDir);
         Directory.CreateDirectory(MusicRoot);
         Directory.CreateDirectory(PresetsDir);
         Directory.CreateDirectory(FirmwareDir);

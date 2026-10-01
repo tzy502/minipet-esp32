@@ -25,6 +25,7 @@ import {
 } from '../api/client'
 import { useDevicesStore } from '../stores/devices'
 import AppearancePicker from '../components/AppearancePicker.vue'
+import CameraPicker from '../components/CameraPicker.vue'
 import {
   CATEGORIES, GENDERS, newDraft, appearanceToDraft, draftToAppearance, buildPaperdollId,
 } from '../utils/appearance'
@@ -806,6 +807,10 @@ async function sendBubble() {
           </div>
         </n-space>
       </n-card>
+
+      <!-- 选镜头（服务端选相机机位）：整图预览 + 框外半黑取景框 + 机位落盘 + 一键下发 cam。
+           放在「素材推送」之后——先有 BGMAP 地图上机，这里才有图可选。 -->
+      <CameraPicker :device-id="device.deviceId" />
 
       <!-- 动作 / 表情 / 气泡调试（T2/E4）：25 表情手动指定 -->
       <n-card title="表情 / 气泡调试（E4 25 表情手动指定）" size="small">
