@@ -45,6 +45,27 @@ esp_err_t touch_cst816_init(void);
  */
 esp_err_t touch_cst816_read(touch_point_t *out);
 
+/** 读法矩阵探针（诊断用）：遍历 寄存器×长度×两种读法，打印各自 err。
+ *  用于"哪种读法能通"的取证，定稿后删。 */
+void touch_cst816_probe_matrix(void);
+
+/**
+ * @brief 软复位唤醒：写命令字 0x00（CST816S RESET），等 1.5ms 让其进入工作态
+ *
+ * 必要性（真机实证）：芯片在无触摸一段时间后进入 auto-sleep，**停止应答 I2C**
+ * （恒 NACK）；读帧前先软复位即可稳定读到数据。返回 ESP_OK = 命令已发出。
+ */
+esp_err_t touch_cst816_wake(void);
+
+/**
+ * @brief 总线级自愈：复位触摸 IC（RST 低 12ms → 高）并重新探测地址
+ *
+ * 用于"连续读失败（NACK / ESP_ERR_INVALID_STATE）导致触屏恒不可用"的真机故障
+ * （开机正常、1~2 秒后开始恒失败）。返回 ESP_OK = 探测通过、可继续轮询。
+ * 注意：会短暂断开触摸（~70ms），期间按下会丢——只在连续失败时调用。
+ */
+esp_err_t touch_cst816_recover(void);
+
 /**
  * @brief 注册 INT 中断通知回调（中断上下文！）
  *

@@ -38,6 +38,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
+#include "esp_rom_sys.h"   /* esp_rom_delay_us（软复位后的就绪等待） */
 #include "i2c_bus.h"
 #include "lcd185b.h"
 
@@ -105,13 +106,14 @@ esp_err_t touch_cst816_init(void)
         .mode         = GPIO_MODE_OUTPUT,
     };
     gpio_config(&rst_cfg);
+    /* 【init 复位时序对齐官方】官方是 RST 低 200ms → 高 200ms（见
+     * touch_cst816s_reset）；原 10/10/10/50ms 太短，实测器件起来后很快又不应答。 */
     gpio_set_level(pins->touch.rst, 1);
-    vTaskDelay(pdMS_TO_TICKS(CST816_RST_PRE_MS));
+    vTaskDelay(pdMS_TO_TICKS(10));
     gpio_set_level(pins->touch.rst, 0);
-    vTaskDelay(pdMS_TO_TICKS(CST816_RST_LOW_MS));
+    vTaskDelay(pdMS_TO_TICKS(200));
     gpio_set_level(pins->touch.rst, 1);
-    vTaskDelay(pdMS_TO_TICKS(CST816_RST_POST_MS));
-    vTaskDelay(pdMS_TO_TICKS(CST816_RDY_WAIT_MS));
+    vTaskDelay(pdMS_TO_TICKS(200));
 
     /* INT：输入上拉（开漏低有效），不挂中断——纯轮询 bring-up，留作将来 */
     gpio_config_t int_cfg = {
@@ -154,6 +156,30 @@ esp_err_t touch_cst816_init(void)
     return ESP_OK;
 }
 
+/* ══ 【读法矩阵探针 2026-10-01】一次把"哪种读法能通"测清楚 ══════════════════
+ * 背景：开机第一次读帧成功，之后寄存器 0x02 恒 NACK，而 0xA7（芯片 ID）始终可读。
+ * 本探针在 init 之后跑一遍组合矩阵（寄存器 × 长度 × 是否两段式），把每格的
+ * err 打出来 —— 用数据决定最终读法，不再猜。 */
+void touch_cst816_probe_matrix(void)
+{
+    if (!s_dev) { ESP_LOGW(TAG, "读法矩阵：设备未注册，跳过"); return; }
+    static const uint8_t regs[] = { 0x00, 0x01, 0x02, 0x0A, 0xA7 };
+    static const uint8_t lens[] = { 1, 3, 5, 6 };
+    ESP_LOGW(TAG, "── 读法矩阵开始（reg × len：单笔 transmit_receive / 两段式）──");
+    for (size_t r = 0; r < sizeof(regs); r++) {
+        for (size_t l = 0; l < sizeof(lens); l++) {
+            uint8_t buf[8] = { 0 };
+            esp_err_t e1 = i2c_bus_read_reg8v(s_dev, regs[r], buf, lens[l]);
+            uint8_t buf2[8] = { 0 };
+            esp_err_t e2 = i2c_bus_read_reg8v_split(s_dev, regs[r], buf2, lens[l], 100);
+            ESP_LOGW(TAG, "  reg=0x%02X len=%u → 单笔=%s | 两段=%s | 单笔首字节=%02X",
+                     regs[r], (unsigned)lens[l], esp_err_to_name(e1),
+                     esp_err_to_name(e2), buf[0]);
+        }
+    }
+    ESP_LOGW(TAG, "── 读法矩阵结束 ──");
+}
+
 esp_err_t touch_cst816_read(touch_point_t *out)
 {
     if (!out) {
@@ -179,6 +205,54 @@ esp_err_t touch_cst816_read(touch_point_t *out)
     out->x = (uint16_t)((((uint16_t)d[CST816_OFF_XH] & 0x0F) << 8) | d[CST816_OFF_XL]);
     out->y = (uint16_t)((((uint16_t)d[CST816_OFF_YH] & 0x0F) << 8) | d[CST816_OFF_YL]);
     return ESP_OK;
+}
+
+/* ══ 【总线级自愈 2026-10-01】连续读失败（NACK/INVALID_STATE）时复位 IC 重探测 ══
+ * 真机症状：开机正常读到帧（chipID=0xB5、空闲帧全 0），约 1~2 秒后开始**恒失败**
+ * （ESP_ERR_INVALID_STATE），触屏彻底不可用，只有断电才恢复。
+ * 对策（官方 esp_lcd_touch 的 rst_gpio 用法同源）：拉低 RST ≥10ms 再拉高，
+ * 等 50ms 让 IC 内部就绪，然后重新探测地址；探测成功即认为总线恢复。
+ * 返回 ESP_OK = 已恢复（调用方清失败计数继续轮询）。 */
+/* ══ 【软复位唤醒 2026-10-01】真机实证的必要动作 ═════════════════════════════
+ * 现象：芯片在"一段时间无触摸"后**停止应答 I2C**（恒 NACK / IDF 报
+ * `unexpected nack`，应用层看到 ESP_ERR_INVALID_STATE）；每次复位后又能读通。
+ * 这是 CST816S 的 auto-sleep（低功耗监测态）：无触摸事件时不响应主机读。
+ * 对策：读帧前先发**软复位**（写命令字 0x00，CST816S 的 RESET 命令——注意这与
+ * "0x00 是手势寄存器"不冲突：写 0x00 即软复位，是官方 BSP/社区一致用法），
+ * 芯片复位后进入正常工作态，随后 1~2ms 即可读到数据帧。
+ * 代价：单次 ~1.5ms（两次 I2C 事务），30ms 轮询下完全可接受。 */
+esp_err_t touch_cst816_wake(void)
+{
+    if (!s_dev) return ESP_ERR_INVALID_STATE;
+    uint8_t cmd = 0x00;
+    esp_err_t err = i2c_bus_write(s_dev, &cmd, 1);
+    if (err == ESP_OK) esp_rom_delay_us(1500);
+    return err;
+}
+
+esp_err_t touch_cst816_recover(void)
+{
+    const minipet_pins_t *pins = &MINIPET_ACTIVE_PROFILE.pins;
+    if (!pins || pins->touch.rst < 0) return ESP_ERR_INVALID_STATE;
+    if (!s_dev) return ESP_ERR_INVALID_STATE;      /* 未注册：init 都没成功，无从恢复 */
+
+    /* 【复位时序 = 官方口径】espressif__esp_lcd_touch_cst816s 的
+     * touch_cst816s_reset()：RST 低 **200ms** → 高 **200ms**。
+     * 我上一版只给 12ms/60ms，实测"复位后只短暂可用" —— 复位不彻底。 */
+    gpio_set_level(pins->touch.rst, 0);
+    vTaskDelay(pdMS_TO_TICKS(200));
+    gpio_set_level(pins->touch.rst, 1);
+    vTaskDelay(pdMS_TO_TICKS(200));
+
+    esp_err_t err = i2c_bus_probe(CST816_ADDR);
+    if (err == ESP_OK) {
+        uint8_t id = 0;
+        i2c_bus_read_reg8v(s_dev, CST816_REG_CHIPID, &id, 1);
+        ESP_LOGW(TAG, "触摸自愈：复位+重探测成功（chipID=%02X）", id);
+    } else {
+        ESP_LOGW(TAG, "触摸自愈：复位后仍探测失败（%s）", esp_err_to_name(err));
+    }
+    return err;
 }
 
 void touch_cst816_set_isr_callback(void (*cb)(void *arg), void *arg)

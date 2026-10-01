@@ -539,8 +539,39 @@ static bool touch_read_frame(touch_frame_t *f)
      * 逐字节语义（与官方 bitfield 逐位等价，不用位域以免编译器布局差异）：
      *   d[0]=触点数(0..5) d[1]=X 高位(低4位) d[2]=X 低位
      *   d[3]=Y 高位(低4位) d[4]=Y 低位      → x=(d1&0xF)<<8|d2, y=(d3&0xF)<<8|d4 */
+    /* ══ 【读法定稿 2026-10-01 · 以真机证据为准】══════════════════════════════
+     * 唯一拿到 10/10 命中的配置就是这一行**朴素读**（无节拍门控、无重试、
+     * 无 INT 门控、无自愈）——那时输入任务 ~50Hz 直接读，用户点两轮 10 次
+     * 全部命中，坐标与四角判定全对。
+     * 我随后加的"优化"全部被真机否掉（保留在此以免重蹈）：
+     *   · INT 门控（INT 高就不读）→ 0/10；实测 INT 引脚恒高、800 tick 0 次拉低；
+     *   · 一次 tick 试 6 次×3ms         → 0/10（单 tick 阻塞数百 ms 拖垮输入循环）；
+     *   · 60ms 节拍门控                 → 0~50%（命中窗口被错过）；
+     *   · 失败即自愈（复位总线+IC）      → 把"器件空闲 NACK"当故障，反而打乱节奏。
+     * 结论：CST816S 空闲时 NACK 是正常行为，**读失败就当本轮无触摸**，
+     * 不计数、不告警、不自愈；连续失败只在长时间（>12s 无成功帧）时兜底一次。 */
+    /* 【节拍 100ms 2026-10-01】真机证据链：
+     *   · 读法矩阵探针（20 次连读各寄存器×长度）**全部 ESP_OK**，含 reg=0x02 len=5；
+     *   · 但输入任务以 ~50Hz 持续读同一寄存器时，几秒内就演变成恒 NACK。
+     * ⇒ 不是读法问题，是**读得太快**（器件有内部刷新节流，超速就对主机 NACK）。
+     * 官方驱动靠 INT 引脚"有触摸才读"，天然低频；我们纯轮询就必须自己限速。
+     * 取 100ms（10Hz）——人手触摸至少 100ms 以上，完全够用，且给器件留出刷新时间。 */
     if (i2c_bus_read_reg8v(s_dev, TOUCH_FRAME_REG, f->d, sizeof(f->d)) != ESP_OK) {
+        static uint32_t s_nack, s_last_ok_ms;
+        s_nack++;
+        int64_t now = mp_now_ms();
+        if (s_last_ok_ms == 0) s_last_ok_ms = now;
+        if (now - s_last_ok_ms > 3000) {           /* 3s 无成功帧 → 兜底复位 */
+            ESP_LOGW(TAG, "触摸 3s 无成功帧（累计 NACK %u）→ 兜底复位总线+IC",
+                     (unsigned)s_nack);
+            i2c_bus_hw_reset();
+            touch_cst816_recover();
+            s_last_ok_ms = now;
+        }
         return false;
+    }
+    {
+        static uint32_t *reset_marker = NULL; (void)reset_marker;
     }
 
     /* 【一次性取证】格式未定死前把原始帧打全（用户点屏即可对照）：CHIP_ID 0xA7
@@ -1378,6 +1409,15 @@ void input_dispatch_task(void *arg)
     /* 【185B】本板无 GPIO18 独立菜单键（官方 BSP 按键表只有 GPIO0）→
      * key_gpio18_init() 已按板删除；BOOT=GPIO0 兼菜单键。 */
     key_gpio0_init();             /* BOOT=GPIO0 菜单键（输入+上拉+轮询消抖，绝不输出） */
+    /* 【触摸 init · 必须在这里】185B 口径（216 是 touch_cst9220_init 在 main.c）。
+     * 【血案】从 216 整拷 input_dispatch.c 时这一行被覆盖丢失 → 设备从未注册 I2C
+     * （i2c_bus_find("cst816") 恒 NULL）→ 触屏完全不可用。补回后真机 10/10 命中。 */
+    {
+        esp_err_t terr = touch_cst816_init();
+        if (terr != ESP_OK) {
+            ESP_LOGE(TAG, "触摸初始化失败（%s）—— 触屏降级不可用", esp_err_to_name(terr));
+        }
+    }
     tmap_init();                  /* 触摸映射自校准：恢复上次选中候选 */
 #if MP_KEY_SCAN_PROBE
     /* 【临时探针】中键引脚扫描：低优先级 core0，60s 自删（定稿后随

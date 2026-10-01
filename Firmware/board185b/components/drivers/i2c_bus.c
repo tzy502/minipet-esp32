@@ -11,6 +11,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "esp_log.h"
+#include "esp_rom_sys.h"   /* esp_rom_delay_us（两段式读的段间延时） */
 #include "lcd185b.h"
 
 static const char *TAG = "i2c_bus";
@@ -111,6 +112,13 @@ esp_err_t i2c_bus_register_device(const char *name, uint16_t addr7, uint32_t scl
         .dev_addr_length = I2C_ADDR_BIT_LEN_7,
         .device_address = addr7,
         .scl_speed_hz   = scl_hz,
+        /* 【时钟拉伸容忍 2026-10-01】默认 scl_wait_us≈1ms 量级，慢/忙器件
+         * （CST816S 在内部采样窗口会拉低 SCL）超过它就触发 IDF 的
+         * "I2C hardware timeout detected" → status 停在 TIMEOUT 非 DONE →
+         * 应用层看到 ESP_ERR_INVALID_STATE，且之后每笔都失败。
+         * 放宽到 10ms（人手触摸场景完全够快，且远小于总线锁 500ms）。
+         * 说明：IDF 语义 scl_wait_us=0 表示用默认值，故这里显式给 10000。 */
+        .scl_wait_us    = 10000,
     };
 
     i2c_master_dev_handle_t handle = NULL;
@@ -130,6 +138,25 @@ esp_err_t i2c_bus_register_device(const char *name, uint16_t addr7, uint32_t scl
     *out_handle = handle;
     ESP_LOGD(TAG, "注册 I2C 器件 %s @0x%02X (%lu Hz)", name, addr7, (unsigned long)scl_hz);
     return ESP_OK;
+}
+
+/* ══ 【总线硬件复位 2026-10-01】卡死自愈 ══════════════════════════════════════
+ * 真机实证（触屏恒失败）：IDF i2c_master 在"事务没收尾"时会把内部 status 停在
+ * 非 IDLE，之后**每一笔** transmit_receive 都立刻返回 ESP_ERR_INVALID_STATE
+ * （i2c_master.c:651 `if (status != I2C_STATUS_DONE) ret = ESP_ERR_INVALID_STATE;`），
+ * 表现为"开机正常读几帧 → 之后恒失败、只有断电才恢复"。
+ * 修法 = 复位 I2C 硬件状态机（i2c_master_bus_reset 同时把 status 置回 IDLE）。
+ * 返回 ESP_OK = 已复位。调用方随后重试即可（本板实测：复位后立刻恢复读帧）。 */
+esp_err_t i2c_bus_hw_reset(void)
+{
+    if (!s_bus) return ESP_ERR_INVALID_STATE;
+    if (!lock_take()) return ESP_ERR_TIMEOUT;
+    esp_err_t err = i2c_master_bus_reset(s_bus);
+    lock_give();
+    if (err == ESP_OK) {
+        ESP_LOGW(TAG, "I2C 总线硬件复位（清卡死状态）");
+    }
+    return err;
 }
 
 i2c_master_dev_handle_t i2c_bus_find(const char *name)
@@ -224,6 +251,32 @@ esp_err_t i2c_bus_read_reg8v(i2c_master_dev_handle_t dev, uint8_t reg,
     }
     esp_err_t err = i2c_master_transmit_receive(dev, &reg, 1, buf, len,
                                                 I2C_BUS_TIMEOUT_TICKS);
+    lock_give();
+    return err;
+}
+
+/* 【两段式读 2026-10-01】写寄存器地址 → **STOP** → 短延时 → 独立读。
+ * 为什么需要它：真机实证（CST816S）`i2c_master_transmit_receive`（写+重复起始+读）
+ * 在连续读若干帧后会把 I2C 控制器卡在非 IDLE（之后每笔都 ESP_ERR_INVALID_STATE，
+ * 而 `i2c_master_probe` 与"单笔写"始终正常）；把重复起始拆成两次独立事务后
+ * 不再出现该卡死。代价：两段之间（数十 µs）总线被释放，理论上可能被其它任务
+ * 插入——本层用**同一把总线锁跨两段持有**规避，总线仍归本器件独占。 */
+esp_err_t i2c_bus_read_reg8v_split(i2c_master_dev_handle_t dev, uint8_t reg,
+                                   uint8_t *buf, size_t len, uint32_t gap_us)
+{
+    if (!dev || !buf || len == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!lock_take()) {
+        return ESP_ERR_TIMEOUT;
+    }
+    esp_err_t err = i2c_master_transmit(dev, &reg, 1, I2C_BUS_TIMEOUT_TICKS);
+    if (err == ESP_OK && gap_us) {
+        esp_rom_delay_us(gap_us);
+    }
+    if (err == ESP_OK) {
+        err = i2c_master_receive(dev, buf, len, I2C_BUS_TIMEOUT_TICKS);
+    }
     lock_give();
     return err;
 }

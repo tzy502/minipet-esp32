@@ -567,8 +567,8 @@ static void *psram(size_t n)
 /* 实体显示尺寸：画布宽高 ×2（clamp 到缓冲与屏幕；画布未算出前为 0 → 无显示区） */
 static void ent_disp_size(int32_t *dw, int32_t *dh)
 {
-    *dw = g_ent_cw * RC_SCALE;
-    *dh = g_ent_ch * RC_SCALE;
+    *dw = RC_ESCALE(g_ent_cw);
+    *dh = RC_ESCALE(g_ent_ch);
     if (*dw > RC_ENT_W) *dw = RC_ENT_W;
     if (*dh > RC_ENT_H) *dh = RC_ENT_H;
     if (*dw > g_sw) *dw = g_sw;
@@ -658,11 +658,11 @@ static void drag_clamp(int32_t *px, int32_t *py)
     ent_disp_size(&dw, &dh);
     if (dw <= 0 || dh <= 0) return;              /* 画布未就绪：不限制 */
     /* 未加 drag 时的基准（与 ent_screen_pos_at 同源，含 tilt 与 base 偏移） */
-    int32_t base_x = g_sw / 2 - (g_ent_ox - g_ent_cx0) * RC_SCALE + RC_ENT_CENTER_OFF_X
-                     + (g_ent_base_wx << RC_SCALE_SHIFT)
+    int32_t base_x = g_sw / 2 - RC_ESCALE(g_ent_ox - g_ent_cx0) + RC_ENT_CENTER_OFF_X
+                     + RC_ESCALE(g_ent_base_wx)
                      + ent_tilt_off_px(g_tilt_mdeg);
-    int32_t base_y = g_sh / 2 - (g_ent_oy - g_ent_cy0) * RC_SCALE + RC_ENT_CENTER_OFF_Y
-                     + (g_ent_base_wy << RC_SCALE_SHIFT);
+    int32_t base_y = g_sh / 2 - RC_ESCALE(g_ent_oy - g_ent_cy0) + RC_ENT_CENTER_OFF_Y
+                     + RC_ESCALE(g_ent_base_wy);
     if (px) {
         int32_t lo = -base_x, hi = g_sw - dw - base_x;
         if (hi < lo) hi = lo;                    /* 画布比屏还宽：贴左 */
@@ -677,7 +677,7 @@ static void drag_clamp(int32_t *px, int32_t *py)
          *      （"拖拽下界/松手落回地面线 这两个我没要求不要乱加"），故恢复为
          *      **下界 = 屏幕最底**（脚底可一直拖到屏底，可全屏拖动）。
          * 上界 lo 仍让画布顶边不越屏顶（不许把整只宠物拖出画面）。 */
-        int32_t anchor_off = (g_ent_oy - g_ent_cy0) * RC_SCALE;   /* 锚点在显示矩形内的 y */
+        int32_t anchor_off = RC_ESCALE(g_ent_oy - g_ent_cy0);   /* 锚点在显示矩形内的 y */
         int32_t lo = -base_y;
         int32_t hi = g_sh - anchor_off - base_y;
         if (hi < lo) hi = lo;
@@ -718,7 +718,7 @@ int32_t render_get_drag_off_y(void) { return g_drag_off_y; }
  * （与 ent_screen_pos_at 同源：画布原点项在锚点上相互抵消） */
 static int32_t ent_anchor_screen_x(int32_t drag_x)
 {
-    return g_sw / 2 + RC_ENT_CENTER_OFF_X + (g_ent_base_wx << RC_SCALE_SHIFT)
+    return g_sw / 2 + RC_ENT_CENTER_OFF_X + RC_ESCALE(g_ent_base_wx)
            + ent_tilt_off_px(g_tilt_mdeg) + drag_x;
 }
 
@@ -758,7 +758,7 @@ static bool ent_stand_on_ground_locked(void)
 {
     if (!g_inited || !g_ent_cbox_ok) return false;
     /* 锚点屏幕 y = 屏心 + CENTER_OFF_Y + base_wy×2 + drag_y ⇒ 令其等于屏心 */
-    int32_t dy = -(RC_ENT_CENTER_OFF_Y + (g_ent_base_wy << RC_SCALE_SHIFT));
+    int32_t dy = -(RC_ENT_CENTER_OFF_Y + RC_ESCALE(g_ent_base_wy));
     drag_clamp(NULL, &dy);            /* 兜底夹取 */
     if (dy == g_drag_off_y) return false;
     g_drag_off_y = dy;
@@ -809,11 +809,11 @@ static void ent_screen_pos_at(int32_t tilt_mdeg, int32_t *sx, int32_t *sy)
 
     /* 锚点在缓冲内的位置 = (origin - 画布左上)×scale；把它钉到屏心 ⇒
      * 缓冲左上角屏幕坐标 = 屏心 - (origin - 画布左上)×scale。 */
-    *sx = g_sw / 2 - (g_ent_ox - g_ent_cx0) * RC_SCALE + RC_ENT_CENTER_OFF_X
-          + (g_ent_base_wx << RC_SCALE_SHIFT) + ent_tilt_off_px(tilt_mdeg)
+    *sx = g_sw / 2 - RC_ESCALE(g_ent_ox - g_ent_cx0) + RC_ENT_CENTER_OFF_X
+          + RC_ESCALE(g_ent_base_wx) + ent_tilt_off_px(tilt_mdeg)
           + drag_x;
-    *sy = g_sh / 2 - (g_ent_oy - g_ent_cy0) * RC_SCALE + RC_ENT_CENTER_OFF_Y
-          + (g_ent_base_wy << RC_SCALE_SHIFT) + drag_y;
+    *sy = g_sh / 2 - RC_ESCALE(g_ent_oy - g_ent_cy0) + RC_ENT_CENTER_OFF_Y
+          + RC_ESCALE(g_ent_base_wy) + drag_y;
 }
 
 static void ent_screen_pos(int32_t *sx, int32_t *sy)
@@ -1132,31 +1132,36 @@ static const rc_part_img_t *resolve_piece(const mpak_piece_t *piece)
 }
 
 /* 2x nearest blit 进实体缓冲（含 1bit 掩码、水平翻转、2×2 块展开、覆盖位） */
-static void blit_ent_2x(const rc_part_img_t *img, bool hflip, int32_t bx, int32_t by)
+/* 世界 1x 部件图 → 合成器像素（**按 RC_ENTITY_SCALE_Q16 任意倍率**）。
+ * 【为什么改成"从目标反查源"】原实现是"每个源像素涂 S×S 块"（S=2 整倍）。
+ * 1.5x 下块大小非整数，按源循环会累积相位误差（第 2 个源像素该涂 1 还是 2 个
+ * 目标像素？），长条图上会看出阶梯/错位。改为遍历目标像素、反算源像素
+ * （xn = src * 65536 / SCALE_Q16），比例恒定、无累积误差，且天然支持降采样。 */
+static void blit_ent_scaled(const rc_part_img_t *img, bool hflip, int32_t bx, int32_t by)
 {
     const uint16_t w = img->meta->w, h = img->meta->h;
     const uint32_t stride_el = rc_align4((uint32_t)w * 2u) / 2u;
+    if (w == 0 || h == 0) return;
 
-    for (uint32_t sy = 0; sy < h; sy++) {
+    const int32_t tw = RC_ESCALE_R(w);
+    const int32_t th = RC_ESCALE_R(h);
+    for (int32_t ty = 0; ty < th; ty++) {
+        int32_t Y = by + ty;
+        if (Y < 0 || Y >= RC_ENT_H) continue;
+        /* 目标 y → 源 y（比例反算） */
+        int32_t sy = (int32_t)(((int64_t)ty * 65536) / RC_ENTITY_SCALE_Q16);
+        if (sy >= (int32_t)h) sy = h - 1;
         const uint16_t *srow = img->px + (size_t)sy * stride_el;
-        int32_t Y0 = by + (int32_t)(sy << RC_SCALE_SHIFT);
-        if (Y0 + 1 < 0 || Y0 >= RC_ENT_H) continue;
-        for (uint32_t sx = 0; sx < w; sx++) {
-            if (img->mask && !rc_mask_bit(img->mask, sy * w + sx)) continue;
-            uint32_t sxx = hflip ? (uint32_t)(w - 1 - sx) : sx;
-            uint16_t c = srow[sxx];
-            int32_t X0 = bx + (int32_t)(sx << RC_SCALE_SHIFT);
-            for (int32_t dy = 0; dy < RC_SCALE; dy++) {
-                int32_t Y = Y0 + dy;
-                if (Y < 0 || Y >= RC_ENT_H) continue;
-                for (int32_t dx = 0; dx < RC_SCALE; dx++) {
-                    int32_t X = X0 + dx;
-                    if (X < 0 || X >= RC_ENT_W) continue;
-                    uint32_t idx = (uint32_t)Y * RC_ENT_W + (uint32_t)X;
-                    g_ent_px[idx] = c;
-                    rc_mask_set(g_ent_cov, idx);
-                }
-            }
+        for (int32_t tx = 0; tx < tw; tx++) {
+            int32_t X = bx + tx;
+            if (X < 0 || X >= RC_ENT_W) continue;
+            int32_t sx = (int32_t)(((int64_t)tx * 65536) / RC_ENTITY_SCALE_Q16);
+            if (sx >= (int32_t)w) sx = w - 1;
+            if (img->mask && !rc_mask_bit(img->mask, (uint32_t)sy * w + (uint32_t)sx)) continue;
+            uint32_t sxx = hflip ? (uint32_t)(w - 1 - sx) : (uint32_t)sx;
+            uint32_t idx = (uint32_t)Y * RC_ENT_W + (uint32_t)X;
+            g_ent_px[idx] = srow[sxx];
+            rc_mask_set(g_ent_cov, idx);
         }
     }
 }
@@ -1210,9 +1215,9 @@ static void recompose_entity_locked(void)
          * 不再减 origin）；+帧位移 move（桌面同轴：画布内绝对位移，非累计），
          * -联合画布原点 → 实体缓冲内位置（世界 1x → 2x 移位展开） */
         /* LAYOUT x/y 已含帧位移（导出契约：画布绝对坐标），move 字段仅参考，勿重复叠加 */
-        int32_t bx = ((int32_t)piece->x - g_ent_cx0) << RC_SCALE_SHIFT;
-        int32_t by = ((int32_t)piece->y - g_ent_cy0) << RC_SCALE_SHIFT;
-        blit_ent_2x(img, piece->flip & 1u, bx, by);
+        int32_t bx = RC_ESCALE((int32_t)piece->x - g_ent_cx0);
+        int32_t by = RC_ESCALE((int32_t)piece->y - g_ent_cy0);
+        blit_ent_scaled(img, piece->flip & 1u, bx, by);
     }
 
     /* 【人物消失自愈 2026-09-27】LAYOUT 与 PARTS 是两份独立资产、分开下载：
@@ -1342,15 +1347,17 @@ static void strip_blit(const rc_strip_t *s, int32_t rx0, int32_t ry0,
                        int32_t rw, int32_t rh)
 {
     if (!s->ok) return;
-    int32_t band_y = (int32_t)s->y << RC_SCALE_SHIFT;
-    int32_t band_h = (int32_t)s->h << RC_SCALE_SHIFT;
+    /* 条带同样是世界 1x 素材 → 合成器像素，统一走 RC_ENTITY_SCALE_Q16
+     * （1.5x 下 period 非 2 的幂，故用比例乘法而非移位）。 */
+    int32_t band_y = RC_ESCALE((int32_t)s->y);
+    int32_t band_h = RC_ESCALE((int32_t)s->h);
     int32_t y0 = band_y > ry0 ? band_y : ry0;
     int32_t y1 = (band_y + band_h < ry0 + rh) ? band_y + band_h : ry0 + rh;
     if (y0 >= y1) return;
 
-    int32_t period = (int32_t)s->w << RC_SCALE_SHIFT;
+    int32_t period = RC_ESCALE((int32_t)s->w);
     if (period <= 0) return;
-    int32_t off2 = s->last_off << RC_SCALE_SHIFT;
+    int32_t off2 = RC_ESCALE(s->last_off);
     const uint32_t stride_el = s->stride_b / 2u;
 
     /* 【合成提速 · 修正版 2026-09-27】掩码是 **tight 按位打包**（bit = y*w + x，
@@ -1359,16 +1366,18 @@ static void strip_blit(const rc_strip_t *s, int32_t rx0, int32_t ry0,
      * **竖条纹**（列可见性乱掉）。现按 tight 位索引取字节，只做"整字节对齐组"
      * 的快速通道；非对齐组走逐像素 tight 判定（与原实现完全等价）。 */
     for (int32_t sy = y0; sy < y1; sy++) {
-        int32_t src_y = (sy - band_y) >> RC_SCALE_SHIFT;
+        int32_t src_y = (int32_t)(((int64_t)(sy - band_y) * 65536) / RC_ENTITY_SCALE_Q16);
+        if (src_y >= (int32_t)s->h) src_y = (int32_t)s->h - 1;
         const uint16_t *srow = s->px + (size_t)src_y * stride_el;
         uint16_t *drow = g_fb + (size_t)sy * g_sw;
         int32_t sx = rx0;
         while (sx < rx0 + rw) {
             int32_t m = (sx + off2) % period;
             if (m < 0) m += period;
-            int32_t src_x = m >> RC_SCALE_SHIFT;
+            int32_t src_x = (int32_t)(((int64_t)m * 65536) / RC_ENTITY_SCALE_Q16);
+            if (src_x >= (int32_t)s->w) src_x = (int32_t)s->w - 1;
             uint32_t bit0 = (uint32_t)src_y * s->w + (uint32_t)src_x;   /* tight 位索引 */
-            int32_t max_src = (rx0 + rw - sx) >> 1;                     /* 本组最多几个源列 */
+            int32_t max_src = (int32_t)(((int64_t)(rx0 + rw - sx) * 65536) / RC_ENTITY_SCALE_Q16);  /* 本组最多几个源列 */
             if (max_src <= 0) max_src = 1;
             int32_t run = 8 - (int32_t)(bit0 & 7u);                     /* 到字节边界 */
             if (run > max_src) run = max_src;
@@ -3398,6 +3407,7 @@ void render_tick(void)
 {
     if (!g_inited) return;
     int64_t now_us = esp_timer_get_time();
+
 
     if (g_menu) {
         /* MENU：LVGL 整屏离屏 → 直拷 framebuffer → 上屏（合成器让路）。

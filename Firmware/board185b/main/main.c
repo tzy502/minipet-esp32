@@ -42,6 +42,7 @@
 #include "esp_log.h"
 
 #include "app_core.h"
+#include "mpconf.h"  /* 串口配置通道 MPCONF */
 #include "hal_contract.h"
 #include "watchdog.h"
 #include "state_machine.h"
@@ -279,6 +280,22 @@ static void app_main_task(void *arg)
      * 缓冲在 PSRAM（32KB，内部动态堆 0 占用）；挂 esp_log vprintf，
      * 串口输出不受影响。失败仅降级（不阻塞启动）。 */
     logbuf_init();
+
+    /* 串口配置通道（MPCONF ...）：无 GUI/未联网时改 WiFi/服务器地址的唯一入口。
+     * 实现走 USB-Serial-JTAG 的 LL 直读（见 mpconf.c 两条弯路的注释）。 */
+    mpconf_start();
+
+    /* 【I2C NACK 刷屏抑制 2026-10-01】CST816S 在忙/低功耗时会 NACK 读请求，
+     * IDF 的 i2c.master 驱动对每次失败打 3 行 ERROR → 实测 ~100 行/秒，
+     * 把串口和 32KB 环形日志缓冲全冲掉（真机：45 秒 5.8MB 日志，关键行被挤丢，
+     * 触摸失败/恢复的第一手证据都看不到）。这里只把该 tag 降到 NONE：
+     * 失败本身仍由 input 任务的"触摸读取失败/恢复"计数上报（带上下文），
+     * 驱动层的逐笔噪声不再输出。排查总线问题时把本行注释掉即可。 */
+    /* 【2026-10-01 修正】上一版设成 NONE 把"为什么失败"一起埋了（IDF 在超时分支
+     * 才打 `I2C software timeout` / `I2C hardware timeout detected`，正是定位
+     * 卡死的关键）。现只压到 ERROR：NACK 逐笔噪声（WARN/INFO 级）不打了，
+     * 真正的超时/硬件异常（ERROR 级）仍可见。 */
+    esp_log_level_set("i2c.master", ESP_LOG_ERROR);
 
     /* 三队列 */
     mp_event_q = xQueueCreate(MP_EVENT_Q_LEN, sizeof(mp_event_t));

@@ -41,6 +41,13 @@ static bool s_inited;
 static const uint16_t SW = 360;
 static const uint16_t SH = 360;
 
+/* ══ 【面板视场比 2026-10-01】════════════════════════════════════════════════
+ * 合成器空间 480×480 → 360 面板时，取源帧居中的多大范围上屏（百分比）：
+ *   100 = 整幅上屏（原行为）；75 = 取中间 360×360（全画面视觉放大 1.33×）；
+ *   133 = 取 638 范围（内容缩小 0.75×，用于"内容太大"的反向调整）。
+ * 见 refresh_task 内的缩放注释（驱动是唯一缩放点，一处可调）。 */
+#define RC_PANEL_FOV_PCT   100
+
 #define BL_GPIO 5
 static bool s_bl_on;
 
@@ -137,19 +144,38 @@ static void refresh_task(void *arg)
                 if (s_frame_unlock) s_frame_unlock();
                 continue;
             }
-            /* 【480 管线复用 2026-10-01】合成器按既有 480×480 管线运行（娃娃/地面/
-             * 时钟/横幅全部原逻辑零改动），本任务唯一缩放点：480→360（×3/4）
-             * 最近邻取样 + 小端→大端交换。 */
+            /* ══ 【480 管线 + 面板裁切缩放 2026-10-01】══════════════════════════
+             * 合成器按 480×480 运行（娃娃/条带/时钟/地图的比例契约全在里面），
+             * 本任务 = **唯一缩放点**。两级：
+             *   ① 先在源帧里取一个**居中的方形窗口**（边长 = 480 × 视场比）；
+             *   ② 再把该窗口映射到整块 360 面板。
+             * 视场比 = RC_PANEL_FOV_PCT/100：
+             *   100 → 整幅 480 上屏（= 原行为，内容按面板 1:1）；
+             *    75 → 只取中间 360×360 上屏 → **全画面（娃娃/菜单/地图一起）
+             *         视觉放大 1/0.75 ≈ 1.33×**，用来把偏小的内容顶满；
+             *    133 → 取更大范围 → 内容缩小。
+             * 为什么放在驱动层：这是唯一不触碰各图层比例契约的收敛点，
+             * 一处常量即可调，且对 480 合成器、触屏映射都零改动。 */
             {
                 const int src_w = (int)s_fb_stride;      /* 480 */
-                const int step_fp = (int)(((int64_t)src_w << 16) / SW);   /* 87381 */
+                const int src_h = src_w;                 /* 合成器恒为方形 */
+                int fov = (int)(((int64_t)RC_PANEL_FOV_PCT * src_w) / 100);
+                if (fov < 1) fov = 1;
+                if (fov > src_w) fov = src_w;
+                const int ox = (src_w - fov) / 2;        /* 居中裁切起点 */
+                const int oy = (src_h - fov) / 2;
+                const int step_fp = (int)(((int64_t)fov << 16) / SW);
                 for (int ry = 0; ry < rows; ry++) {
-                    int sy = ((int64_t)(y0 + ry) * src_w) / SW;
+                    int sy = oy + (int)(((int64_t)(y0 + ry) * fov) / SW);
+                    if (sy >= src_h) sy = src_h - 1;
                     const uint16_t *srow = s_fb_src + (size_t)sy * s_fb_stride;
                     uint16_t *drow = (uint16_t *)stage + (size_t)ry * SW;
                     int sx_fp = 0;
-                    for (int i = 0; i < SW; i++, sx_fp += step_fp)
-                        drow[i] = __builtin_bswap16(srow[sx_fp >> 16]);
+                    for (int i = 0; i < SW; i++, sx_fp += step_fp) {
+                        int sx = ox + (sx_fp >> 16);
+                        if (sx >= src_w) sx = src_w - 1;
+                        drow[i] = __builtin_bswap16(srow[sx]);
+                    }
                 }
             }
             xSemaphoreGive(s_lock);
@@ -208,7 +234,17 @@ void display_set_frame_source(const uint16_t *fb, int stride)
             s_refresh_on = false;
             ESP_LOGE(TAG, "刷新任务创建失败");
         } else {
-            ESP_LOGW(TAG, "持续全帧刷新已启动");
+            /* 【缩放自证 2026-10-01】用户报"内容大 1.33 倍"（= 480÷360）。
+         * 这一行直接给出真相：源 stride 与屏幕宽不等 = 正在做 0.75x 最近邻采样
+         * （内容按面板 1:1 呈现）；两者相等 = 1:1 直通（内容会比面板大 1.33 倍）。
+         * stride 由 render_init 的 display_set_frame_source(g_fb, g_sw) 给出。 */
+        {
+            int sw = s_fb_stride > 0 ? s_fb_stride : SW;
+            int fov = (int)(((int64_t)RC_PANEL_FOV_PCT * sw) / 100);
+            ESP_LOGW(TAG, "缩放自证：源 %d px → 取中间 %d px（视场 %d%%）→ 面板 %d px",
+                     sw, fov, (int)RC_PANEL_FOV_PCT, (int)SW);
+        }
+        ESP_LOGW(TAG, "持续全帧刷新已启动");
         }
     }
 #endif

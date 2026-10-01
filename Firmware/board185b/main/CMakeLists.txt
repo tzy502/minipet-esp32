@@ -15,6 +15,7 @@ idf_component_register(
         "app/input_dispatch.c"
         "app/provision.c"
         "app/logbuf.c"
+        "app/mpconf.c"   # 串口配置通道（MPCONF WIFI/SRV/SHOW/CLEAR/REBOOT）
         "render/mpak.c"
         "render/compositor.c"
         "render/entity_anim.c"

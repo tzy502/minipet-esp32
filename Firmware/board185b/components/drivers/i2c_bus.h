@@ -57,6 +57,15 @@ esp_err_t i2c_bus_probe(uint16_t addr7);
 /** 纯写（无寄存器地址，如 RTC 复位/停止命令） */
 esp_err_t i2c_bus_write(i2c_master_dev_handle_t dev, const uint8_t *buf, size_t len);
 
+/** 两段式寄存器读（写地址 → STOP → gap_us → 独立读；同一把总线锁内完成）。
+ *  专治 transmit_receive（重复起始）在慢/忙器件上把控制器卡死的问题。 */
+esp_err_t i2c_bus_read_reg8v_split(i2c_master_dev_handle_t dev, uint8_t reg,
+                                   uint8_t *buf, size_t len, uint32_t gap_us);
+
+/** 总线硬件复位：清"事务没收尾导致 status 非 IDLE → 之后每笔都 INVALID_STATE"的卡死。
+ *  返回 ESP_OK = 已复位（status 置回 IDLE），调用方随后重试即可。 */
+esp_err_t i2c_bus_hw_reset(void);
+
 /** 纯读（无寄存器地址） */
 esp_err_t i2c_bus_read(i2c_master_dev_handle_t dev, uint8_t *buf, size_t len);
 
