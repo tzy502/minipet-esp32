@@ -1240,14 +1240,26 @@ static void dispatch_manifest_synced(void)
         static char hs[8][20]; static char lb[8][32]; static bool ca[8];
         int n = asset_dl_bgmap_list(hs, lb, ca, 8);
         if (n > 0 && !asset_dl_map_exists(want)) {
+            /* 【挑选优先级 2026-10-01 真机修正】原先只挑"第一张已缓存"，真机暴露
+             * 真实场景：NVS 记着 004000032（另一个会话/服务端推过的图），但本设备
+             * 清单里只有另一张 → 兜底会随便挑一张，与用户当前想看的图不符。
+             * 现改为三级优先：
+             *   ① 当前**激活**图（asset_dl_map_is_active：服务端推送或菜单刚选过的
+             *      那张，语义="用户现在要的图"）；
+             *   ② 已缓存的（不用等下载）；
+             *   ③ 清单首图（触发下载）。
+             * 三级都不命中才算真的没图。 */
             int pick = -1;
-            for (int i = 0; i < n; i++) if (ca[i]) { pick = i; break; }   /* 已缓存优先 */
-            if (pick < 0) pick = 0;                                       /* 都没有就选第一张（触发下载） */
+            for (int i = 0; i < n; i++) if (asset_dl_map_is_active(hs[i])) { pick = i; break; }
+            if (pick < 0) for (int i = 0; i < n; i++) if (ca[i]) { pick = i; break; }
+            if (pick < 0) pick = 0;
             mp_cmd_t fc = { .type = MP_CMD_SET_MAP };
             strlcpy(fc.s, hs[pick], sizeof(fc.s));
             mp_post_cmd(&fc);
-            ESP_LOGW(TAG, "活动图 %s（id 口径）不在清单 → 兜底装载清单首图 %.16s（%s）",
-                     want, hs[pick], lb[pick]);
+            ESP_LOGW(TAG, "目标图 %s 不在清单 → 兜底装载 %s%.16s（%s）",
+                     want,
+                     asset_dl_map_is_active(hs[pick]) ? "当前激活图 " : "",
+                     hs[pick], lb[pick]);
         } else if (n == 0) {
             ESP_LOGW(TAG, "清单里没有任何 BGMAP（服务端未登记地图？）—— 背景保持黑底");
         }

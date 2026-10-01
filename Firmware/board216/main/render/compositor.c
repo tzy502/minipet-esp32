@@ -3629,7 +3629,11 @@ static void flush_dirty(void)
  * esp_lcd 每次传输 malloc 内部 DMA 拷贝，更糟）。定稿 2 块（24KB，比原来多 12KB）：
  * 双缓冲已足够让 SPI 连续（填 B 与传 A 重叠），第 3 块只平滑抖动、不值 12KB。 */
 #define RC_BLIT_STAGES 2
-static uint8_t s_blit_stage[RC_BLIT_STAGES][12288] __attribute__((aligned(64)));
+/* 【块大小 12288→6144 2026-10-01】双缓冲 × 12KB = 24KB 内部 RAM 仍把开机堆压到
+ * 31KB/最大块 7.6KB（原基线 48KB/22.5KB），素材绑定/动作切换会被门限拦。
+ * 改 2 × 6144B = 12KB —— **与改动前的单块 12KB 完全同量**，同时保住双缓冲流水。
+ * 代价：满屏块数 38→75，每笔多一次命令开销（~50~100µs）≈ +3~6ms，可接受。 */
+static uint8_t s_blit_stage[RC_BLIT_STAGES][6144] __attribute__((aligned(64)));
 static int     s_blit_stage_idx;
 
 static void blit_be(int32_t x, int32_t y, int32_t w, int32_t h,
