@@ -25,6 +25,7 @@
 #include "app_core.h"
 #include "hal_contract.h"
 #include "http_client.h"
+#include "mp_psram.h"
 #include "asset_dl.h"
 #include "ota.h"
 #include "state_machine.h"
@@ -188,6 +189,15 @@ static void handle_cmd(cJSON *jc)
         c.type = MP_CMD_SET_MAP;
         strlcpy(c.s, v, sizeof(c.s));
         mp_post_cmd(&c);
+    } else if (strcmp(t, "cam") == 0 && v) {
+        /* 【服务端选镜头】{"type":"cam","value":"<x>,<y>"}（世界坐标）→ 应用并落 NVS。
+         * 服务端是主口径，本地卡只是辅助（断网时用 NVS 记忆）。 */
+        int cx = 0, cy = 0;
+        if (sscanf(v, "%d,%d", &cx, &cy) == 2) {
+            c.type = MP_CMD_CAM_SET;
+            c.a = cx; c.b = cy;
+            mp_post_cmd(&c);
+        }
     } else if (strcmp(t, "camtest") == 0) {
         /* 【压测钩子】{"type":"camtest","value":"<步数>,<步长>"} → 连续平移相机 */
         c.type = MP_CMD_CAM_PAN_TEST;
@@ -269,8 +279,19 @@ static bool do_poll_once(void)
     snprintf(path, sizeof(path), "/api/device/poll?deviceId=%s&since=%lu",
              mp_http_device_id(), (unsigned long)s_since);
 
-    static char resp[POLL_RESP_CAP];
-    resp_ctx_t ctx = { .buf = resp, .cap = sizeof(resp) };
+    /* 【内部 RAM 腾挪 2026-10-02】poll 响应文本（4KB）原为内部 .bss。
+     * 它只被 mp_http_get 的 resp_collect 顺序写、随后 cJSON_Parse 只读，
+     * 无任何 DMA；PSRAM 只换存储位置。懒分配 + 常驻复用（每几秒一次 poll，
+     * 反复 malloc/free 是碎片源）。分配失败即本轮 poll 放弃（有界损失）。 */
+    static char *resp;
+    if (!resp) {
+        resp = mp_psram_malloc(POLL_RESP_CAP);
+        /* 旧静态数组初值全 0（空响应时 cJSON_Parse 看到空串而不是残留数据）——
+         * 这里显式清零做**逐字节等价**，不依赖堆的初值。 */
+        if (resp) memset(resp, 0, POLL_RESP_CAP);
+    }
+    if (!resp) { ESP_LOGW(TAG, "poll 响应缓冲分配失败 → 跳过本轮"); return false; }
+    resp_ctx_t ctx = { .buf = resp, .cap = POLL_RESP_CAP };
 
     int status = mp_http_get(path, POLL_TIMEOUT_MS, resp_collect, &ctx);
     if (status != 200) {
@@ -313,7 +334,10 @@ static bool do_poll_once(void)
             }
             cJSON *t = cJSON_GetObjectItem(jc, "type");
             cJSON *payload = cJSON_GetObjectItem(jc, "payload");
-            if (!t) { handle_cmd(jc); continue; }   /* 旧口径直通 */
+            if (!t) { ESP_LOGW(TAG, "[取证] 旧口径指令直通"); handle_cmd(jc); continue; }
+            ESP_LOGW(TAG, "[取证] poll 现代指令 type='%s' payload_is_string=%d payload=%p",
+                     cJSON_GetStringValue(t) ? cJSON_GetStringValue(t) : "?",
+                     cJSON_IsString(payload) ? 1 : 0, (void *)payload);
             /* 构造 {t, v, n, u} 视图：v=字符串 payload 或对象中的字符串字段 */
             cJSON *vitem = NULL;
             if (cJSON_IsString(payload)) vitem = payload;
@@ -359,6 +383,7 @@ static bool do_poll_once(void)
                     mp_cmd_t c = { 0 }; c.type = MP_CMD_SET_EXPRESSION;
                     strlcpy(c.s, vitem->valuestring, sizeof(c.s)); mp_post_cmd(&c);
                 } else if (strcmp(tbuf, "bubble") == 0 && cJSON_IsString(vitem)) {
+                    ESP_LOGW(TAG, "[取证] poll 收到 bubble v='%.16s'", vitem->valuestring);
                     mp_cmd_t c = { 0 }; c.type = MP_CMD_BUBBLE;
                     strlcpy(c.s, vitem->valuestring, sizeof(c.s)); mp_post_cmd(&c);
                 } else if (strcmp(tbuf, "map") == 0 && cJSON_IsString(pid)) {

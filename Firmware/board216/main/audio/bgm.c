@@ -293,8 +293,18 @@ typedef struct {
     uint8_t  *in;
     size_t    in_len;
     mp3dec_t *dec;
-    int16_t   pcm[MINIMP3_MAX_SAMPLES_PER_FRAME];
-    int16_t   stereo[MINIMP3_MAX_SAMPLES_PER_FRAME * 2];
+    /* ══ 【内部 RAM 腾挪 2026-10-02】pcm/stereo 由内联数组改指针（PSRAM）══
+     * 原内联 int16_t[2304] + int16_t[4608] = 13,824B **常驻内部 .bss**。
+     * 为什么可以搬：
+     *   · pcm 是 minimp3 的输出暂存（mp3dec_decode_frame 写、本函数读）；
+     *   · stereo 是"单声道→双声道复制"的成形缓冲，只被 pcm_ring_write()
+     *     **逐样本 memcpy** 进 PSRAM 环形缓冲（pcm_ring.c 的实现就是逐元素赋值）；
+     *   · 真正交给 I2S DMA 的是 feeder_task 的静态 out[FEEDER_FRAMES*2]
+     *     （pcm_ring_read 逐元素拷进去）—— 那份**仍在内部 DRAM**，DMA 可及性不变。
+     * 所以这两个数组全程只在 CPU 侧流转，PSRAM 只换存储位置，零语义变化。
+     * 分配在每曲开头、失败即本轮播放失败（与 s_sc.in 同一失败口径）。 */
+    int16_t  *pcm;
+    int16_t  *stereo;
     int       frames;          /* 本会话解出的帧数 */
     int       stall;           /* 连续无帧计数 */
     uint32_t  bytes_in;        /* 已接收的码流字节（断点续流用；跨续传累加） */
@@ -409,7 +419,20 @@ static bool play_track(uint32_t track_id)
     snprintf(url, sizeof(url), "/api/device/bgm/stream?deviceId=%s&id=%u&source=%s",
              mp_http_device_id(), (unsigned)track_id, source_str((mp_bgm_source_t)s_source));
 
+    /* pcm/stereo（共 13.8KB，原来是内部 .bss 内联数组）一次分配、跨曲复用：
+     * 反复 malloc/free 大块是 PSRAM 碎片源（与 mpak 窗口缓存同一条纪律）。 */
+    if (!s_sc.pcm)    s_sc.pcm    = heap_caps_malloc(MINIMP3_MAX_SAMPLES_PER_FRAME * sizeof(int16_t),
+                                                     MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!s_sc.stereo) s_sc.stereo = heap_caps_malloc(MINIMP3_MAX_SAMPLES_PER_FRAME * 2 * sizeof(int16_t),
+                                                     MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!s_sc.pcm || !s_sc.stereo) {
+        ESP_LOGE(TAG, "解码暂存分配失败（pcm=%p stereo=%p）→ 本轮播放放弃", s_sc.pcm, s_sc.stereo);
+        return false;
+    }
+    int16_t *pcm_keep = s_sc.pcm, *stereo_keep = s_sc.stereo;
     memset(&s_sc, 0, sizeof(s_sc));
+    s_sc.pcm = pcm_keep;                        /* memset 后回填（跨曲复用） */
+    s_sc.stereo = stereo_keep;
     mp3dec_init(s_dec);                         /* 每曲复位解码器（清 bit reservoir/合成
                                                  * 残态；上游 mp3dec_init 仅清头缓存，开销极小。
                                                  * 流内逐帧调用间则必须保持状态，勿在此之外重置） */

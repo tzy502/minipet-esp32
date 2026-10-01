@@ -16,6 +16,7 @@
 #include <unistd.h>      /* pread / fileno：瓦片整块读（契约 §6 只允许整块 pread） */
 
 #include "esp_heap_caps.h"
+#include "mp_psram.h"
 #include "esp_log.h"
 #include "watchdog.h"    /* 瓦片整块读循环喂狗（渲染任务 5s 不喂 = E14 熔断黑屏） */
 
@@ -531,7 +532,11 @@ static int parse_parts(mpak_t *m)
      */
     uint32_t bmp_base  = idx_len;                 /* payload 相对 */
     uint32_t bmp_area  = m->payload_len - bmp_base;
-    uint32_t *offs = malloc(n * sizeof(uint32_t));
+    /* 【内部 RAM 腾挪 2026-10-02】extent 推导用的 offset 排序副本：纯粹是
+     * qsort/upper_bound 的 CPU 侧中间数组（打开后循环用完即 free），
+     * 与 SD 读路径无关（SD 读走 payload_read/psram_alloc）→ PSRAM。
+     * 每个包省 n×4B 内部堆；PARTS 包 n 可达数百（包一多就是几 KB）。 */
+    uint32_t *offs = mp_psram_malloc(n * sizeof(uint32_t));
     if (!offs) { heap_caps_free(tab); return MPAK_ERR_NOMEM; }
     for (uint32_t i = 0; i < n; i++) offs[i] = tab[i].offset;
     qsort(offs, n, sizeof(uint32_t), u32_cmp);
@@ -1932,6 +1937,21 @@ int mpak_open(mpak_t *m, const char *path, uint64_t expect_hash, uint64_t expect
         ESP_LOGE(TAG, "open %s failed", path);
         return MPAK_ERR_IO;
     }
+    /* 【stdio 缓冲实测结论 2026-10-02 —— 查过并**刻意不动**】
+     * 曾考虑 `setvbuf(_IONBF)` 省掉每个 FILE 的 stdio 缓冲，实测否决：
+     *   · 本工具链是 newlib（CONFIG_LIBC_NEWLIB=y）且 **BUFSIZ = 128**（不是 1024）
+     *     → 每句柄那点缓冲只有 128B，6~10 个常开句柄合计 ~1KB，收益太小；
+     *   · 而 `_IONBF` 在 newlib 里会把 `_bf._size` 设成 **1**
+     *     （libc_a-makebuf.o：0xa7 处 `_bf._base = &_nbuf; _bf._size = 1`），
+     *     且 `_fread_r`（libc_a-fread.o）**没有**"大请求直读用户缓冲"的快路径
+     *     （其重定位表里只有 __srefill_r/memcpy，没有 _read_r）
+     *     → `fread` 会退化成**一次 1 字节**的 read()，17MB 校验直接灾难。
+     * 结论：保持默认缓冲。顺带记录一个**性能**线索（本次不动，供后续单独评估）：
+     * 既然 BUFSIZ=128，`fread` 每 1KB 就要 8 次 read()（17MB 的 crc 校验
+     * ≈13.6 万次系统调用）。要提速应走 `setvbuf(fp, NULL, _IOFBF, 8192)`
+     * —— 8192 > CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL(4096)，缓冲会落到 PSRAM，
+     * 既不占内部堆又能把 read() 次数降 64 倍；但随机读会多读前一扇区，
+     * 属行为变更，须真机按"地图装载/瓦片读"回归后再上。 */
 
     int rc = envelope_check(m, expect_hash, expect_kind);
     if (rc) goto fail;
@@ -1949,9 +1969,18 @@ int mpak_open(mpak_t *m, const char *path, uint64_t expect_hash, uint64_t expect
     }
     if (rc) goto fail;
 
-    ESP_LOGI(TAG, "opened %s kind=%llu hash=%016llx payload=%" PRIu32,
+    /* 【内部堆取证 2026-10-02】每次成功打开都带上当时的内部堆水位/最大块：
+     * 真机现象是"@联网后 空闲=32819 → 6 个 mpak opened → @@素材全绑后 只剩
+     * 1307"，但逐个包究竟各吃多少内部 RAM 一直只能靠猜。这一行让"谁吃的"
+     * 直接可读（本条日志本身就是交付的验证判据之一，不是临时调试件）：
+     * 每个包的增量 = 本行空闲值 - 上一行空闲值；增量大的包就是嫌疑包。
+     * 只读两个计数（heap_caps_get_*），对打开耗时无影响。 */
+    ESP_LOGI(TAG, "opened %s kind=%llu hash=%016llx payload=%" PRIu32
+                  " 内部堆(此包后) 空闲=%u 最大块=%u",
              path, (unsigned long long)m->kind,
-             (unsigned long long)m->content_hash, m->payload_len);
+             (unsigned long long)m->content_hash, m->payload_len,
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
     return MPAK_OK;
 
 fail:

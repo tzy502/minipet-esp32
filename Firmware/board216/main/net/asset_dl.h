@@ -145,7 +145,9 @@ bool asset_dl_map_hidden(const char *hash_or_id);
 
 /* 【活动地图持久化】hash/id → map_id；以及 map_id 是否还在当前清单里 */
 bool asset_dl_map_id_of(const char *hash_or_id, char *out, size_t cap);
-bool asset_dl_map_exists(const char *map_id);                     /* 该图当前是否被隐藏 */
+bool asset_dl_map_exists(const char *map_id);
+/* 当前活动地图 hash（NULL=未设置）；用于派生 per-map NVS 键 */
+const char *asset_dl_active_map_hash(void);                     /* 该图当前是否被隐藏 */
 int  asset_dl_bgmap_visible_count(void);                              /* 未被隐藏的 BGMAP 条数 */
 bool asset_dl_map_is_active(const char *hash_or_id);                  /* 是否正在渲染的当前图 */
 

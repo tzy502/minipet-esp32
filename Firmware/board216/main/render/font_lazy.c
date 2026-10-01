@@ -15,6 +15,7 @@
 #include <string.h>
 
 #include "esp_heap_caps.h"
+#include "mp_psram.h"
 #include "esp_log.h"
 
 static const char *TAG = "font";
@@ -39,12 +40,39 @@ typedef struct {
     uint8_t  *src_scratch;   /* 4bpp 源位图暂存（A8 展开用） */
 } fl_inst_t;
 
-static fl_inst_t s_inst[FONT_ID_COUNT];
+/* 【内部 RAM 腾挪 2026-10-02】3 档字体的实例表（3×320B=960B）原为内部 .bss。
+ * 内容是 LVGL 字体回调用的句柄/指针/尺寸（位图缓存 slot_bufs 与 src_scratch
+ * **本来就在 PSRAM**）→ 表本身放 PSRAM 完全等价，且这些字段只在 CPU 侧
+ * 被回调读，无 DMA 约束。
+ * 形状：单槽兜底 + 唯一取槽入口 fl_at()。兜底槽故意只有 1 个，所以**任何**
+ * 按下标取槽都必须走 fl_at()（未就绪时它一律返回兜底槽），否则越界。
+ * 兜底槽全 0 ⇒ open=false ⇒ 所有字形回调安全退化为"无此字"（与"字体未装载"
+ * 同语义，不崩）。 */
+static fl_inst_t  s_inst_zero;
+static fl_inst_t *s_inst;                 /* NULL = 未就绪（见 fl_inst_ensure） */
+static bool       s_inst_ready;
+
+static void fl_inst_ensure(void)
+{
+    if (s_inst_ready) return;
+    s_inst_ready = true;                  /* 先置位：失败也不再重试（防抖） */
+    s_inst = mp_psram_calloc(FONT_ID_COUNT, sizeof *s_inst);
+    if (!s_inst) ESP_LOGE(TAG, "字体实例表分配失败 → 字体功能不可用（降级，不崩）");
+}
+
+/* 唯一取槽入口；调用方须先做 0<=id<FONT_ID_COUNT 校验 */
+static fl_inst_t *fl_at(int id)
+{
+    fl_inst_ensure();
+    return s_inst ? &s_inst[id] : &s_inst_zero;
+}
 
 static fl_inst_t *fl_self(const lv_font_t *font)
 {
-    for (int i = 0; i < FONT_ID_COUNT; i++)
-        if (&s_inst[i].font == font) return &s_inst[i];
+    for (int i = 0; i < FONT_ID_COUNT; i++) {
+        fl_inst_t *c = fl_at(i);
+        if (&c->font == font) return c;
+    }
     return NULL;
 }
 
@@ -162,7 +190,7 @@ static void fl_clear_slots(fl_inst_t *self)
 void font_lazy_deinit(font_id_t id)
 {
     if ((int)id < 0 || id >= FONT_ID_COUNT) return;
-    fl_inst_t *self = &s_inst[id];
+    fl_inst_t *self = fl_at((int)id);
     if (self->open) {
         mpak_close(&self->mpk);
         self->open = false;
@@ -181,7 +209,7 @@ void font_lazy_deinit(font_id_t id)
 int font_lazy_init(font_id_t id, const char *mpk_path)
 {
     if ((int)id < 0 || id >= FONT_ID_COUNT || !mpk_path) return MPAK_ERR_ARG;
-    fl_inst_t *self = &s_inst[id];
+    fl_inst_t *self = fl_at((int)id);
     font_lazy_deinit(id);
 
     ESP_LOGW("font", "font_lazy_init open %s", mpk_path);
@@ -245,21 +273,24 @@ int font_lazy_init(font_id_t id, const char *mpk_path)
 
 const lv_font_t *font_lazy_get(font_id_t id)
 {
-    if ((int)id < 0 || id >= FONT_ID_COUNT || !s_inst[id].open) return NULL;
-    return &s_inst[id].font;
+    if ((int)id < 0 || id >= FONT_ID_COUNT) return NULL;
+    fl_inst_t *c = fl_at((int)id);
+    return c->open ? &c->font : NULL;
 }
 
 bool font_lazy_ready(font_id_t id)
 {
-    return !((int)id < 0 || id >= FONT_ID_COUNT) && s_inst[id].open;
+    if ((int)id < 0 || id >= FONT_ID_COUNT) return false;
+    return fl_at((int)id)->open;
 }
 
 int font_lazy_measure(font_id_t id, uint32_t codepoint, uint32_t *adv_w)
 {
-    if ((int)id < 0 || id >= FONT_ID_COUNT || !s_inst[id].open || !adv_w)
-        return MPAK_ERR_ARG;
+    if ((int)id < 0 || id >= FONT_ID_COUNT || !adv_w) return MPAK_ERR_ARG;
+    fl_inst_t *c = fl_at((int)id);
+    if (!c->open) return MPAK_ERR_ARG;
     const mpak_glyph_t *g;
-    if (mpak_font_find_glyph(&s_inst[id].mpk, codepoint, &g) != MPAK_OK)
+    if (mpak_font_find_glyph(&c->mpk, codepoint, &g) != MPAK_OK)
         return MPAK_ERR_RANGE;
     *adv_w = g->advance;
     return MPAK_OK;

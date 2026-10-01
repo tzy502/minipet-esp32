@@ -37,6 +37,7 @@
 #include "esp_netif.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
+#include "cJSON.h"       /* cJSON_InitHooks：清单/指令树的分配改走 PSRAM */
 #include "esp_rom_uart.h"
 #include "soc/soc.h"
 #include "soc/usb_serial_jtag_reg.h"
@@ -44,6 +45,7 @@
 
 #include "app_core.h"
 #include "hal_contract.h"
+#include "mp_psram.h"    /* PSRAM 优先分配（内部 DRAM 只有 ~133KB） */
 #include "watchdog.h"
 #include "state_machine.h"
 #include "provision.h"
@@ -117,8 +119,16 @@ static bool cmd_latest_wins(mp_cmd_type_t t)
 
 static int render_drain_cmds(void)
 {
-    static mp_cmd_t s_drain[MP_CMD_Q_LEN];      /* 静态：渲染任务栈最紧只有 3.5KB */
-    static bool     s_drop[MP_CMD_Q_LEN];
+    /* 静态（免占渲染任务 3.5KB 的最紧栈），但**不必占内部 DRAM**：
+     * 【内部 RAM 腾挪 2026-10-02】s_drain（16×108B=1728B）+ s_drop 原来常驻
+     * 内部 .bss。它只是"从 cmd_q 出队的拷贝"，只在渲染任务内被读、随后喂给
+     * app_cmd_dispatch；无任何 DMA 直接读它 → PSRAM 懒分配（首次排空时分配，
+     * 之后复用；分配失败退内部堆，再失败则本拍不排空、下拍重试，不丢指令）。 */
+    static mp_cmd_t *s_drain;
+    static bool     *s_drop;
+    if (!s_drain) s_drain = mp_psram_malloc(sizeof(mp_cmd_t) * MP_CMD_Q_LEN);
+    if (!s_drop)  s_drop  = mp_psram_malloc(sizeof(bool) * MP_CMD_Q_LEN);
+    if (!s_drain || !s_drop) return 0;
     int n = 0;
     while (n < MP_CMD_Q_LEN && xQueueReceive(mp_cmd_q, &s_drain[n], 0) == pdTRUE) n++;
     for (int i = 0; i < n; i++) s_drop[i] = false;
@@ -142,7 +152,7 @@ static int render_drain_cmds(void)
     }
     for (int i = 0; i < n; i++) {
         if (s_drop[i]) continue;
-        ESP_LOGD(TAG, "cmd 收到 type=%d", (int)s_drain[i].type);
+        ESP_LOGW(TAG, "[取证] cmd 派发 type=%d s='%.16s'", (int)s_drain[i].type, s_drain[i].s);
         app_cmd_dispatch(&s_drain[i]);
         watchdog_kick();              /* 单条指令若耗时（素材懒加载），也持续喂狗 */
     }
@@ -317,9 +327,46 @@ void app_main(void)
     /* app_main 功成身退，由 mp_main 继续承载原启动流程 */
 }
 
+/* ══ 【内部 RAM 腾挪 2026-10-02：cJSON 全量改走 PSRAM】══════════════════════
+ * 机理：本板 sdkconfig 的 CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096 规定
+ * 「普通 malloc ≤4KB 一律给内部 RAM」。这条**不能往下调**（FatFS 的 4096B
+ * 扇区窗口必须 DMA 可及，见 mp_psram.h），于是所有 ≤4KB 的默认堆分配都压在
+ * 内部 DRAM 上。cJSON 恰好是最典型的受害者：节点 ~40B/个、每条字符串再一份，
+ * 一份清单（真机实测 27,461B）就是数百个节点 + 数百个字符串，**全部**落在
+ * 内部堆（清单树 + 每轮 poll 的响应树 + 上行 body 树，是持续的内部堆抖动源）。
+ *
+ * ⚠️ 诚实边界（避免误判收益）：清单那棵树在 sync_once 里是**先**
+ * cJSON_Delete(root) **再** post MANIFEST_SYNCED 的，所以它**不**与随后的
+ * "地图装载/素材绑定"窗口重叠 —— 这一条不是"@@素材全绑后掉 31KB"的元凶。
+ * 保留它的理由是两个真实但较小的收益：
+ *   ① 同步/poll 窗口内的**内部堆峰值**下降（去掉那几十 KB 的瞬时内部占用）；
+ *   ② 内部堆**碎片**下降：几百个小块分配再释放，正是"空闲 43KB 但最大块只剩
+ *      9.7KB"这类碎片的典型来源之一，而本板的最大块恰恰是硬约束（fopen /
+ *      任务栈都要求连续块）。
+ * 修法：装全局 hooks，让 cJSON 的 malloc/free 走 PSRAM（失败自动退内部堆）。
+ *   · cJSON 只在各任务上下文里解析/打印，**没有任何 ISR 或关 cache 临界区
+ *     访问它**，PSRAM 访问安全；
+ *   · heap_caps_free 区域无关，PSRAM/内部两块都能还；
+ *   · 唯一要求：必须在**第一次 cJSON_* 调用之前**装好 —— 本函数在 app_main_task
+ *     入口调用，早于任何任务/网络/渲染代码（全仓 cJSON 调用点都在任务里）。 */
+static void *cj_psram_alloc(size_t sz)
+{
+    return mp_psram_malloc(sz);
+}
+static void cj_psram_free(void *p)
+{
+    heap_caps_free(p);      /* 区域无关：PSRAM 与内部堆指针都能还 */
+}
+static void cjson_hooks_install(void)
+{
+    cJSON_Hooks h = { .malloc_fn = cj_psram_alloc, .free_fn = cj_psram_free };
+    cJSON_InitHooks(&h);
+}
+
 static void app_main_task(void *arg)
 {
     (void)arg;
+    cjson_hooks_install();      /* 必须早于任何 cJSON_* 调用（见上注释） */
     /* 【串口非阻塞 2026-09-27】默认 UART 写是阻塞的：无人读串口时 TX 缓冲满
      * → 打日志的任务被挂住（真机表现：渲染任务 >5s 不喂狗 → E14 熔断关屏）。
      * 设为非阻塞 + 允许覆盖，宁可丢日志也不能拖死任务。 */

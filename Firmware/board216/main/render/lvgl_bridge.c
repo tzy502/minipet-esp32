@@ -1232,10 +1232,30 @@ void bridge_cam_adjust_poll(void)
 }
 
 /* 子页②入口：真正进入相机调参态。返回 true = 已进入（菜单随即被收起）。 */
+/* 【2026-10-01 用户定稿：相机只走服务端选镜头】用户真机体验后明确：
+ *   "地图选择镜头的时候就会这样（屏上大片黑+一小块亮/确认要等很久），体验很差，
+ *    我希望直接服务端选择"
+ * ⇒ 设备端**不再进入拖动调参态**（那条路径在整图+14 条带+分块包组合下会出现
+ * 半屏黑与秒级等待），改为提示去服务端「选镜头」卡片（Web → 选图 → 拖框 →
+ * 上送 `{"type":"cam","value":"x,y"}`；固件已实现该指令：应用 + 写该图 NVS）。
+ * 代码保留（置 MP_CAM_ONDEVICE_ADJUST=1 可恢复板端拖动），默认关闭。 */
+#ifndef MP_CAM_ONDEVICE_ADJUST
+#define MP_CAM_ONDEVICE_ADJUST 0
+#endif
+
 static bool menu_map_fn_camera_enter(void)
 {
     ESP_LOGW(TAG, "menu: 子页②相机入口 hash=%.16s key=%s label=%.24s",
              s_menu.fn_hash, s_menu.fn_key, s_menu.fn_label);
+#if !MP_CAM_ONDEVICE_ADJUST
+    if (!render_cam_supported()) {
+        menu_status_flash(CAM_FLASH_NO_FULLMAP);
+        return false;
+    }
+    menu_status_flash("请在服务端「选镜头」调整（Web → 设备页）");
+    ESP_LOGW(TAG, "menu: 板端拖动已按用户口径关闭 → 引导到服务端选镜头");
+    return false;
+#endif
 
     /* ① 能力门（§3.3）：render_cam_supported()==false = 非整图包（无可平移余量）
      *    → 状态行提示、**不进入调参态**（旧包视觉与交互逐字节不变）。 */

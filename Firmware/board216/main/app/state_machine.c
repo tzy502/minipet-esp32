@@ -34,6 +34,7 @@ static const char *TAG = "sm";
 #include "app_core.h"
 #include "hal_contract.h"
 #include "watchdog.h"
+#include "mp_psram.h"
 #include "provision.h"
 #include "nvs.h"              /* §3.3 相机 per-map 持久化（namespace "cam"） */
 #include "input_dispatch.h"   /* E7：切换后随机表情 */
@@ -697,6 +698,22 @@ static bool heap_ok_for_asset_load(void)
     return heap_caps_get_free_size(MALLOC_CAP_INTERNAL) >= CONFIG_MP_ASSET_HEAP_GATE_KB * 1024;
 }
 
+/* ══ 【绑定窗口逐段内部堆取证 2026-10-02】════════════════════════════════
+ * 真机现象（胶水抓串口）：@联网后 空闲=32819 → 一段"地图装载（6 个 mpak
+ * opened）+ 字体 + parts + layout"之后 → @@素材全绑后 只剩 1307（掉 ~31KB），
+ * 直接把 24KB 门限踩穿 →「跳过本轮素材绑定/字体装载」= 纸娃娃消失。
+ * 但"这 31KB 到底是谁吃的"此前只能靠猜（每个包的 open 日志不带水位）。
+ * 本探针在每个子阶段后打一行，配合 mpak.c 里 `opened ... 内部堆(此包后)`
+ * 与 asset_dl 的 sync 日志，能**逐段算出净增量**，把嫌疑锁死到一个包/一步。
+ * 常态只多 5 行启动日志，无需开关。 */
+static void bind_heap_probe(const char *stage)
+{
+    ESP_LOGW(TAG, "· 绑定水位[%s] 内部堆 空闲=%u 最大块=%u",
+             stage,
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+}
+
 static esp_timer_handle_t s_bind_retry_timer;   /* 低堆跳过绑定/字体后的自愈重试 */
 static bool s_font_pending;                     /* 字体还没装上（跳过或装载失败） */
 static void bind_retry_cb(void *arg)
@@ -756,6 +773,34 @@ static void font_retry_arm(void)
     };
     if (esp_timer_create(&t, &s_bind_retry_timer) == ESP_OK)
         esp_timer_start_periodic(s_bind_retry_timer, 10ULL * 1000000ULL);
+}
+
+/* 【压测通道】气泡层已被用户整体去除（CONFIG_MP_BUBBLE_ENABLE=n），
+ * 原来的 `::camtest` 气泡魔数随之失效 → 拖动压测改走 action 指令：
+ *   {"type":"action","value":"camtest:10,8,1"} = 10 步 × 8 世界 px，档位 1。
+ * 正常动作名不含 ':'，不会误触。 */
+static void cam_pan_test_run_ex(int steps, int step, int level);
+
+static bool action_maybe_camtest(const char *action)
+{
+    /* 【抓帧魔数】气泡层已被去除（::shot 失效）→ 帧倾倒改走 action：
+     *   {"type":"action","value":"shot"} → UDP 帧倾倒（排障通道） */
+    if (action && strcmp(action, "shot") == 0) {
+        extern void render_frame_dump_udp(void);
+        render_frame_dump_udp();
+        return true;
+    }
+    /* 【只设档位】"camlevel:N" → 只切调参档位（不动相机），用于抓帧比对 */
+    if (action && strncmp(action, "camlevel:", 9) == 0) {
+        render_cam_adjust_set(atoi(action + 9));
+        return true;
+    }
+    if (!action || strncmp(action, "camtest:", 8) != 0) return false;
+    int st = 12, sp = 8, lv = -1;
+    sscanf(action + 8, "%d,%d,%d", &st, &sp, &lv);
+    if (st <= 0) st = 12;
+    cam_pan_test_run_ex(st, sp, lv);
+    return true;
 }
 
 static void dispatch_action(const char *action)
@@ -916,7 +961,16 @@ void state_machine_banner_restore(void)
 static void dispatch_map(const char *hash)
 {
     char bg[MP_MPK_PATH_MAX];
-    static char strips[16][MP_MPK_PATH_MAX];  /* BGMAP 条带引用（§五）；16=旧导出器分段可到 9+（真机 200000000=9，8 截断致 rc=-100） */
+    /* BGMAP 条带引用（§五）；16=旧导出器分段可到 9+（真机 200000000=9，8 截断致 rc=-100）。
+     * 【内部 RAM 腾挪 2026-10-02】16×96B=1536B 原为内部 .bss 常驻。它只是
+     * 一摞**路径字符串**（喂给 mpak_open/asset_dl 查询），无 DMA 直接读 →
+     * PSRAM 懒分配；分配失败则本图不装条带（退化成只有 static_back，
+     * 与既有"条带 0 条"路径同语义，不崩）。 */
+    static char (*strips)[MP_MPK_PATH_MAX];
+    if (!strips) strips = mp_psram_malloc((size_t)16 * MP_MPK_PATH_MAX);
+    /* 两边都拿不到时 n 归零走"0 条带"路径：active_map/LRU/NVS/相机等后续
+     * 流程一字不动，只是不装条带（与既有"该图没有条带"完全同语义）。 */
+    if (!strips) ESP_LOGW(TAG, "条带路径表分配失败 → 本条按 0 条带装载");
     /* 【指针数组修复 2026-09-27】render_set_map 的形参是 const char **，
      * 此前直接 `(const char **)strips` 强转二维数组 —— 布局是"每行 96B 连续"，
      * 按 char* 解释会把行首 8 个字节当成指针 → 传进去的是野指针，
@@ -939,7 +993,7 @@ static void dispatch_map(const char *hash)
         asset_dl_request_sync();
         return;
     }
-    int n = asset_dl_map_strips(bg, strips, 16);
+    int n = strips ? asset_dl_map_strips(bg, strips, 16) : 0;
     if (n < 0) n = 0;
     /* 【条带数上限修正 2026-10-01】原写死 8：整图新导出里 神秘岛 14 条、明珠港 12 条、
      * 时空裂缝 1 条……被截到 8 → 渲染层判"条带不全"→ **缺段不绘制**（背景少层、
@@ -1034,6 +1088,7 @@ static void dispatch_manifest_synced(void)
      * display_refresh_resume() 再退出，漏一条 = 屏幕永久冻结。
      * 216 板（GRAM）该 API 为空操作，本段零行为变化。 */
     display_refresh_suspend();
+    bind_heap_probe("绑定段入口");
 
     /* 字体三档（气泡 24 / 列表 16 / 标题 32，E12） */
     static const struct { render_font_t id; int px; } fonts[] = {
@@ -1082,6 +1137,7 @@ static void dispatch_manifest_synced(void)
         if (all_ok) s_font_pending = false;
         else        { s_font_pending = true; font_retry_arm(); }
     }
+    bind_heap_probe("字体三档之后");      /* 门拦截时也要打（否则看不到"未装"的对照） */
 
     /* 默认纸娃娃部件 + 站立布局（E13：每设备独立装扮） */
     if (!heap_ok_for_asset_load()) {
@@ -1109,6 +1165,7 @@ static void dispatch_manifest_synced(void)
     } else {
         ESP_LOGE(TAG, "parts 路径查询失败（清单里没有 PARTS）");
     }
+    bind_heap_probe("parts 绑定之后");
     /* 加载失败不黑屏：屏显文字提示（E11 素材故障 → dam 语义的文本版） */
     /* 【TF 并发争用重试 2026-09-30】dispatch（渲染任务）与 sync_once（asset_dl
      * 任务）并发读 TF：SDMMC 1-bit 下偶发 open 失败（真机：同文件 60s 前
@@ -1124,6 +1181,7 @@ static void dispatch_manifest_synced(void)
         }
         ESP_LOGW(TAG, "layout 路径=%s rc=%d", path, lrc);
     }
+    bind_heap_probe("layout 绑定之后");
     if (!l_ok || lrc != 0 ||
         !asset_dl_parts_path(NULL, path, sizeof(path))) {
         /* 【拉取失败降级 2026-09-29，用户定稿】TF 在位但素材没下全（链路/堆
@@ -1237,8 +1295,17 @@ static void dispatch_manifest_synced(void)
          * 就**直接用清单里第一张已缓存 BGMAP 的 content hash 再投一次**
          * （绕过 id→hash 映射），保证"有图就一定有背景"。
          * 用户从菜单选图时照旧按 id 走，不受影响。 */
-        static char hs[8][20]; static char lb[8][32]; static bool ca[8];
-        int n = asset_dl_bgmap_list(hs, lb, ca, 8);
+        /* 【内部 RAM 腾挪 2026-10-02】兜底挑选用的 hash/label/cached 三张小表
+         * （8×20 + 8×32 + 8B = 424B）原为内部 .bss；纯字符串/旗标，
+         * 只在 state_machine 内读 → PSRAM 懒分配，失败即跳过兜底挑选
+         * （与既有"清单里没有 BGMAP"路径同语义）。 */
+        static char (*hs)[20]; static char (*lb)[32]; static bool *ca;
+        if (!hs) hs = mp_psram_malloc(8 * 20);
+        if (!lb) lb = mp_psram_malloc(8 * 32);
+        if (!ca) ca = mp_psram_malloc(8);
+        bool sel_ok = (hs && lb && ca);
+        if (!sel_ok) ESP_LOGW(TAG, "兜底挑选缓冲分配失败 → 跳过本轮兜底挑选");
+        int n = sel_ok ? asset_dl_bgmap_list(hs, lb, ca, 8) : 0;
         if (n > 0 && !asset_dl_map_exists(want)) {
             /* 【挑选优先级 2026-10-01 真机修正】原先只挑"第一张已缓存"，真机暴露
              * 真实场景：NVS 记着 004000032（另一个会话/服务端推过的图），但本设备
@@ -1285,6 +1352,7 @@ void app_cmd_dispatch(const mp_cmd_t *cmd)
 {
     switch (cmd->type) {
     case MP_CMD_SET_ACTION:
+        if (action_maybe_camtest(cmd->s)) break;   /* 压测魔数（见上） */
         dispatch_action(cmd->s);
         break;
     case MP_CMD_SET_EXPRESSION:
@@ -1317,11 +1385,33 @@ void app_cmd_dispatch(const mp_cmd_t *cmd)
         }
         bubble_show(cmd->s, RENDER_FONT_24);   /* 协议传 UTF-8（E12） */
         break;
+    case MP_CMD_CAM_SET: {
+        /* 服务端"选镜头"界面下发：应用到渲染层并写入该图 NVS（重启/断网后仍生效） */
+        if (!render_cam_supported()) {
+            ESP_LOGW(TAG, "服务端相机 %d,%d：当前图非整图包 → 忽略", (int)cmd->a, (int)cmd->b);
+            break;
+        }
+        render_cam_set(cmd->a, cmd->b);
+        int32_t gx = 0, gy = 0;
+        render_cam_get(&gx, &gy);
+        char key[16];
+        /* 当前活动地图的 NVS 键：activity map hash → map_id 派生（与相机 UX 同口径） */
+        const char *ah = asset_dl_active_map_hash();
+        if (ah && asset_dl_map_key(ah, key, sizeof key)) {
+            sm_cam_nvs_set(key, gx, gy);
+            ESP_LOGW(TAG, "服务端相机 → 应用 (%d,%d)，已写入 NVS[key=%s]", (int)gx, (int)gy, key);
+        } else {
+            ESP_LOGW(TAG, "服务端相机 → 应用 (%d,%d)（无活动地图键，未持久化）", (int)gx, (int)gy);
+        }
+        break;
+    }
     case MP_CMD_CAM_PAN_TEST:
         cam_pan_test_run(cmd->a > 0 ? cmd->a : 20, cmd->b != 0 ? cmd->b : 8);
         break;
     case MP_CMD_SET_MAP:
+        bind_heap_probe("地图装载之前");
         dispatch_map(cmd->s);
+        bind_heap_probe("地图装载之后");
         /* 【E7 补齐 2026-09-27】需求：「切换完成后宠物反应 = 随机表情」。
          * 此前切换路径无任何 render_set_expression 调用（核对报告列为缺口）。 */
         switch_random_expression();

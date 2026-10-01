@@ -16,6 +16,7 @@
 
 #include "app_core.h"
 #include "http_client.h"
+#include "mp_psram.h"
 #include "asset_dl.h"
 
 static const char *TAG = "events";
@@ -75,10 +76,21 @@ static void add_hashes_array(cJSON *root, const char *hashes)
 static void events_task(void *arg)
 {
     (void)arg;
-    static mp_event_t batch[BATCH_MAX];
-    static char hashes[MP_HASH_LIST_CAP];
+    /* 【内部 RAM 腾挪 2026-10-02】事件批次（384B）与 hash 列表（4KB）原为
+     * 内部 .bss：前者只是队列出队的拷贝，后者只是拼 JSON 用的字符串数组，
+     * 两者无 DMA、只在事件任务内使用 → PSRAM。懒分配 + 任务常驻复用；
+     * 失败退内部堆（mp_psram_malloc 内建），再失败则本轮跳过上报（有界损失，
+     * 与本文件既有的"失败即丢不重放"口径一致）。 */
+    static mp_event_t *batch;
+    static char       *hashes;
 
     for (;;) {
+        if (!batch)  batch  = mp_psram_malloc(sizeof(mp_event_t) * BATCH_MAX);
+        if (!hashes) hashes = mp_psram_malloc(MP_HASH_LIST_CAP);
+        if (!batch || !hashes) {           /* 两次都拿不到 → 本轮不上报（有界损失） */
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
         /* 阻塞等第一件，再非阻塞捎带（降低请求频次） */
         if (xQueueReceive(mp_event_q, &batch[0], portMAX_DELAY) != pdTRUE) {
             continue;

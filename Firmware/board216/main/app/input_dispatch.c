@@ -29,6 +29,7 @@
 #include "nvs.h"
 
 #include "app_core.h"
+#include "mp_psram.h"
 #include "provision.h"
 #include "hal_contract.h"
 #include "state_machine.h"
@@ -75,12 +76,26 @@ static bool input_cmd_mergeable(mp_cmd_type_t t)
 }
 /* 合并窗口表：下标 = mp_cmd_type_t（表长取最后一个枚举 MP_CMD_SCREENSHOT+1，
  * 别再拿 MP_CMD_OTA_DONE 当上界——BANNER 在枚举里排在它后面，会被漏掉）。 */
-static struct { int64_t ms; char s[24]; } s_last_cmd[MP_CMD_SCREENSHOT + 1];
+/* 【内部 RAM 腾挪 2026-10-02】合并窗口表（26 项 × 32B = 832B）原为内部 .bss。
+ * 内容是"上次同类型指令的参数快照 + 时刻"，只在输入任务内读写，无 DMA →
+ * PSRAM（懒分配、任务常驻复用）。
+ * 空表语义：**没有表就整段不合并**（所有指令照原样下发）。这一点是刻意的——
+ * 兜底成"1 槽零表"再按下标 c->type 访问会越界（type 最大 25），所以这里
+ * 让指针保持 NULL 并以 `s_last_cmd &&` 收口，宁可不合并也绝不越界。 */
+typedef struct { int64_t ms; char s[24]; } in_last_cmd_t;
+static in_last_cmd_t *s_last_cmd;
+static bool           s_last_cmd_tried;
 
 static void input_post_cmd_merged(const mp_cmd_t *c)
 {
+    if (!s_last_cmd_tried) {
+        s_last_cmd_tried = true;
+        s_last_cmd = mp_psram_calloc(MP_CMD_SCREENSHOT + 1, sizeof *s_last_cmd);
+        if (!s_last_cmd) ESP_LOGW(TAG, "指令合并表分配失败 → 关闭同键合并（功能降级，不崩）");
+    }
     int64_t now = mp_now_ms();
-    if (c->type >= MP_CMD_NONE && c->type <= MP_CMD_SCREENSHOT &&
+    if (s_last_cmd &&
+        c->type >= MP_CMD_NONE && c->type <= MP_CMD_SCREENSHOT &&
         input_cmd_mergeable(c->type) && c->s[0]) {
         if (strncmp(s_last_cmd[c->type].s, c->s, sizeof s_last_cmd[0].s - 1) == 0 &&
             (now - s_last_cmd[c->type].ms) < INPUT_MERGE_MS) {

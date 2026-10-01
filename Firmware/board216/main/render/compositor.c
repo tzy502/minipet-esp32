@@ -41,6 +41,7 @@
 #include "render.h"
 
 #include "esp_heap_caps.h"
+#include "mp_psram.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 
@@ -994,7 +995,10 @@ static const rc_part_img_t *pc_get(const mpak_part_t *meta)
         return NULL;
     }
 
-    rc_part_img_t *e = malloc(sizeof *e);
+    /* 【内部 RAM 腾挪 2026-10-02】部件缓存链表节点（48B/个，纸娃娃全装扮
+     * 可达上百个 = 数 KB）原走默认堆 → 内部 RAM。节点只是指针+指纹元数据，
+     * 像素在 psram()（PSRAM）里 → 节点本身放 PSRAM 完全等价。 */
+    rc_part_img_t *e = mp_psram_malloc(sizeof *e);
     if (!e) return NULL;
     e->meta = meta;
     e->px   = psram(pb);
@@ -5028,20 +5032,26 @@ static int bubble_render_fallback(const char *text, uint16_t *buf,
 
 int render_bubble_show(const char *text, render_font_t font)
 {
+    ESP_LOGW(TAG, "[取证] bubble_show 进入 inited=%d menu=%d text='%.12s'",
+             (int)g_inited, (int)g_menu, text ? text : "(null)");
     if (!g_inited) return RENDER_ERR_STATE;
     rc_lock();
     if (g_menu) { rc_unlock(); return RENDER_ERR_STATE; }
     if (!text || !text[0]) { render_bubble_hide(); rc_unlock(); return RENDER_OK; }
 
     uint16_t *buf = psram((size_t)RC_BUBBLE_MAX_W * RC_BUBBLE_MAX_H * 2u);
+    ESP_LOGW(TAG, "[取证] bubble 缓冲 %ux%u = %p", (unsigned)RC_BUBBLE_MAX_W,
+             (unsigned)RC_BUBBLE_MAX_H, (void *)buf);
     if (!buf) { rc_unlock(); return RENDER_ERR_NOMEM; }
 
     int32_t bw = 0, bh = 0;
     int rc = bridge_bubble_render(text, (int)font, buf, RC_BUBBLE_MAX_W,
                                   RC_BUBBLE_MAX_W, RC_BUBBLE_MAX_H, &bw, &bh);
     if (rc != RENDER_OK) {
+        ESP_LOGW(TAG, "[取证] 桥接失败 rc=%d → 走 5x7 兜底", rc);
         rc = bubble_render_fallback(text, buf, RC_BUBBLE_MAX_W, RC_BUBBLE_MAX_H, &bw, &bh);
         if (rc != RENDER_OK) {
+            ESP_LOGW(TAG, "[取证] 5x7 兜底也失败 rc=%d", rc);
             heap_caps_free(buf);
             rc_unlock();
             return rc;
@@ -5165,8 +5175,14 @@ void render_input_tilt(float tilt_deg)
 #define MP_SHOT_KEEP       3                    /* 保留最近 3 张 */
 #define MP_SHOT_MAX_W      512                  /* render_init 校验屏宽上限 512 */
 
-/* 一行 BGR 缓冲：最大屏宽 ×3B + 3B 对齐余量（static，不占运行时堆） */
-static uint8_t s_shot_row[MP_SHOT_MAX_W * 3 + 3];
+/* 一行 BGR 缓冲：最大屏宽 ×3B + 3B 对齐余量。
+ * 【内部 RAM 腾挪 2026-10-02】原为内部 .bss 常驻 1539B —— 截图是**排障**功能，
+ * 不该让它常占内部 DRAM。改 PSRAM 懒分配（首次截图时分配，之后复用）：
+ *   · 该缓冲只被 CPU 逐字节填 BGR，再交给 POSIX write()；落盘时 FatFS 会把行
+ *     拷进它自己的扇区窗口（ff_memalloc 优先 PSRAM）再走 SDMMC，
+ *     本缓冲**不直接进 DMA**，所以放 PSRAM 不影响 SPI/SDMMC 路径；
+ *   · 分配失败 = 本次截图返回 NOMEM（绝不改渲染主流程，本函数只在 debug 路径）。 */
+static uint8_t *s_shot_row;
 
 /* ══ 【UDP 帧倾倒 2026-10-01】远程取证第二通道（TF 截图要拔卡，远程看不见屏） ══
  * 把 g_fb（最终合成帧 RGB565）经 UDP 广播倾倒到局域网 :9999。Mac 侧一条命令收帧：
@@ -5201,7 +5217,13 @@ static void frame_dump_udp_locked(void)
         return;
     }
     const uint8_t *fb = (const uint8_t *)g_fb;
-    static uint8_t pkt[2 + 1400];          /* 1.4KB 在 bss，不占运行时堆 */
+    /* 【内部 RAM 腾挪 2026-10-02】原为内部 .bss 常驻 1402B。此缓冲只做
+     * memcpy(g_fb) → sendto()，lwIP 会把它拷进自己的 pbuf，**不直接进 DMA**
+     * → PSRAM 懒分配（取证通道，首次倾倒时分配，之后复用）。
+     * 分配失败静默 return：取证通道绝不反噬渲染主流程（本函数既有纪律）。 */
+    static uint8_t *pkt;
+    if (!pkt) pkt = mp_psram_malloc(2 + 1400);
+    if (!pkt) { close(sock); return; }
     int sent = 0;
     for (int i = 0; i < data_pkts; i++) {
         size_t off = (size_t)i * payload_max;
@@ -5318,6 +5340,15 @@ int render_screenshot_to_tf(void)
     shot_put_u32(hdr + 30, 0u);                    /* biCompression = BI_RGB */
     shot_put_u32(hdr + 34, img_size);              /* biSizeImage */
     /* bfReserved1/2、biXPelsPerMeter/biYPelsPerMeter/biClrUsed/biClrImportant 恒 0 */
+
+    if (!s_shot_row) s_shot_row = mp_psram_malloc(MP_SHOT_MAX_W * 3 + 3);
+    if (!s_shot_row) {
+        ESP_LOGE(TAG, "截图行缓冲分配失败（PSRAM/内部都拿不到）→ 放弃本次截图");
+        close(fd);
+        unlink(path);                      /* 不留 54B 空壳文件 */
+        rc_unlock();
+        return MPAK_ERR_NOMEM;
+    }
 
     bool io_err = false;
     if (write(fd, hdr, sizeof hdr) != (ssize_t)sizeof hdr) io_err = true;
