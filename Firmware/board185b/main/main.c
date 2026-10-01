@@ -355,6 +355,47 @@ static void app_main_task(void *arg)
         ESP_ERROR_CHECK(err);
     }
 
+    /* ══ 【一次性清理地图偏好 2026-10-01 · 用户口径「把185的地图配置删了」】══════
+     * 范围（**只清配置，不删素材**）：三个命名空间整段清空——
+     *   · `uimap`   —— 活动地图选择（`active`）：清掉后下次开机用默认图，不再记住上次那张
+     *   · `cam`     —— 每张图的相机位置（键 = map_id）：回到各图默认相机
+     *   · `maphide` —— 每张图的隐藏标记：被隐藏的图重新出现在地图菜单
+     * 为什么用 nvs_erase_all 而不是逐键删：maphide 的键名是 map_id 派生、内容随清单变化，
+     * 逐键删容易漏；按命名空间整段清是**完备**的（这也正是用户要的"所有地图配置"）。
+     * 为什么幂等：用一个哨兵键 `purged` 标记已清过，开机只执行一次；清完立刻写哨兵。
+     * 删掉本段代码即恢复"记住地图偏好"的常态行为（其余功能零影响）。
+     * 【素材包不受影响】/sdcard/minipet/bg/ 下的 mpk 与 manifest 完全不动。 */
+    {
+        static const char *kMapNs[] = { "uimap", "cam", "maphide" };
+        bool purged = false;
+        nvs_handle_t h;
+        if (nvs_open("uimap", NVS_READONLY, &h) == ESP_OK) {
+            uint8_t v = 0;
+            purged = (nvs_get_u8(h, "purged", &v) == ESP_OK && v == 1);
+            nvs_close(h);
+        }
+        if (!purged) {
+            for (size_t i = 0; i < sizeof(kMapNs) / sizeof(kMapNs[0]); i++) {
+                if (nvs_open(kMapNs[i], NVS_READWRITE, &h) != ESP_OK) {
+                    ESP_LOGW("main", "地图偏好清理：命名空间 %s 不存在（无需清）", kMapNs[i]);
+                    continue;
+                }
+                esp_err_t er = nvs_erase_all(h);
+                if (er == ESP_OK) nvs_commit(h);
+                ESP_LOGW("main", "地图偏好清理：%s → %s", kMapNs[i],
+                         (er == ESP_OK) ? "已清空" : esp_err_to_name(er));
+                nvs_close(h);
+            }
+            if (nvs_open("uimap", NVS_READWRITE, &h) == ESP_OK) {
+                uint8_t one = 1;
+                nvs_set_u8(h, "purged", one);
+                nvs_commit(h);
+                nvs_close(h);
+                ESP_LOGW("main", "地图偏好清理完成（哨兵已写，后续开机不再重复）");
+            }
+        }
+    }
+
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     /* LWIP TCP/IP 线程启动（必需）：离线起播路径不经过配网，poller 仍会建
      * socket（连接失败优雅返回）；不初始化 → tcpip mbox 断言崩溃 */
