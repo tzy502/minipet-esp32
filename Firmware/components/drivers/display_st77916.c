@@ -101,6 +101,7 @@ static int s_fb_stride;
 static void (*s_frame_lock)(void);
 static void (*s_frame_unlock)(void);
 static volatile bool s_refresh_on;
+static volatile bool s_refresh_suspended;   /* 绑定期挂起标志（display_refresh_suspend/resume） */
 static uint8_t *s_refr_stage;
 static int s_refr_rows;
 
@@ -114,9 +115,20 @@ static void refresh_task(void *arg)
     TickType_t last_wake = xTaskGetTickCount();
     uint32_t frames = 0, fails = 0, last_report = 0;
     while (s_refresh_on && s_fb_src && s_panel) {
+        if (s_refresh_suspended) {
+            /* 【绑定挂起 2026-09-30】素材绑定 fopen 期间挂起绘制，减少本任务
+             * 与渲染层对 s_lock / TF 的竞争。挂起 = 跳过绘制 + 100ms 轮询，
+             * 【绝不退出循环、绝不释放 stage】——任务一旦走到下方 heap_caps_free
+             * + vTaskDelete，resume 后就再无刷新通路 = 屏幕永久冻结。
+             * 期间 display_blit/display_fill_rect 的 s_refresh_on 跳过逻辑照旧，
+             * 屏面静止在最后一帧合成结果。顺手重置相位：挂起期间 last_wake
+             * 持续落后，若不重置，恢复后 vTaskDelayUntil 会连续立即返回追帧空转。 */
+            last_wake = xTaskGetTickCount();
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
         for (int c = 0; c < chunks && s_refresh_on; c++) {
             const int y0 = c * rows;
-            const uint8_t *src = (const uint8_t *)(s_fb_src + (size_t)y0 * s_fb_stride);
             /* 锁序=先帧锁后显示锁：合成器持帧锁→display_blit 拿显示锁；
              * 若本任务反序（持显示锁等帧锁）= ABBA 死锁（真机 15s 全系统冻结实证） */
             if (s_frame_lock) s_frame_lock();
@@ -124,14 +136,27 @@ static void refresh_task(void *arg)
                 if (s_frame_unlock) s_frame_unlock();
                 continue;
             }
-            memcpy(stage, src, chunk_sz);
+            /* 【480 管线复用 2026-10-01】合成器按 216 同构跑 480×480（娃娃/地面/
+             * 时钟/横幅全部原逻辑零改动），本任务唯一缩放点：480→360（×3/4）
+             * 最近邻取样 + 小端→大端交换。 */
+            {
+                const int src_w = (int)s_fb_stride;      /* 480 */
+                const int step_fp = (int)(((int64_t)src_w << 16) / SW);   /* 87381 */
+                for (int ry = 0; ry < rows; ry++) {
+                    int sy = ((int64_t)(y0 + ry) * src_w) / SW;
+                    const uint16_t *srow = s_fb_src + (size_t)sy * s_fb_stride;
+                    uint16_t *drow = (uint16_t *)stage + (size_t)ry * SW;
+                    int sx_fp = 0;
+                    for (int i = 0; i < SW; i++, sx_fp += step_fp)
+                        drow[i] = __builtin_bswap16(srow[sx_fp >> 16]);
+                }
+            }
             xSemaphoreGive(s_lock);
             if (s_frame_unlock) s_frame_unlock();
             bool slot = tx_slot_take();
             esp_err_t e = esp_lcd_panel_draw_bitmap(s_panel, 0, y0, SW, y0 + rows, stage);
             if (slot && e != ESP_OK) tx_slot_give();
             if (e != ESP_OK) fails++;
-            xSemaphoreGive(s_lock);
         }
         frames++;
         if (frames - last_report >= 150) {
@@ -186,6 +211,20 @@ void display_set_frame_source(const uint16_t *fb, int stride)
         }
     }
 #endif
+}
+
+/* 【绑定挂起 2026-09-30】素材绑定（fopen TF 包）期间暂停全帧刷新，减少
+ * 锁/TF 竞争。约定：suspend/resume 必须同作用域成对（调用方负责所有
+ * return 路径都 resume，见 state_machine dispatch_manifest_synced）。
+ * 只置标志，不触碰任务/stage/面板——幂等，重复 suspend 无害。 */
+void display_refresh_suspend(void)
+{
+    s_refresh_suspended = true;
+}
+
+void display_refresh_resume(void)
+{
+    s_refresh_suspended = false;   /* 下一轮 while 检查即恢复绘制 */
 }
 
 esp_err_t display_init(void)
@@ -265,9 +304,10 @@ esp_err_t display_init(void)
                  (unsigned)vc.init_cmds_size);
     }
 
-    /* 【INVON 必需 2026-09-30】官方 v2 表尾的 0x21(INVON) 是本面板显示前提
-     * （补 0x20 INVOFF 立即黑屏，真机实证）——不要动它。 */
-    
+    /* 【INVOFF 固化 2026-09-30】官方 v2 表尾的 0x21(INVON) 对本批次面板是
+     * 错误极性——扫频实证 INVOFF 段颜色正确（段2/3）、INVON 段颜色负片。
+     * 表后补 0x20 关闭反转。MADCTL 保持 RGB(0x00)——扫频段 2/3 均正确，
+     * BGR 位在本面板无区分度。 */
 
     const esp_lcd_panel_dev_config_t pc = {
         .reset_gpio_num = pins->lcd.rst,
@@ -285,55 +325,26 @@ esp_err_t display_init(void)
     esp_lcd_panel_disp_on_off(s_panel, true);
     esp_lcd_panel_swap_xy(s_panel, false);
     esp_lcd_panel_mirror(s_panel, false, false);
-    /* 【BGR 双帧序写入】MADCTL=0x08(BGR=1)：低字节与中间字节两种寄存器
-     * 寻址各发一次——读路径实证中间字节、组件写路径低字节均存在响应，
-     * 无法预判写路径归属，双写保平安（若某一寻址落在别的寄存器，
-     * 后续 disp_on_off 系列会覆盖回来，无累积风险）。 */
+    esp_lcd_panel_io_tx_param(s_io, (uint32_t)0x02 << 24 | 0x20, NULL, 0);   /* INVOFF */
+
+    /* 【COLMOD 取证+强制】像素格式错位=全图色偏+闪烁的候选根因：
+     * 读 0x3A（中间字节读法），非 0x55(16bpp) 则以同款写法强制 0x55。 */
     {
-        uint8_t mctl = 0x08;                         /* MY=0,MX=0,MV=0,BGR=1 */
-        esp_lcd_panel_io_tx_param(s_io, (uint32_t)0x02 << 24 | 0x36, &mctl, 1);
-        esp_lcd_panel_io_tx_param(s_io, (uint32_t)0x02 << 24 | (uint32_t)0x36 << 16, &mctl, 1);
+        uint8_t cm[2] = { 0 };
+        uint32_t rd = (uint32_t)0x3A << 8 | (uint32_t)0x0B << 24;
+        if (esp_lcd_panel_io_rx_param(s_io, rd, cm, 2) == ESP_OK)
+            ESP_LOGW(TAG, "COLMOD(3A)=%02X %02X", cm[0], cm[1]);
+        uint8_t set55 = 0x55;
+        esp_lcd_panel_io_tx_param(s_io, (uint32_t)0x02 << 24 | 0x3A, &set55, 1);
+        cm[0] = cm[1] = 0;
+        if (esp_lcd_panel_io_rx_param(s_io, rd, cm, 2) == ESP_OK)
+            ESP_LOGW(TAG, "COLMOD after force=%02X %02X", cm[0], cm[1]);
     }
 
     s_inited = true;
     ESP_LOGI(TAG, "ST77916(LCD) 就绪 %ux%u QSPI BL=GPIO%d PCLK=%dMHz",
              SW, SH, BL_GPIO, CONFIG_MP_LCD_PCLK_HZ / 1000000);
 
-#if CONFIG_MP_LCD_BRINGUP_TEST
-    /* 【配置扫频判读】三色竖条（左红 中绿 右蓝）轮播 4 配置：
-     *   段0=INVON+BGR 段1=INVON+RGB 段2=INVOFF+BGR 段3=INVOFF+RGB
-     * 用户回报"第几段颜色正确"→ 直接锁定 MADCTL/INV 极性。 */
-    for (int r = 0; r < 2; r++) {
-        for (int ci = 0; ci < 4; ci++) {
-            static const uint8_t inv_arg[4] = { 0xFF, 0xFF, 0x00, 0x00 };
-            (void)inv_arg;
-            if (ci >= 2)
-                esp_lcd_panel_io_tx_param(s_io, (uint32_t)0x02 << 24 | 0x20, NULL, 0);  /* INVOFF */
-            else
-                esp_lcd_panel_io_tx_param(s_io, (uint32_t)0x02 << 24 | 0x21, NULL, 0);  /* INVON */
-            uint8_t mad = (ci == 0 || ci == 2) ? 0x08 : 0x00;
-            esp_lcd_panel_io_tx_param(s_io, (uint32_t)0x02 << 24 | 0x36, &mad, 1);      /* MADCTL */
-
-            static uint8_t bar[120 * 2];
-            for (int seg = 0; seg < 3; seg++) {
-                uint16_t c = (seg == 0) ? 0xF800 : (seg == 1) ? 0x07E0 : 0x001F;
-                uint8_t hi = (uint8_t)(c >> 8), lo = (uint8_t)(c & 0xFF);
-                for (int i = 0; i < 120; i++) { bar[i * 2] = hi; bar[i * 2 + 1] = lo; }
-                for (int y = 0; y < (int)SH; y += 2) {
-                    uint8_t ca[4] = { (uint8_t)((seg * 120) >> 8), (uint8_t)(seg * 120),
-                                      (uint8_t)(((seg + 1) * 120 - 1) >> 8), (uint8_t)((seg + 1) * 120 - 1) };
-                    esp_lcd_panel_io_tx_param(s_io, (uint32_t)0x02 << 24 | 0x2A, ca, 4);
-                    uint8_t ra[4] = { 0, (uint8_t)y, 0, (uint8_t)(y + 1) };
-                    esp_lcd_panel_io_tx_param(s_io, (uint32_t)0x02 << 24 | 0x2B, ra, 4);
-                    esp_lcd_panel_io_tx_param(s_io, (uint32_t)0x32 << 24 | 0x2C, bar, sizeof(bar));
-                }
-            }
-            ESP_LOGW(TAG, "配置段 %d：INV=%d BGR=%d（红|绿|蓝竖条）", ci,
-                     (ci == 0 || ci == 2), (ci == 0 || ci == 2) ? 1 : 0);
-            vTaskDelay(pdMS_TO_TICKS(3000));
-        }
-    }
-#endif
     return ESP_OK;
 }
 
@@ -359,6 +370,7 @@ bool display_tx_busy(void)
 esp_err_t display_blit(int x, int y, int w, int h, const uint8_t *rgb565_be)
 {
     if (!s_inited || !rgb565_be) return ESP_ERR_INVALID_STATE;
+    if (s_refresh_on) return ESP_OK;   /* 持续刷新为唯一显示通路：脏区直推冗余且会交替闪烁 */
     if (x < 0 || y < 0 || w <= 0 || h <= 0 || x + w > SW || y + h > SH)
         return ESP_ERR_INVALID_ARG;
 
@@ -418,6 +430,7 @@ esp_err_t display_brightness(uint8_t pct)
 esp_err_t display_fill_rect(int16_t x, int16_t y, int16_t w, int16_t h, uint16_t rgb565)
 {
     if (!s_inited) return ESP_ERR_INVALID_STATE;
+    if (s_refresh_on) return ESP_OK;   /* 同 blit：刷新流统一呈现 */
     if (x < 0 || y < 0 || w <= 0 || h <= 0 || x + w > SW || y + h > SH)
         return ESP_ERR_INVALID_ARG;
 

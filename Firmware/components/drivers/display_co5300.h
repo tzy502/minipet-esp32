@@ -86,6 +86,18 @@ void display_set_frame_source(const uint16_t *fb, int stride);
 void display_set_frame_locks(void (*lock)(void), void (*unlock)(void));
 
 /**
+ * @brief 暂停/恢复持续全帧刷新（RAMless 面板专用；GRAM 板为空操作）
+ *
+ * 用途：素材绑定等 fopen TF 密集段挂起刷新任务，减少显示锁/TF 竞争
+ * （185B）。挂起期间屏幕静止在最后一帧，任务与 DMA stage 均保留，
+ * resume 后无缝续刷。两个 API 幂等、可重入安全（仅置/清内部标志）。
+ * 【契约】调用方必须保证每条 return 路径都 resume——RAMless 板挂起
+ * 泄漏 = 屏幕永久冻结。216（CO5300 GRAM）实现为空操作，行为零变化。
+ */
+void display_refresh_suspend(void);
+void display_refresh_resume(void);
+
+/**
  * @brief 进入/退出睡眠（CLOCK_DOZE 待机时钟 / FATAL 关屏用，design §4.3）
  *
  * sleep=true: 0x10 SLPIN（屏幕熄灭，功耗降低）

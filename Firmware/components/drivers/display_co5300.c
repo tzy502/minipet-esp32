@@ -283,6 +283,17 @@ void display_set_frame_locks(void (*lock)(void), void (*unlock)(void))
     (void)lock; (void)unlock;   /* 216 GRAM：无持续刷新，无撕裂源 */
 }
 
+/* 【绑定挂起 2026-09-30】216 GRAM 板无持续刷新任务，无需挂起——仅为跨板
+ * API 完整性而存在（185B RAMless 面板才真正消费，见 display_st77916.c）。
+ * 空操作保证 216 板调用点零行为变化。 */
+void display_refresh_suspend(void)
+{
+}
+
+void display_refresh_resume(void)
+{
+}
+
 esp_err_t display_brightness(uint8_t pct)
 {
     /* CO5300 亮度 = 0x51 DBV 命令（0-255）。panel 未就绪前静默跳过，
