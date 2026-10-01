@@ -25,6 +25,7 @@
 
 #include <stdio.h>
 #include <assert.h>
+#include <string.h>      /* 指令合并用的 strcmp（见 render_drain_cmds） */
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -75,6 +76,79 @@ mp_app_config_t g_mp_cfg = {
 /* ------------------------------------------------------------------ */
 /* APP 核任务                                                            */
 /* ------------------------------------------------------------------ */
+/* ══ 【指令排空 + 合并 2026-10-01】═══════════════════════════════════════════
+ * 用户原话："现在因为卡顿体验比较差 会有一种卡顿了以后在突然好多按钮一口气
+ * 点一遍"。
+ *
+ * 机理：渲染任务被长任务堵住时（整图装载 >5s、整屏重合成 100ms 级），cmd_q
+ * 照常收指令（16 深）。堵完恢复后旧代码是 `while (xQueueReceive(...)) dispatch()`
+ * —— 把攒下的十几条**一次性全执行**：屏上就是一串动作连播（气泡/表情/横幅
+ * 一帧一条）。
+ *
+ * 现在的语义（与"忙时丢弃"配套，见 input_dispatch 的 bridge_cam_busy 入口）：
+ *   ① 排空整批后再落地，落地前做一次合并；
+ *   ② 合并只对**纯显示、后到覆盖先到**的类型生效（白名单见 cmd_latest_wins）：
+ *      同类只保留最后一次，屏上表现为"直接到最终状态"，不会有中间态连播；
+ *   ③ 其余类型（BGM_TOGGLE 乒乓、MENU_ENTER/EXIT 状态迁移、REBOOT、OTA_*、
+ *      PAIRING_CODE…）**原样按队列顺序执行**——合并它们会改变语义；
+ *   ④ SET_MAP 只做**完全重复**合并（同 hash 的连投 = 一次 5s 装载的重放）。
+ *   ⑤ 与旧写法的唯一行为差异：指令处理函数内部若再投一条新指令（如
+ *      dispatch_manifest_synced 末尾重投默认地图），旧写法会在**同一次排空**里
+ *      继续收走并执行，现在会留到**下一帧**排空（+33ms）。对渲染/横幅类结果无
+ *      影响，且顺带把"处理函数互相投递"造成的同帧长链截断了（对看门狗更友好）。
+ * 批缓冲是静态的（不进渲染任务栈：该任务栈最紧时只有 3584 字节，见下面
+ * render_stacks 的降档表——1.7KB 的栈数组就是一次栈溢出）。 */
+static bool cmd_latest_wins(mp_cmd_type_t t)
+{
+    switch (t) {
+    case MP_CMD_BUBBLE:          /* 气泡文本：后一条覆盖前一条 */
+    case MP_CMD_BANNER:          /* 顶部横幅：同上 */
+    case MP_CMD_SET_ACTION:      /* 动作：只需最终动作 */
+    case MP_CMD_SET_EXPRESSION:  /* 表情：同上 */
+    case MP_CMD_BRIGHTNESS:      /* 亮度：同上 */
+    case MP_CMD_NET_STATE:       /* 在线态：同上 */
+    case MP_CMD_BGM_STATE:       /* BGM 回显态：同上 */
+    case MP_CMD_OTA_BEGIN:       /* 升级进度提示：同上 */
+        return true;
+    default:
+        return false;
+    }
+}
+
+static int render_drain_cmds(void)
+{
+    static mp_cmd_t s_drain[MP_CMD_Q_LEN];      /* 静态：渲染任务栈最紧只有 3.5KB */
+    static bool     s_drop[MP_CMD_Q_LEN];
+    int n = 0;
+    while (n < MP_CMD_Q_LEN && xQueueReceive(mp_cmd_q, &s_drain[n], 0) == pdTRUE) n++;
+    for (int i = 0; i < n; i++) s_drop[i] = false;
+
+    int merged = 0;
+    for (int i = 0; i < n; i++) {
+        for (int j = i + 1; j < n; j++) {
+            bool dup = (s_drain[j].type == s_drain[i].type);
+            if (dup && !cmd_latest_wins(s_drain[i].type)) {
+                /* 非白名单：只合并**完全一样**的条目（同类型同参数同文本）——
+                 * 例：同 hash 的 MP_CMD_SET_MAP 连投。 */
+                dup = (s_drain[j].a == s_drain[i].a && s_drain[j].b == s_drain[i].b &&
+                       strcmp(s_drain[j].s, s_drain[i].s) == 0);
+            }
+            if (dup) { s_drop[i] = true; merged++; break; }
+        }
+    }
+    if (merged > 0) {
+        ESP_LOGW(TAG, "cmd_q 合并：本拍排空 %d 条，丢弃被覆盖的旧条目 %d 条（防卡顿后一口气执行）",
+                 n, merged);
+    }
+    for (int i = 0; i < n; i++) {
+        if (s_drop[i]) continue;
+        ESP_LOGD(TAG, "cmd 收到 type=%d", (int)s_drain[i].type);
+        app_cmd_dispatch(&s_drain[i]);
+        watchdog_kick();              /* 单条指令若耗时（素材懒加载），也持续喂狗 */
+    }
+    return n - merged;
+}
+
 /* 渲染任务：30fps 帧循环；每帧先排空 cmd_q（net→render 指令落地），
  * 再 render_tick 一帧，最后喂看门狗（E14 渲染心跳）。 */
 static void render_task(void *arg)
@@ -83,7 +157,6 @@ static void render_task(void *arg)
     watchdog_subscribe_render_task();      /* 本任务上下文订阅 TWDT（E14） */
     ESP_LOGW("rt", "render_task 起步");
 
-    mp_cmd_t cmd;
     for (;;) {
         /* 【看门狗熔断修复 2026-09-27】先喂狗再排空指令队列。
          * 真机实证：启动期一次性涌入几十条指令，而每条都打一条 WARN 日志
@@ -92,11 +165,7 @@ static void render_task(void *arg)
          * ① 每条指令的 WARN 降为 DEBUG（启动期不再刷屏）；
          * ② 喂狗提到排空之前，并在每条指令后补喂一次。 */
         watchdog_kick();
-        while (xQueueReceive(mp_cmd_q, &cmd, 0) == pdTRUE) {
-            ESP_LOGD("rt", "cmd 收到 type=%d", (int)cmd.type);
-            app_cmd_dispatch(&cmd);
-            watchdog_kick();              /* 单条指令若耗时（素材懒加载），也持续喂狗 */
-        }
+        render_drain_cmds();              /* 排空 + 合并（见上"指令排空 + 合并"） */
         render_tick();                    /* 4.2 帧循环（30fps） */
         watchdog_kick();
 

@@ -48,6 +48,74 @@ extern bool bridge_cam_adjust_drag_move(int32_t sx, int32_t sy);
 extern void bridge_cam_adjust_drag_end(void);
 extern void bridge_cam_adjust_finish(bool confirm);
 extern void bridge_cam_adjust_poll(void);
+/* 【忙判定 2026-10-01】用户口径："正在做整屏重合成/相机吸附/地图装载的窗口内
+ * 丢弃按键与触摸"+"卡顿后不要一口气把攒的按键都执行一遍"。
+ * lvgl_bridge.c 实现 = render_busy()（重活中/忙尾/相机拖动极限档）+ 相机收尾的
+ * 地图重派发窗口。**忙时直接丢弃**：不排队、不延后执行（下面的按键状态机是
+ * "消费掉边沿但不动作"，否则松手后那次按压会在忙窗结束时补触发）。 */
+extern bool bridge_cam_busy(void);
+
+/* ══ 【输入侧去积压】══════════════════════════════════════════════════════════
+ * 用户原话："卡顿了以后在突然好多按钮一口气点一遍"。除了上面的忙窗丢弃，
+ * 投递口再加一道闸：队列已经用了 ≥3/4（16 深的 cmd_q / 8 深的 audio_q）时
+ * 说明消费端正被长任务堵住 —— 此时**丢新的**而不是继续堆（堆下去的结果就是
+ * 恢复后一次爆发；丢新条目至少保证"队列里的旧意图"不变成一串动作）。
+ * 加一道 250ms 同内容合并：同类型同文本的显示型指令（气泡/横幅/表情）在窗口内
+ * 重复投递只留第一条 —— 等价于用户口径"同一键的重复短按只保留最后一次"。 */
+#define INPUT_Q_FULL_HIGH_WATER(q, len) (uxQueueMessagesWaiting(q) >= (UBaseType_t)((len) * 3 / 4))
+#define INPUT_MERGE_MS 250
+/* 可合并的显示型指令（同类型 + 同文本在 INPUT_MERGE_MS 内只投一次）。
+ * 为什么只列这四类：它们是"同一键连按"产生的重复显示意图（气泡/横幅/动作/
+ * 表情），后到覆盖先到，丢掉重复的**不改变最终画面**；而 SET_MAP/CLOCK/
+ * MENU_* 之类是状态迁移，去重会改变语义（宁可让渲染侧排空时按队列顺序执行）。 */
+static bool input_cmd_mergeable(mp_cmd_type_t t)
+{
+    return t == MP_CMD_BUBBLE || t == MP_CMD_BANNER ||
+           t == MP_CMD_SET_ACTION || t == MP_CMD_SET_EXPRESSION;
+}
+/* 合并窗口表：下标 = mp_cmd_type_t（表长取最后一个枚举 MP_CMD_SCREENSHOT+1，
+ * 别再拿 MP_CMD_OTA_DONE 当上界——BANNER 在枚举里排在它后面，会被漏掉）。 */
+static struct { int64_t ms; char s[24]; } s_last_cmd[MP_CMD_SCREENSHOT + 1];
+
+static void input_post_cmd_merged(const mp_cmd_t *c)
+{
+    int64_t now = mp_now_ms();
+    if (c->type >= MP_CMD_NONE && c->type <= MP_CMD_SCREENSHOT &&
+        input_cmd_mergeable(c->type) && c->s[0]) {
+        if (strncmp(s_last_cmd[c->type].s, c->s, sizeof s_last_cmd[0].s - 1) == 0 &&
+            (now - s_last_cmd[c->type].ms) < INPUT_MERGE_MS) {
+            return;                     /* 同键重复短按 → 只保留最后一次的语义 */
+        }
+        s_last_cmd[c->type].ms = now;
+        strlcpy(s_last_cmd[c->type].s, c->s, sizeof s_last_cmd[0].s);
+    }
+    if (INPUT_Q_FULL_HIGH_WATER(mp_cmd_q, MP_CMD_Q_LEN)) {
+        static int64_t s_full_log_ms;
+        if (now - s_full_log_ms > 1000) {
+            s_full_log_ms = now;
+            ESP_LOGW(TAG, "cmd_q 近满（%u/%d）→ 丢弃本次输入指令 type=%d（防卡顿后爆发）",
+                     (unsigned)uxQueueMessagesWaiting(mp_cmd_q), MP_CMD_Q_LEN, (int)c->type);
+        }
+        return;
+    }
+    if (!mp_post_cmd(c)) ESP_LOGW(TAG, "cmd_q 满：指令 type=%d 未入队", (int)c->type);
+}
+
+/* 音频消息投递（音量±）：同样"近满即丢"，不把卡顿期的连按攒成恢复后的一串音量步进 */
+static void input_post_audio_drop(const mp_audio_msg_t *m)
+{
+    if (INPUT_Q_FULL_HIGH_WATER(mp_audio_q, MP_AUDIO_Q_LEN)) {
+        static int64_t s_log_ms;
+        int64_t now = mp_now_ms();
+        if (now - s_log_ms > 1000) {
+            s_log_ms = now;
+            ESP_LOGW(TAG, "audio_q 近满（%u/%d）→ 丢弃音量指令 a=%d（防卡顿后爆发）",
+                     (unsigned)uxQueueMessagesWaiting(mp_audio_q), MP_AUDIO_Q_LEN, (int)m->a);
+        }
+        return;
+    }
+    if (!mp_post_audio(m)) ESP_LOGW(TAG, "audio_q 满，音量指令丢失");
+}
 
 /* ------------------------------------------------------------------ */
 /* 参数（默认值；阈值可被服务端下发覆盖——E6「阈值全部 Web 可配」）       */
@@ -124,14 +192,14 @@ static void post_action(const char *action)
     strlcpy(s_cur_action, action, sizeof(s_cur_action));
     mp_cmd_t c = { .type = MP_CMD_SET_ACTION };
     strlcpy(c.s, action, sizeof(c.s));
-    mp_post_cmd(&c);
+    input_post_cmd_merged(&c);   /* 忙窗丢弃 + 去积压（见 input_post_cmd_merged） */
 }
 
 static void post_expression(const char *expr)
 {
     mp_cmd_t c = { .type = MP_CMD_SET_EXPRESSION };
     strlcpy(c.s, expr, sizeof(c.s));
-    mp_post_cmd(&c);
+    input_post_cmd_merged(&c);
 }
 
 /* 交互记账：本地闲置计时（随机表情用）+ 状态机唤醒/闲置刷新 */
@@ -674,6 +742,22 @@ static void touch_tick(void)
     }
     cam_down = false;    /* 调参态已结束（按键收尾/状态机打断）：清相机手势残留 */
 
+    /* 【忙窗丢弃触摸 2026-10-01】整屏重合成/窗口缓存补读/地图装载/相机收尾重派发
+     * 期间**直接丢弃**本次触摸：不排队、不延后执行——卡顿后集中触发一串
+     * "抚摸/气泡/控制条"正是用户报的"卡完突然好多按钮一口气点一遍"。
+     * 位置约束（三处都不能动）：
+     *   ① 在相机调参分支**之后**：调参期拖动=相机平移，必须照常跟手；
+     *   ② 在菜单/时钟态的 LVGL 喂帧**之后**：那些态走的是另一条 return 分支；
+     *   ③ 清掉宠物手势状态：忙窗前按下的手势不能在忙窗后补触发（松手那一刻
+     *      若还按着，忙窗结束后会按"新手势"重新开始，语义上就是一次新按压）。 */
+    if (bridge_cam_busy()) {
+        down = false;
+        drag_active = false;
+        longpress_fired = false;
+        cam_down = false;
+        return;
+    }
+
     if (f.touched && !down) {
         down = true;
         down_x = f.x; down_y = f.y;
@@ -816,7 +900,7 @@ static void touch_tick(void)
             input_trigger_expression((rand() % 2) ? MP_EXPR_SMILE : MP_EXPR_LOVE, 1500);
             mp_cmd_t bc = { .type = MP_CMD_BUBBLE };
             strlcpy(bc.s, "hello", sizeof(bc.s));
-            mp_post_cmd(&bc);
+            input_post_cmd_merged(&bc);   /* 连点抚摸 → 只留最后一次气泡（防积压） */
             note_interaction();
         }
     }
@@ -905,12 +989,19 @@ static void key_tick(void)
                 menu_fired = clock_fired = false;
             }
         } else {
-            /* 释放沿：未达长按 → 短按翻转菜单一次（长按已转时钟则吞掉） */
+            /* 释放沿：未达长按 → 短按翻转菜单一次（长按已转时钟则吞掉）。
+             * 【忙窗丢弃 2026-10-01】忙时**消费掉**这次按压（menu_fired=true）但
+             * 不执行动作：不能直接 return——那样边沿没被消费，忙窗结束后这次按压
+             * 会在松手/下一次判定里补触发 = 用户报的"卡顿后一口气点一遍"。 */
             release_pending = true;
             released_ms = now;
             if (latched && !clock_fired && !menu_fired) {
                 menu_fired = true;
-                key_fire_menu_toggle();
+                if (bridge_cam_busy()) {
+                    ESP_LOGI(TAG, "忙窗（重活/装载/相机拖动）→ 丢弃顶键短按，不排队");
+                } else {
+                    key_fire_menu_toggle();
+                }
             }
         }
         note_interaction();
@@ -918,12 +1009,15 @@ static void key_tick(void)
 
     /* 长按 ≥700ms（按住未释放）→ 转时钟模式（用户定稿：长按菜单键=时间）。
      * 【§3.3】相机调参态例外：长按 = 取消（与中键长按同义；调参期不转时钟，
-     * 否则待机时钟会盖掉地图、调参态悬空）。 */
+     * 否则待机时钟会盖掉地图、调参态悬空）。
+     * 【忙窗丢弃】同样"消费但不动作"：clock_fired=true 先落，忙时只打一条日志。 */
     if (latched && stable_pressed && !clock_fired && !menu_fired &&
         (now - press_ms) >= 700) {
         clock_fired = true;
         note_interaction();
-        if (bridge_cam_adjust_active()) {
+        if (bridge_cam_busy()) {
+            ESP_LOGI(TAG, "忙窗（重活/装载/相机拖动）→ 丢弃顶键长按，不排队");
+        } else if (bridge_cam_adjust_active()) {
             ESP_LOGI(TAG, "顶键长按 → 相机取消（复原进入前状态）");
             bridge_cam_adjust_finish(false);
         } else {
@@ -971,6 +1065,15 @@ static void key0_tick(void)
     }
     note_interaction();
     mp_state_t st = state_machine_current();
+    /* 【忙窗丢弃 2026-10-01】重活/装载/相机拖动期：本次按下沿**直接丢弃**。
+     * 位置在 note_interaction() 之后（保留"有人操作"的语义：唤醒待机/重置闲置），
+     * 在各归属分支之前——`key_gpio0_tick()` 已经把这次边沿消费掉了，所以忙窗
+     * 结束后不会补触发（这正是"丢弃而不是延后"）。 */
+    if (bridge_cam_busy()) {
+        ESP_LOGI(TAG, "忙窗（重活/装载/相机拖动）→ 丢弃中键按下沿，不排队（态=%s）",
+                 state_machine_name(st));
+        return;
+    }
     /* 【契约 §3.3 相机调参态】中键（GPIO0）：短按=确认保存、长按(≥800ms)=取消。
      * 与菜单内「短按动作 · 长按退出」同构：按下沿不动作，交按住时长判定，
      * 长按不会顺带触发确认。放在菜单分支之前——调参态跑在 POKER 态（菜单已收起），
@@ -1017,7 +1120,7 @@ static void key0_tick(void)
     }
     /* POKER/OFFLINE：默认音量减（216 板角色分工：GPIO18=菜单键）。 */
     mp_audio_msg_t m = { .type = MP_AUDIO_VOLUME, .a = -10 };
-    if (!mp_post_audio(&m)) ESP_LOGW(TAG, "audio_q 满，音量-丢失");
+    input_post_audio_drop(&m);               /* 近满即丢：不把连按攒成恢复后的一串步进 */
     render_banner_show_for("VOL -", 1500);   /* 定时横幅：1.5s 后渲染侧自动隐藏 */
 }
 
@@ -1038,10 +1141,17 @@ static void key0_menu_hold_tick(void)
     }
     bool still_down = key_gpio0_pressed();
     int64_t held = mp_now_ms() - s_k0_pressed_ms;
+    /* 【忙窗丢弃 2026-10-01】忙窗（重活/装载/相机拖动）期间：状态机照常推进
+     * （阈值判定、释放判定都保留），但**不执行动作**——不能提前 return，
+     * 否则 s_k0_wait_release 一直挂着，等忙窗结束松手时会补触发一次
+     * "确认保存/菜单下移"（= 用户报的"卡顿后突然好多按钮一口气点一遍"）。 */
+    bool busy = bridge_cam_busy();
 
     if (still_down && !s_k0_long_fired && held >= K0_LONG_MS) {
         s_k0_long_fired = true;
-        if (on_cam) {
+        if (busy) {
+            ESP_LOGI(TAG, "忙窗 → 丢弃中键长按（≥%dms），不排队", K0_LONG_MS);
+        } else if (on_cam) {
             ESP_LOGI(TAG, "中键长按（≥%dms）→ 相机取消（复原进入前状态）", K0_LONG_MS);
             bridge_cam_adjust_finish(false);
         } else if (on_bar) {
@@ -1057,7 +1167,9 @@ static void key0_menu_hold_tick(void)
     if (!still_down) {                      /* 释放 */
         s_k0_wait_release = false;
         if (!s_k0_long_fired) {
-            if (s_k0_cam_mode) {
+            if (busy) {
+                ESP_LOGI(TAG, "忙窗 → 丢弃中键短按，不排队");
+            } else if (s_k0_cam_mode) {
                 ESP_LOGI(TAG, "中键短按 → 相机确认保存（NVS 写入 + 重合成）");
                 bridge_cam_adjust_finish(true);
             } else if (s_k0_bar_mode) {
@@ -1225,6 +1337,14 @@ static void pwron_tick(void)
     if (!pmu_pwron_short_press()) return;
     ESP_LOGI(TAG, "底键（PWRON 短按）");
     mp_state_t st = state_machine_current();
+    /* 【忙窗丢弃 2026-10-01】重活/装载/相机拖动期：连音量都不调（用户口径
+     * "这期间不要接受按钮信息"）。AXP2101 的短按是"事件"而非电平，这里丢弃
+     * 就是丢弃——驱动侧已消费该事件，不会补报。 */
+    if (bridge_cam_busy()) {
+        ESP_LOGI(TAG, "忙窗（重活/装载/相机拖动）→ 丢弃底键短按，不排队（态=%s）",
+                 state_machine_name(st));
+        return;
+    }
     if (st == MP_ST_MENU) {
         extern void render_menu_nav(int dir);
         render_menu_nav(1);              /* 菜单内：选中项下移 */
@@ -1237,7 +1357,7 @@ static void pwron_tick(void)
     note_interaction();
     /* POKER/OFFLINE：音量加 */
     mp_audio_msg_t m = { .type = MP_AUDIO_VOLUME, .a = +10 };
-    if (!mp_post_audio(&m)) ESP_LOGW(TAG, "audio_q 满，音量+丢失");
+    input_post_audio_drop(&m);          /* 近满即丢：不把连按攒成恢复后的一串步进 */
     /* 【§3.3】相机调参态：音量照调，但不弹 VOL 横幅——调参提示横幅是那个态下唯一
      * 可见的操作提示（POKER 态无中文文字通道），不能被 1.5s 定时横幅顶掉。 */
     if (bridge_cam_adjust_active()) {

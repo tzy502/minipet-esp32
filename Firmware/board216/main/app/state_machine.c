@@ -885,6 +885,19 @@ static void dispatch_map(const char *hash)
      * 判据日志：`地图装载 <id>（条带 N）rc=0` 的 N 应等于 BGMAP 声明条带数。 */
     if (n > 16) n = 16;
     for (int i = 0; i < n; i++) strip_ptrs[i] = strips[i];
+    /* 【装载期直落相机】把该图的 NVS 相机在装载**之前**交给渲染层，让它第一次
+     * 填窗口缓存就落在正确位置（否则置中填一遍、应用相机再整窗重填一遍，
+     * 真机实测开机 10.7s + 14.2s）。取不到记忆就不调（渲染层按置中）。 */
+    {
+        char ckey[16];
+        int32_t cx = 0, cy = 0;
+        if (asset_dl_map_key(hash, ckey, sizeof(ckey)) && sm_cam_nvs_get(ckey, &cx, &cy)) {
+            render_cam_set_pending(cx, cy);
+            ESP_LOGI(TAG, "地图 %s：装载期直落 NVS 相机 (%d,%d)", hash, (int)cx, (int)cy);
+        } else {
+            render_cam_clear_pending();
+        }
+    }
     int mrc = render_set_map(bg, (n > 0) ? strip_ptrs : NULL, n);
     if (n > 0)
         ESP_LOGI(TAG, "地图条带 %d 条：%s | %s", n, strips[0], (n > 1) ? strips[1] : "-");

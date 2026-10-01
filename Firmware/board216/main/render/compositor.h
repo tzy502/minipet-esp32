@@ -110,8 +110,13 @@ static inline uint32_t rc_align4(uint32_t n) { return (n + 3u) & ~3u; }
 
 /* 窗口缓存尺寸（世界 px）：可见窗口 240×240 + 两侧各 48 余量。
  * 余量内的小幅拖动 = 纯命中（零 TF 读）；超出后只补新露出的边条。 */
-#define RC_CAM_CACHE_W      336
-#define RC_CAM_CACHE_H      336
+/* 【缓存尺寸 2026-10-01 由 336 收到 288】每层窗口缓存 = 可见窗口(240) + 两侧余量。
+ * 余量 48→24 的理由：**装载/切图时间 ∝ 缓存行数**（真机取数：8 条带图一次填充
+ * 5892 行 ≈ 10.2s，SD 有效吞吐 ~230KB/s 是硬顶），336→288 直接省 ~27% 行数；
+ * 代价是拖动时补边条的触发频率从"每 48px"变"每 24px"（一次补边条约 50~130ms，
+ * 在调参降级档下已不构成体感卡顿）。内存也从 1110~2204KB 降到 ~800~1600KB。 */
+#define RC_CAM_CACHE_W      288
+#define RC_CAM_CACHE_H      288
 
 /* 整图包（含可平移余量）→ true；旧窗口包/无地图 → false */
 bool render_cam_supported(void);
@@ -129,14 +134,78 @@ void render_cam_center(void);
  * 返回 -1 = 无地面表/越界/非整图（调用方回落通用线 ground_line_y_at 的口径不变）。 */
 int32_t render_ground_screen_y(int32_t screen_x);
 
-/* 【相机调参性能模式 2026-10-01】用户口径："调整摄像头时卡顿太严重，
- * 调整的时候把背景（条带层）全部隐藏，只留 tile"。
- * on=true → 合成与窗口缓存同步都**跳过整图条带层**（条带是最贵的一层：
- * 每条带一份 336×N 缓存 + 逐像素 1bit 掩码 + 时间滚动相位），拖动只重画
- * static+tile ⇒ 帧耗时可降一个量级；on=false → 恢复完整合成（收尾一帧）。
- * 语义：纯渲染降级，不动任何持久化状态；进出都会整屏重合成一次。 */
-void render_cam_adjust_set(bool on);
-bool render_cam_adjust_get(void);
+/* ══════════════════════════════════════════════════════════════════════════
+ * 【相机调参性能模式（两级降级）2026-10-01 二次定稿】
+ *
+ * 用户口径（原话）："调整摄像头的时候卡顿很严重很严重"；第一版只做了
+ * "跳条带层"（level 1）后**仍然卡**。真机耗时构成（见 compose_region/flush_dirty
+ * 的哨兵日志）决定了单靠跳条带不够——拖动每一拍仍要付：
+ *   · static 全屏 480×480 采样（窗口缓存未命中处还要补边条 = 每 48 世界 px
+ *     一次 336 行 × 逐行 fseek+fread 的小块读，SD 上 ≈ 100ms 级尖峰）；
+ *   · tile 层逐像素 1bit 掩码判定（230K 次位测试）；
+ *   · 上屏 460KB 分块字节交换 + SPI（这一项无论怎么降级都省不掉）。
+ * 所以再加一档"极限档"，把**拖动进行中**的那几帧压到只剩 static 底图 + 上屏：
+ *
+ *   level 0 = 正常：static → 条带 → tile（逐像素掩码）→ 时钟 → 实体 → 气泡 → 横幅。
+ *             **与加本功能之前的整图渲染逐像素一致**（不许动这条路径）。
+ *   level 1 = 跳条带：整图条带层合成与窗口缓存同步都跳过（= 上一版行为，
+ *             条带是最贵的一层：每条带一份 336×N 缓存 + 掩码 + 相位）；
+ *             static + tile 照常。语义：整段调参态的**静止**底色。
+ *   level 2 = 极限：只画 static 底图（tile/条带全跳），且**窗口缓存零 TF 读**
+ *             （cam_scene_sync 整段跳过）——缓存没覆盖到的边缘改用"最近列延展"
+ *             而不是黑边（纯黑带比"拉伸的边缘像素"刺眼得多，且松手后 200ms
+ *             就回 level 1 补回真内容）。相机位移由 UX 层按大步长吸附（见
+ *             lvgl_bridge.c 的 CAM_PAN_SNAP_PX），避免每 1 世界 px 一次整屏重合成。
+ *
+ * 自动回落（"松手出全图"）：拖动停止 200ms → 自动回 level 1（条带仍未画，
+ * 但 tile/条带缓存补齐内容）；再静止 300ms → 自动回 level 0 并整屏重合成一次，
+ * 条带层重新出现 = 用户看到的"松手出全图"。确认/取消/被打断（cam_finish_core）
+ * 直接 set(0)。回落由 render_tick 内的 cam_adjust_tick() 驱动（渲染任务上下文），
+ * 不需要任何 input 侧定时器。
+ *
+ * 语义：纯渲染降级，不动任何持久化状态；每次 level 变化都整屏重合成一次
+ * （level 2 除外：进 level 2 必然伴随一次相机平移 = 整屏已标脏，不必重复合成）。
+ * ══════════════════════════════════════════════════════════════════════════ */
+#define RC_CAM_ADJ_OFF      0
+#define RC_CAM_ADJ_NO_STRIP 1   /* 跳条带层 */
+#define RC_CAM_ADJ_MINIMAL  2   /* 极限：只画 static 底图 + 零 TF 读 */
+#define RC_CAM_ADJ_L2_IDLE_MS 200   /* 拖动停止 → 2 回 1 */
+#define RC_CAM_ADJ_L1_IDLE_MS 300   /* 再静止 → 1 回 0（松手出全图） */
+
+/* 设置降级档（>0 时进调参性能模式；越界自动夹到 [0,2]）。
+ * 注意：level 0 与"进调参态之前"的渲染路径完全一致。 */
+/* 【装载期直落相机 2026-10-01】用户口径"启动渲染卡住 / 切图很久"。
+ * 真机取数（000010000 整图包）：装载后先在**置中相机**填一遍窗口缓存（10.7s），
+ * 紧接着 NVS 相机一应用，锚点跨度过大 → rc_shift_plan 判 RELOAD → **整窗重填**
+ * （14.2s）⇒ 开机光缓存填充就 ~25s。
+ * 用法：装载前调 render_cam_set_pending(x,y)（无记忆则不调），cam_scene_load
+ * 会直接以该相机为初始位置，只填一次；随后 render_cam_set 到同一位置时
+ * 命中缓存（零 IO）。 */
+void render_cam_set_pending(int32_t x, int32_t y);
+void render_cam_clear_pending(void);
+
+void render_cam_adjust_set(int level);
+int  render_cam_adjust_get(void);
+/* UX 层每下发一次相机位移就调一次：进/续 level 2（拖动期极限档）。
+ * 由渲染任务按 RC_CAM_ADJ_L2_IDLE_MS 自动回落到 level 1 → level 0。 */
+void render_cam_adjust_motion(void);
+
+/* ── 忙判定（输入侧丢弃按键/触摸的判据）─────────────────────────────────
+ * 用户口径："正在做整屏重合成/相机吸附/地图装载的窗口内丢弃按键与触摸，
+ * 不要排队、不要延后执行"。render_busy() 为真的三种来源：
+ *   ① 重活深度：地图装载 / 整屏重合成 / 半屏以上脏区 flush 期间（可嵌套计数）；
+ *   ② 忙尾：最后一次重活结束后的 RC_BUSY_TAIL_MS 内（卡顿刚过的那一下也丢，
+ *      否则用户"卡完再按"的那一下正好落进队列形成积压）；
+ *   ③ 相机调参极限档（= 正在拖动/吸附）或显式 loading 窗口（相机收尾重派发地图）。
+ * 只读、可从任意任务调用（内部全是 volatile 标量）。 */
+#define RC_BUSY_TAIL_MS     200
+bool render_busy(void);
+/* 重活窗口（可嵌套；只在渲染任务/持有 rc_lock 的路径调用）。why = 横幅文案前缀。 */
+void render_busy_enter(const char *why);
+void render_busy_leave(void);
+/* 显式 loading 横幅（相机收尾/地图装载窗口；UX 层开关，on=false 立即结束忙窗）。
+ * 文案 = 5x7 ASCII 大写（横幅字库只有 ASCII，中文会渲染成 '?'）。 */
+void render_busy_banner(const char *why, bool on);
 
 #ifdef __cplusplus
 }

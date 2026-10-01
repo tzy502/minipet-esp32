@@ -11,6 +11,9 @@
 #include "sd_tf.h"
 
 #include <time.h>        /* time()：TF 自愈节流用系统时钟 */
+#include <fcntl.h>       /* open()：TF 只读吞吐基准 */
+#include <unistd.h>      /* pread/close */
+#include "esp_timer.h"   /* 基准计时 */
 
 #include <errno.h>
 #include <stdio.h>
@@ -161,6 +164,37 @@ int sd_mount(void)
     s_mounted = true;
     s_on_flash = false;
     s_tf_present = true;                 /* TF 在位（此后空卡降级不清此标志） */
+    /* 【SD 有效吞吐基准 2026-10-01】整图装载/切图慢的定位需要"硬顶"数据：
+     * 顺序读 1MB（32KB 块，POSIX pread 绕过 stdio/FATFS f_read 语义）。
+     * 若这里也只有 ~200KB/s ⇒ 卡/总线到顶，优化方向只能是"少读"；
+     * 若 1MB/s+ ⇒ 读模式还有空间。只在启动打一行。 */
+    {
+        static const char *cands[] = {
+            "/sdcard/minipet/font/15438471dce64329.mpk",
+            "/sdcard/minipet/bg/b8336dcfb192b6db.mpk",
+            NULL
+        };
+        int fd = -1;
+        for (int i = 0; cands[i] && fd < 0; i++) fd = open(cands[i], O_RDONLY);
+        uint8_t *buf = malloc(32 * 1024);
+        if (fd >= 0 && buf) {
+            int64_t t0 = esp_timer_get_time();
+            size_t total = 0;
+            for (int k = 0; k < 32; k++) {
+                ssize_t r = pread(fd, buf, 32 * 1024, (off_t)total);
+                if (r <= 0) break;
+                total += (size_t)r;
+            }
+            int64_t dt = esp_timer_get_time() - t0;
+            if (dt > 0 && total > 0)
+                ESP_LOGW(TAG, "SD 顺序读基准：%u KB / %lld ms = %u KB/s（1-bit 20MHz 理论 2560 KB/s）",
+                         (unsigned)(total / 1024), (long long)(dt / 1000),
+                         (unsigned)((uint64_t)total * 1000u / (uint64_t)dt));
+        }
+        if (buf) free(buf);
+        if (fd >= 0) close(fd);
+    }
+
     sdmmc_card_print_info(stdout, s_card);
     ESP_LOGI(TAG, "SD 已挂载 %s（SDMMC 1-bit：CMD=%d CLK=%d D0=%d）",
              SD_MOUNT_POINT, pins->sd.mosi, pins->sd.sclk, pins->sd.miso);
