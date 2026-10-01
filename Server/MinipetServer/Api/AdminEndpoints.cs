@@ -315,7 +315,8 @@ public static class AdminEndpoints
         //                                  （写成 {"type":"cam","payload":"1,2"} 会被静默忽略）
         //   ⚠ 写成 {"value":"…"} / {"n":…} 之类的对象会被固件静默忽略（既不报错也不生效）——勿改。
         g.MapPost("/devices/{id}/command", (string id, DeviceCommandRequest body,
-            DeviceRegistry reg, CommandQueue queue, DeviceEventLog eventLog) =>
+            DeviceRegistry reg, CommandQueue queue, DeviceEventLog eventLog,
+            CameraPlanStore cameraStore) =>
         {
             var dev = reg.Get(id);
             if (dev == null) return NotFoundDevice(id);
@@ -452,11 +453,19 @@ public static class AdminEndpoints
                     {
                         error = $"cam 需要 value=\"<x>,<y>\"（整图世界坐标，非负整数；收到：{camValue ?? "<null>"}）"
                     }, statusCode: 400);
-                var normalized = $"{camX},{camY}";
+                /* 【必须带 mapId 2026-10-02】真机事故：Web 上选了 A 图推机位，而设备当时
+                 * 显示的是 B 图 ⇒ 旧口径（只有 x,y）把坐标应用到了**错误的图**上，还写进
+                 * 了 B 图的 NVS（用户现象："上送了但位置不对/像失败"）。
+                 * 固件已支持 "<mapId>,<x>,<y>"：先切到该图再定位。这里由服务端补 mapId
+                 * （Web 不必改）：优先用请求里显式给的 mapId，否则用该设备"最近一次选过的图"
+                 * （camera-positions.json 的 lastMapId）。 */
+                string? mapId = body?.MapId?.Trim();
+                if (string.IsNullOrEmpty(mapId)) mapId = cameraStore.Get(id).lastMapId;
+                var normalized = string.IsNullOrEmpty(mapId) ? $"{camX},{camY}" : $"{mapId},{camX},{camY}";
                 var cmd = queue.EnqueueLegacy(id, "cam", normalized, null);
                 eventLog.Append(id, $"指令下发：cam 机位 ({normalized})");
-                return Results.Json(new { ok = true, seq = cmd.Seq, type, value = normalized, x = camX, y = camY },
-                    statusCode: 202);
+                return Results.Json(new { ok = true, seq = cmd.Seq, type, value = normalized,
+                                          mapId, x = camX, y = camY }, statusCode: 202);
             }
 
             return Results.Json(new
@@ -539,7 +548,8 @@ public static class AdminEndpoints
         // 反了设备会先收到切图指令而新 manifest 还没拉到。
         g.MapPost("/devices/{id}/push", (string id, DevicePushRequest body, DeviceRegistry reg,
             DeviceAssetService assets, WzService wz, DeviceManifestService mfst, CommandQueue queue,
-            DeviceEventLog eventLog, HealthReport health, Config.ServerPaths paths) =>
+            DeviceEventLog eventLog, HealthReport health, Config.ServerPaths paths,
+            CameraPlanStore camera) =>
         {
             try
             {
@@ -596,6 +606,15 @@ public static class AdminEndpoints
                             var bgHash = FindBgmapHash(paths, id, assetId);
                             if (bgHash != null)
                             {
+                                /* 【2026-10-02】切图成功即记"当前图"= 这张：删除地图的保护判据
+                                 * （DELETE …/camera/maps/{mapId} 的 409）用的就是 camera-positions.json
+                                 * 的 lastMapId，此前只有「选镜头」上送机位会写它 —— 刚推完切过去、
+                                 * 还没设机位的那张会被当成"可删"（保护漏判）。失败不阻断切图。 */
+                                try { camera.SetLastMap(id, assetId); }
+                                catch (Exception ex)
+                                {
+                                    Console.Error.WriteLine($"[DevicePush] 设备 {id} 记 lastMapId={assetId} 失败（不影响切图）: {ex.Message}");
+                                }
                                 queue.Enqueue(id, "map", new { id = bgHash });
                                 _ = Task.Run(async () =>
                                 {
@@ -790,6 +809,10 @@ public static class AdminEndpoints
         public string? Type { get; set; }
         public string? Value { get; set; }
         public int? N { get; set; }
+        /// <summary>【cam 专用】目标地图 id（整图世界坐标所属的图）。缺省时服务端用
+        /// camera-positions.json 的 lastMapId。见 cam 分支注释：不带 mapId 会把机位
+        /// 应用到设备**当前显示**的图（真机事故）。</summary>
+        public string? MapId { get; set; }
         /// <summary>
         /// 点播曲目（bgm + value=track）：源内 key（WZ 源 = /music/tracks 返回的 id 字段）。
         /// 【Web 点歌 2026-09-27】用户报障「页面 bgm 没有选择歌曲的地方」——曲库行内点播按钮带本字段。

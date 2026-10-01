@@ -125,6 +125,247 @@ public sealed class DeviceAssetService
     }
 
     /// <summary>
+    /// 从该设备 manifest 里**删除一张地图**（Web「选镜头」卡片地图列表的删除按钮 → 端点
+    /// DELETE /api/admin/devices/{id}/camera/maps/{mapId}）。
+    ///
+    /// 语义：只摘 manifest 条目（= 服务端"愿意服务"的清单），**不动磁盘 mpak 文件**——
+    /// 设备侧对账（Firmware/…/asset_dl.c prune_stale_locked）本就以清单为准剪除本地索引，
+    /// 磁盘文件由设备自己的 LRU 淘汰；服务端留文件是为了可重推/可复用，且删文件不可逆
+    /// （同既有"换口径重导只摘旧条目"的 RemoveMapEntries 口径）。
+    ///
+    /// 删谁（判据，勿轻改）：
+    ///   ① 主条目：selector=map &amp; kind=BGMAP &amp; extra.map==mapId（与 CameraService.ReadBgmapEntries /
+    ///      AdminEndpoints.FindBgmapHash 同口径：kind/selector 忽略大小写，map 用 Ordinal 精确匹配）。
+    ///   ② 派生条带 PARTS：label 以 `条带 {mapId}#` 或 `背景层 {mapId}#` 开头（AssetExporter.ExportMap
+    ///      只有地图导出会写这两个前缀；`#` 分隔符保证 "200000000" 不会误配 "2000000000" 的图），
+    ///      外加主包**条带表 part_ref** 直接引用的 hash（读包头 96B 解析，权威引用关系）。
+    ///   ③ 派生缩略图：主条目 `thumb` 字段指向的 hash，或 label 恰为 `缩略图 {mapId}` 的 THUMB 条目。
+    /// 共享资产（纸娃娃 / NPC 的 PARTS+LAYOUT、FONT、AUDIO_META）**永不进候选集**：label 不带上述
+    /// 前缀、kind 也不是条带/缩略图形态 —— 这是"别误删共享资产"的第一道闸门。
+    ///
+    /// 第二道闸门 = **引用计数**：内容寻址（hash=内容身份）下同一份条带可能被另一张图的 BGMAP
+    /// 条带表引用、同一张缩略图可能被两个 BGMAP 的 thumb 指向 ⇒ 只要还有**存活条目**引用它，
+    /// 就保留（记进 KeptAssets 说明原因）。若存活 BGMAP 的包文件读不到（引用关系未知），
+    /// 一律保守保留条带候选（多留一条无害，误删会让另一张图缺素材）。
+    ///
+    /// 幂等：清单里没有这张图 → Removed=false 直接返回（不写盘、不 bump rev），由端点回 200。
+    /// 调用方负责 BumpRev（本服务不认识 DeviceManifestService）与"当前图"保护判定。
+    /// </summary>
+    public MapDeleteResult DeleteMap(string deviceId, string mapId)
+    {
+        ValidateIds(deviceId, mapId, "地图 id");
+        mapId = mapId.Trim();
+        lock (_deviceLocks.GetOrAdd(deviceId, _ => new object()))
+        {
+            var deviceDir = DeviceDir(deviceId);
+            var root = ReadIndex(Path.Combine(deviceDir, ManifestBuilder.AssetsManifestFileName));
+            var assetsObj = root["assets"] as JsonObject ?? new JsonObject();
+            var result = new MapDeleteResult { MapId = mapId, RemainingMaps = CountBgmapMaps(assetsObj) };
+
+            // ① 主条目
+            var mainHashes = new List<string>();
+            foreach (var kv in assetsObj)
+                if (kv.Value is JsonObject e && IsBgmapOfMap(e, mapId)) mainHashes.Add(kv.Key);
+            if (mainHashes.Count == 0) return result;      // 幂等：本来就没有这张图
+
+            // ②/③ 候选派生条目（先收集，引用计数后再决定去留）
+            var candidates = new Dictionary<string, DeletedAsset>(StringComparer.Ordinal);
+            string stripA = $"条带 {mapId}#", stripB = $"背景层 {mapId}#", thumbLabel = $"缩略图 {mapId}";
+            foreach (var kv in assetsObj)
+            {
+                if (mainHashes.Contains(kv.Key) || kv.Value is not JsonObject e) continue;
+                var kind = e["kind"]?.GetValue<string>() ?? "";
+                var label = e["label"]?.GetValue<string>() ?? "";
+                if (string.Equals(kind, "PARTS", StringComparison.OrdinalIgnoreCase)
+                    && (label.StartsWith(stripA, StringComparison.Ordinal) || label.StartsWith(stripB, StringComparison.Ordinal)))
+                {
+                    candidates[kv.Key] = new DeletedAsset
+                    {
+                        Hash = kv.Key, Kind = "PARTS", Label = label,
+                        Reason = "该图专用条带 PARTS（label 前缀判定：" + (label.StartsWith(stripA, StringComparison.Ordinal) ? stripA : stripB) + "）",
+                    };
+                }
+                else if (string.Equals(kind, "THUMB", StringComparison.OrdinalIgnoreCase)
+                         && string.Equals(label, thumbLabel, StringComparison.Ordinal))
+                {
+                    candidates[kv.Key] = new DeletedAsset
+                    {
+                        Hash = kv.Key, Kind = "THUMB", Label = label,
+                        Reason = $"该图专用缩略图（label = {thumbLabel}）",
+                    };
+                }
+            }
+            foreach (var h in mainHashes)
+            {
+                if (assetsObj[h] is not JsonObject main) continue;
+                var file = main["file"]?.GetValue<string>();
+                if (!string.IsNullOrEmpty(file))
+                {
+                    var refs = ReadBgmapStripRefs(Path.Combine(deviceDir, file));
+                    if (refs != null)
+                        foreach (var r in refs)
+                            candidates.TryAdd(r, new DeletedAsset
+                            {
+                                Hash = r, Kind = "PARTS",
+                                Label = (assetsObj[r] as JsonObject)?["label"]?.GetValue<string>(),
+                                Reason = "被该图 BGMAP 条带表引用（part_ref）",
+                            });
+                }
+                var thumbHash = main["thumb"]?.GetValue<string>();
+                if (!string.IsNullOrEmpty(thumbHash))
+                    candidates.TryAdd(thumbHash, new DeletedAsset
+                    {
+                        Hash = thumbHash, Kind = "THUMB",
+                        Label = (assetsObj[thumbHash] as JsonObject)?["label"]?.GetValue<string>(),
+                        Reason = "该图 BGMAP 的 thumb 字段指向",
+                    });
+            }
+
+            // 引用计数：存活条目（除即将删除的主条目外）持有的 hash 引用
+            var referenced = new HashSet<string>(StringComparer.Ordinal);
+            bool stripRefsComplete = true;                 // false = 有存活 BGMAP 的包读不到 → 条带一律不删
+            foreach (var kv in assetsObj)
+            {
+                if (mainHashes.Contains(kv.Key) || kv.Value is not JsonObject e) continue;
+                var th = e["thumb"]?.GetValue<string>();
+                if (!string.IsNullOrEmpty(th)) referenced.Add(th);         // 缩略图引用（纯 JSON，无需读包）
+                if (!IsBgmapAny(e)) continue;
+                var file = e["file"]?.GetValue<string>();
+                if (string.IsNullOrEmpty(file)) { stripRefsComplete = false; continue; }
+                var refs = ReadBgmapStripRefs(Path.Combine(deviceDir, file));
+                if (refs == null) stripRefsComplete = false;
+                else foreach (var r in refs) referenced.Add(r);
+            }
+
+            foreach (var (hash, cand) in candidates)
+            {
+                if (assetsObj[hash] is not JsonObject ce) continue;         // 已不在索引里（同 hash 只占一条）
+                var kind = ce["kind"]?.GetValue<string>() ?? "";
+                bool isParts = string.Equals(kind, "PARTS", StringComparison.OrdinalIgnoreCase);
+                bool isThumb = string.Equals(kind, "THUMB", StringComparison.OrdinalIgnoreCase);
+                if (!isParts && !isThumb)
+                {
+                    result.KeptAssets.Add(new DeletedAsset { Hash = hash, Kind = kind, Label = cand.Label,
+                        Reason = "kind 不是 PARTS/THUMB（共享资产形态），不删" });
+                    continue;
+                }
+                if (referenced.Contains(hash))
+                {
+                    result.KeptAssets.Add(new DeletedAsset { Hash = hash, Kind = kind, Label = cand.Label,
+                        Reason = "仍被其它存活条目引用（引用计数 > 0：同内容条带被另一张图共用），保留" });
+                    continue;
+                }
+                if (isParts && !stripRefsComplete)
+                {
+                    result.KeptAssets.Add(new DeletedAsset { Hash = hash, Kind = kind, Label = cand.Label,
+                        Reason = "有存活 BGMAP 的包文件读不到（引用关系未知）→ 保守保留" });
+                    continue;
+                }
+                assetsObj.Remove(hash);
+                cand.Kind = kind;
+                result.RemovedAssets.Add(cand);
+            }
+
+            foreach (var h in mainHashes)
+            {
+                if (assetsObj[h] is JsonObject main)
+                {
+                    result.BgmapHash ??= h;
+                    result.Label ??= main["label"]?.GetValue<string>();
+                }
+                assetsObj.Remove(h);
+            }
+            root["assets"] = assetsObj;
+            WriteIndex(deviceDir, root);
+            result.Removed = true;
+            result.RemainingMaps = CountBgmapMaps(assetsObj);
+            Console.WriteLine($"[DeviceAsset] 设备 {deviceId} 删除地图 {mapId}（{result.Label}）："
+                              + $"摘除 BGMAP {mainHashes.Count} 条 + 派生素材 {result.RemovedAssets.Count} 条"
+                              + $"（保守保留 {result.KeptAssets.Count} 条），剩余地图 {result.RemainingMaps} 张");
+            return result;
+        }
+    }
+
+    /// <summary>删除结果（端点直接序列化回 Web）。</summary>
+    public sealed class MapDeleteResult
+    {
+        public string MapId { get; set; } = "";
+        /// <summary>主条目 label（导出器写的中文地图名）；幂等分支为 null。</summary>
+        public string? Label { get; set; }
+        /// <summary>true = 主条目确实被摘掉；false = 清单里本来就没有这张图（幂等）。</summary>
+        public bool Removed { get; set; }
+        public string? BgmapHash { get; set; }
+        /// <summary>本次摘掉的派生条目（条带 PARTS / 缩略图），带中文判据。</summary>
+        public List<DeletedAsset> RemovedAssets { get; set; } = new();
+        /// <summary>判定为"仍被引用/引用关系未知"而**保留**的候选（排障用；不删）。</summary>
+        public List<DeletedAsset> KeptAssets { get; set; } = new();
+        /// <summary>删完该设备清单里还剩几张 BGMAP 地图。</summary>
+        public int RemainingMaps { get; set; }
+    }
+
+    /// <summary>被删/被保留的派生条目（hash + kind + label + 中文判据）。</summary>
+    public sealed class DeletedAsset
+    {
+        public string Hash { get; set; } = "";
+        public string Kind { get; set; } = "";
+        public string? Label { get; set; }
+        public string Reason { get; set; } = "";
+    }
+
+    private static bool IsBgmapOfMap(JsonObject e, string mapId)
+        => string.Equals(e["kind"]?.GetValue<string>(), "BGMAP", StringComparison.OrdinalIgnoreCase)
+           && string.Equals(e["selector"]?.GetValue<string>(), "map", StringComparison.OrdinalIgnoreCase)
+           && string.Equals(e["map"]?.GetValue<string>(), mapId, StringComparison.Ordinal);
+
+    private static bool IsBgmapAny(JsonObject e)
+        => string.Equals(e["kind"]?.GetValue<string>(), "BGMAP", StringComparison.OrdinalIgnoreCase)
+           && string.Equals(e["selector"]?.GetValue<string>(), "map", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>清单里剩余的 BGMAP 地图条数（= Web 列表/设备菜单会看到的张数）。</summary>
+    private static int CountBgmapMaps(JsonObject assetsObj)
+    {
+        int n = 0;
+        foreach (var kv in assetsObj)
+            if (kv.Value is JsonObject e && IsBgmapAny(e)) n++;
+        return n;
+    }
+
+    /// <summary>
+    /// 读 BGMAP 包的条带表 part_ref 集合（**只读文件头部 ~100B**：整图包 17MB 级，绝不能整包读）。
+    /// 布局（BgmapPackWriter 类头 / mpak wire）：MPAK 信封 40B → payload 头 56B
+    /// （map_id32 | vw2 | vh2 | static_len4 | static_off4 | tile_len4 | tile_off4 | strip_count4）
+    /// → strip_count × 14B（part_ref u64 | y i16 | speed_x i16 | rx u8 | blend u8）。
+    /// 返回 null = 文件缺失/头不合法（调用方按"引用关系未知"保守处理，绝不据此删派生条目）。
+    /// </summary>
+    private static List<string>? ReadBgmapStripRefs(string mpakPath)
+    {
+        try
+        {
+            if (!File.Exists(mpakPath)) return null;
+            using var fs = File.OpenRead(mpakPath);
+            var head = new byte[Mpak.HeaderSize + 56];
+            if (fs.Read(head, 0, head.Length) != head.Length) return null;
+            if (!head.AsSpan(0, 4).SequenceEqual("MPAK"u8)) return null;
+            uint payloadLen = BitConverter.ToUInt32(head, 32);
+            if (payloadLen < 56) return null;
+            int stripCount = (int)BitConverter.ToUInt32(head, Mpak.HeaderSize + 52);
+            if (stripCount is < 0 or > 4096) return null;              // 明显损坏：别拿它当引用集
+            var refs = new List<string>(stripCount);
+            if (stripCount == 0) return refs;
+            var table = new byte[stripCount * 14];
+            if (fs.Read(table, 0, table.Length) != table.Length) return null;
+            for (int i = 0; i < stripCount; i++)
+                refs.Add($"{BitConverter.ToUInt64(table, i * 14):x16}");   // manifest 键口径 = 16 位小写 hex
+            return refs;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[DeviceAsset] 读 BGMAP 条带表失败 {mpakPath}: {ex.Message}");
+            return null;
+        }
+    }
+
+    /// <summary>
     /// 确保设备的 manifest-assets.json 已登记该 NPC 资产包（PARTS 整包 + 每动作 LAYOUT）。
     /// 返回是否实际生成新包（false = 索引已有该 NPC，幂等跳过）。
     /// NPC 数据缺失/条带导出失败抛异常，由上层记录。
@@ -171,7 +412,6 @@ public sealed class DeviceAssetService
 
     private static void MergeAndWrite(string deviceDir, JsonObject root, List<ExportedAsset> assets)
     {
-        Directory.CreateDirectory(deviceDir);
         var assetsObj = root["assets"] as JsonObject ?? new JsonObject();
         foreach (var a in assets)
         {
@@ -179,6 +419,17 @@ public sealed class DeviceAssetService
             assetsObj[$"{a.Hash:x16}"] = EntryOf(a);
         }
         root["assets"] = assetsObj;
+        WriteIndex(deviceDir, root);
+    }
+
+    /// <summary>
+    /// 落盘索引（generated 时间戳刷新；中文 label 不转义，同既有写手口径）。
+    /// 删除路径（DeleteMap）只摘条目、不写任何包文件，所以单独抽出来复用。
+    /// 调用方须已持有该设备的锁（_deviceLocks）。
+    /// </summary>
+    private static void WriteIndex(string deviceDir, JsonObject root)
+    {
+        Directory.CreateDirectory(deviceDir);
         root["generated"] = DateTimeOffset.UtcNow.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'");
         File.WriteAllText(Path.Combine(deviceDir, ManifestBuilder.AssetsManifestFileName),
             root.ToJsonString(new JsonSerializerOptions

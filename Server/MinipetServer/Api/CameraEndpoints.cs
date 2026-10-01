@@ -21,6 +21,8 @@ namespace MinipetServer.Api;
 ///   GET  /maps/{mapId}/viewport?x=&y=   → 该机位下"设备实际会看到的那一屏" PNG（1x，Web 按 2x 显示）
 ///   PUT  /camera  {mapId,x,y}           → 记录坐标（幂等 upsert 到 data/camera-positions.json）
 ///   GET  /camera                        → 全部机位（Web 重新打开时回填；/maps 里也带一份）
+///   DELETE /maps/{mapId}                → 从该设备素材清单删除这张图（BGMAP + 仅它引用的派生
+///                                         素材）并 BumpRev；正在使用的图 409 拒绝（见端点注释）
 /// 下发设备仍走既有 POST /api/admin/devices/{id}/command 的 type=cam 通道（AdminEndpoints）。
 /// </summary>
 public static class CameraEndpoints
@@ -122,6 +124,110 @@ public static class CameraEndpoints
                 resp.Headers["X-Cam-Win-W"] = map.WinW.ToString();
                 resp.Headers["X-Cam-Win-H"] = map.WinH.ToString();
                 resp.Headers["X-Cam-Clamped"] = (cx != (x ?? 0) || cy != (y ?? 0)) ? "1" : "0";
+            });
+        });
+
+        /// <summary>
+        /// 从该设备素材清单里**删除一张地图**（Web「选镜头」卡片地图列表的删除按钮）。
+        ///
+        /// 语义：摘掉 manifest-assets.json 里这张图的 BGMAP 主条目 + 仅它引用的派生素材
+        /// （条带 PARTS / 缩略图，判据与引用计数见 DeviceAssetService.DeleteMap 注释），
+        /// 然后 BumpRev —— 设备长轮询被唤醒 → 拉新清单 → 对账剪除本地条目
+        /// （固件 asset_dl.c prune_stale_locked：清单里没有的条目一律剪掉，菜单里随之消失）。
+        /// 磁盘 mpak 不动（设备侧 LRU 自己淘汰；服务端留文件可重推，删除不可逆故不做）。
+        ///
+        /// 保护：**设备当前正在使用的那张图拒绝删除**（409，中文原因），见下方口径注释。
+        /// 幂等：清单里没有这张图 → 200 { removed:false, idempotent:true }（不是 500，也不必 404——
+        /// 页面重试/重复点击都应当成功）。设备不存在 404、mapId 空 400。
+        /// </summary>
+        g.MapDelete("/devices/{id}/camera/maps/{mapId}", (string id, string mapId, DeviceRegistry reg,
+            CameraService camera, CameraPlanStore store, DeviceAssetService assets, DeviceManifestService mfst,
+            DeviceEventLog eventLog) =>
+        {
+            if (reg.Get(id) == null) return NotFoundDevice(id);
+            var mid = mapId?.Trim();
+            if (string.IsNullOrEmpty(mid))
+                return Results.Json(new { error = "mapId 必填（路径参数，取自 GET …/camera/maps 的 mapId）" },
+                    statusCode: 400);
+
+            /* ══ 「当前正在使用的图」保护（用户口径：删了会没有背景可渲染）══════════════
+             * 服务端现成口径只有一份：data/camera-positions.json 的 lastMapId，写它的是
+             *   ① PUT …/camera（「选镜头」上送机位 = 这张图正在被设备渲染）；
+             *   ② POST …/push {switch:true}（AdminEndpoints 切图后补记一笔，2026-10-02 加）。
+             * 设备端**不回报** active_map（它只把 active_map 写本地 /sdcard/minipet/manifest.json），
+             * 所以这是服务端能拿到的最强信号，局限必须在返回体里讲清：
+             *   · 服务端从未记录过切图/机位（新设备、换服务端实例）→ 判不出来，放行；
+             *   · 用户在设备菜单上手动换过图 → 服务端不知道，放行。
+             * 兜底：固件在"活动图不在清单里"时会回落到清单首图（1.85B 的 fallback 装载），
+             * 不会永久黑屏；所以这里选**拒绝**（提示先切图）而不是自动切默认图 ——
+             * 切图是另一条指令链路（要等设备下完包再发 SET_MAP），混进删除请求里会让人
+             * 以为"已经切好了"，明确让用户先切更不容易出错。
+             * 返回体 note 里也带上这句口径，便于页面/排障看到判据。 */
+            var (lastMapId, _) = store.Get(id);
+            string activeNote = string.IsNullOrEmpty(lastMapId)
+                ? "服务端没有该设备的切图/机位记录（口径：最后设过机位或最后推送切图的那张），本次未做占用保护"
+                : $"服务端口径的当前图 = {lastMapId}（最后设过机位 / 最后推送切图的那张）";
+            if (!string.IsNullOrEmpty(lastMapId) && string.Equals(lastMapId, mid, StringComparison.Ordinal))
+            {
+                var cur = camera.FindMap(id, mid);
+                var curLabel = cur != null ? $"{cur.Label}（{mid}）" : mid;
+                Console.WriteLine($"[MapDelete] 设备 {id} 拒绝删除当前正在使用的图 {mid}（lastMapId 口径）");
+                return Results.Json(new
+                {
+                    error = $"地图 {curLabel} 是设备当前正在使用的图（{activeNote}）——删了会没有背景可渲染。"
+                            + "请先切到别的图：到「素材推送」把目标地图推一次（缺省勾选自动切图即会切过去），"
+                            + "或在「选镜头」里给目标图上送一次机位，然后再删这张。",
+                    code = "map_in_use",
+                    deviceId = id,
+                    mapId = mid,
+                    activeMapId = lastMapId,
+                }, statusCode: 409);
+            }
+
+            var result = assets.DeleteMap(id, mid);
+            long rev = mfst.GetCurrentRev(id);
+            if (result.Removed)
+            {
+                // 清单变了 → rev+1（BumpRev 内部还会往指令队列塞 manifest 唤醒指令，
+                // 长轮询立即返回；设备收到新清单即对账剪除本地条目）
+                rev = mfst.BumpRev(id, $"删除地图 {mid}（用户操作）");
+                eventLog.Append(id, $"删除地图 {mid}（{result.Label}）：摘除 BGMAP 1 条 + 派生素材 "
+                                    + $"{result.RemovedAssets.Count} 条，剩余 {result.RemainingMaps} 张");
+                Console.WriteLine($"[MapDelete] 设备 {id} 删除地图 {mid}：派生 {result.RemovedAssets.Count} 条"
+                                  + $"（保留 {result.KeptAssets.Count}），剩余 {result.RemainingMaps} 张，rev={rev}");
+            }
+            else
+            {
+                Console.WriteLine($"[MapDelete] 设备 {id} 删除地图 {mid}：清单里没有这张图 → 幂等返回（rev={rev} 不变）");
+            }
+
+            return Results.Json(new
+            {
+                ok = true,
+                deviceId = id,
+                mapId = mid,
+                label = result.Label,
+                removed = result.Removed,
+                /** true = 该图本来就不在清单里（重复删除/已被删过）：成功但什么都没做 */
+                idempotent = !result.Removed,
+                bgmapHash = result.BgmapHash,
+                removedAssets = result.RemovedAssets,
+                removedCount = result.RemovedAssets.Count,
+                /** 判定为仍被引用而保留的候选（正常为空；非空说明有另一张图共用了同内容素材） */
+                keptAssets = result.KeptAssets,
+                keptCount = result.KeptAssets.Count,
+                remainingMaps = result.RemainingMaps,
+                manifestRev = rev,
+                activeMapId = lastMapId,
+                warning = result.RemainingMaps == 0
+                    ? "该设备清单里已经没有任何地图：设备下次同步后没有 BGMAP 可渲染"
+                      + "（固件会尝试回落默认图 000010000，那份没登记则背景为黑）"
+                    : null,
+                note = result.Removed
+                    ? "已从该设备素材清单移除该地图及其专用素材（BGMAP 主包 + 条带 PARTS + 缩略图）；"
+                      + "磁盘 .mpk 保留（设备侧按清单对账剪除条目，文件由其 LRU 淘汰）；"
+                      + "设备下次同步（长轮询 ≤55s，已被 rev 唤醒）后本地清单里不再有这张图。"
+                    : "该图本来就不在该设备清单里（幂等：无需删除）。"
             });
         });
 

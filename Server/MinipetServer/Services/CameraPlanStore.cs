@@ -145,6 +145,31 @@ public sealed class CameraPlanStore
         return Clone(saved);
     }
 
+    /// <summary>
+    /// 只更新"最后操作过的地图"（不动任何机位）。写盘失败抛异常（调用方在后台任务里 catch 记日志）。
+    ///
+    /// 为什么需要：删除地图（DELETE /api/admin/devices/{id}/camera/maps/{mapId}）要拒绝删除
+    /// "设备当前正在渲染的那张"，而服务端唯一的信号就是本文件的 LastMapId。此前只有
+    /// PUT /camera（上送机位）会写它 —— 「素材推送」按 switch 切图（push → SET_MAP 指令）同样
+    /// 是"把设备切到了这张图"，不记的话"刚推过去、还没设机位"的那张会被当成可删（保护漏判）。
+    /// </summary>
+    public void SetLastMap(string deviceId, string mapId)
+    {
+        if (string.IsNullOrWhiteSpace(deviceId) || string.IsNullOrWhiteSpace(mapId)) return;
+        lock (_gate)
+        {
+            if (!_model.Devices.TryGetValue(deviceId, out var plan))
+            {
+                plan = new DevicePlan();
+                _model.Devices[deviceId] = plan;
+            }
+            plan.LastMapId = mapId.Trim();
+            plan.LastUpdatedUtc = DateTime.UtcNow;
+            StorageUtil.AtomicWriteAllText(_paths.CameraPositionsFile,
+                JsonSerializer.Serialize(_model, FileJsonOpts));
+        }
+    }
+
     private static Position Clone(Position p) => new()
     {
         X = p.X, Y = p.Y, Vw = p.Vw, Vh = p.Vh, UpdatedUtc = p.UpdatedUtc,

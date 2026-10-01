@@ -190,10 +190,25 @@ static void handle_cmd(cJSON *jc)
         strlcpy(c.s, v, sizeof(c.s));
         mp_post_cmd(&c);
     } else if (strcmp(t, "cam") == 0 && v) {
-        /* 【服务端选镜头】{"type":"cam","value":"<x>,<y>"}（世界坐标）→ 应用并落 NVS。
-         * 服务端是主口径，本地卡只是辅助（断网时用 NVS 记忆）。 */
+        /* 【服务端选镜头】两种载荷：
+         *   "<x>,<y>"        旧：应用到**当前**地图（保留兼容）
+         *   "<mapId>,<x>,<y>" 新：**先切到该地图再定位**。
+         * 为什么必须带 mapId：真机事故——用户在 Web 上选了 876008001 推送机位，
+         * 而设备当时显示的是别的图 ⇒ 旧口径把坐标应用到了**错误的图**上，
+         * 还写进了那张图的 NVS（用户看到"上送了但没生效/位置不对"）。
+         * 服务端为主口径，本地卡只是辅助（断网时用 NVS 记忆）。 */
+        char mid[16] = "";
         int cx = 0, cy = 0;
-        if (sscanf(v, "%d,%d", &cx, &cy) == 2) {
+        if (sscanf(v, "%15[^,],%d,%d", mid, &cx, &cy) == 3) {
+            mp_cmd_t m = { 0 };                 /* 先切图（幂等：已在该图则无操作） */
+            m.type = MP_CMD_SET_MAP;
+            strlcpy(m.s, mid, sizeof(m.s));
+            mp_post_cmd(&m);
+            c.type = MP_CMD_CAM_SET;
+            c.a = cx; c.b = cy;
+            strlcpy(c.s, mid, sizeof(c.s));     /* 带地图 id：装载完成后校验再应用 */
+            mp_post_cmd(&c);
+        } else if (sscanf(v, "%d,%d", &cx, &cy) == 2) {
             c.type = MP_CMD_CAM_SET;
             c.a = cx; c.b = cy;
             mp_post_cmd(&c);

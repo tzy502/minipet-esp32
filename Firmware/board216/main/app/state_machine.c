@@ -89,10 +89,18 @@ static const char *active_map_get(char *buf, size_t cap);
 bool sm_cam_nvs_set(const char *key, int32_t x, int32_t y);   /* 定义在后段 */
 static bool    s_cam_pending;
 static int32_t s_cam_pending_x, s_cam_pending_y;
+static char    s_cam_pending_map[16];      /* 目标地图 id（空=不限定） */
 
 static void cam_pending_apply(void)
 {
     if (!s_cam_pending || !render_cam_supported()) return;
+    /* 目标图校验：不等目标图装载完就不应用（防"应用到错误的图"） */
+    if (s_cam_pending_map[0]) {
+        char cur[16] = "";
+        const char *h = asset_dl_active_map_hash();
+        if (h) asset_dl_map_id_of(h, cur, sizeof cur);
+        if (strcmp(cur, s_cam_pending_map) != 0) return;
+    }
     s_cam_pending = false;
     render_cam_set(s_cam_pending_x, s_cam_pending_y);
     int32_t gx = 0, gy = 0;
@@ -1414,12 +1422,23 @@ void app_cmd_dispatch(const mp_cmd_t *cmd)
          * 与启动/换图重叠）→ render_cam_supported() 还是 false → 之前直接丢弃，
          * 用户在 Web 点了"上送"却没反应。改为**挂起记忆**：地图一装载成功就补上
          * （见 dispatch_map 成功分支的 cam_pending_apply）。 */
-        if (!render_cam_supported()) {
+        /* 【目标图校验 2026-10-02】指令带 mapId 时必须等**那张图**装载完成再应用；
+         * 若当前显示的是别的图（或不支持平移），一律挂起（SET_MAP 已由 poller 先投）。 */
+        char want[16];
+        strlcpy(want, cmd->s, sizeof want);
+        char cur[16] = "";
+        const char *ah = asset_dl_active_map_hash();
+        if (ah) asset_dl_map_id_of(ah, cur, sizeof cur);
+        bool map_ok = (want[0] == 0) || (cur[0] && strcmp(want, cur) == 0);
+        if (!render_cam_supported() || !map_ok) {
             s_cam_pending_x = cmd->a;
             s_cam_pending_y = cmd->b;
             s_cam_pending = true;
-            ESP_LOGW(TAG, "服务端相机 %d,%d：当前图非整图包 → 挂起，待整图装载后自动补上",
-                     (int)cmd->a, (int)cmd->b);
+            strlcpy(s_cam_pending_map, want, sizeof s_cam_pending_map);
+            ESP_LOGW(TAG, "服务端相机 %d,%d 目标图='%s'（当前='%s' 支持=%d）→ 挂起，"
+                          "待目标整图装载后自动补上", (int)cmd->a, (int)cmd->b,
+                     want[0] ? want : "(当前图)", cur[0] ? cur : "(无)",
+                     (int)render_cam_supported());
             break;
         }
         render_cam_set(cmd->a, cmd->b);
@@ -1427,7 +1446,6 @@ void app_cmd_dispatch(const mp_cmd_t *cmd)
         render_cam_get(&gx, &gy);
         char key[16];
         /* 当前活动地图的 NVS 键：activity map hash → map_id 派生（与相机 UX 同口径） */
-        const char *ah = asset_dl_active_map_hash();
         if (ah && asset_dl_map_key(ah, key, sizeof key)) {
             sm_cam_nvs_set(key, gx, gy);
             ESP_LOGW(TAG, "服务端相机 → 应用 (%d,%d)，已写入 NVS[key=%s]", (int)gx, (int)gy, key);
