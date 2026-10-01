@@ -17,7 +17,7 @@ RAMless 面板：靠持续全帧刷新任务维持画面（合成器 480×480 �
 ## 目录结构
 
 ```
-Firmware/
+Firmware/board185b/                    # 工程根（2026-10-01 双板目录化，自持独立 ESP-IDF 工程）
 ├── CMakeLists.txt                    # 工程根；SDKCONFIG_DEFAULTS + EXTRA_COMPONENT_DIRS
 ├── sdkconfig.defaults                # 通用默认（FREERTOS_HZ=1000 / FATFS LFN / 性能优先）
 ├── sdkconfig.defaults.amoled185b     # 185B 板级默认（含素材堆门 6KB）
@@ -71,6 +71,7 @@ key_gpio0_init();            // 6. 菜单键 BOOT=GPIO0（input 任务内）
 ## 构建
 
 ```bash
+cd Firmware/board185b         # 工程根 = board185b 目录（仓库根/CMakeLists.txt 已不存在）
 idf.py -B build build        # 需 main/ 组件就位（应用层）
 ```
 

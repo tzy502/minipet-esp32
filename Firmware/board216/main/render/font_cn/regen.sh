@@ -1,9 +1,9 @@
 #!/bin/bash
 # 重新烘焙菜单中文字体：自动提取 lvgl_bridge.c 全部菜单用字（防缺字）
-# 用法：在仓库任意目录执行 bash Firmware/main/render/font_cn/regen.sh
+# 用法：在仓库根执行 bash Firmware/board216/main/render/font_cn/regen.sh
 set -e
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
-SRC="$ROOT/Firmware/main/render/lvgl_bridge.c"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"   # = Firmware/board216/
+SRC="$ROOT/main/render/lvgl_bridge.c"
 OUT_DIR="$(dirname "${BASH_SOURCE[0]}")"
 FONT="/Library/Fonts/Arial Unicode.ttf"
 

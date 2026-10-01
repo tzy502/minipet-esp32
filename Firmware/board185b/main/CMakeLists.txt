@@ -58,7 +58,7 @@ idf_component_register(
 )
 
 # profiles/lcd185b.h：profiles 组件经 drivers 传递暴露（drivers.h 里 #include "lcd185b.h"）；
-# render/render.h 里也是 #include "lcd185b.h" —— 需要 Firmware 根目录在包含路径上。
+# render/render.h 里也是 #include "lcd185b.h" —— 需要工程根目录（Firmware/board185b）在包含路径上。
 target_include_directories(${COMPONENT_LIB} PRIVATE
     "${CMAKE_CURRENT_LIST_DIR}/.."
     "${CMAKE_CURRENT_LIST_DIR}/../profiles"

@@ -19,7 +19,7 @@
 const minipet_profile_t MINIPET_PROFILE_LCD185B = {
     /* 【合成器空间=480×480 2026-10-01】与既有 480 世界→屏幕管线同构（RC_SCALE=2、
      * 地面表/娃娃/时钟/横幅全部原逻辑零改动），360 面板的适配收敛在显示驱动
-     * 的唯一缩放点（480→360 取样）。教训见 docs/ai/amoled185b-bringup-pitfalls.md。 */
+     * 的唯一缩放点（480→360 取样）。教训见 docs/amoled185b-bringup-pitfalls.md（随板文档）。 */
     .width  = 480,
     .height = 480,
     .shape  = MINIPET_SHAPE_ROUND,

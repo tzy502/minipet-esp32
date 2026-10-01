@@ -1,5 +1,5 @@
 /*
- * render.h — 固件渲染层对外总接口（Firmware/main/render/）
+ * render.h — 固件渲染层对外总接口（Firmware/board216/main/render/）
  *
  * 面向 app/（状态机）与 net/（指令执行）。除 render_input_tilt 外，
  * 所有函数必须与 render_tick 同任务调用（APP_CPU lvgl 任务，软件设计 4.1）。

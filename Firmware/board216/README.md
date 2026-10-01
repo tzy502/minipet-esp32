@@ -1,7 +1,8 @@
-# Firmware — ESP32-S3 固件
+# Firmware/board216 — ESP32-S3 固件（AMOLED-2.16 板）
 
-目标硬件：Waveshare ESP32-S3-Touch-AMOLED-2.16（SKU 33969）
+目标硬件：Waveshare ESP32-S3-Touch-AMOLED-2.16（SKU 33969，CO5300 480×480）
 框架：ESP-IDF v5.5+ + LVGL v9
+本目录是独立自持的 ESP-IDF 工程（与 Firmware/board185b 零共享文件）。
 
 固件铁律：
 - 零 WZ 解析（素材由服务端下发）
@@ -9,13 +10,14 @@
 - 设备永远是 HTTP client
 - 动画只播服务端下发布局表（WZ 真实 action，禁自创）
 
-引脚表见 ../docs/ai/waveshare-wiki-ESP32-S3-Touch-AMOLED-2.16.md
+引脚表见 ../../docs/ai/waveshare-wiki-ESP32-S3-Touch-AMOLED-2.16.md（仓库级文档）
+本板自持文档：docs/technical-reference.md、docs/hardware-bringup-issues.md
 已知坑：GPIO46=PA_CTRL 功放使能（不开无声）；GPIO14/15 共享 I2C 五器件。
 
 ## 目录结构
 
 ```
-Firmware/
+Firmware/board216/
 ├── CMakeLists.txt               # 工程根；SDKCONFIG_DEFAULTS + EXTRA_COMPONENT_DIRS
 ├── sdkconfig.defaults           # 通用默认（FREERTOS_HZ=1000 / FATFS LFN / 性能优先）
 ├── sdkconfig.defaults.amoled216 # 板级：S3 / 240MHz / 8MB Octal PSRAM / 16MB Flash QIO
@@ -75,8 +77,9 @@ sd_mount();                  // 8. TF 卡（SPI3_HOST，失败返回 errno，app
 ## 构建
 
 ```bash
+cd Firmware/board216        # 必须 cd 进板级工程根（仓库根/Firmware 层都没有 CMakeLists）
 idf.py set-target esp32s3   # 首次
-idf.py build flash monitor  # 需 main/ 组件就位（应用层）
+idf.py build flash monitor  # 首次构建会下载托管组件（managed_components/）
 ```
 
 sdkconfig 默认值链：`sdkconfig.defaults` → `sdkconfig.defaults.amoled216`。

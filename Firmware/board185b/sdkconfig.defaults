@@ -50,7 +50,7 @@ CONFIG_LV_FONT_MONTSERRAT_28=y
 # 熔断待机）。若置 y：IDF panic 处理器会在渲染栈已损坏（正是卡死场景）时接管，
 # 绕过 watchdog.c 的 NVS 计数与熔断路径 —— 与设计相反，且表现为不可控重启循环。
 # 诊断期若确需 panic 回溯，临时改 y 并同步 watchdog.c（trigger_panic 跟随本项），
-# 用完必须回 n：docs/ai/technical-reference.md「临时件清理清单」同源。
+# 用完必须回 n：docs/technical-reference.md（本目录自持副本）「临时件清理清单」同源。
 CONFIG_ESP_TASK_WDT_PANIC=n
 
 # E11 OTA 真回滚（2026-09-27）：新固件能启动但坏了时由 bootloader 回滚旧分区。

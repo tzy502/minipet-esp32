@@ -1,5 +1,6 @@
 # 1.85B 显示 bring-up —— 坑与教训实录(2026-10-01)
 
+> 本档随板存放于 Firmware/board185b/docs/（2026-10-01 双板目录化）。
 > 本文档由主会话按用户要求落地。配套代码状态见 git 工作区(未提交清单在文末)。
 > 记忆卡同步:`~/.zcode/cli/memories/.../amoled185b-bringup.md`。
 

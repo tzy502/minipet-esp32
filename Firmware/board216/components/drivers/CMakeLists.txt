@@ -1,7 +1,7 @@
 # BSP 驱动层组件：只依赖硬件外设驱动 + profiles 引脚表。
 # 对外暴露 components/drivers/include/drivers.h（统一入口头）。
 #
-# 单板分支（board-216，仅 AMOLED-2.16）：显示驱动固定 display_co5300.c
+# board216 工程（仅 AMOLED-2.16 板）：显示驱动固定 display_co5300.c
 # （480x480 AMOLED，CO5300，背压版，勿动）。
 set(DRIVERS_DISPLAY_SRCS "display_co5300.c")
 

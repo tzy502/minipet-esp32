@@ -1,5 +1,9 @@
 # MiniPet ESP32 技术总档（唯一权威技术文档）
 
+> 【目录化注记 2026-10-01】本档为 board185b 目录自持副本，仅服务 LCD-1.85B 板。
+> 正文第一章等处的 2.16 板（CO5300/CST9220/AXP2101/ES8311）事实章节**不适用于本板**；
+> 本板（ST77916 360×360）硬件与 bring-up 事实以本目录 `amoled185b-bringup-pitfalls.md` 为权威。
+
 > 【分支注记 2026-10-01】本分支 = board-185b 单板分支（仅 LCD-1.85B / ST77916）。
 > worktree 路径：/Users/a502/IdeaProjects/minipet-esp32-185b。
 > 禁止在本分支构建/烧录 2.16 板（2.16 一切工作在 board-216 分支的 worktree 做）。
@@ -40,7 +44,7 @@ SD 1/2/3/41 · LCD 4/5/6/7/12/38/39 · 音频 8/9/10/42/45/46 · 触摸 11/40 ·
 ### 2.1 环境（每次新 shell 必做）
 ```bash
 source /Users/<USER>/esp/esp-idf/export.sh        # IDF v5.5
-cd /Users/<USER>/IdeaProjects/minipet-esp32/Firmware   # ⚠️ 必须 cd 进这层，仓库根目录没有 CMakeLists
+cd /Users/<USER>/IdeaProjects/minipet-esp32/Firmware/board185b   # ⚠️ 必须 cd 进本板工程目录，仓库根目录没有 CMakeLists
 ```
 - IDF 自带 python（含 pyserial）：`/Users/<USER>/.espressif/python_env/idf5.5_py3.9_env/bin/python`——系统 python3 **没有** serial 模块，抓日志必须用这个。
 
@@ -84,7 +88,7 @@ s.setDTR(False); s.setRTS(True); time.sleep(0.1); s.setRTS(False)   # RTS 脉冲
 ### 2.4 常见故障
 | 症状 | 处置 |
 |---|---|
-| `idf.py` 报 CMakeLists not found | 当前目录不对，cd 进 Firmware |
+| `idf.py` 报 CMakeLists not found | 当前目录不对，cd 进本板工程目录 Firmware/board185b |
 | 端口打不开/烧录失败 | 残留 monitor 占口：`lsof | grep usbmodem` 找 PID kill，或 pkill -f idf_monitor |
 | ModuleNotFoundError: serial | 用 IDF 环境的 python（见 2.1） |
 | 恢复出厂（重配网） | esptool `erase_region 0x9000 0xF000`（只擦 NVS 不动 assets）；配网页 WiFi 密码 12 位 <WIFI_PASSWORD> |
@@ -100,7 +104,7 @@ s.setDTR(False); s.setRTS(True); time.sleep(0.1); s.setRTS(False)   # RTS 脉冲
 
 **铁律（避免互相影响）**：
 1. **端口名会换**（重插 USB 后 21101/21201 可能互换）——任何 flash/reset 前先静听 5 秒核对身份特征，**禁止裸 `idf.py flash`**（必须 `-p` 显式指定）。
-2. **构建目录已分板**：板A=Firmware/build、板B=Firmware/build-185b（各自 `-B` 指定）；同目录并行 `idf.py build` 会互相踩（ninja 锁/半成品）。
+2. **构建目录已随双板目录化天然隔离**（2026-10-01）：板A=Firmware/board216/build、板B=Firmware/board185b/build（各自工程目录内的 build/）；同一工程目录内并行 `idf.py build` 仍会互相踩（ninja 锁/半成品）。
 3. 串口互斥：monitor/脚本用完立刻关，不然对方烧录报端口占用。
 4. 服务端天然隔离：deviceId 由 MAC 派生，两板各自注册/配对/manifest，互不覆盖；Web 换装注意选对 deviceId。
 5. WiFi 两板各自 DHCP，无冲突。
