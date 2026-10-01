@@ -141,9 +141,74 @@ namespace MinipetServer.Services
         {
             if (string.IsNullOrEmpty(mapId)) return string.Empty;
             var cache = _mapNameCache;
-            if (cache != null && cache.TryGetValue(mapId, out var name)) return name;
+            if (cache != null && TryLookup(cache, mapId, out var name)) return name;
             return $"map_{mapId}";
         }
+
+        /* ══ 【地图 id 键形态归一 2026-10-01：任务 A 根因】══
+         * 实测（探针 BuildMapNameCache）：String/Map.img 的键是**去前导零的数字**
+         * —— 000010000 → 键 "10000"（"彩虹岛：枫树山丘"），而 ListMapIds()/Map{0..9}/*.img
+         * 文件名口径是 9 位带前导零（"000010000"）。两者不等价 ⇒ 旧代码拿带前导零的 id
+         * 去查 String/Map.img 必然 miss，GetMapName 回退哨兵 map_{id}，push 端点登记的
+         * BGMAP label 于是成了 `map_000010000` 裸编号（设备菜单"数字编号"根因）。
+         * 9 位 id（100000000/200000100…）两种形态相同，所以此前只有短 id 地图暴露问题。 */
+        private static string CanonicalMapKey(string mapId)
+            => long.TryParse(mapId, out var n) && n >= 0 ? n.ToString() : mapId;
+
+        /// <summary>按「原样 → 去前导零」两种键查目录缓存。</summary>
+        private static bool TryLookup(Dictionary<string, string> cache, string mapId, out string name)
+        {
+            if (cache.TryGetValue(mapId, out name!)) return true;
+            var canon = CanonicalMapKey(mapId);
+            return !string.Equals(canon, mapId, StringComparison.Ordinal) && cache.TryGetValue(canon, out name!);
+        }
+
+        /// <summary>
+        /// 【任务 A 根因层 2026-10-01】直接解析单张地图的 **WZ 真实名**（中文），
+        /// **不依赖后台目录缓存是否建好**：目录命中且非哨兵 → 直接用；否则现场读
+        /// String/Map.img/{分组}/{id}（ResolveUol 后取 mapName + streetName，
+        /// 与 BuildMapNameCache 同口径同锁纪律；键按"原样/去前导零"两种形态各试一次）。
+        /// 返回 "" = WZ 里确实没有名字（调用方自行兜底），**绝不返回 `map_{id}` 哨兵**
+        /// —— 哨兵正是 push 端点 label 出现 `map_000010000` 裸编号的原因。
+        /// </summary>
+        public string ResolveMapName(string mapId)
+        {
+            if (string.IsNullOrEmpty(mapId)) return "";
+            var cache = _mapNameCache;   // 引用读，无需持锁
+            if (cache != null && TryLookup(cache, mapId, out var cached) && !IsMissSentinel(mapId, cached))
+                return cached;
+            if (!_wz.IsWzLoaded || _wz.WzRoot == null) return "";
+            lock (_wz.WzLock)
+            {
+                try
+                {
+                    var imgNode = _wz.WzRoot.FindNodeByPath(true, "String", "Map.img");
+                    var img = imgNode?.GetValue<Wz_Image>();
+                    if (img == null || !img.TryExtract()) return "";
+                    string canon = CanonicalMapKey(mapId);
+                    foreach (Wz_Node group in img.Node.Nodes)
+                    {
+                        var idNode = group.FindNodeByPath(mapId)
+                                     ?? (canon != mapId ? group.FindNodeByPath(canon) : null);
+                        if (idNode == null) continue;
+                        var resolved = idNode.ResolveUol() ?? idNode;
+                        var mapName = resolved.FindNodeByPath("mapName")?.GetValueEx<string>(null);
+                        var streetName = resolved.FindNodeByPath("streetName")?.GetValueEx<string>(null);
+                        if (!string.IsNullOrEmpty(streetName) && !string.IsNullOrEmpty(mapName))
+                            return $"{streetName}：{mapName}";
+                        if (!string.IsNullOrEmpty(mapName)) return mapName;
+                        if (!string.IsNullOrEmpty(streetName)) return streetName;
+                        return "";   // 节点在但无名字 → 交给调用方兜底
+                    }
+                }
+                catch (Exception ex) { Console.Error.WriteLine($"[MapCatalogService] ResolveMapName({mapId}): {ex.Message}"); }
+            }
+            return "";
+        }
+
+        /// <summary>目录/取名口径里的 miss 哨兵形态 == `map_{id}`（真地图名不可能长这样）。</summary>
+        public static bool IsMissSentinel(string mapId, string? name)
+            => !string.IsNullOrEmpty(name) && name == $"map_{mapId}";
 
         /// <summary>
         /// 后台构建地图目录缓存（单飞 + 版本化）：LoadWz 成功后触发；WZ 重载时仅发布最新一次构建结果。

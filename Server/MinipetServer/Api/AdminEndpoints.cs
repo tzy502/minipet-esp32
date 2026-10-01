@@ -488,6 +488,10 @@ public static class AdminEndpoints
                     return Results.Json(new { error = "WZ 未加载（到「设置」页配置后重试）" }, statusCode: 503);
 
                 bool switchAfter = body?.Switch != false;
+                // R2 整图口径开关（缺省 false = 现网 240×240 窗口包，行为不变）；仅 map 生效
+                bool fullMap = kind == "map" && body?.FullMap == true;
+                if (fullMap)
+                    Console.WriteLine($"[DevicePush] 设备 {id} 地图 {assetId} 请求**整图口径**（R2：vw/vh=整图 1x 尺寸 + 地面表）");
                 _ = Task.Run(() =>
                 {
                     try
@@ -496,7 +500,7 @@ public static class AdminEndpoints
                         // 调用方放后台线程）→ bump rev（设备长轮询被唤醒、拉到新 manifest）
                         // → 最后才 enqueue 切图指令（设备先拿到新 manifest 再收到 map 指令才稳）。
                         bool generated = kind == "map"
-                            ? assets.EnsureMapAsync(id, assetId)
+                            ? assets.EnsureMapAsync(id, assetId, fullMap)
                             : assets.EnsureNpcAsync(id, assetId);
                         Console.WriteLine($"[DevicePush] 设备 {id} {kind} {assetId} 资产登记{(generated ? "完成（新打包）" : "跳过（已登记，幂等）")}");
                         // 登记成功必 bump：manifest-assets.json 变了，rev 不动设备感知不到。
@@ -525,7 +529,7 @@ public static class AdminEndpoints
                             }
                         }
                         eventLog.Append(id, kind == "map"
-                            ? $"推送地图 {assetId}（资产已登记）"
+                            ? $"推送地图 {assetId}（资产已登记{(fullMap ? "，整图口径" : "")}）"
                             : $"推送 NPC {assetId}（资产已登记）");
                     }
                     catch (Exception ex)
@@ -677,6 +681,12 @@ public static class AdminEndpoints
         public string? Kind { get; set; }
         public string? Id { get; set; }
         public bool? Switch { get; set; }
+        /// <summary>
+        /// R2 整图口径（2026-10-01，**缺省/ false = 现网 240×240 窗口口径不变**）：
+        /// true = BGMAP 按整图世界尺寸 1x 导出（vw/vh = 整图 bbox、条带 y 改世界系、尾部地面表扩展块）。
+        /// 仅 kind=map 有意义；整图包体量 17MB 级，仅供支持整图相机的固件使用。
+        /// </summary>
+        public bool? FullMap { get; set; }
     }
 
     /// <summary>

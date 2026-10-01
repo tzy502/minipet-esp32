@@ -1326,6 +1326,12 @@ namespace MinipetServer.Services
         public string GetMapName(string mapId) => _mapCatalog.GetMapName(mapId);
 
         /// <summary>
+        /// 【任务 A 根因层 2026-10-01】直接取 WZ 真实地图名（不依赖后台目录是否建好；
+        /// 无名字返回 ""，**绝不返回 `map_{id}` 哨兵**）。push/登记 BGMAP 的 label 走这里。
+        /// </summary>
+        public string ResolveMapDisplayName(string mapId) => _mapCatalog.ResolveMapName(mapId);
+
+        /// <summary>
         /// 后台构建地图目录缓存（转发 MapCatalogService，单飞 + 版本化）：LoadWz 成功后触发。
         /// </summary>
         public void EnsureMapCatalog() => _mapCatalog.EnsureMapCatalog();

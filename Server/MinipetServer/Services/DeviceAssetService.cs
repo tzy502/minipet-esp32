@@ -56,10 +56,15 @@ public sealed class DeviceAssetService
     /// 确保设备的 manifest-assets.json 已登记该地图资产包（BGMAP + 条带小 PARTS + 缩略图）。
     /// 返回是否实际生成新包（false = 索引已有该地图，幂等跳过）。
     /// 地图数据缺失/导出为空抛异常，由上层记录。
+    /// <paramref name="fullMap"/>（R2 整图口径 2026-10-01，**默认 false**）：
+    /// true = 按整图世界尺寸 1x 导出（vw/vh = 整图 bbox + 尾部地面表扩展块）；
+    /// false = 现网 240×240 窗口口径（逐字节不变）。
+    /// 幂等口径：按条目里的 `viewport` 字段（"full"/"window"，缺失=window 兼容旧索引）
+    /// **与请求口径一致才跳过**；口径不同则重导并替换该地图条目（否则切不回/切不过去）。
     /// 同步方法（打包本体在 WzService 内部锁内串行，同 EnsurePacked 口径；
     /// 需要异步语义由调用方 Task.Run 放后台线程）。
     /// </summary>
-    public bool EnsureMapAsync(string deviceId, string mapId)
+    public bool EnsureMapAsync(string deviceId, string mapId, bool fullMap = false)
     {
         ValidateIds(deviceId, mapId, "地图 id");
         mapId = mapId.Trim();
@@ -67,13 +72,17 @@ public sealed class DeviceAssetService
         {
             var deviceDir = DeviceDir(deviceId);
             var root = ReadIndex(Path.Combine(deviceDir, ManifestBuilder.AssetsManifestFileName));
-            if (HasEntry(root, selector: "map", key: "map", value: mapId)) return false;
+            string wantViewport = fullMap ? "full" : "window";
+            if (HasEntry(root, selector: "map", key: "map", value: mapId, viewport: wantViewport)) return false;
 
             var warnings = new List<string>();
             /* E13：按该设备 hello 上报的 profile 烘焙（w/h/shape/psram/audio）；
  * 取不到才回落默认 480×480（见 AssetExporter.ExportMapAssets 注释）。 */
             var devProfile = _reg.Get(deviceId)?.Profile;
-            var assets = new AssetExporter(_wz).ExportMapAssets(mapId, warnings, ToExportProfile(devProfile));
+            var assets = new AssetExporter(_wz).ExportMapAssets(mapId, warnings, ToExportProfile(devProfile), fullMap);
+            // 口径切换（window ↔ full）时替换：先摘掉该地图的旧 BGMAP 条目，否则 manifest 里
+            // 会同时存在两条同 map 的 selector=map 条目（设备列表出现重复项/切图 hash 取错）。
+            RemoveMapEntries(root, mapId);
             MergeAndWrite(deviceDir, root, assets);
             return true;
         }
@@ -154,8 +163,10 @@ public sealed class DeviceAssetService
     /// 幂等判定：索引里已有 selector 相同且 extra 字段 key==value 的条目。
     /// 主条目 kind 必须是固件白名单大写（map→BGMAP / npc→PARTS）：旧版小写条目视为未登记，
     /// 走重打覆盖——否则坏索引永不被纠正，设备永不下载（同 PaperdollPackService.HasAppearance）。
+    /// <paramref name="viewport"/>（可选）：再要求条目的 `viewport` 字段匹配（"full"/"window"）；
+    /// 缺失该字段的旧条目按 "window" 处理（兼容 2026-10-01 之前登记的索引）。
     /// </summary>
-    private static bool HasEntry(JsonObject root, string selector, string key, string value)
+    private static bool HasEntry(JsonObject root, string selector, string key, string value, string? viewport = null)
     {
         var primaryKind = selector == "map" ? "BGMAP" : "PARTS";
         if (root["assets"] is not JsonObject ao) return false;
@@ -164,9 +175,35 @@ public sealed class DeviceAssetService
             if (kv.Value is not JsonObject e) continue;
             if (!string.Equals(e["selector"]?.GetValue<string>(), selector, StringComparison.Ordinal)) continue;
             if (!string.Equals(e[key]?.GetValue<string>(), value, StringComparison.Ordinal)) continue;
-            if (string.Equals(e["kind"]?.GetValue<string>(), primaryKind, StringComparison.Ordinal)) return true;
+            if (string.Equals(e["kind"]?.GetValue<string>(), primaryKind, StringComparison.Ordinal))
+            {
+                if (viewport == null) return true;
+                var vp = e["viewport"]?.GetValue<string>();
+                if (string.IsNullOrEmpty(vp)) vp = "window";   // 旧条目无 viewport 字段 = 窗口口径
+                if (string.Equals(vp, viewport, StringComparison.Ordinal)) return true;
+            }
         }
         return false;
+    }
+
+    /// <summary>
+    /// 摘掉索引里该地图的 BGMAP 条目（口径切换 window↔full 重导时调用；同 map 只能有一条
+    /// selector=map 的 BGMAP，否则设备列表重复、切图 hash 取错）。返回摘掉的条数。
+    /// 注：旧包的条带/缩略图条目（无 selector/map 字段）不在此清——与既有重导路径同口径。
+    /// </summary>
+    private static int RemoveMapEntries(JsonObject root, string mapId)
+    {
+        if (root["assets"] is not JsonObject ao) return 0;
+        var doomed = new List<string>();
+        foreach (var kv in ao)
+        {
+            if (kv.Value is not JsonObject e) continue;
+            if (!string.Equals(e["selector"]?.GetValue<string>(), "map", StringComparison.Ordinal)) continue;
+            if (!string.Equals(e["map"]?.GetValue<string>(), mapId, StringComparison.Ordinal)) continue;
+            if (string.Equals(e["kind"]?.GetValue<string>(), "BGMAP", StringComparison.Ordinal)) doomed.Add(kv.Key);
+        }
+        foreach (var k in doomed) ao.Remove(k);
+        return doomed.Count;
     }
 
     /// <summary>

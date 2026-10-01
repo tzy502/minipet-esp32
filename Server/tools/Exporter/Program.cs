@@ -63,16 +63,19 @@ for (int i = 0; i < args.Length; i++)
         case "--charset": options.CharsetFile = Next(); break;
         case "--font-family": options.FontFamily = Next(); break;
         case "--dump-footholds": dumpFootholds = Next(); break;
+        case "--full-map": options.FullMap = true; break;   // R2 整图口径（默认关 = 240×240 窗口包不变）
         case "--help" or "-h":
             Console.WriteLine("""
                 用法: Exporter [--appearance <json>] [--profile <名|路径>] [--maps <id,...>] [--out <dir>]
                        [--device-id <id>] [--wz <WZ数据目录>] [--fonts 16,24,32|--no-fonts]
                        [--no-audio] [--no-fonttime] [--firmware <ver>] [--charset <file>] [--font-family <名>]
-                       [--dump-footholds <mapId>]
+                       [--dump-footholds <mapId>] [--full-map]
                 默认: profile=amoled216  out=data/cache/export  fonts=16  audio=on  fontTime=on
                 WZ 目录: --wz 或环境变量 MINIPET_WZ_DATA
                 --dump-footholds: 只打印该图 foothold 第 0 层（地面层）+ 设备视口相机换算，
                                   并输出可直接粘进固件的 C 数组（不导出任何资产）
+                --full-map: R2 整图口径（vw/vh = 整图 1x 世界尺寸 + 条带 y 世界系 + 尾部地面表扩展块）；
+                            **默认关**（现网 240×240 窗口包逐字节不变）。整图包体量 MB 级。
                 """);
             return 0;
         default:

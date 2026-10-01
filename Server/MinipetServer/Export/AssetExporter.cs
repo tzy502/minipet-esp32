@@ -35,6 +35,11 @@ public sealed class ExportOptions
     public string? CharsetFile;
     /// <summary>字体族覆盖（缺省走宋体候选链）。</summary>
     public string? FontFamily;
+    /// <summary>
+    /// R2 整图口径（2026-10-01）：BGMAP 按**整图世界尺寸 1x** 导出（vw/vh = 整图 bbox，
+    /// 无任何降采样）+ 尾部地面表扩展块。**默认 false** = 现网 240×240 窗口口径逐字节不变。
+    /// </summary>
+    public bool FullMap;
 }
 
 /// <summary>单个导出产物（一个 hash 一个文件）。</summary>
@@ -157,7 +162,7 @@ public sealed class AssetExporter
         // ── 2. 地图：BGMAP + 条带小 PARTS + 缩略图 + clock_table ──
         foreach (var mapId in o.Maps.Where(m => !string.IsNullOrWhiteSpace(m)).Distinct())
         {
-            try { ExportMap(mapId.Trim(), profile, summary); }
+            try { ExportMap(mapId.Trim(), profile, summary, o.FullMap); }
             catch (Exception ex)
             {
                 Console.Error.WriteLine($"[AssetExporter] 地图 {mapId} 导出失败: {ex}");
@@ -600,7 +605,7 @@ public sealed class AssetExporter
         return (tm & 4) != 0 || (tm & 8) != 0;
     }
 
-    private void ExportMap(string mapId, DeviceProfile profile, ExportSummary summary)
+    private void ExportMap(string mapId, DeviceProfile profile, ExportSummary summary, bool fullMap = false)
     {
         var map = _map.LoadMap(mapId);
         if (map == null) { summary.Warnings.Add($"地图 {mapId} 加载失败"); return; }
@@ -613,21 +618,50 @@ public sealed class AssetExporter
          * 现改为按 **世界视口 = 屏宽/scale = 240×240** 出图；固件侧
          * layer_rgb_load / tile_mask_load 已有 2x 展开分支（vw*RC_SCALE==屏宽）。
          * 与桌面同口径：等于 mapleStoryMiniPet 的 RenderViewport(zoom=2)。 */
-        int vwScale = Math.Max(1, PlacementMath.Scale);
-        int vw = Math.Max(1, profile.ViewportW / vwScale);
-        int vh = Math.Max(1, profile.ViewportH / vwScale);
-        // 相机中心：含 clock 配置的图以 clock 锚点为优先（2026-09-26 定稿）——480 视口下地图中心
-        // 相机多看不到 clock 面板（实测 18/26 出界）；这 26 张"售票处/码头"图的存在意义就是
-        // 显示时钟，以锚点为中心烘焙 → 面板入镜 + 时钟落面板（与桌面版 1080 视口验收一致）。
-        // 无 clock 的图保持地图中心。ClockTableSeeder 换算与此同口径。
+        int worldW = map.MaxX - map.MinX, worldH = map.MaxY - map.MinY;
         string clockMapRoot = MapService.GetMapWzPath(mapId);
         int clockAnchorX = _wz.GetIntProperty($"{clockMapRoot}/clock/x");
         int clockAnchorY = _wz.GetIntProperty($"{clockMapRoot}/clock/y");
         bool hasClock = clockAnchorX != 0 || clockAnchorY != 0;
+
+        /* ══ 【R2 整图口径 2026-10-01：fullMap=true，**默认关闭**】══
+         * vw/vh = 整图世界尺寸（1x 原始像素，硬约束：禁止任何降采样/缩放；000010000 = 2270×1807）。
+         * 相机 = 地图中心（整图视口唯一解）⇒「图内坐标 = WZ 世界坐标 − (MinX,MinY)」，
+         * static/tile 像素、条带 y（带图顶边）、地面表列索引 x 共用这同一个原点（下称"整图世界系"）。
+         * 与桌面 RenderMapFull（= RenderViewport(camCenter, zoom=1, worldW×worldH)）同口径。
+         * 老固件（board216 现状）对 vw/vh>512 与 static 长度公式有硬校验，整图包会被它拒收
+         * ——故仅由 push 端点显式 fullMap=true / CLI --full-map 触发，现网默认包逐字节不变。 */
+        bool full = fullMap;
+        if (full && (worldW <= 0 || worldH <= 0 || worldW > ushort.MaxValue || worldH > ushort.MaxValue))
+        {
+            // u16 溢出/空图：整图包做不出来 → 退回窗口包（保住"至少有可用的包"，不抛异常）
+            summary.Warnings.Add($"地图 {mapId} 整图尺寸 {worldW}×{worldH} 非法或超 u16，已退回窗口包");
+            full = false;
+        }
+
+        int vw, vh;
+        float camX, camY;
+        if (full)
+        {
+            vw = worldW; vh = worldH;
+            (camX, camY) = MapService.GetMapCenter(map);
+            Console.WriteLine($"[AssetExporter] 整图口径：{mapId} vw×vh={vw}×{vh}（1x 原始像素，无缩放）"
+                              + $" bbox X[{map.MinX},{map.MaxX}] Y[{map.MinY},{map.MaxY}]");
+        }
+        else
+        {
+        int vwScale = Math.Max(1, PlacementMath.Scale);
+        vw = Math.Max(1, profile.ViewportW / vwScale);
+        vh = Math.Max(1, profile.ViewportH / vwScale);
+        // 相机中心：含 clock 配置的图以 clock 锚点为优先（2026-09-26 定稿）——480 视口下地图中心
+        // 相机多看不到 clock 面板（实测 18/26 出界）；这 26 张"售票处/码头"图的存在意义就是
+        // 显示时钟，以锚点为中心烘焙 → 面板入镜 + 时钟落面板（与桌面版 1080 视口验收一致）。
+        // 无 clock 的图保持地图中心。ClockTableSeeder 换算与此同口径。
         var (ccx, ccy) = hasClock
             ? ((float)clockAnchorX, (float)clockAnchorY)
             : MapService.GetMapCenter(map);
-        var (camX, camY) = MapService.ClampCamera(map, ccx, ccy, 1f, vw, vh); // 必须夹取（clock-display-spec §五）
+        (camX, camY) = MapService.ClampCamera(map, ccx, ccy, 1f, vw, vh); // 必须夹取（clock-display-spec §五）
+        }
 
         // 条带 = ScrollH/V 项（profile 关条带时置空 → strip_count=0）
         var stripBacks = profile.Strips ? map.Backs.Where(IsStripBack).ToList() : new List<MapBack>();
@@ -655,11 +689,43 @@ public sealed class AssetExporter
          * 修法（不改 BGMAP wire 格式）：把 back 按条带**切成若干段**，每段单独渲一张透明底
          * 图，作为 **speed=0 的"条带"**下发（条带槽位本就是"按序叠加的整层"，y=0、h=视口高）；
          * 设备按 payload 顺序绘制 ⇒ 与桌面同序。第一段仍作 static_back（在最底层）。
-         * front back 仍烘进最后一段（设备无"人物之后"的层，符合 E5 现状）。 */
+         * front back 仍烘进最后一段（设备无"人物之后"的层，符合 E5 现状）。
+         *
+         * 【整图口径 2026-10-01】同一"段序"模型搬到整图上：
+         *   · static_back = map.Backs **原序前缀**中「静止」的 back（无滚动 && rx==0 && ry==0）→
+         *     整图快照（相机无关，符合需求 §5.2"rx=0 且 speed==0 的 back 段可烘进整图 static"）。
+         *     只取前缀：前缀之后的静止 back 若烘进 static，会被画到"本该盖住它的条带"下面（错层）。
+         *   · 其余非条带段 → **整图宽 × 内容高**的世界对齐带（speed=0，y=带图顶边世界 y），
+         *     仍按原序叠在 static 之上 ⇒ 层序与窗口口径逐条一致（000010000：丘陵/远景段 = 带）。
+         *   · 滚动条带 → 与窗口口径同款「一个循环周期宽 × 带高」预平铺图，只是 y 改世界系。 */
+        List<MapBack> staticBacks;
+        List<MapBack> bandBacks;
+        if (full)
+        {
+            staticBacks = new List<MapBack>();
+            int bi = 0;
+            while (bi < map.Backs.Count)
+            {
+                var b = map.Backs[bi];
+                if (stripBacks.Contains(b) || b.Rx != 0 || b.Ry != 0) break;
+                staticBacks.Add(b);
+                bi++;
+            }
+            bandBacks = map.Backs.Skip(bi).ToList();
+            Console.WriteLine($"[AssetExporter]   整图分层：static 前缀 {staticBacks.Count} 条 back"
+                              + $"[{string.Join(",", staticBacks.Select(b => b.Id))}]，"
+                              + $"余下 {bandBacks.Count} 条按段/条带出口");
+        }
+        else
+        {
+            staticBacks = new List<MapBack>();
+            bandBacks = map.Backs;
+        }
+
         var segs = new List<(bool isStrip, List<MapBack> backs, MapBack? strip)>();
         {
             var cur = new List<MapBack>();
-            foreach (var b in map.Backs)
+            foreach (var b in bandBacks)
             {
                 if (stripBacks.Contains(b))
                 {
@@ -672,10 +738,16 @@ public sealed class AssetExporter
             segs.Add((false, cur, null));
         }
         int firstSegIdx = segs.FindIndex(x => !x.isStrip);
-        var firstSeg = firstSegIdx >= 0 ? segs[firstSegIdx].backs : new List<MapBack>();
+        /* bakedSeg = 已被烘进 static_back 的那一段（**仅窗口口径**：第一段；整图口径烘的是
+         * staticBacks 前缀，与任何 seg 段都不是同一对象）。整图口径下必须为 null，否则当前缀
+         * 短于第一段时（如 back[0] 静止 + back[1] 视差带 + back[2] 条带）会把本该出口的
+         * 第一段带层误当成"已烘段"跳过 → 整图少一层 back。 */
+        List<MapBack>? bakedSeg = full
+            ? null
+            : (firstSegIdx >= 0 ? segs[firstSegIdx].backs : new List<MapBack>());
 
-        // 1. static_back：第一段（条带之前的所有 back）快照
-        var staticMap = CloneMap(map, firstSeg);
+        // 1. static_back：窗口口径 = 第一段（条带之前的所有 back）快照；整图口径 = 静止前缀整图快照
+        var staticMap = CloneMap(map, full ? staticBacks : bakedSeg!);
         _map.MapShowBack = true;
         _map.MapShowTile = false;
         _map.MapShowObj = false;
@@ -690,7 +762,7 @@ public sealed class AssetExporter
          * 三层；而桌面 MapService 是"全部 back + tile/obj"一次渲。这里额外渲一张
          * **完整参考图**（MapShowBack/Tile/Obj 全开，与桌面同口径）并落盘到导出目录，
          * 用于与设备三层合成结果逐像素对照，定位到底哪一层 back 没画上。
-         * 仅诊断产物，不进 manifest。 */
+         * 仅诊断产物，不进 manifest。整图口径下这张即"整图 1x 参考图"（R2 零缩放对拍基线）。 */
         _map.MapShowBack = true;
         _map.MapShowTile = true;
         _map.MapShowObj = true;
@@ -707,6 +779,7 @@ public sealed class AssetExporter
                 using var fs = File.Create(rp);
                 dat.SaveTo(fs);
                 Console.WriteLine($"[AssetExporter]   参考图（back+tile+obj 全开）→ {rp}");
+                refBmp.Dispose();   // 整图口径下这是 MB 级位图，落盘后立即释放
             }
         }
         catch (Exception ex) { summary.Warnings.Add($"参考图渲染失败: {ex.Message}"); }
@@ -727,9 +800,34 @@ public sealed class AssetExporter
         foreach (var (isStripSeg, segBacks, stripB) in segs)
         {
             if (isStripSeg) continue;                      /* 条带在本函数后半段输出（保持原逻辑） */
-            if (segBacks.Count == 0 || ReferenceEquals(segBacks, firstSeg)) continue;
+            if (segBacks.Count == 0 || (bakedSeg != null && ReferenceEquals(segBacks, bakedSeg))) continue;
             try
             {
+                if (full)
+                {
+                    /* 整图口径：整图宽 × 内容高 的世界对齐带（y = 带图顶边在整图世界系的 y，0 = bbox 顶边）。
+                     * 设备放置规则（新固件）：**带宽 == vw ⇒ 世界对齐层**（整幅从世界 x=0 起绘制，不平铺）；
+                     * 带宽 < vw 的滚动条带仍按 offset_x mod 图宽 循环平铺（沿用现规则）。 */
+                    var bandBmp = RenderFullMapBand(map, segBacks, camX, camY, vw, vh, out int bandTop);
+                    if (bandBmp == null) continue;
+                    var bandPayload = PartPackWriter.Build(new[]
+                    {
+                        new PartPackWriter.PartEntry { PartId = 1, ExprGroup = 0, Bitmap = bandBmp, OriginX = 0, OriginY = 0 },
+                    });
+                    bandBmp.Dispose();   // Build 内已编码；整图带是 MB 级位图，立刻释放
+                    var bandAsset = AddAsset(summary, MpakKind.Parts, bandPayload,
+                                            $"背景层 {mapId}#{segBacks[0].Id}", selector: null);
+                    strips.Add(new BgmapPackWriter.BgmapStrip
+                    {
+                        PartRef = bandAsset.Hash,
+                        Y = (short)Math.Clamp(bandTop, short.MinValue, short.MaxValue),
+                        SpeedX = 0,                  /* 不滚动：静止/视差段（视差由设备按 rx_parallax 处理） */
+                        RxParallax = (byte)Math.Clamp(Math.Abs(segBacks[0].Rx), 0, 255),
+                        Blend = 255,                 /* bit0=1：带 1bit alpha 掩码（透明处露出下层） */
+                        Label = $"seg:{segBacks[0].Id}",
+                    });
+                    continue;
+                }
                 var segMap = CloneMap(map, segBacks);
                 _map.MapShowBack = true; _map.MapShowTile = false; _map.MapShowObj = false;
                 _map.MapShowLife = false; _map.MapShowPortal = false; _map.MapShowFoothold = false;
@@ -778,13 +876,18 @@ public sealed class AssetExporter
                 if (scrollV) { /* t=0 时滚动偏移为 0 */ }
                 else worldY += camY * (100 + b.Ry) / 100f;
                 worldY = (float)Math.Floor(worldY);
+                /* 窗口口径（默认，逐字节不变）：视口内屏幕 y（固件 strip_load 只认 y 当"带顶"，
+                 * 而这里是精灵放置点 ⇒ 二者差一个 origin.y，属既有口径，不动）。
+                 * 整图口径：**带图顶边**在整图世界系的 y = 放置点世界 y − 素材 origin.y − MinY
+                 *（与 seg 带同语义；新固件按"带图顶边在世界系"解读，见 BgmapPackWriter 类头契约）。 */
+                float yFull = worldY - oy - map.MinY;
                 float screenY = worldY - camY + vh / 2f;
 
                 strips.Add(new BgmapPackWriter.BgmapStrip
                 {
                     Label = b.Resource.ResourceUrl,
                     PartRef = stripAsset.Hash,
-                    Y = (short)Math.Clamp((int)Math.Round(screenY), short.MinValue, short.MaxValue),
+                    Y = (short)Math.Clamp((int)Math.Round(full ? yFull : screenY), short.MinValue, short.MaxValue),
                     SpeedX = (short)Math.Clamp(scrollH ? b.Rx * 5 : 0, short.MinValue, short.MaxValue),
                     RxParallax = (byte)Math.Clamp(b.Rx, 0, 255),
                     Blend = (byte)(b.Alpha > 0 ? b.Alpha : 255),
@@ -814,9 +917,17 @@ public sealed class AssetExporter
             strips = ordered;
         }
 
+        // 3c. 整图口径：全宽地面表（vw 列，第 x 列 ↔ 整图世界系 x；0xFFFF = 无 foothold）
+        ushort[]? groundTable = null;
+        if (full)
+        {
+            groundTable = BuildGroundTable(map, vw, out int groundCols, out int groundMin, out int groundMax);
+            Console.WriteLine($"[AssetExporter]   地面表：{vw} 列，有 foothold {groundCols} 列"
+                              + $"（世界系 y ∈ [{groundMin},{groundMax}]；无 foothold/越界写 0xFFFF）");
+        }
+
         // 4. BGMAP 主包
-        string mapName = "";
-        try { mapName = _wz.GetMapName(mapId) ?? ""; } catch { /* 目录服务未预热时名称可缺省 */ }
+        string mapName = ResolveMapLabel(mapId);
         var bgmapPayload = BgmapPackWriter.Build(new BgmapPackWriter.BgmapInput
         {
             MapId = mapId,
@@ -825,6 +936,7 @@ public sealed class AssetExporter
             StaticBack = staticBmp,
             TileLayer = tileBmp,
             Strips = strips,
+            GroundTable = groundTable,
         });
 
         // 5. 缩略图（96×96，nearest 保持像素风）
@@ -854,9 +966,14 @@ public sealed class AssetExporter
         catch (Exception ex) { summary.Warnings.Add($"缩略图 {mapId} 失败: {ex.Message}"); }
 
         var extra = new Dictionary<string, object?> { ["map"] = mapId };
+        /* 口径标注（**仅整图包**下发；字符串，两个 manifest 写手都直收，设备/Web 未知字段忽略）：
+         * "full" = R2 整图包（vw/vh = 整图尺寸、strip.y = 整图世界系、带地面尾部扩展块）。
+         * 窗口口径**不写**该字段 ⇒ 现网 manifest 结构零变化（DeviceAssetService.HasEntry
+         * 把"无 viewport 字段"等同 window，兼容 2026-10-01 之前登记的旧索引）。 */
+        if (full) extra["viewport"] = "full";
         if (thumbHash != 0) extra["thumb"] = $"{thumbHash:x16}";
         AddAsset(summary, MpakKind.Bgmap, bgmapPayload,
-            string.IsNullOrEmpty(mapName) ? $"地图 {mapId}" : mapName, selector: "map", extra: extra);
+            string.IsNullOrEmpty(mapName) ? $"map_{mapId}" : mapName, selector: "map", extra: extra);
 
         // 6. clock_table 建议值（R15：烘焙视口内屏幕坐标；WZ clock 世界锚点经导出相机换算）
         try
@@ -872,6 +989,120 @@ public sealed class AssetExporter
 
         staticBmp.Dispose();
         tileBmp?.Dispose();
+    }
+
+    /// <summary>
+    /// 地图显示名（manifest label）——**任务 A 根因修复**（docs/ai/map-feature-requirements.md §2.2 / §3.2 L1）：
+    /// 旧实现只调 `WzService.GetMapName`，而该口径在「后台目录未就绪 / WZ 无名」时返回 **miss 哨兵
+    /// `map_{id}`**，于是 push 端点（EnsureMapAsync 路径）登记出来的 label 就是 `map_000010000`
+    /// 这类裸编号 = 设备菜单里"数字编号"的真正来源。现在：
+    ///   ① `WzService.ResolveMapDisplayName` 直接读 WZ String/Map.img 取真实中文名
+    ///      （streetName：mapName，与 NPC 路径 npcName 同款先例），不依赖后台目录是否建好；
+    ///   ② 直接读不到（真无名/WZ 未加载）→ 退回**原有兜底串** `map_{id}`（保持既有形态，
+    ///      设备侧 L2「剥 map_ 前缀显示阿拉伯数字」兜底链路不变）。
+    /// 全链路吞异常，绝不因取名失败中断导出。
+    /// </summary>
+    private string ResolveMapLabel(string mapId)
+    {
+        try
+        {
+            var name = _wz.ResolveMapDisplayName(mapId);
+            if (!string.IsNullOrEmpty(name)) return name;
+        }
+        catch (Exception ex) { Console.Error.WriteLine($"[AssetExporter] 地图名解析失败 {mapId}: {ex.Message}"); }
+        try
+        {
+            // 目录就绪时这里是"街道：地图"中文名；未就绪返回哨兵 map_{id}（保持原兜底形态）
+            var fallback = _wz.GetMapName(mapId);
+            if (!string.IsNullOrEmpty(fallback)) return fallback;
+        }
+        catch { /* 目录服务未预热 */ }
+        return $"map_{mapId}";
+    }
+
+    /// <summary>
+    /// 整图口径「背景段带」：把一段非条带 back 渲成 **整图宽 × 内容高** 的 RGBA5650 层
+    /// （世界对齐：带宽 == vw，设备据此按 x 对世界一次性绘制而非周期平铺）。
+    /// <paramref name="worldTop"/> = 带图顶边在整图世界系（0 = 地图 bbox 顶边）的 y。
+    /// 上下透明边裁掉省体积；段内若有**垂直平铺** back（tileMode bit1）则整高不裁（裁了会缺口）。
+    /// 渲染相机 = 整图参考相机（地图中心），与 static 快照同源 ⇒ 三层合成可与 _ref 图逐像素对拍。
+    /// </summary>
+    private SKBitmap? RenderFullMapBand(MapInfo map, List<MapBack> segBacks, float camX, float camY,
+        int vw, int vh, out int worldTop)
+    {
+        worldTop = 0;
+        var segMap = CloneMap(map, segBacks);
+        _map.MapShowBack = true; _map.MapShowTile = false; _map.MapShowObj = false;
+        _map.MapShowLife = false; _map.MapShowPortal = false; _map.MapShowFoothold = false;
+        var segBmp = _map.RenderViewport(segMap, camX, camY, 1f, 0, vw, vh);
+        if (segBmp == null) return null;
+
+        bool tileV = segBacks.Any(b => (BackTileMode(b.Type) & 2) != 0);
+        int top = 0, bottom = vh;
+        if (!tileV)
+        {
+            (top, bottom) = FindOpaqueRowRange(segBmp);
+            if (bottom <= top) { segBmp.Dispose(); return null; }   // 整段全透明 → 不出层
+        }
+        worldTop = top;
+        if (top == 0 && bottom == vh) return segBmp;
+
+        var cropped = new SKBitmap(new SKImageInfo(vw, bottom - top, SKColorType.Bgra8888, SKAlphaType.Unpremul));
+        using (var c = new SKCanvas(cropped))
+        {
+            c.Clear(SKColors.Transparent);
+            using var paint = new SKPaint { IsAntialias = false, FilterQuality = SKFilterQuality.None };
+            c.DrawBitmap(segBmp, new SKRect(0, top, vw, bottom), new SKRect(0, 0, vw, bottom - top), paint);
+        }
+        segBmp.Dispose();
+        return cropped;
+    }
+
+    /// <summary>扫描位图 alpha 通道，返回非透明内容的行区间 [top, bottom)（全透明返回 (0,0)）。</summary>
+    private static (int top, int bottom) FindOpaqueRowRange(SKBitmap bmp)
+    {
+        int w = bmp.Width, h = bmp.Height;
+        if (w <= 0 || h <= 0) return (0, 0);
+        var span = bmp.GetPixelSpan();
+        int rowBytes = bmp.RowBytes;
+        int top = h, bottom = 0;
+        for (int y = 0; y < h; y++)
+        {
+            int rowBase = y * rowBytes;
+            bool any = false;
+            for (int x = 0; x < w; x++)
+            {
+                if (span[rowBase + x * 4 + 3] != 0) { any = true; break; }
+            }
+            if (any) { if (y < top) top = y; bottom = y + 1; }
+        }
+        if (bottom <= top) return (0, 0);
+        return (top, bottom);
+    }
+
+    /// <summary>
+    /// 整图全宽地面表（需求 §5.2「真 foothold 地面表」）：长度 = vw，第 x 列 = 整图世界系 x 处
+    /// 的地面 Y（= `MapService.GetGroundY` 的 WZ 世界 y − MinY，与 static/tile 像素同一原点）。
+    /// 无 foothold / 落在 [0,0xFFFE] 之外（u16 表达不了）→ 0xFFFF（设备按"无数据"回退通用地面线）。
+    /// </summary>
+    private static ushort[] BuildGroundTable(MapInfo map, int vw, out int cols, out int min, out int max)
+    {
+        var table = new ushort[vw];
+        cols = 0;
+        min = int.MaxValue; max = int.MinValue;
+        for (int x = 0; x < vw; x++)
+        {
+            int? gy = MapService.GetGroundY(map, map.MinX + x);
+            if (gy == null) { table[x] = BgmapPackWriter.GroundNone; continue; }
+            int rel = gy.Value - map.MinY;
+            if (rel < 0 || rel > 0xFFFE) { table[x] = BgmapPackWriter.GroundNone; continue; }
+            table[x] = (ushort)rel;
+            cols++;
+            if (rel < min) min = rel;
+            if (rel > max) max = rel;
+        }
+        if (cols == 0) { min = 0; max = 0; }
+        return table;
     }
 
     private static SKRect FitRect(int srcW, int srcH, int dstW, int dstH)
@@ -946,7 +1177,7 @@ public sealed class AssetExporter
     /// InvalidOperationException。clock_table 建议值不在此返回（由 ClockTableSeeder/配置管理）。
     /// </summary>
     public List<ExportedAsset> ExportMapAssets(string mapId, List<string>? warnings = null,
-        DeviceProfile? deviceProfile = null)
+        DeviceProfile? deviceProfile = null, bool fullMap = false)
     {
         if (string.IsNullOrWhiteSpace(mapId)) throw new ArgumentException("地图 id 不能为空", nameof(mapId));
         if (!_wz.IsLoaded) throw new InvalidOperationException("WZ 未加载（先调用 WzService.LoadWz）");
@@ -954,8 +1185,9 @@ public sealed class AssetExporter
         /* 【E13 缺口补齐 2026-09-27】原先恒用 `new DeviceProfile()`（默认 480×480），
          * 即"导出忽略设备上报 profile" —— hello 里 device.profile{w,h,shape,psram}
          * 完全没参与烘焙。现在调用方（DeviceAssetService）把该设备记录里的
-         * profile 传进来；为空才回落到默认（ViewportW/H 内部有 480 兜底）。 */
-        ExportMap(mapId.Trim(), deviceProfile ?? new DeviceProfile(), summary);
+         * profile 传进来；为空才回落到默认（ViewportW/H 内部有 480 兜底）。
+         * fullMap=true（R2 整图）时 profile 只影响条带是否导出（Strips），视口由整图 bbox 决定。 */
+        ExportMap(mapId.Trim(), deviceProfile ?? new DeviceProfile(), summary, fullMap);
         warnings?.AddRange(summary.Warnings);
         if (summary.Assets.Count == 0)
             throw new InvalidOperationException(
