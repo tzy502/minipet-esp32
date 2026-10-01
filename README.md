@@ -27,7 +27,7 @@ minipet-esp32/
 
 ## 三步部署（开源用户）
 
-前置：一台能跑 Docker 的机器（NAS / PC / 树莓派均可）、现有冒险岛 WZ 数据目录、一块刷好固件的 ESP32-S3-Touch-AMOLED-2.16。
+前置：一台能跑 Docker 的机器（NAS / PC / 树莓派均可）、现有冒险岛 WZ 数据目录、一块刷好固件的 MiniPet 设备（当前支持 AMOLED-2.16 与 LCD-1.85B 圆屏两板，固件在 Firmware/board216、Firmware/board185b 分别构建）。
 
 ```bash
 # ① 放 WZ：把 WZ 数据目录准备好（只读挂载进容器，例：/volume1/wz）
@@ -54,13 +54,22 @@ docker compose up -d
 > NAS 上再 `docker compose pull && docker compose up -d`。验证：`curl http://<服务器IP>:38090/api/admin/device-logs/<deviceId>`
 > 应返回 JSON（若返回 HTML 说明还是旧镜像，SPA fallback 把它接走了）。
 
-固件烧录（开发者）：
+固件烧录（开发者）：两块板各是完全独立的工程，改哪块板进哪个目录。
 
 ```bash
 source ~/esp/esp-idf/export.sh          # IDF v5.5
-cd Firmware && idf.py build             # 必须 0 error
-idf.py -p /dev/cu.usbmodemXXXX flash    # 板子串口按实际改
+
+# 板 A：AMOLED-2.16（CO5300 480×480）
+cd Firmware/board216 && idf.py -B build build   # 必须 0 error
+idf.py -p /dev/cu.usbmodem21101 flash
+
+# 板 B：LCD-1.85B 圆屏（ST77916 360×360）
+cd Firmware/board185b && idf.py -B build build
+idf.py -p /dev/cu.usbmodem21201 flash
 ```
+
+> 串口号插拔后可能互换，烧录前先核对（`ls /dev/cu.usbmodem*`）；板级工作文档在
+> 各工程 `docs/` 下（board216/docs、board185b/docs）。
 
 设备首次上电无 WiFi 配置 → 开热点 `MiniPet-XXXX` → 手机连上自动弹配网页 →
 填家里 WiFi（密码别多输一位）+ 服务器地址 `http://<服务器IP>:38090`。
@@ -68,8 +77,8 @@ idf.py -p /dev/cu.usbmodemXXXX flash    # 板子串口按实际改
 
 ## 硬件
 
-- 桌面主力：Waveshare ESP32-S3-Touch-AMOLED-2.16（480×480 AMOLED / 8MB PSRAM / 16MB Flash）
-- 冰箱贴（二期）：ESP32-S3-Touch-LCD-1.28-B（240×240 圆屏）
+- 板 A（桌面主力）：Waveshare ESP32-S3-Touch-AMOLED-2.16（480×480 AMOLED / CO5300 / 8MB PSRAM / 16MB Flash）→ `Firmware/board216/`
+- 板 B（圆屏）：Waveshare ESP32-S3-Touch-LCD-1.85B（360×360 圆屏 LCD / ST77916 / 8MB PSRAM / 16MB Flash）→ `Firmware/board185b/`
 
 ## 文档索引
 
@@ -89,7 +98,7 @@ idf.py -p /dev/cu.usbmodemXXXX flash    # 板子串口按实际改
 |---|---|
 | 服务端（Server/） | 核心服务迁入 + 导出器 + 8 个设备端点 + 管理端点（素材推送/字体/指令/OTA） |
 | Web（Web/） | 设备卡片 / 素材浏览器 / 纸娃娃编辑器 / 曲库 / 设置 / 表情调试 / BGM 控制 |
-| 固件（Firmware/） | 渲染合成 + 触摸/IMU 交互 + 菜单选择器 + BGM 解码 + OTA 双分区回滚 |
+| 固件（Firmware/） | 双板独立工程（board216 / board185b，零共享文件）：渲染合成 + 触摸/IMU 交互 + 菜单选择器 + BGM 解码 + OTA 双分区回滚 |
 
 真机联调遗留问题与逐条证据见 [docs/ai/selftest-report-2026-09-27.md](docs/ai/selftest-report-2026-09-27.md)
 与 [docs/ai/keys-touch-handoff.md](docs/ai/keys-touch-handoff.md)。
