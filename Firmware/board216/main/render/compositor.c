@@ -688,20 +688,22 @@ static int32_t ground_line_y_at(int32_t dev_x)
 
 static int32_t ground_line_y(void) { return ground_line_y_at(ent_anchor_screen_x(g_drag_off_x)); }
 
-/* 站到地面线上（需持锁）。返回是否真的改了位置。 */
+/* 站位（需持锁）。返回是否真的改了位置。
+ * 【屏中回归制 2026-10-01 用户定稿】开机/换图后宠物固定回归**屏幕正中间**
+ * （锚点=屏心），不再追地面线——旧地面线站位在新装扮包布局下把画布顶放到
+ * y=460，角色沉底只露头发（真机帧实测：落点=(240,460 194x20)）。调参收尾
+ * 同样回到这里（需求文档 §5.2 宠物锚定语义）。 */
 static bool ent_stand_on_ground_locked(void)
 {
     if (!g_inited || !g_ent_cbox_ok) return false;
-    /* 锚点屏幕 y = 屏心 + CENTER_OFF_Y + base_wy×2 + drag_y ⇒ 令其等于地面线即得 drag_y */
-    int32_t line = ground_line_y();
-    int32_t dy = line - (g_sh / 2 + RC_ENT_CENTER_OFF_Y + (g_ent_base_wy << RC_SCALE_SHIFT));
-    drag_clamp(NULL, &dy);            /* 兜底夹取（下界=同一地面线） */
+    /* 锚点屏幕 y = 屏心 + CENTER_OFF_Y + base_wy×2 + drag_y ⇒ 令其等于屏心 */
+    int32_t dy = -(RC_ENT_CENTER_OFF_Y + (g_ent_base_wy << RC_SCALE_SHIFT));
+    drag_clamp(NULL, &dy);            /* 兜底夹取 */
     if (dy == g_drag_off_y) return false;
     g_drag_off_y = dy;
     mark_rect(0, 0, g_sw, g_sh);      /* 位置变了：整屏重合成（罕见事件） */
-    ESP_LOGI(TAG, "站位：脚底 y=%d（地面线来源=%s，锚点 x=%d）drag_y=%d",
-             (int)line, g_ground_tbl_on ? "本图地面表" : "通用线(屏底-20)",
-             (int)ent_anchor_screen_x(g_drag_off_x), (int)dy);
+    ESP_LOGI(TAG, "站位：宠物回归屏幕正中间（锚点 y=%d，drag_y=%d）",
+             (int)(g_sh / 2), (int)dy);
     return true;
 }
 
@@ -2724,11 +2726,20 @@ static int render_set_map_nolock(const char *bgmap_path,
     if (rc != MPAK_OK) return rc;
     const mpak_bgmap_t *bg = bm.u.bgmap;
 
-    if ((int)bg->strip_count != strip_count) {
+    /* 【缺条带降级 2026-10-01】given < declared = 部分条带部件未下载（清单有
+     * 引用、文件未到，真机：200000000 声明 9 条、本地只解析出 8）→ 硬失败会
+     * 让整图永远装不上（sync 又只把它当"非关键资产"慢慢补）。改为警告+降级：
+     * 缺的段不画（场景略不完整），等补齐后下次切图自然完整。given > declared
+     * 仍是调用方 bug，维持硬失败。 */
+    if (strip_count > (int)bg->strip_count) {
         ESP_LOGE(TAG, "strip count mismatch: bgmap=%u given=%d",
                  bg->strip_count, strip_count);
         mpak_close(&bm);
         return RENDER_ERR_ARG;
+    }
+    if (strip_count < (int)bg->strip_count) {
+        ESP_LOGW(TAG, "条带不全：bgmap 声明 %u、本地就绪 %d → 缺段暂不绘制（等同步补齐）",
+                 bg->strip_count, strip_count);
     }
 
     ESP_LOGW(TAG, "[取证] bg vw=%u vh=%u static_off=%u static_len=%u tile_len=%u tile_off=%u strips=%u",

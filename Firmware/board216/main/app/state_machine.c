@@ -655,14 +655,14 @@ static bool g_map_loaded;
 static void dispatch_map(const char *hash)
 {
     char bg[MP_MPK_PATH_MAX];
-    static char strips[8][MP_MPK_PATH_MAX];   /* BGMAP 条带引用（§五） */
+    static char strips[16][MP_MPK_PATH_MAX];  /* BGMAP 条带引用（§五）；16=旧导出器分段可到 9+（真机 200000000=9，8 截断致 rc=-100） */
     /* 【指针数组修复 2026-09-27】render_set_map 的形参是 const char **，
      * 此前直接 `(const char **)strips` 强转二维数组 —— 布局是"每行 96B 连续"，
      * 按 char* 解释会把行首 8 个字节当成指针 → 传进去的是野指针，
      * 真机表现：`mpak: open  failed` / `strip 0 load failed ()`（路径恒空）
      * → 默认地图的视差条带永远加载不了（地图静默退化成只有 static_back）。
      * 正确做法：显式建指针数组。 */
-    const char *strip_ptrs[8];
+    const char *strip_ptrs[16];
 
     asset_dl_set_active_map(hash);
     asset_dl_touch(hash);                     /* E7：切过的秒切（LRU 前排） */
@@ -678,7 +678,7 @@ static void dispatch_map(const char *hash)
         asset_dl_request_sync();
         return;
     }
-    int n = asset_dl_map_strips(bg, strips, 8);
+    int n = asset_dl_map_strips(bg, strips, 16);
     if (n < 0) n = 0;
     if (n > 8) n = 8;
     for (int i = 0; i < n; i++) strip_ptrs[i] = strips[i];
