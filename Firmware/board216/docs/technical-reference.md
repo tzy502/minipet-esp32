@@ -215,6 +215,13 @@ app_main（main.c）
 | **manifest 拉到了但素材还是旧的** | 设备 s_files 与服务端清单不对账（历史遗留混入） | 已修：每轮 sync 对账剪除；复发先查 boot 日志"清单对账：剪除 N 个" |
 | **同步 40B 大清单静默失败** | 响应缓冲 16K < rev30+ 清单 18.6KB，collect 中断 | MANIFEST_RESP_CAP 16K→24K |
 
+### 音频（BGM）—— 2026-10-01 全程无声定案
+| 症状 | 根因 | 修法/铁律 |
+|---|---|---|
+| **BGM 点了播放毫无反应/全程无声**（命令被消费、曲目表建成 1167 首、PA 也开了，就是没声音，串口零报错） | **`codec_es8311_init()` 全仓零调用**：`hal_contract.h` 的 `mp_codec_init()` 只有定义没人调，`bgm_start()` 里也没有——git 取证 `051ff84` 的 bgm_start 有 `mp_codec_init(44100);`，`feb1360` 重排建栈顺序时删掉后再没恢复（main.c 注释"codec_init 在内"成了过期承诺）。后果：`s_tx/s_dev` 恒 NULL → `codec_es8311_set_sample_rate()` 返回 `ESP_ERR_INVALID_STATE`、`codec_es8311_write()` 返回 `ESP_ERR_INVALID_ARG`，而 feeder 两处返回值原先把丢弃 → 解码/环形缓冲/PA 全在正常跑，没有一字节进 I2S | `bgm_start()` 在建栈**之后**补 `mp_codec_init(44100)`（顺序铁律：mp_codec_init 会吃内部堆连续块，先建 codec 会让 8KB bgm 栈再也建不起来）；feeder 的 `codec_write` 返回值必须计数+报错（`g_bgm_wr_err`），**禁止再出现"返回值丢弃"的静默失败** |
+| 起播/拖动期"卡顿"（可听断音） | 三处叠加：① 起播时"ring 里有一帧就往 I2S 送"，首包未到就抽干 DMA；② I2S DMA 默认只有 6×240=1440 帧（22.05kHz ≈65ms），而 feeder 每次写 1152 帧（52ms）→ 抗抖动余量仅 ~13ms；③ feeder 优先级 4，与 bgm/poller/events/asset_dl（同为 prio 3）挤在 PRO 核，素材同步/长轮询一次调度抖动就抽干 DMA | ① 起播预缓冲 `PRIME_MS=400`（带 2.5s 超时兜底）再开声；② I2S DMA 抬到 8×512=4096 帧（22.05kHz ≈186ms）；③ feeder 优先级 4→6（仍低于 WiFi23/TCP-IP18）。取证口径：tprobe 的「bgm 音频：断供/最低水位/I2S 写最长」 |
+| "设了 BGM 没声音"判读顺序（排障用） | —— | ① `bgm 任务起步/ codec 初始化完成` 有没有（没有=启动期就断了）② `曲目表构建：命中 N 首`（0 首=TF audio 包缺失）③ tprobe 的「丢弃[无解码器/断网/置灰]」是否在涨 ④ `codec写失败` 是否在涨 ⑤ 断供/水位（ring 侧）⑥ I2S 写最长（DMA 侧） |
+
 ---
 
 ## 五、跨端契约（C# 导出 ↔ C 解析，全部真机炸过后定稿）

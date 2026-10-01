@@ -42,6 +42,8 @@ mp_bgm_state_t bgm_get_state(void);
 mp_bgm_source_t bgm_get_source(void);
 uint8_t bgm_get_volume(void);
 bool bgm_source_greyed(mp_bgm_source_t src);
+/** 当前流采样率（Hz；0=未定）——仅供遥测/探针打印用。 */
+uint32_t bgm_rate_get(void);
 
 /* 源显示名（菜单标签用）："wz"/"qq"。 */
 const char *bgm_source_name(void);

@@ -52,7 +52,25 @@ static const char *TAG = "bgm";
 #define RETRY_SAME_TRACK   2                /* 同曲重试 2 次 */
 #define TRACK_FAIL_LIMIT   3                /* 连续 3 曲失败 → 源置灰 */
 #define STALL_NOFRAME_MAX  64               /* 连续空帧判失联（喂错流/占位解码器） */
+/* 【BGM "变快+顿卡"根因修复 2026-10-01】minimp3 的 mp3dec_decode_frame 只有在缓冲里
+ * **同时拿到"当前帧 + 下一帧头"** 时才走快路径；否则走慢路径，而慢路径开头就是
+ * `memset(dec, 0, sizeof(mp3dec_t))`（清掉 bit reservoir），并且 mp3d_find_frame
+ * 找不到"可验证的完整帧"时返回 mp3_bytes → 调用方 `info.frame_bytes` 拿到整缓冲长度
+ * → 把**未解码的完整帧当垃圾丢掉**。
+ * 设备按 2048B/块喂流，块边界上永远是"半帧"，于是每块都可能触发这条路：
+ *   host 复现（同一 minimp3 源码 + 同一缓冲管理）：
+ *     整文件一次解码 = 5269 帧 / 137.6s（= 源，正确）
+ *     2048B 分块     = 3930 帧 / 102.7s（丢 25% ← 真机实测同样 3930 帧！）
+ *   本宏修法：**缓冲里不足 2 帧就不解**（等下一块拼齐），流结束时再 force 冲一次：
+ *     512/1024/2048/4096B 分块 = 全部 5269 帧 / 137.6s ✓
+ * 本曲 80kbps@22.05kHz ≈ 261B/帧，2048B ≈ 7 帧，余量充足。 */
+#define MP3_DEC_MIN_BYTES  2048
 #define UNDERRUN_PA_OFF    20               /* 静音 2s → 关 PA */
+/* 起播预缓冲（治"卡顿"）：攒够 PRIME_MS 毫秒的 PCM 再开声；超时 PRIME_TIMEOUT_MS
+ * 兜底（慢流/坏流不能让 feeder 永久等待）。数值取 400ms：本板 ring=128KB
+ * （22.05kHz 立体声 ≈1.45s），400ms ≈ 28% 水位，足够跨过一次网络/解码抖动。 */
+#define PRIME_MS           400
+#define PRIME_TIMEOUT_MS   2500
 
 /* ------------------------------------------------------------------ */
 /* 状态（feeder/外部读）                                                 */
@@ -279,19 +297,28 @@ typedef struct {
     int16_t   stereo[MINIMP3_MAX_SAMPLES_PER_FRAME * 2];
     int       frames;          /* 本会话解出的帧数 */
     int       stall;           /* 连续无帧计数 */
+    uint32_t  bytes_in;        /* 已接收的码流字节（断点续流用；跨续传累加） */
 } stream_ctx_t;
 
 static stream_ctx_t s_sc;
 
 static mp3dec_t *s_dec;   /* 解码器常驻（bgm 任务启始分配；play_track 每曲 mp3dec_init 复位） */
 
+/* 【丢数据取证 2026-10-01】"缓冲满 → 整缓冲丢弃重同步"这条支路原先完全静默，
+ * 而它正是"曲子变短/听着变快"的现场：丢掉的是**未解码的完整 MP3 帧**。
+ * 计数交 tprobe 打印（>0 = 音乐被跳过）。 */
+volatile uint32_t g_bgm_drop_bytes;
+volatile uint32_t g_bgm_drops;
+
 /* 前向：流中控制队列排空（定义见「控制消息」节） */
 static void drain_audio_q_nonblock(void);
 
 /* 解码 in 缓冲内所有完整帧 → 环形缓冲；false=外部要求停 */
-static bool decode_pending(stream_ctx_t *c)
+static bool decode_pending(stream_ctx_t *c, bool force)
 {
     while (c->in_len > 0) {
+        /* 不足 2 帧且非收尾 → 保留缓冲等下一块（见 MP3_DEC_MIN_BYTES 注释） */
+        if (!force && c->in_len < MP3_DEC_MIN_BYTES) break;
         mp3dec_frame_info_t info;
         int samples = mp3dec_decode_frame(c->dec, c->in, (int)c->in_len,
                                           c->pcm, &info);
@@ -349,10 +376,14 @@ static bool stream_chunk(void *ctx, const char *data, size_t len)
 
     /* 追加进码流缓冲（满则先解码腾空） */
     if (c->in_len + len > MP3_INBUF_LEN) {
-        if (!decode_pending(c)) return false;
+        if (!decode_pending(c, false)) return false;
     }
     size_t take = len;
     if (c->in_len + take > MP3_INBUF_LEN) {
+        /* 【丢数据取证 2026-10-01】这一支原先完全静默，而它正是"曲子变短"的现场：
+         * 整缓冲（含未解码的完整 MP3 帧）被丢弃 = 音乐被跳过一截。打点计数。 */
+        g_bgm_drop_bytes += (uint32_t)c->in_len;
+        g_bgm_drops++;
         /* 缓冲仍满且解不出帧（16KB 无同步头：坏流/超长垃圾前缀）。
          * 上游 find_frame 已证明整缓冲无可解码帧 → 整段丢弃重同步，
          * 保证流的前向推进（否则后续数据会被永久丢弃）。 */
@@ -361,8 +392,9 @@ static bool stream_chunk(void *ctx, const char *data, size_t len)
     }
     memcpy(c->in + c->in_len, data, take);
     c->in_len += take;
+    c->bytes_in += (uint32_t)take;          /* 断点续流的续传位置 */
 
-    return decode_pending(c);
+    return decode_pending(c, false);
 }
 
 /* 播放一首：返回 true=自然播完（可续下一首），false=失败/中止 */
@@ -386,9 +418,58 @@ static bool play_track(uint32_t track_id)
     if (!s_sc.in) return false;
 
     s_playing = true;
-    int status = mp_http_get(url, 15000, stream_chunk, &s_sc);
-
-    bool natural = (status == 200);              /* 200+读尽 = 服务端结束本曲 */
+    /* 【播放速率取证 2026-10-01】用户口径"比本地快了很多很多"。
+     * 一边是 I2S 侧（tprobe 的 feeder 计数 ×1152/秒）已实测 ≈22.0k 帧/s（= 源
+     * 22.05kHz，速率正确），另一边是听感——若解码/读流环节**丢过数据**，
+     * 音乐会"跳着播"（既快又顿）。这里记下每曲的墙钟时长与解出帧数：
+     *   · 解出帧数 × 576 / 22050 ≈ 源音频秒数（MPEG2 LSF 每帧 576 样本）
+     *   · 两者若接近 → 播放速率正常，问题在别处（编解码/听感）；
+     *   · 墙钟 << 源秒数 → 确实丢数据/跳播。 */
+    int64_t t_start_us = esp_timer_get_time();
+    /* ══ 【BGM "变快+顿卡"根因修复 2026-10-01】══════════════════════════════
+     * 症状：曲子在设备上比源文件快 1.36×（实测 137.6s 的曲子在 101.1s 内"播完"，
+     * 解码帧数 3930 vs 源 5269），且隔几秒顿一下。
+     * 根因：**流被网络中断截断，但调用方把截断当成"本曲自然播完"**：
+     *   · mp_http_get 只回 HTTP 状态码，读中断（真机 errno=113 ECONNABORTED /
+     *     读超时）与正常读完同为 status=200；
+     *   · play_track 见 200 即 natural=true → 直接跳下一首 ⇒ 少掉的那 25% 音乐
+     *     被"跳过"，听感就是**又快又顿**（不是时钟/采样率问题：I2S 侧实测
+     *     22.0k 帧/s 与源一致，解码器 host 侧逐帧复核 5269 帧/137.6s 全对）。
+     * 修法：**断点续流**——用 count 到的字节数做 Range 续传（服务端 asset/bgm
+     * 已支持 206），只有"干净读到 EOF"才算自然播完；中断则原地续，最多 8 次，
+     * 仍失败按失败处理（走既有重试/跳曲逻辑）。用户侧听感 = 不再跳段。 */
+    bool natural = false;
+    int  resumes = 0;
+    /* （续流循环见下：每轮结束后 force 冲一次缓冲尾巴） */
+    for (;;) {
+        bool clean = false;
+        int status = mp_http_get_range(url, s_sc.bytes_in, 15000, stream_chunk, &s_sc, &clean);
+        if (status == 200 || status == 206) {
+            if (clean) { natural = true; break; }        /* 服务端读完 = 本曲结束 */
+            if (!s_playing || s_offline) break;          /* 控制中止：不算失败 */
+            if (s_sc.bytes_in == 0) break;               /* 一字节没拿到：交给失败路径 */
+            if (++resumes > 8) {
+                ESP_LOGW(TAG, "曲 %u 续流 8 次仍未读完（已收 %u KB）→ 放弃本曲",
+                         (unsigned)track_id, (unsigned)(s_sc.bytes_in / 1024));
+                break;
+            }
+            ESP_LOGW(TAG, "码流中断（已收 %u KB）→ Range 续流第 %d 次",
+                     (unsigned)(s_sc.bytes_in / 1024), resumes);
+            vTaskDelay(pdMS_TO_TICKS(200));              /* 稍候再续，避开瞬时抖动 */
+            continue;
+        }
+        break;                                            /* 连接失败：走失败路径 */
+    }
+    if (s_playing) decode_pending(&s_sc, true);           /* 冲掉缓冲尾巴的最后一帧 */
+    {
+        uint32_t ms = (uint32_t)((esp_timer_get_time() - t_start_us) / 1000);
+        uint32_t rate = s_rate ? s_rate : 44100;
+        ESP_LOGW(TAG, "播放速率取证：曲 %u 收到 %u B / 解出 %d 帧 → 源≈%u s；墙钟 %u.%us（%s）",
+                 (unsigned)track_id, (unsigned)s_sc.bytes_in, s_sc.frames,
+                 (unsigned)((uint64_t)s_sc.frames * 576u / rate),
+                 (unsigned)(ms / 1000), (unsigned)((ms % 1000) / 100),
+                 natural ? "自然播完" : "中止/失败");
+    }
     free(s_sc.in);
     s_sc.in = NULL;
 
@@ -593,13 +674,36 @@ volatile int32_t  g_bgm_state_probe;
 /* PLAY 分支逐点标记：1 入口 / 2 bgm_cmd 后 / 3 codec_start 后 / 4 表情后 /
  * 5 取到表锁 / 6 tbl_ensure 后 / 7 play_session 后 —— 卡在哪一步看它 */
 volatile uint32_t g_bgm_step;
+/* 【静默丢弃取证 2026-10-01】bgm_task 三处 continue/return 全无日志：
+ * 解码器缺失 / 断网降级 / 源置灰 —— 用户侧表现都是"点了播放毫无反应"。
+ * 计数由 main.c 的 tprobe 打印，判定"命令到了但被谁吃掉"。 */
+volatile uint32_t g_bgm_drop_nodec, g_bgm_drop_offline, g_bgm_drop_greyed;
+/* feeder 侧 codec 写失败次数（未初始化/句柄空 → 此前完全静默） */
+volatile uint32_t g_bgm_wr_err;
+/* 【卡顿取证 2026-10-01】环形缓冲断供次数（I2S 被抽干=可听断音）+
+ * 打印周期内最低水位（int16 样本；rate*2=1 秒）+ 单次 I2S 写最长耗时（µs）。
+ * 判读：underruns 持续涨 = 解码/网络供不上（查 HTTP 读速与 decode）；
+ *       水位长期贴着 0 = ring 太小或读端节流；wr_max_us > 50ms = I2S 侧被阻塞。 */
+volatile uint32_t g_bgm_underruns;
+volatile uint32_t g_bgm_ring_min = 0xFFFFFFFFu;
+volatile uint32_t g_bgm_wr_max_us;
+/* 【节律性卡顿取证 2026-10-01】用户口径：BGM"隔几秒卡一下，像断帧"。
+ * ring 侧无断供（underruns=0）+ 水位 1.2s 满 ⇒ 只可能是 **feeder 被抢占**：
+ * I2S DMA 只有 ~139ms 余量，feeder 晚到 >139ms 就抽干 → 可听断音。
+ * 这里记录两次 I2S 写之间的最大间隔（µs）与超阈值次数，用于和串口里
+ * "谁在那个时刻跑"（WiFi 重连/素材同步/NVS 提交/字体装载）对表。
+ * 判据：gap_max > 139000µs（22.05kHz 下 DMA 深度）即实锤欠载；
+ *       gap_over 每 10s 涨 = 卡顿频次。 */
+volatile uint32_t g_bgm_gap_max_us;
+volatile uint32_t g_bgm_gap_over;
+volatile uint32_t g_bgm_gap_at_ms;
 
 static void handle_audio_msg(const mp_audio_msg_t *m)
 {
     switch (m->type) {
     case MP_AUDIO_PLAY: {
         g_bgm_step = 1;
-        if (s_greyed[s_source]) return;                 /* 置灰源禁播（E8） */
+        if (s_greyed[s_source]) { g_bgm_drop_greyed++; return; }   /* 置灰源禁播（E8） */
         int id = m->a;                              /* 0=服务端决定；负数=高位 u32 id 的位型 */
         if (id == 0) {
             if (bgm_cmd("play", 0, &id) != 0 || id == 0) {
@@ -748,11 +852,15 @@ static void handle_audio_msg(const mp_audio_msg_t *m)
 static void bgm_task(void *arg)
 {
     (void)arg;
-    /* 解码器状态 ≈6.7KB（float 合成器），内部 RAM 优先；紧张时退 PSRAM
-     * （float 访存变慢但仍可解，好过无声） */
-    s_dec = heap_caps_malloc(sizeof(mp3dec_t), MALLOC_CAP_8BIT);
+    /* 解码器状态 ≈6.7KB（float 合成器）。
+     * 【内部堆让位 2026-10-01】原先"内部 RAM 优先、紧张才退 PSRAM"——但本板
+     * 内部 DRAM 只有 ~133KB，真机实测整图包（17MB）分块下载期间内部堆会掉到
+     * 几百字节，连 SDMMC 的 512B DMA 缓冲都拿不到（`sdmmc_read_sectors:
+     * not enough mem` → 地图包 open 失败 → 黑屏）。解码器放 PSRAM 只损失少量
+     * 访存速度，换回 6.7KB 内部堆是划算的：**改为 PSRAM 优先，失败才退内部**。 */
+    s_dec = heap_caps_malloc(sizeof(mp3dec_t), MALLOC_CAP_8BIT | MALLOC_CAP_SPIRAM);
     if (!s_dec) {
-        s_dec = heap_caps_malloc(sizeof(mp3dec_t), MALLOC_CAP_8BIT | MALLOC_CAP_SPIRAM);
+        s_dec = heap_caps_malloc(sizeof(mp3dec_t), MALLOC_CAP_8BIT);
     }
     if (s_dec) {
         mp3dec_init(s_dec);
@@ -763,16 +871,25 @@ static void bgm_task(void *arg)
     uint32_t src = 0;
     if (mp_nvs_get_u32("bgm_src", &src)) s_source = (mp_bgm_source_t)src;
 
+    /* 【取证 2026-10-01】此前任务起步完全静默：解码器分配失败时任务照跑但
+     * 每条消息都被丢弃，串口/Web 日志里看不出任何异常（"点了播放毫无反应"）。
+     * 这里把起步状态一次打全：dec/ring 指针 + 起始源/音量。 */
+    ESP_LOGI(TAG, "bgm 任务起步：dec=%p(%uB) ring=%p 源=%s 音量=%u 栈=%d",
+             (void *)s_dec, (unsigned)sizeof(mp3dec_t), (void *)s_ring,
+             source_str((mp_bgm_source_t)s_source), (unsigned)s_vol,
+             (int)MP_BGM_TASK_STACK);
+
     for (;;) {
         mp_audio_msg_t m;
         if (xQueueReceive(mp_audio_q, &m, portMAX_DELAY) == pdTRUE) {
             g_bgm_msgs++;
             g_bgm_state_probe = (int32_t)s_state;
-            if (!s_dec) continue;                       /* 解码器不可用 */
+            if (!s_dec) { g_bgm_drop_nodec++; continue; }   /* 解码器不可用（计数取证） */
             if (m.type == MP_AUDIO_VOL || m.type == MP_AUDIO_VOLUME) {
                 handle_audio_msg(&m); continue;     /* 音量本地可用，断网也不拦 */
             }
             if (s_offline && m.type != MP_AUDIO_SOURCE) {
+                g_bgm_drop_offline++;
                 continue;                               /* 断网静音降级（E8）；切源仍可 */
             }
             handle_audio_msg(&m);
@@ -802,6 +919,9 @@ static void feeder_task(void *arg)
     static int16_t out[FEED_FRAMES * 2];
     bool pa_on = false;
     int underruns = 0;
+    bool primed = false;             /* 起播预缓冲已完成 */
+    int64_t prime_deadline = 0;      /* 预缓冲等待上限（防慢流死等） */
+    int64_t s_last_wr_end_us = 0;    /* 上次 I2S 写结束时刻（卡顿取证） */
 
     for (;;) {
         g_feeder_loops++;
@@ -815,12 +935,39 @@ static void feeder_task(void *arg)
         if (!s_playing) {
             if (pa_on) { mp_pa_enable(false); pa_on = false; }
             underruns = 0;
+            prime_deadline = 0;
+            primed = false;
             vTaskDelay(pdMS_TO_TICKS(50));
             continue;
         }
 
+        /* ══ 【起播预缓冲 2026-10-01：治"卡顿"】════════════════════════════
+         * 原实现"环形缓冲里有一帧就往 I2S 送"：起播瞬间 HTTP 首包 + 首帧解码
+         * 都还没跟上，I2S DMA 几毫秒内就被抽干 → 开头必有一串断音；流中途
+         * 网络/解码抖动同样直接漏到喇叭（ring 只有 1.4s 余量，浅水位就断）。
+         * 现在：等 ring 攒到 PREBUF_MS 的水位再开声（带超时兜底，防慢流死等），
+         * 期间 PA 保持关闭 → 用户听到的是"干净起播"而不是"先咔哒几声"。 */
+        if (!primed) {
+            uint32_t rate = s_rate ? s_rate : 44100;
+            size_t need = (size_t)((uint64_t)rate * 2u * PRIME_MS / 1000u);   /* int16 计 */
+            size_t have = pcm_ring_count(s_ring);
+            int64_t now_us = esp_timer_get_time();
+            if (prime_deadline == 0) prime_deadline = now_us + PRIME_TIMEOUT_MS * 1000;
+            if (have < need && now_us < prime_deadline) {
+                if (have < g_bgm_ring_min) g_bgm_ring_min = (uint32_t)have;
+                vTaskDelay(pdMS_TO_TICKS(10));
+                continue;
+            }
+            primed = true;
+        }
+
         size_t n = pcm_ring_read(s_ring, out, FEED_FRAMES * 2, 100);
+        {
+            size_t lvl = pcm_ring_count(s_ring);
+            if (lvl < g_bgm_ring_min) g_bgm_ring_min = (uint32_t)lvl;   /* 水位取证 */
+        }
         if (n == 0) {
+            g_bgm_underruns++;
             if (++underruns > UNDERRUN_PA_OFF && pa_on) {
                 mp_pa_enable(false);                 /* 空载关 PA（防底噪） */
                 pa_on = false;
@@ -842,7 +989,32 @@ static void feeder_task(void *arg)
             mp_pa_enable(true);                      /* 有声才开 PA（GPIO46） */
             pa_on = true;
         }
-        mp_codec_write(out, n / 2);                        /* 立体声帧数 */
+        /* 【静默无声根因取证 2026-10-01】此前 codec_write 返回值被丢弃：
+         * codec 未初始化（s_tx=NULL）时每笔都返回 ESP_ERR_INVALID_ARG，串口零日志
+         * → 现象就是"解码在跑、PA 开了、就是没声音"。计数交 tprobe，前几笔另行报错。 */
+        int64_t wr_t0 = esp_timer_get_time();
+        /* 【节律性卡顿取证】上一次写结束 → 本次写开始的最大间隔。
+         * 正常节奏 = FEED_FRAMES/rate ≈ 52ms（22.05kHz）；> DMA 深度（6×512 帧
+         * ≈139ms@22.05k / 70ms@44.1k）即已欠载（可听断音）。 */
+        if (s_last_wr_end_us) {
+            uint32_t gap = (uint32_t)(wr_t0 - s_last_wr_end_us);
+            if (gap > g_bgm_gap_max_us) {
+                g_bgm_gap_max_us = gap;
+                g_bgm_gap_at_ms = (uint32_t)(wr_t0 / 1000);
+            }
+            if (gap > 150000u) g_bgm_gap_over++;          /* 150ms 保守阈值 */
+        }
+        esp_err_t werr = mp_codec_write(out, n / 2);        /* 立体声帧数 */
+        uint32_t wr_us = (uint32_t)(esp_timer_get_time() - wr_t0);
+        s_last_wr_end_us = wr_t0 + wr_us;
+        if (wr_us > g_bgm_wr_max_us) g_bgm_wr_max_us = wr_us;   /* DMA 侧被拖住的取证 */
+        if (werr != ESP_OK) {
+            g_bgm_wr_err++;
+            if (g_bgm_wr_err <= 3) {
+                ESP_LOGE(TAG, "codec_write 失败：%s（codec 未初始化？见 mp_codec_init）",
+                         esp_err_to_name(werr));
+            }
+        }
     }
 }
 
@@ -927,7 +1099,42 @@ void bgm_start(void)
             esp_timer_start_periodic(s_task_retry_timer, 10ULL * 1000000ULL);
         }
     }
-    xTaskCreatePinnedToCore(feeder_task, "i2s_feed", 4096, NULL, 4, NULL, 0 /* PRO */);
+
+    /* ══ 【BGM 全程无声的真根因 2026-10-01：codec 从未初始化】══════════════════
+     * 证据链：
+     *   · 全仓 `codec_es8311_init()` 只有定义，**零调用点**（hal_contract 的
+     *     mp_codec_init 同样零调用）；git 取证：051ff84 的 bgm_start 里有
+     *     `mp_codec_init(44100);`，feb1360 重排建栈顺序时被删，此后从未恢复
+     *     （main.c 注释"codec_init 在内"成了过期承诺）。
+     *   · 后果：s_tx/s_dev 恒为 NULL →
+     *       codec_es8311_set_sample_rate() 返回 ESP_ERR_INVALID_STATE，
+     *       codec_es8311_write()          返回 ESP_ERR_INVALID_ARG，
+     *     而 feeder_task 两处返回值原先都被丢弃 → 解码/环形缓冲/PA 全在正常跑，
+     *     就是没有一字节进 I2S，串口零日志（真机：命令消费、曲目表建好、无下文）。
+     * 位置纪律（feb1360 的教训）：**必须在 bgm 任务建栈之后**——mp_codec_init 会
+     * 吃掉内部堆连续块（I2S 通道 + 中断 + DMA 描述符），先建 codec 会让 8KB 的
+     * bgm 栈再也建不起来（"bgm 任务首建失败"每 10s 重试、永不成功）。 */
+    esp_err_t cerr = mp_codec_init(44100);
+    if (cerr != ESP_OK) {
+        ESP_LOGE(TAG, "codec 初始化失败：%s → BGM 将无声（I2S/ES8311 未就绪）",
+                 esp_err_to_name(cerr));
+    } else {
+        ESP_LOGI(TAG, "codec 初始化完成（ES8311 + I2S TX 就绪，PA 默认关）");
+    }
+
+    /* 【卡顿修复 2026-10-01 · 第二轮：换核（关键）+ 加厚 DMA】
+     * 用户口径：「隔几秒卡一下，像断帧」——节律与**轮询/网络突发**同量级。
+     * 机理：feeder 原先与 WiFi(prio 23)/TCP-IP(prio 18) 同在 **PRO 核**，
+     * 每次 poll 的收发突发都把 prio 6 的 feeder 压住；I2S DMA（6×512 帧，
+     * 22.05kHz ≈139ms）一被压过 139ms 就抽干 → 可听断音。
+     * 修法：
+     *   ① **feeder 移到 APP 核（core 1）**——那里只有 render(prio 5)/
+     *      input(prio 4)，无网络栈；feeder prio 6 只在"该喂 DMA"时短暂抢占
+     *      渲染（每次 ~1ms 量级，30fps 无感），却再不会被 WiFi 突发压住。
+     *   ② DMA 6×512 → **6×768**（4608 帧：22.05kHz ≈209ms / 44.1kHz ≈104ms），
+     *      内部 DMA 多 6KB（本波次已把解码器 6.7KB 挪去 PSRAM，账平）。
+     * 栈 4096 不变（feeder 无解码）。 */
+    xTaskCreatePinnedToCore(feeder_task, "i2s_feed", 4096, NULL, 6, NULL, 1 /* APP */);
 }
 
 /* ---------------- 曲目表 / 播放控制（任意任务上下文，异步生效）--------- */
@@ -1025,5 +1232,6 @@ void bgm_set_offline(bool offline)
 
 mp_bgm_state_t bgm_get_state(void)  { return s_state; }
 mp_bgm_source_t bgm_get_source(void){ return (mp_bgm_source_t)s_source; }
+uint32_t bgm_rate_get(void)         { return s_rate; }
 uint8_t bgm_get_volume(void)        { return (uint8_t)s_vol; }
 bool bgm_source_greyed(mp_bgm_source_t src) { return s_greyed[src]; }

@@ -281,10 +281,17 @@ static void raw_tcp_probe_once(const char *url)
 /* ------------------------------------------------------------------ */
 /* 通用事务：GET / POST，流式回调                                        */
 /* ------------------------------------------------------------------ */
+/* 【流式中断可判 2026-10-01】BGM"卡顿+变快"根因：mp_http_get 只回 HTTP 状态码，
+ * 中途读失败（errno=113 ECONNABORTED 等）与"服务端正常读完"同为 status=200，
+ * 调用方（bgm play_track）把**被截断的流**当成"本曲自然播完"→ 直接跳下一首，
+ * 用户听到的就是"少了一截 + 声音跳着往前跑（快）+ 隔几秒顿一下"。
+ * 这里把"是否干净读到 EOF"作为出参暴露；range_from > 0 时带 Range 头做断点续流。 */
 static int http_txn(const char *url, const char *path, bool is_post, const char *body,
                     mp_http_chunk_cb cb, void *ctx,
-                    char *resp_buf, size_t resp_cap, uint32_t timeout_ms)
+                    char *resp_buf, size_t resp_cap, uint32_t timeout_ms,
+                    uint32_t range_from, bool *clean_eof)
 {
+    if (clean_eof) *clean_eof = false;
     if (!url || url[0] == 0) return -1;
 
     esp_http_client_config_t cfg = {
@@ -312,6 +319,11 @@ static int http_txn(const char *url, const char *path, bool is_post, const char 
     if (is_post) {
         esp_http_client_set_method(h, HTTP_METHOD_POST);
         esp_http_client_set_header(h, "Content-Type", "application/json");
+    }
+    if (range_from > 0) {                       /* 断点续流（BGM 中断续传） */
+        char rng[32];
+        snprintf(rng, sizeof rng, "bytes=%u-", (unsigned)range_from);
+        esp_http_client_set_header(h, "Range", rng);
     }
 
     int body_len = (body ? (int)strlen(body) : 0);
@@ -343,7 +355,8 @@ static int http_txn(const char *url, const char *path, bool is_post, const char 
             /* -1=读超时/对端中途掐断（0=正常 EOF，不算失败） */
             tx_fail_log(url, path, "read", ESP_FAIL, esp_http_client_get_errno(h));
         }
-        if (r <= 0) break;
+        if (r < 0) break;                      /* 中断：clean_eof 保持 false */
+        if (r == 0) { if (clean_eof) *clean_eof = true; break; }   /* 正常 EOF */
         bool keep = true;
         if (cb) keep = cb(ctx, chunk, (size_t)r);
         if (resp_buf && resp_cap > 1 && resp_len < resp_cap - 1) {
@@ -384,7 +397,19 @@ int mp_http_get(const char *path_or_url, uint32_t timeout_ms,
 {
     char url[URL_BUF_LEN];
     if (build_url(url, sizeof(url), path_or_url) != 0) return -1;
-    return http_txn(url, path_or_url, false, NULL, cb, ctx, NULL, 0, timeout_ms);
+    return http_txn(url, path_or_url, false, NULL, cb, ctx, NULL, 0, timeout_ms, 0, NULL);
+}
+
+/* 【BGM 断点续流】带 Range 的流式 GET：from_off > 0 时服务端回 206 + 余下字节。
+ * clean_eof 出参区分"自然读完"与"中途被掐断"（判据见 http_txn 注释）。
+ * 返回 HTTP 状态码（200/206…）；网络错误 -1。 */
+int mp_http_get_range(const char *path_or_url, uint32_t from_off, uint32_t timeout_ms,
+                      mp_http_chunk_cb cb, void *ctx, bool *clean_eof)
+{
+    char url[URL_BUF_LEN];
+    if (build_url(url, sizeof(url), path_or_url) != 0) return -1;
+    return http_txn(url, path_or_url, false, NULL, cb, ctx, NULL, 0, timeout_ms,
+                    from_off, clean_eof);
 }
 
 int mp_http_post_json(const char *path, const char *json_body,
@@ -392,7 +417,7 @@ int mp_http_post_json(const char *path, const char *json_body,
 {
     char url[URL_BUF_LEN];
     if (build_url(url, sizeof(url), path) != 0) return -1;
-    return http_txn(url, path, true, json_body, NULL, NULL, resp_buf, resp_cap, timeout_ms);
+    return http_txn(url, path, true, json_body, NULL, NULL, resp_buf, resp_cap, timeout_ms, 0, NULL);
 }
 
 /* ------------------------------------------------------------------ */

@@ -92,13 +92,19 @@ void asset_dl_set_favorite(const char *hash, bool fav);   /* E7 收藏保护 */
  * 与 asset_dl 任务的 upsert/淘汰并发时会看到半更新行）→ 允许从 LVGL
  * 渲染任务（菜单重建）直接调用。单次持锁含 access(F_OK) 少量 IO。
  *
- * label 口径（菜单字体是内置 Montserrat，仅拉丁字形 → CJK 渲染成空白）：
- *   manifest label 只在「纯可打印 ASCII」时透传；否则回退
+ * label 口径（2026-10-01 中文化改造）：manifest label 只要是「可显示串」
+ * （非空 + 无控制字符，**UTF-8 中文原名原样透传**——服务端 L1 修好后地图名
+ * 就是中文）即采用；否则回退
  *   ① map/entity 字段（ASCII，如 "001010000" / "npc:2100000"）
  *   ② hash 前 8 位。
+ * 兜底（§3.2 L2）：label 形如 "map_<纯数字>"（push 端点没接 WZ 地图名）时
+ * 自动剥掉 "map_" 前缀只显示数字原名（不做中文数字转换，用户已拍板）。
+ * 注意：菜单字体是烘焙 CJK 子集，动态中文名缺字时由菜单层回落数字键
+ * （lvgl_bridge.c menu_label_font_safe），本层不做字体判断。
  * cached[i]（可 NULL）= <kind_dir>/<hash>.mpk 是否已在 TF（access F_OK）。
  * 注意：s_files[] 里含「已登记元数据但未下载成功」的条目，故 list 结果
  * 是「清单全集 + 缓存标记」，不是「仅已缓存」（菜单需据此提供下载入口）。
+ * **BGMAP 列表另过滤用户隐藏的图**（asset_dl_map_set_hidden）。
  * 返回条数（≤ max）；hashes 为 manifest 原文（小写 16 hex），可直接回填
  * MP_CMD_SET_MAP / MP_CMD_SET_PARTS 的 s 通道。 */
 int asset_dl_bgmap_list(char hashes[][20], char labels[][32], bool *cached, int max);
@@ -122,6 +128,26 @@ bool asset_dl_file_cached(const char *hash);
  * false = 参数非法 / 未登记 / 同步任务未启动。
  * 完成判定：调用方轮询 asset_dl_file_cached(hash)（菜单 100ms tick）。 */
 bool asset_dl_request_one(const char *hash);
+
+/* ---------------- 地图"删除" = 本地隐藏标识（§4.4 拍板方案）--------------
+ * 语义：**不物理删文件**——NVS（namespace "maphide"）打 per-map 隐藏标识：
+ *   · 置位后 asset_dl_bgmap_list() 不再返回该图 → 菜单列表消失；文件/清单/
+ *     LRU 全部照常（天然规避"本地删除被 sync 复活"的对账死循环）；
+ *   · **服务端再次推送该图**（poll 收到 map 指令，poller.c 调 set_hidden(false)）
+ *     → 自动解除隐藏、列表恢复可选用；
+ *   · 重启保持（NVS，掉电不丢）。
+ * 键 = per-map 键（map_id 如 "000010000" 优先；无 map_id 时 "h"+hash 前 14 位，
+ * 恒 ≤15 字符 = NVS 键长上限）。
+ * hash_or_id：内容 hash（列表项）或地图 id（服务端指令）两种口径都认
+ * （与 asset_dl_map_path 同款双键解析）。 */
+bool asset_dl_map_set_hidden(const char *hash_or_id, bool hidden);   /* true=NVS 落地成功 */
+bool asset_dl_map_hidden(const char *hash_or_id);                     /* 该图当前是否被隐藏 */
+int  asset_dl_bgmap_visible_count(void);                              /* 未被隐藏的 BGMAP 条数 */
+bool asset_dl_map_is_active(const char *hash_or_id);                  /* 是否正在渲染的当前图 */
+
+/* per-map 键查询（相机 agent 的 NVS per-map 键同口径，见 requirements §5.3）：
+ * out = map_id 优先，无则 "h"+hash 前 14 位；找不到该 BGMAP 条目返回 false */
+bool asset_dl_map_key(const char *hash_or_id, char *out, size_t cap);
 
 void asset_dl_touch(const char *hash);                    /* 最近使用 */
 uint32_t asset_dl_local_rev(void);

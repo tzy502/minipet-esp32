@@ -114,6 +114,19 @@ esp_err_t codec_es8311_init(uint32_t sample_rate_hz)
        mono 源由 audio 模块在解码后自行重复/映射到双声道） */
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_AUTO, I2S_ROLE_MASTER);
     chan_cfg.auto_clear = true; /* DMA 欠载时保持末帧电平，防爆音 */
+    /* 【卡顿根因修复 2026-10-01】默认 DMA 只有 6×240 帧 = 1440 帧
+     * （22.05kHz 立体声 ≈ 65ms）——feeder 每次写 1152 帧（52ms），
+     * 留给"任务被抢占"的抖动余量只有 ~13ms。而 feeder 与 WiFi(prio23)/
+     * TCP-IP(prio18)/poller/asset_dl 同在 PRO 核：任何一次素材同步或长轮询
+     * 调度抖动都会让 DMA 抽干 → 可听断音（用户口径"有点卡顿"）。
+     * 抬到 4096 帧（22.05kHz ≈ 186ms / 44.1kHz ≈ 93ms），
+     * 把抗抖动余量放大一个数量级。
+     * 【内部堆回让 2026-10-01】随后真机发现内部 DRAM 才是本板瓶颈（整图包
+     * 下载期会被榨到几百字节 → SDMMC 读失败 → 黑屏）。16KB DMA 常驻太重，
+     * 折回 **6×512 = 3072 帧（22.05kHz ≈ 139ms）**：仍是原默认（1440 帧/65ms）
+     * 的 2.1 倍余量，省回 8KB 内部 DMA 内存（配合起播预缓冲 400ms 一起抗卡顿）。 */
+    chan_cfg.dma_desc_num  = 6;
+    chan_cfg.dma_frame_num = 512;
     err = i2s_new_channel(&chan_cfg, &s_tx, NULL);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "i2s_new_channel 失败: %s", esp_err_to_name(err));

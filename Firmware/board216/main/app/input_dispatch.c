@@ -35,6 +35,20 @@
 
 static const char *TAG = "input";
 
+/* ══ 【契约 §3.3 相机 UX】调参态接口（lvgl_bridge.c 实现；跨任务可调）══════════
+ * 状态与快照都在渲染层（见 lvgl_bridge.c 文件头"相机 UX 层"），本文件只做**路由**：
+ *   active      —— 调参态激活（触摸/按键归属判据）
+ *   drag_begin/move/end —— 触摸按下/拖动/抬起 = 相机跟手平移（move 返回是否已下发）
+ *   finish      —— 中键或顶键：短按=确认保存(true) / 长按=取消(false)
+ *   poll        —— 主循环兜底：状态机离开 POKER/OFFLINE → 未确认即取消
+ * 命名沿用本工程既有的跨模块前向声明惯例（render_menu_* / render_bgm_bar_* 同款）。 */
+extern bool bridge_cam_adjust_active(void);
+extern void bridge_cam_adjust_drag_begin(int32_t sx, int32_t sy);
+extern bool bridge_cam_adjust_drag_move(int32_t sx, int32_t sy);
+extern void bridge_cam_adjust_drag_end(void);
+extern void bridge_cam_adjust_finish(bool confirm);
+extern void bridge_cam_adjust_poll(void);
+
 /* ------------------------------------------------------------------ */
 /* 参数（默认值；阈值可被服务端下发覆盖——E6「阈值全部 Web 可配」）       */
 /* ------------------------------------------------------------------ */
@@ -553,9 +567,30 @@ static const char *touch_quadrant_name(int16_t x, int16_t y)
     return (y < TOUCH_RANGE_PX / 2) ? "右上" : "右下";
 }
 
+/* 【契约 §3.3】相机调参态触摸：按下=记基准+相机快照，拖动=跟手平移，抬起=补最后一帧。
+ * 手势状态独立于宠物手势（下面的 down/drag_active）——调参期宠物冻结、不抚摸、
+ * 不长按呼出控制条，退出调参态不留残余手势。
+ * downp 由调用方持有（touch_tick 内的 cam_down），调参态不在时清零：调参被按键收尾
+ * 或被状态机打断时手指可能还按着，残留的"按下中"会让下次进入调参态的首个手势走错分支。 */
+static void cam_touch_tick(const touch_frame_t *f, bool *downp)
+{
+    if (f->touched && !*downp) {
+        *downp = true;
+        bridge_cam_adjust_drag_begin(f->x, f->y);
+        note_interaction();
+    } else if (f->touched && *downp) {
+        if (bridge_cam_adjust_drag_move(f->x, f->y)) note_interaction();
+    } else if (!f->touched && *downp) {
+        *downp = false;
+        bridge_cam_adjust_drag_end();
+        note_interaction();
+    }
+}
+
 static void touch_tick(void)
 {
     static bool down = false;
+    static bool cam_down = false;         /* 【§3.3】相机调参态手势（独立于宠物手势） */
     static int16_t down_x, down_y;
     static int64_t down_ms;
     static bool longpress_fired;
@@ -626,6 +661,18 @@ static void touch_tick(void)
                  f.d[4], f.d[5], f.d[6], f.d[7], f.count);
     }
     /* 帧流诊断已完成（格式定稿：status=d[0]&0xF==0x06 有效） */
+
+    /* 【契约 §3.3】相机调参态：整段触摸手势归相机平移（宠物**冻结**——不拖拽/
+     * 不抚摸/不长按呼出控制条）。宠物手势状态在这里一并清掉，防止调参结束后
+     * 用一份陈旧手势继续跑（"按着拖相机→退出→松手"变成抚摸宠物之类的串味）。 */
+    if (bridge_cam_adjust_active()) {
+        cam_touch_tick(&f, &cam_down);
+        down = false;
+        drag_active = false;
+        longpress_fired = false;
+        return;
+    }
+    cam_down = false;    /* 调参态已结束（按键收尾/状态机打断）：清相机手势残留 */
 
     if (f.touched && !down) {
         down = true;
@@ -785,6 +832,14 @@ static void key_fire_menu_toggle(void)
 {
     mp_state_t before = state_machine_current();
 
+    /* 【契约 §3.3 相机调参态】顶键短按 = 确认保存（与菜单内"顶键=确认"同构）。
+     * 调参态绝不能在这里打开菜单：全屏菜单会盖住地图，调参就没得看了。 */
+    if (bridge_cam_adjust_active()) {
+        ESP_LOGI(TAG, "顶键短按 → 相机确认保存（NVS 写入 + 重合成）");
+        bridge_cam_adjust_finish(true);
+        return;
+    }
+
     /* 【E6 半屏控制条】控制条显示时，顶键=确认当前控件（侧键口径与菜单一致：
      * 顶=OK 中=移光标 底=收起），不打开菜单。 */
     if (render_bgm_bar_showing()) {
@@ -861,13 +916,20 @@ static void key_tick(void)
         note_interaction();
     }
 
-    /* 长按 ≥700ms（按住未释放）→ 转时钟模式（用户定稿：长按菜单键=时间） */
+    /* 长按 ≥700ms（按住未释放）→ 转时钟模式（用户定稿：长按菜单键=时间）。
+     * 【§3.3】相机调参态例外：长按 = 取消（与中键长按同义；调参期不转时钟，
+     * 否则待机时钟会盖掉地图、调参态悬空）。 */
     if (latched && stable_pressed && !clock_fired && !menu_fired &&
         (now - press_ms) >= 700) {
         clock_fired = true;
         note_interaction();
-        ESP_LOGI(TAG, "菜单键长按 → 待机时钟");
-        state_machine_handle(MP_SM_EV_IDLE_TIMEOUT);
+        if (bridge_cam_adjust_active()) {
+            ESP_LOGI(TAG, "顶键长按 → 相机取消（复原进入前状态）");
+            bridge_cam_adjust_finish(false);
+        } else {
+            ESP_LOGI(TAG, "菜单键长按 → 待机时钟");
+            state_machine_handle(MP_SM_EV_IDLE_TIMEOUT);
+        }
     }
 
     if (latched && release_pending && !stable_pressed &&
@@ -880,6 +942,7 @@ static int64_t s_k0_pressed_ms;      /* 菜单内该键按下时刻（长按判�
 static bool    s_k0_long_fired;      /* 本次按压已触发长按 */
 static bool    s_k0_wait_release;    /* 正在等释放（短按=下移在释放时执行） */
 static bool    s_k0_bar_mode;        /* 【E6】本次按压归 BGM 控制条（否则归菜单） */
+static bool    s_k0_cam_mode;        /* 【§3.3】本次按压归相机调参态（确认/取消） */
 
 static void key0_menu_hold_tick(void);   /* 定义见下（前向声明） */
 
@@ -908,6 +971,18 @@ static void key0_tick(void)
     }
     note_interaction();
     mp_state_t st = state_machine_current();
+    /* 【契约 §3.3 相机调参态】中键（GPIO0）：短按=确认保存、长按(≥800ms)=取消。
+     * 与菜单内「短按动作 · 长按退出」同构：按下沿不动作，交按住时长判定，
+     * 长按不会顺带触发确认。放在菜单分支之前——调参态跑在 POKER 态（菜单已收起），
+     * 但即便状态机侧出现 MENU 与调参态并存，也以调参态优先（防误改菜单选中项）。 */
+    if (bridge_cam_adjust_active()) {
+        s_k0_pressed_ms = mp_now_ms();
+        s_k0_long_fired = false;
+        s_k0_wait_release = true;
+        s_k0_bar_mode = false;
+        s_k0_cam_mode = true;
+        return;
+    }
     if (st == MP_ST_MENU) {
         /* 【用户定稿 2026-09-27】这个键（红框底键，走 GPIO0 通路）在菜单里：
          *   短按 → 光标【下移】（此前是上移，用户明确要求改向下）
@@ -922,6 +997,7 @@ static void key0_tick(void)
         s_k0_long_fired = false;
         s_k0_wait_release = true;
         s_k0_bar_mode = false;
+        s_k0_cam_mode = false;
         (void)render_menu_nav;
         return;
     }
@@ -936,6 +1012,7 @@ static void key0_tick(void)
         s_k0_long_fired = false;
         s_k0_wait_release = true;
         s_k0_bar_mode = true;
+        s_k0_cam_mode = false;
         return;
     }
     /* POKER/OFFLINE：默认音量减（216 板角色分工：GPIO18=菜单键）。 */
@@ -944,16 +1021,18 @@ static void key0_tick(void)
     render_banner_show_for("VOL -", 1500);   /* 定时横幅：1.5s 后渲染侧自动隐藏 */
 }
 
-/* 菜单内该键的"按住时长"状态机（key0_tick 每次调用都跑，含无按下沿的轮询帧）。
- * 【E6】BGM 半屏控制条复用同一套：短按=光标左移，长按=收起控制条。 */
+/* 该键的"按住时长"状态机（key0_tick 每次调用都跑，含无按下沿的轮询帧）。
+ * 【E6】BGM 半屏控制条复用同一套：短按=光标左移，长按=收起控制条。
+ * 【§3.3】相机调参态复用同一套：短按=确认保存，长按=取消（复原进入前相机）。 */
 #define K0_LONG_MS 800
 static void key0_menu_hold_tick(void)
 {
     if (!s_k0_wait_release) return;
     mp_state_t st = state_machine_current();
     bool on_bar = render_bgm_bar_showing();
-    /* 菜单态与"控制条显示中"两种归属，都不在则清状态 */
-    if (st != MP_ST_MENU && !on_bar) {
+    bool on_cam = bridge_cam_adjust_active();
+    /* 菜单态 / 控制条显示中 / 相机调参态三种归属，都不在则清状态 */
+    if (st != MP_ST_MENU && !on_bar && !on_cam) {
         s_k0_wait_release = false;
         return;
     }
@@ -962,7 +1041,10 @@ static void key0_menu_hold_tick(void)
 
     if (still_down && !s_k0_long_fired && held >= K0_LONG_MS) {
         s_k0_long_fired = true;
-        if (on_bar) {
+        if (on_cam) {
+            ESP_LOGI(TAG, "中键长按（≥%dms）→ 相机取消（复原进入前状态）", K0_LONG_MS);
+            bridge_cam_adjust_finish(false);
+        } else if (on_bar) {
             ESP_LOGI(TAG, "底键长按（≥%dms）→ 收起 BGM 控制条", K0_LONG_MS);
             render_bgm_bar_hide();
         } else {
@@ -975,7 +1057,10 @@ static void key0_menu_hold_tick(void)
     if (!still_down) {                      /* 释放 */
         s_k0_wait_release = false;
         if (!s_k0_long_fired) {
-            if (s_k0_bar_mode) {
+            if (s_k0_cam_mode) {
+                ESP_LOGI(TAG, "中键短按 → 相机确认保存（NVS 写入 + 重合成）");
+                bridge_cam_adjust_finish(true);
+            } else if (s_k0_bar_mode) {
                 ESP_LOGI(TAG, "底键短按 → 控制条光标左移");
                 render_bgm_bar_nav(0);
             } else {
@@ -985,6 +1070,7 @@ static void key0_menu_hold_tick(void)
             }
         }
         s_k0_long_fired = false;
+        s_k0_cam_mode = false;
     }
 }
 
@@ -1152,7 +1238,13 @@ static void pwron_tick(void)
     /* POKER/OFFLINE：音量加 */
     mp_audio_msg_t m = { .type = MP_AUDIO_VOLUME, .a = +10 };
     if (!mp_post_audio(&m)) ESP_LOGW(TAG, "audio_q 满，音量+丢失");
-    render_banner_show_for("VOL +", 1500);
+    /* 【§3.3】相机调参态：音量照调，但不弹 VOL 横幅——调参提示横幅是那个态下唯一
+     * 可见的操作提示（POKER 态无中文文字通道），不能被 1.5s 定时横幅顶掉。 */
+    if (bridge_cam_adjust_active()) {
+        ESP_LOGI(TAG, "相机调参态：音量+ 已执行（不弹横幅，保住调参提示）");
+    } else {
+        render_banner_show_for("VOL +", 1500);
+    }
 }
 
 /* ================================================================== */
@@ -1335,6 +1427,7 @@ void input_dispatch_task(void *arg)
         touch_tick();
         key_tick();
         key0_tick();              /* 中键 GPIO0：音量减（用户定稿，BGM 切换已废弃） */
+        bridge_cam_adjust_poll(); /* 【§3.3】调参态兜底：离开 POKER/OFFLINE → 未确认即取消 */
         expr_fsm_tick();
 
         int64_t idle_ms = (s_last_interaction_ms == 0)

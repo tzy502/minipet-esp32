@@ -11,6 +11,7 @@
  * 内存（PSRAM，heap_caps）：见文件尾 RENDER_PSRAM_BUDGET 注释。
  */
 #include "compositor.h"
+#include "watchdog.h"   /* 长任务喂狗：整图装载/窗口缓存填充可远超 5s 帧预算 */
 
 #include <inttypes.h>
 #include <stdio.h>
@@ -98,18 +99,67 @@ static uint16_t *g_tile;
 static uint8_t  *g_tile_mask;              /* 屏幕尺寸 1bit */
 static int64_t   g_map_epoch_us;
 
+/* ══ R2 整图窗口缓存（世界 px；契约 §3.2）════════════════════════════════════
+ * 每层一块 PSRAM 常驻缓存，覆盖「可见窗口 ± 余量」。相机平移时缓存锚点跟着走：
+ *   命中 → 零 IO；小幅平移 → memmove 搬移 + 只读新露出的边条；跳变超窗 → 整窗重载。
+ * cov = 1bit/px（行按 (cw+7)/8 字节对齐，MSB first，与 rc_mask_bit 同序）；
+ * NULL = 该层不透明（static）。 */
+#define RC_WC_STATIC 0
+#define RC_WC_TILE   1
+#define RC_WC_STRIP  2
+#define RC_STRIP_PATH_MAX  160             /* 条带包路径（/sdcard/minipet/bg/<hash>.mpk 量级） */
+
+typedef struct {
+    uint16_t *px;                          /* cw×ch RGB565（源像素；无数据=0） */
+    uint8_t  *cov;                         /* cw×ch 1bit（NULL=不透明） */
+    int32_t   cw, ch;                      /* 缓存尺寸（世界 px） */
+    int32_t   ax, ay;                      /* 缓存左上角 = 源坐标（wrap 层 ax ∈ [0,sw)） */
+    bool      valid;                       /* 内容已装载 */
+    uint8_t   kind;                        /* RC_WC_* */
+    int32_t   sw, sh;                      /* 源尺寸（static/tile=vw×vh；strip=带图 w×h） */
+    bool      wrap;                        /* x 方向周期平铺（带宽 < vw 的滚动条带） */
+    /* 源 IO 描述 */
+    mpak_t   *pkg;                         /* 句柄（static/tile = g_bgmap） */
+    uint32_t  px_off;                      /* 源像素区绝对文件偏移（strip 直读） */
+    uint32_t  cov_off;                     /* 源掩码区绝对文件偏移（strip / tile 桥接） */
+    uint32_t  row_bytes;                   /* 源行字节（align4(源宽×2)） */
+    int       fd;                          /* strip 专用：本次补读期间打开的文件 fd（-1=未开） */
+} rc_wincache_t;
+
 typedef struct {
     bool      ok;
-    uint16_t *px;                          /* 1x 存储 */
+    uint16_t *px;                          /* 1x 存储（旧窗口口径；整图模式不用） */
     uint8_t  *mask;                        /* NULL=不透明 */
     uint16_t  w, h;
     uint32_t  stride_b;
     int16_t   y, speed_x;
     uint8_t   rx, blend;
     int32_t   last_off;
+    /* ── 整图（整图包）字段：y = 世界系带顶；水平世界对齐采样 ── */
+    bool      world;
+    int32_t   delta;                       /* 当前水平相位 Δ（世界 px，见 strip_delta_world） */
+    int32_t   off_q;                       /* 量化后的时间/IMU 相位（刷新窗口推进；与 last_off 同源） */
+    char      path[RC_STRIP_PATH_MAX];     /* 源包路径（按需 pread，不常开句柄） */
+    rc_wincache_t wc;                      /* 源列/行窗口缓存 */
 } rc_strip_t;
 static rc_strip_t *g_strips;
 static int         g_strip_n;
+
+/* ── R2 整图相机状态（契约 §3.2；详见 compose_region 前的相机块）── */
+static bool    g_cam_on;                   /* true = 当前包为整图（相机可用） */
+static int32_t g_cam_vw, g_cam_vh;         /* 整图世界尺寸 */
+static int32_t g_cam_fov_w, g_cam_fov_h;   /* 可见窗口（世界 px）= 屏/RC_SCALE */
+static int32_t g_cam_x, g_cam_y;           /* 相机 = 可见窗口左上角世界坐标（已夹取） */
+static int32_t g_cam_max_x, g_cam_max_y;   /* 可平移上限（0 = 无余量/居中） */
+static int32_t g_cam_ref_cx;               /* 导出参考相机中心（= vw/2） */
+static mpak_t  g_bgmap; static bool g_bgmap_ok;   /* BGMAP 句柄常开（流式读 + 地面表） */
+static uint32_t g_cam_static_off, g_cam_tile_off;         /* payload 相对 */
+static uint32_t g_cam_mask_off;                            /* tile 掩码 payload 相对 */
+static uint32_t g_cam_ground_off, g_cam_ground_len;        /* 地面表 payload 相对 */
+static bool    g_cam_tile_on, g_cam_ground_on;
+static rc_wincache_t g_wc_static, g_wc_tile;
+static uint32_t s_cam_io_rows, s_cam_io_cols, s_cam_io_bytes;   /* 本轮同步的实际读量 */
+static uint32_t s_cam_strip_fopens;                             /* 本轮条带按需开文件次数 */
 
 /* 实体 */
 static uint16_t *g_ent_px;                 /* RC_ENT_W×RC_ENT_H（内容=2x 展开图，像素=屏幕像素） */
@@ -1400,6 +1450,950 @@ static void ent_compose(int32_t x, int32_t y, int32_t w, int32_t h, int darken_p
     }
 }
 
+/* ══════════════════════════════════════════════════════════════════════════
+ * R2 整图相机 + 分块流式窗口缓存（契约 docs/ai/map-fullmap-firmware-contract.md §3.2）
+ *
+ * 用户硬约束（需求 §5.2）：整图包（vw/vh ≫ 屏，如 000010000 = 2270×1807）下
+ *   · 相机可任意平移覆盖整张地图（永不出图边界；图小于窗口时居中）；
+ *   · **世界像素比例恒定**：世界 1x → 屏 2x 整倍最近邻，零插值/零半像素/零重采样；
+ *   · 拖动只补新露出的边条（增量读）；相机静止时**零 TF 读**。
+ *
+ * 三层结构：
+ *   ① 相机状态 g_cam_x/y = 可见窗口左上角世界坐标；窗口 = fov = 屏/RC_SCALE；
+ *   ② 每层一块 PSRAM 窗口缓存（rc_wincache_t）= 可见窗口 ± 余量（336 ⇒ 余 48）；
+ *      锚点不变 → 零 IO；小幅平移 → memmove + 只读新露出的边条；跳变 → 整窗重载；
+ *   ③ 合成：static → 条带 → tile（与旧路径同序），逐屏像素按
+ *      world = (cam + screen/2) 采样（⇒ 每个世界像素正好铺 2×2 同色块）。
+ *
+ * 条带世界系语义（服务端 AssetExporter.RenderFullMapBand 明示的设备规则）：
+ *   · y = 带图顶边世界 y ⇒ 屏 y = (y − cam_y)·2；
+ *   · 带宽 == vw 的带 = **世界对齐层**（整幅从世界 x=0 起绘制，不周期平铺）；
+ *     带宽 < vw 的滚动带仍按周期平铺 —— 但相位锚在**世界原点**（旧实现锚在
+ *     屏幕 x=0 ⇒ 相位随相机漂移，"沿用周期平铺会相位错"即此）；
+ *   · 视差 Δ = floor((ref_cx − cam_cx)·rx/100) + 时间滚动 + IMU 视差：导出带图
+ *     已含"参考相机（地图中心 = vw/2）"下的视差位移，故设备只叠加相对量
+ *     （与桌面 DrawBackViewport `worldX += camCenterX·(100+rx)/100` 同源同向）。
+ *
+ * 内存（PSRAM 常驻，见文件尾 RENDER_PSRAM_BUDGET；整图模式**不再分配**
+ * g_static/g_tile/g_tile_mask 的屏尺寸 949KB ⇒ 相对旧口径净省 ≈384KB）：
+ *   static 336×336×2 = 226KB；tile 226KB + 掩码 14KB；
+ *   4 条带（000010000 实测 850×222 / 2270×260 / 613×125 / 2270×508）
+ *   窗口缓存 634KB + 掩码 40KB ⇒ 合计 ≈ **1.14MB**（硬预算 ≤1.2MB）。
+ *   ⚠️ 条带源图全驻留需 5.9MB（实测：2270×508 单条 2.45MB）⇒ 必须流式，
+ *   条带 PARTS 句柄常开、按行直读（mpak_read_at，布局见 mpak.h）。
+ *
+ * 性能（SDMMC 1-bit 实效 2-4MB/s）：1 世界 px 平移 ≈ 读 336×2B×层 ≈1.7KB；
+ *   100 世界 px 平移 ≈ 67KB/层 ⇒ 拖动 8-15fps（帧内增量读 + 整屏重合成）；
+ *   静止 = 零 TF 读、30fps 满帧。
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+/* ── 纯计算段（无 ESP/PSRAM 依赖）：/tmp/cam_math_test.c 按 RC_PURE_BEGIN/END
+ * 标记抽取**本段原文**编译断言 ⇒ host 自证的就是固件在跑的数学。 ── */
+/* RC_PURE_BEGIN */
+
+/* 非负取模 */
+static int32_t rc_mod(int32_t v, int32_t m)
+{
+    if (m <= 0) return 0;
+    int32_t r = v % m;
+    if (r < 0) r += m;
+    return r;
+}
+
+/* 向下取整除法（负数亦然；视差相位按 floor 口径对齐桌面/服务端） */
+static int32_t rc_floor_div(int32_t a, int32_t b)
+{
+    int32_t q = a / b, r = a % b;
+    if (r != 0 && ((r < 0) != (b < 0))) q--;
+    return q;
+}
+
+/* 屏 px ↔ 世界 px：恒 ×RC_SCALE 整倍（屏上成对像素共享同一世界像素 = 无插值） */
+static int32_t rc_world_of_screen(int32_t screen_px, int32_t cam_world)
+{
+    return cam_world + (screen_px >> RC_SCALE_SHIFT);
+}
+static int32_t rc_screen_of_world(int32_t world_px, int32_t cam_world)
+{
+    return (world_px - cam_world) << RC_SCALE_SHIFT;
+}
+
+/* ══ 相机口径三件套（**同源**：起始相机 / 置中 / 参考相机中心，P0-2）══
+ *  · rc_cam_home(sw,fov)      = 窗口居中时的相机（可见窗口左上角）；
+ *  · rc_cam_ref_center(sw,fov)= 该居中的**窗口中心** = 导出参考相机中心（服务端整图导出
+ *    相机 = 地图中心：worldW/2；bbox 原点下两者恒等，见下恒等式断言）；
+ *  · 采样相位用的 cam_cx = g_cam_x + fov/2（当前窗口中心）。
+ * 恒等式（**对所有 sw/fov 成立，含图 ≤ 窗口**）：rc_cam_home + fov/2 == rc_cam_ref_center == sw/2。
+ * （sw ≤ fov 时 rc_cam_home 为居中负值，故 sw=200/fov=240 得 −20，中心 100 = sw/2 ✓）
+ * 旧代码三处分别写 max/2、vw/2 —— 数值相等但非一处来源，本组函数把它们钉成同源。 */
+static int32_t rc_cam_home(int32_t sw, int32_t fov)
+{
+    if (sw <= fov) return -((fov - sw) / 2);   /* 图 ≤ 窗口：居中（相机为负，图心=屏心） */
+    return (sw - fov) / 2;                     /* 图 > 窗口：留出两侧等量余量 */
+}
+static int32_t rc_cam_ref_center(int32_t sw, int32_t fov)
+{
+    return rc_cam_home(sw, fov) + fov / 2;
+}
+
+/* 相机单轴夹取：图 > 窗口 → [0, sw-fov]（永不出边界）；图 ≤ 窗口 → 居中（cam 负值） */
+static int32_t rc_cam_clamp_axis(int32_t want, int32_t sw, int32_t fov)
+{
+    if (sw <= fov) return -((fov - sw) / 2);
+    int32_t hi = sw - fov;
+    if (want < 0) return 0;
+    if (want > hi) return hi;
+    return want;
+}
+
+/* 线性窗口锚点：保证 need [n, n+fov) ⊆ [a, a+cw)（源 [0,sw)）；
+ * 源 ≤ 缓存 → a=0（整源入窗）；否则 a = clamp(n − margin, 0, sw−cw) 并做覆盖校正。 */
+static int32_t rc_anchor_linear(int32_t n, int32_t sw, int32_t cw, int32_t fov, int32_t margin)
+{
+    if (sw <= cw) return 0;
+    int32_t hi = sw - cw;
+    int32_t a = n - margin;
+    if (a < 0) a = 0;
+    if (a > hi) a = hi;
+    if (a > n) a = n;                                    /* 锚点必须 ≤ need */
+    if (n + fov > a + cw) a = n + fov - cw;              /* need 末尾必须被覆盖 */
+    if (a > hi) a = hi;
+    if (a < 0) a = 0;
+    return a;
+}
+
+/* 锚点保持（命中零 IO）或重定位：
+ * 当前缓存仍覆盖 need [n, n+fov) → **锚点不动**（相机在余量内小幅移动 = 零 TF 读）；
+ * 否则重定位到 need − margin（线性夹取 / 循环 mod）。这是"拖动只补新露出边条"的关键：
+ * 每 margin 个世界 px 才触发一次补边条（读 margin 列），摊销 = 1 列/世界 px。 */
+static int32_t rc_anchor_hold(int32_t cur, bool valid, int32_t n, int32_t sw, int32_t cw,
+                              int32_t fov, int32_t margin, bool wrap)
+{
+    if (valid) {
+        if (!wrap) {
+            if (cur <= n && n + fov <= cur + cw) return cur;
+        } else if (sw > 0) {
+            if (rc_mod(n - cur, sw) + fov <= cw) return cur;
+        }
+    }
+    if (wrap) {
+        if (sw <= cw) return 0;
+        return rc_mod(n - margin, sw);
+    }
+    return rc_anchor_linear(n, sw, cw, fov, margin);
+}
+
+/* 窗口平移决策（返回**内容搬移量**）：
+ *   0 = 命中（零 IO）；>0 = 内容向低索引搬 d（新内容补在尾部）；
+ *   <0 = 向高索引搬 |d|（新内容补在首部）；RC_WC_RELOAD = 跳变超窗 → 整窗重载。
+ * wrap=true：锚点在 [0,span) 循环（周期平铺带），取较小搬移方向。 */
+#define RC_WC_RELOAD 0x3FFF
+static int32_t rc_shift_plan(int32_t old_a, int32_t new_a, int32_t span, int32_t cw, bool wrap)
+{
+    if (old_a == new_a) return 0;
+    if (!wrap) {
+        int32_t d = new_a - old_a;
+        if (d >= cw || d <= -cw) return RC_WC_RELOAD;
+        return d;
+    }
+    int32_t fwd = rc_mod(new_a - old_a, span);
+    if (fwd == 0) return 0;
+    if (fwd <= cw / 2) return fwd;
+    int32_t bwd = span - fwd;
+    if (bwd <= cw / 2) return -bwd;
+    return RC_WC_RELOAD;
+}
+
+/* 增量读的"新露出边条"（实现与自证共用）：shift>0 → 缓存尾段 [cw-shift, cw)；
+ * shift<0 → 缓存首段 [0, -shift)；返回该段在**新锚点**下的源坐标区间。 */
+static void rc_band_rect(int32_t shift, int32_t cw, int32_t new_a, int32_t span, bool wrap,
+                         int32_t *dst_lo, int32_t *dst_hi, int32_t *src_lo, int32_t *src_hi)
+{
+    if (shift > 0) {
+        *dst_lo = cw - shift; *dst_hi = cw;
+        *src_lo = new_a + cw - shift; *src_hi = new_a + cw;
+    } else {
+        *dst_lo = 0; *dst_hi = -shift;
+        *src_lo = new_a; *src_hi = new_a - shift;
+    }
+    if (wrap && span > 0) *src_lo = rc_mod(*src_lo, span);
+    *src_hi = *src_lo + (*dst_hi - *dst_lo);
+}
+
+/* 视差符号（真机看感判定点，一处可翻转）：
+ *   +1 = 条带世界位置随相机同向偏移 rx%（⇒ 屏上比 static 慢 rx%，远端"滞后"观感）；
+ *   -1 = 反向（条带越过 static，"超前"观感）。
+ * 依据：契约 §3.2「rx_parallax（相机偏移×系数）」+ 带图世界锚定（服务端四条带
+ * 实测列 0..宽-1 全不透明 ⇒ 世界对齐带）。桌面 DrawBackViewport 是**屏幕锚定**模型
+ * （worldX += camCenterX·(100+rx)/100，rx=0 时层钉在屏上），设备用世界锚定带无法
+ * 逐式复刻，只能按契约在世界系里加"相机偏移×rx%"这一项；符号取"远端滞后"= 物理常规。 */
+#define RC_CAM_PARALLAX_SIGN  (+1)
+
+/* 条带水平相位（世界 px）= 相机视差项（逐帧实时）+ 量化时间/IMU 项（刷新窗口推进）。
+ * 量化理由（P1-1）：相位若逐帧实时推进，而脏区标脏受 4Hz/交互冻结限制 ⇒ 局部脏区
+ * （如宠物区）会按新相位重画条带、而带内其余部分还是旧相位 = 带内 1px 相位缝。
+ * 故时间/IMU 项一律走 off_q（与旧口径 last_off 同款"量化值"），**绘制与缓存同源**；
+ * 相机视差项必须逐帧（拖拽期条带与 static 同移），其变化一律伴随整屏标脏。 */
+static int32_t rc_strip_delta_q(int32_t ref_cx, int32_t cam_cx, int32_t rx, int32_t off_q)
+{
+    return RC_CAM_PARALLAX_SIGN * rc_floor_div((int32_t)((int64_t)(ref_cx - cam_cx) * rx), 100)
+           + off_q;
+}
+
+/* 条带源列：**世界对齐**采样（旧实现锚在屏幕 x=0 ⇒ 相位随相机漂移）。
+ * wrap=false（带宽 ≥ vw 的世界对齐带）越界返回 -1 = 该列不画（露出下层）。 */
+static int32_t rc_strip_src_col(int32_t cam_x, int32_t screen_x, int32_t delta,
+                                int32_t bw, bool wrap)
+{
+    int32_t sc = cam_x + (screen_x >> RC_SCALE_SHIFT) + delta;
+    if (wrap) return rc_mod(sc, bw);
+    return (sc >= 0 && sc < bw) ? sc : -1;
+}
+/* RC_PURE_END */
+
+/* 屏幕列 → 缓存列映射表（每层合成前重建：480 次迭代，零堆分配） */
+static int16_t  s_xmap[RC_MAX_W];
+static uint8_t  s_wc_maskline[RC_CAM_CACHE_W];                    /* 掩码 1B/px 行暂存 */
+static uint8_t  s_wc_bitbuf[(RC_CAM_CACHE_W + 7) / 8 + 2];        /* tight 位图行暂存 */
+#define RC_WC_COV_ROW_MAX  ((RC_CAM_CACHE_W + 7) / 8)              /* 掩码行搬移暂存上限 */
+
+/* ── 契约 §3.1 分块读接口：弱引用 ─────────────────────────────────────────
+ * F1（mpak 层）并行施工中：接口未落地时符号为 NULL → 走下方"桥接行读"
+ * （同样只用 mpak_read_at 公开原语 + mpak.h 已冻结的整图行布局），
+ * 落地后链接自动绑定强符号 ⇒ 本文件零改动切到真接口。 */
+#pragma weak mpak_bgmap_read_static_rect
+#pragma weak mpak_bgmap_read_tile_rect
+#pragma weak mpak_bgmap_read_tile_mask_rect
+#pragma weak mpak_bgmap_ground_y
+
+static bool cam_rect_api_ready(void)
+{
+    return mpak_bgmap_read_static_rect && mpak_bgmap_read_tile_rect &&
+           mpak_bgmap_read_tile_mask_rect;
+}
+
+/* ── 1bit 掩码（缓存内）存取 ── */
+static inline uint32_t wc_cov_rowbytes(const rc_wincache_t *wc)
+{
+    return ((uint32_t)wc->cw + 7u) / 8u;
+}
+static inline bool wc_cov_get(const rc_wincache_t *wc, int32_t cx, int32_t cy)
+{
+    if (!wc->cov) return true;
+    uint32_t bit = (uint32_t)cy * wc_cov_rowbytes(wc) * 8u + (uint32_t)cx;
+    return (wc->cov[bit >> 3] >> (7 - (bit & 7))) & 1u;
+}
+static inline void wc_cov_put(rc_wincache_t *wc, int32_t cx, int32_t cy, bool v)
+{
+    if (!wc->cov) return;
+    uint32_t bit = (uint32_t)cy * wc_cov_rowbytes(wc) * 8u + (uint32_t)cx;
+    if (v) wc->cov[bit >> 3] |= (uint8_t)(1u << (7 - (bit & 7)));
+    else   wc->cov[bit >> 3] &= (uint8_t)~(1u << (7 - (bit & 7)));
+}
+static void wc_cov_clear_range(rc_wincache_t *wc, int32_t cy, int32_t cx0, int32_t n)
+{
+    for (int32_t i = 0; i < n; i++) wc_cov_put(wc, cx0 + i, cy, false);
+}
+/* 行内搬移（mv>0 左移）：新列 i ← 旧列 i+mv */
+static void wc_cov_shift_row(rc_wincache_t *wc, int32_t cy, int32_t mv)
+{
+    if (!wc->cov || mv == 0) return;
+    uint32_t rb = wc_cov_rowbytes(wc);
+    uint8_t tmp[RC_WC_COV_ROW_MAX];
+    /* 结构化护栏：缓存加宽到超过本暂存（RC_CAM_CACHE_W 改大）时**不静默丢掩码**——
+     * 调用方 wc_sync_to 已按同一常量预判并走整窗 RELOAD；此处仅兜底。 */
+    if (rb > RC_WC_COV_ROW_MAX) return;
+    uint8_t *row = wc->cov + (size_t)cy * rb;
+    memcpy(tmp, row, rb);
+    for (int32_t i = 0; i < wc->cw; i++) {
+        int32_t j = i + mv;
+        bool v = false;
+        if (j >= 0 && j < wc->cw) {
+            uint32_t b = (uint32_t)j;
+            v = (tmp[b >> 3] >> (7 - (b & 7))) & 1u;
+        }
+        uint32_t bi = (uint32_t)i;
+        if (v) row[bi >> 3] |= (uint8_t)(1u << (7 - (bi & 7)));
+        else   row[bi >> 3] &= (uint8_t)~(1u << (7 - (bi & 7)));
+    }
+    for (uint32_t b = (uint32_t)wc->cw; b < rb * 8u; b++)       /* 行尾填充位清零 */
+        row[b >> 3] &= (uint8_t)~(1u << (7 - (b & 7)));
+}
+/* 行搬移（按行字节；行对齐 ⇒ 纯 memmove） */
+static void wc_cov_move_rows(rc_wincache_t *wc, int32_t dst_row, int32_t src_row, int32_t rows)
+{
+    if (!wc->cov || rows <= 0) return;
+    uint32_t rb = wc_cov_rowbytes(wc);
+    memmove(wc->cov + (size_t)dst_row * rb, wc->cov + (size_t)src_row * rb,
+            (size_t)rows * rb);
+}
+/* 把 1B/像素掩码行写进缓存行 */
+static void wc_cov_put_1b(rc_wincache_t *wc, int32_t cy, int32_t cx0, const uint8_t *src, int32_t n)
+{
+    for (int32_t i = 0; i < n; i++) wc_cov_put(wc, cx0 + i, cy, src[i] != 0);
+}
+/* 把 tight 位图（bit0 = buf 内起始位）一段写进缓存行 */
+static void wc_cov_put_bits(rc_wincache_t *wc, int32_t cy, int32_t cx0,
+                            const uint8_t *buf, int32_t bit0, int32_t n)
+{
+    for (int32_t i = 0; i < n; i++) {
+        int32_t b = bit0 + i;
+        wc_cov_put(wc, cx0 + i, cy, (buf[b >> 3] >> (7 - (b & 7))) & 1u);
+    }
+}
+
+/* ── 源行读（一层一行）─────────────────────────────────────────────────── */
+static int wc_read_px_row(rc_wincache_t *wc, int32_t sy, int32_t sx0, int32_t n, int32_t cx0)
+{
+    if (n <= 0) return 0;
+    uint16_t *dst = wc->px + (size_t)(sy - wc->ay) * (size_t)wc->cw + cx0;
+    s_cam_io_rows++; s_cam_io_bytes += (uint32_t)n * 2u;
+    if (wc->kind == RC_WC_STRIP) {
+        /* 裸 pread：装载期已由 mpak_open 校验过信封/长度（含 CRC），这里只按偏移取像素。
+         * 原因：条带包 0.15~2.45MB < MPAK_CRC_SKIP_BYTES(4MB) ⇒ 每次 mpak_open 都会
+         * 全量 CRC32C（秒级），拖动期开合不可行；裸读一次几十 µs 且不占常驻句柄。 */
+        if (wc->fd < 0) return MPAK_ERR_IO;
+        off_t off = (off_t)(wc->px_off + (uint32_t)sy * wc->row_bytes + (uint32_t)sx0 * 2u);
+        return pread(wc->fd, dst, (size_t)n * 2u, off) == (ssize_t)((size_t)n * 2u)
+               ? MPAK_OK : MPAK_ERR_IO;
+    }
+    if (mpak_bgmap_read_static_rect) {
+        return (wc->kind == RC_WC_TILE)
+            ? mpak_bgmap_read_tile_rect(wc->pkg, sx0, sy, n, 1, dst, wc->cw)
+            : mpak_bgmap_read_static_rect(wc->pkg, sx0, sy, n, 1, dst, wc->cw);
+    }
+    /* 桥接：直读整图行（static_back_off/tile_layer_off + 行 4B 对齐，与 layer_rgb_load 同口径） */
+    {
+        uint32_t layer_off = (wc->kind == RC_WC_TILE) ? g_cam_tile_off : g_cam_static_off;
+        uint32_t off = wc->pkg->payload_off + layer_off
+                     + (uint32_t)sy * wc->row_bytes + (uint32_t)sx0 * 2u;
+        return mpak_read_at(wc->pkg, off, dst, (size_t)n * 2u);
+    }
+}
+
+static int wc_read_cov_row(rc_wincache_t *wc, int32_t sy, int32_t sx0, int32_t n, int32_t cx0)
+{
+    if (!wc->cov || n <= 0) return 0;
+    s_cam_io_rows++; s_cam_io_bytes += (uint32_t)((n + 7) / 8);
+    if (wc->kind != RC_WC_STRIP && mpak_bgmap_read_tile_mask_rect) {
+        int rc = mpak_bgmap_read_tile_mask_rect(wc->pkg, sx0, sy, n, 1, s_wc_maskline, n);
+        if (rc != MPAK_OK) return rc;
+        wc_cov_put_1b(wc, sy - wc->ay, cx0, s_wc_maskline, n);
+        return 0;
+    }
+    /* tight 位图直读：strip = 带内 bit(y*w+x)；tile 桥接 = 整图 bit(y*vw+x) */
+    {
+        int32_t span = (wc->kind == RC_WC_STRIP) ? wc->sw : g_cam_vw;
+        uint32_t bit0 = (uint32_t)sy * (uint32_t)span + (uint32_t)sx0;
+        uint32_t nb = ((uint32_t)n + 7u) / 8u + 1u;
+        if (nb > sizeof s_wc_bitbuf) nb = sizeof s_wc_bitbuf;
+        int rc;
+        if (wc->kind == RC_WC_STRIP) {                 /* 裸 pread（同像素行口径） */
+            if (wc->fd < 0) return MPAK_ERR_IO;
+            rc = (pread(wc->fd, s_wc_bitbuf, nb, (off_t)(wc->cov_off + (bit0 >> 3))) == (ssize_t)nb)
+                 ? MPAK_OK : MPAK_ERR_IO;
+        } else {
+            rc = mpak_read_at(wc->pkg, wc->cov_off + (bit0 >> 3), s_wc_bitbuf, nb);
+        }
+        if (rc != MPAK_OK) return rc;
+        wc_cov_put_bits(wc, sy - wc->ay, cx0, s_wc_bitbuf, (int32_t)(bit0 & 7u), n);
+        return 0;
+    }
+}
+
+/* 把缓存矩形 [cx0,cx0+w)×[cy0,cy0+h) 填成对应源像素（源越界 = 0/透明）。
+ * 先清后读：保证越界与无数据处不含上一任残留（历史坑：未初始化掩码 = 黑斑/竖条纹）。 */
+static int wc_fill_cache(rc_wincache_t *wc, int32_t cx0, int32_t cy0, int32_t w, int32_t h)
+{
+    if (!wc->px) return MPAK_ERR_ARG;
+    int32_t x0 = cx0 < 0 ? 0 : cx0, y0 = cy0 < 0 ? 0 : cy0;
+    int32_t x1 = cx0 + w, y1 = cy0 + h;
+    if (x1 > wc->cw) x1 = wc->cw;
+    if (y1 > wc->ch) y1 = wc->ch;
+    if (x0 >= x1 || y0 >= y1) return 0;
+    int rc = 0;
+    for (int32_t cy = y0; cy < y1; cy++) {
+        /* 【长任务喂狗 2026-10-01 真机根因】整图包(17MB)首帧窗口缓存填充 =
+         * 336 行 × 多层 fread，实测 static 层就 ~2s、整场 >5s → 触发 E14
+         * 三振熔断（监控任务 vTaskSuspend(render_task)）→ 设备"卡死"。
+         * 这是**合法长任务**，必须主动喂狗：每 16 行一次（≈100ms 粒度）。 */
+        if ((cy & 15) == 0) watchdog_kick();
+        memset(wc->px + (size_t)cy * wc->cw + x0, 0, (size_t)(x1 - x0) * 2u);
+        if (wc->cov) wc_cov_clear_range(wc, cy, x0, x1 - x0);
+        int32_t sy = wc->ay + cy;
+        if (sy < 0 || sy >= wc->sh) continue;
+        if (!wc->wrap) {
+            int32_t s0 = wc->ax + x0, s1 = wc->ax + x1;
+            if (s0 < 0) s0 = 0;
+            if (s1 > wc->sw) s1 = wc->sw;
+            if (s0 < s1) {
+                int32_t cstart = x0 + (s0 - (wc->ax + x0));
+                rc |= wc_read_px_row(wc, sy, s0, s1 - s0, cstart);
+                rc |= wc_read_cov_row(wc, sy, s0, s1 - s0, cstart);
+            }
+        } else {
+            int32_t s = rc_mod(wc->ax + x0, wc->sw), cx = x0;
+            while (cx < x1) {
+                int32_t run = wc->sw - s;
+                if (run > x1 - cx) run = x1 - cx;
+                rc |= wc_read_px_row(wc, sy, s, run, cx);
+                rc |= wc_read_cov_row(wc, sy, s, run, cx);
+                cx += run;
+                s = 0;
+            }
+        }
+    }
+    return rc;
+}
+
+/* 锚点搬到 (nax,nay)：命中零 IO / 增量搬移+补边条 / 跳变整窗重载 */
+static int wc_sync_to(rc_wincache_t *wc, int32_t nax, int32_t nay)
+{
+    if (!wc->px) return 0;
+    if (wc->valid && nax == wc->ax && nay == wc->ay) return 0;
+    if (!wc->valid) {
+        wc->ax = nax; wc->ay = nay; wc->valid = true;
+        return wc_fill_cache(wc, 0, 0, wc->cw, wc->ch);
+    }
+    int rc = 0;
+    /* ① 横向：内容搬移 + 只补新露出的列条（整高） */
+    int32_t mvx = rc_shift_plan(wc->ax, nax, wc->sw, wc->cw, wc->wrap);
+    if (mvx == RC_WC_RELOAD) {
+        wc->ax = nax; wc->ay = nay;
+        return wc_fill_cache(wc, 0, 0, wc->cw, wc->ch);
+    }
+    if (mvx != 0 && wc->cov && wc_cov_rowbytes(wc) > RC_WC_COV_ROW_MAX) {
+        wc->ax = nax; wc->ay = nay;                 /* 掩码行缓冲不够 → 整窗重载（不丢掩码） */
+        return wc_fill_cache(wc, 0, 0, wc->cw, wc->ch);
+    }
+    if (mvx != 0) {
+        int32_t a = mvx > 0 ? mvx : -mvx;
+        for (int32_t cy = 0; cy < wc->ch; cy++) {
+            uint16_t *row = wc->px + (size_t)cy * wc->cw;
+            if (mvx > 0) memmove(row, row + a, (size_t)(wc->cw - a) * 2u);
+            else         memmove(row + a, row, (size_t)(wc->cw - a) * 2u);
+            wc_cov_shift_row(wc, cy, mvx);
+        }
+        int32_t dl, dh, sl, sh2;
+        rc_band_rect(mvx, wc->cw, nax, wc->sw, wc->wrap, &dl, &dh, &sl, &sh2);
+        wc->ax = nax;                       /* 先定新锚点，补边条按新锚点解源坐标 */
+        s_cam_io_cols += (uint32_t)(dh - dl);
+        rc |= wc_fill_cache(wc, dl, 0, dh - dl, wc->ch);
+        (void)sl; (void)sh2;
+    }
+    /* ② 纵向：行搬移 + 只补新露出的行条（整宽） */
+    int32_t mvy = rc_shift_plan(wc->ay, nay, wc->sh, wc->ch, false);
+    if (mvy == RC_WC_RELOAD) {
+        wc->ay = nay;
+        return wc_fill_cache(wc, 0, 0, wc->cw, wc->ch);
+    }
+    if (mvy != 0) {
+        int32_t a = mvy > 0 ? mvy : -mvy;
+        int32_t rows = wc->ch - a;
+        if (mvy > 0) {
+            memmove(wc->px, wc->px + (size_t)a * wc->cw, (size_t)rows * wc->cw * 2u);
+            wc_cov_move_rows(wc, 0, a, rows);
+        } else {
+            memmove(wc->px + (size_t)a * wc->cw, wc->px, (size_t)rows * wc->cw * 2u);
+            wc_cov_move_rows(wc, a, 0, rows);
+        }
+        wc->ay = nay;
+        rc |= wc_fill_cache(wc, 0, mvy > 0 ? wc->ch - a : 0, wc->cw, a);
+    }
+    return rc;
+}
+
+/* 分配窗口缓存（越界部分留 0 = 透明/黑底；sw ≤ CACHE → 整源入窗） */
+static bool wc_alloc(rc_wincache_t *wc, uint8_t kind, int32_t sw, int32_t sh, bool cov, bool wrap)
+{
+    memset(wc, 0, sizeof *wc);
+    wc->kind = kind;
+    wc->sw = sw;
+    wc->sh = sh;
+    wc->wrap = wrap;
+    wc->cw = (sw < RC_CAM_CACHE_W) ? sw : RC_CAM_CACHE_W;
+    wc->ch = (sh < RC_CAM_CACHE_H) ? sh : RC_CAM_CACHE_H;
+    if (wc->cw <= 0 || wc->ch <= 0) return false;
+    wc->px = psram((size_t)wc->cw * (size_t)wc->ch * 2u);
+    if (!wc->px) return false;
+    memset(wc->px, 0, (size_t)wc->cw * (size_t)wc->ch * 2u);
+    if (cov) {
+        size_t rb = (((size_t)wc->cw + 7u) / 8u) * (size_t)wc->ch;
+        wc->cov = psram(rb);
+        if (!wc->cov) {
+            heap_caps_free(wc->px);
+            wc->px = NULL;
+            return false;
+        }
+        memset(wc->cov, 0, rb);
+    }
+    return true;
+}
+
+static void wc_free(rc_wincache_t *wc)
+{
+    if (wc->px) { heap_caps_free(wc->px); wc->px = NULL; }
+    if (wc->cov) { heap_caps_free(wc->cov); wc->cov = NULL; }
+    wc->valid = false;
+}
+
+/* ══ 相机同步：把三层缓存搬到当前相机需要的窗口（命中则零 IO）══ */
+static int32_t cam_margin_x(const rc_wincache_t *wc)
+{
+    int32_t m = (wc->cw - g_cam_fov_w) / 2;
+    return m > 0 ? m : 0;
+}
+static int32_t cam_margin_y(const rc_wincache_t *wc)
+{
+    int32_t m = (wc->ch - g_cam_fov_h) / 2;
+    return m > 0 ? m : 0;
+}
+
+/* 条带水平相位（世界 px）：相机视差（逐帧）+ 量化时间/IMU 项 s->off_q（刷新窗口推进） */
+static int32_t strip_delta_world(const rc_strip_t *s)
+{
+    int32_t cam_cx = g_cam_x + g_cam_fov_w / 2;
+    return rc_strip_delta_q(g_cam_ref_cx, cam_cx, (int32_t)s->rx, s->off_q);
+}
+
+/* 本层本次是否需要读源（锚点要动 / 首载）—— 句柄只在"确实要读"时才开 */
+static bool wc_needs_io(const rc_wincache_t *wc, int32_t nax, int32_t nay)
+{
+    if (!wc->px) return false;
+    if (!wc->valid) return true;
+    return (nax != wc->ax || nay != wc->ay);
+}
+
+/* ══ 相机同步：把三层缓存搬到当前相机需要的窗口（命中则零 IO）══ */
+static int cam_strip_sync(rc_strip_t *s)
+{
+    if (!s->ok || !s->world || !s->wc.px) return 0;
+    s->delta = strip_delta_world(s);
+    int32_t q = g_cam_x + s->delta;                    /* 屏 x=0 对应的源列（未取模/未裁剪） */
+    int32_t nay = rc_anchor_hold(s->wc.ay, s->wc.valid, g_cam_y - (int32_t)s->y,
+                                 s->wc.sh, s->wc.ch, g_cam_fov_h, cam_margin_y(&s->wc), false);
+    int32_t nax = rc_anchor_hold(s->wc.ax, s->wc.valid, q, s->wc.sw, s->wc.cw,
+                                 g_cam_fov_w, cam_margin_x(&s->wc), s->wc.wrap);
+    if (!wc_needs_io(&s->wc, nax, nay)) return 0;      /* 命中：零 IO、零开文件 */
+
+    /* 按需开合（P0-1）：窗口缓存只在"相机越过 48px 余量"时才补读，完全可以在这一次
+     * 补读里 open → pread 若干行 → close。稳态常开句柄因此 = 1（仅 BGMAP）。
+     * 不用 mpak_open：条带包 0.15~2.45MB < MPAK_CRC_SKIP_BYTES(4MB) ⇒ 每次 open 都全量
+     * CRC32C（秒级），拖动期开合不可行；裸 pread 无 CRC（信封已在装载期校验过）。 */
+    int fd = open(s->path, O_RDONLY);
+    if (fd < 0) {
+        ESP_LOGE(TAG, "整图条带开文件失败 %s（errno=%d）→ 本帧不画该带", s->path, errno);
+        s->wc.valid = false;                           /* 下次重试整窗 */
+        return MPAK_ERR_IO;
+    }
+    s->wc.fd = fd;
+    s_cam_strip_fopens++;
+    int rc = wc_sync_to(&s->wc, nax, nay);
+    s->wc.fd = -1;
+    close(fd);
+    return rc;
+}
+
+static void cam_scene_sync(void)
+{
+    if (!g_cam_on) return;
+    s_cam_io_rows = s_cam_io_cols = s_cam_io_bytes = 0;
+    s_cam_strip_fopens = 0;
+    int64_t t0 = esp_timer_get_time();
+    int rc = 0;
+    if (g_wc_static.px) {
+        rc |= wc_sync_to(&g_wc_static,
+                         rc_anchor_hold(g_wc_static.ax, g_wc_static.valid, g_cam_x,
+                                        g_cam_vw, g_wc_static.cw, g_cam_fov_w,
+                                        cam_margin_x(&g_wc_static), false),
+                         rc_anchor_hold(g_wc_static.ay, g_wc_static.valid, g_cam_y,
+                                        g_cam_vh, g_wc_static.ch, g_cam_fov_h,
+                                        cam_margin_y(&g_wc_static), false));
+    }
+    if (g_wc_tile.px) {
+        rc |= wc_sync_to(&g_wc_tile,
+                         rc_anchor_hold(g_wc_tile.ax, g_wc_tile.valid, g_cam_x,
+                                        g_cam_vw, g_wc_tile.cw, g_cam_fov_w,
+                                        cam_margin_x(&g_wc_tile), false),
+                         rc_anchor_hold(g_wc_tile.ay, g_wc_tile.valid, g_cam_y,
+                                        g_cam_vh, g_wc_tile.ch, g_cam_fov_h,
+                                        cam_margin_y(&g_wc_tile), false));
+    }
+    for (int i = 0; i < g_strip_n; i++) rc |= cam_strip_sync(&g_strips[i]);
+
+    if (s_cam_io_rows) {
+        int64_t ms = (esp_timer_get_time() - t0) / 1000;
+        ESP_LOGI(TAG, "rc: 相机 → (%d,%d) 窗口读 %u 行 / 补 %u 列 / %u KB（%lld ms）开条带文件 %u 次%s",
+                 (int)g_cam_x, (int)g_cam_y, (unsigned)s_cam_io_rows,
+                 (unsigned)s_cam_io_cols, (unsigned)(s_cam_io_bytes / 1024u),
+                 (long long)ms, (unsigned)s_cam_strip_fopens,
+                 rc == 0 ? "" : "（含读错误）");
+    }
+    s_cam_strip_fopens = 0;
+    if (rc != 0) ESP_LOGE(TAG, "整图窗口读失败 rc=%d（本帧该层按缺失处理）", rc);
+}
+
+/* ── 整图合成（世界 1x → 屏 2x 整倍最近邻；与旧路径同序 static→条带→tile）── */
+static void cam_static_compose(int32_t x, int32_t y, int32_t w, int32_t h)
+{
+    const rc_wincache_t *wc = &g_wc_static;
+    for (int32_t sx = 0; sx < g_sw; sx++) {
+        int32_t cx = rc_world_of_screen(sx, g_cam_x) - wc->ax;
+        s_xmap[sx] = (cx >= 0 && cx < wc->cw) ? (int16_t)cx : (int16_t)-1;
+    }
+    for (int32_t sy = y; sy < y + h; sy++) {
+        uint16_t *drow = g_fb + (size_t)sy * g_sw;
+        int32_t cy = rc_world_of_screen(sy, g_cam_y) - wc->ay;
+        if (!wc->px || cy < 0 || cy >= wc->ch) {          /* 图外/缓存外 = 黑底 */
+            memset(drow + x, 0, (size_t)w * 2u);
+            continue;
+        }
+        const uint16_t *crow = wc->px + (size_t)cy * wc->cw;
+        for (int32_t sx = x; sx < x + w; sx++) {
+            int16_t cx = s_xmap[sx];
+            drow[sx] = (cx >= 0) ? crow[cx] : 0;
+        }
+    }
+}
+
+static void cam_tile_compose(int32_t x, int32_t y, int32_t w, int32_t h)
+{
+    const rc_wincache_t *wc = &g_wc_tile;
+    if (!wc->px) return;
+    for (int32_t sx = 0; sx < g_sw; sx++) {
+        int32_t cx = rc_world_of_screen(sx, g_cam_x) - wc->ax;
+        s_xmap[sx] = (cx >= 0 && cx < wc->cw) ? (int16_t)cx : (int16_t)-1;
+    }
+    for (int32_t sy = y; sy < y + h; sy++) {
+        int32_t cy = rc_world_of_screen(sy, g_cam_y) - wc->ay;
+        if (cy < 0 || cy >= wc->ch) continue;
+        const uint16_t *crow = wc->px + (size_t)cy * wc->cw;
+        uint16_t *drow = g_fb + (size_t)sy * g_sw;
+        for (int32_t sx = x; sx < x + w; sx++) {
+            int16_t cx = s_xmap[sx];
+            if (cx < 0) continue;
+            if (wc->cov && !wc_cov_get(wc, cx, cy)) continue;
+            drow[sx] = crow[cx];
+        }
+    }
+}
+
+static void cam_strip_compose(const rc_strip_t *s, int32_t x, int32_t y, int32_t w, int32_t h)
+{
+    const rc_wincache_t *wc = &s->wc;
+    if (!s->ok || !wc->px) return;
+    for (int32_t sx = 0; sx < g_sw; sx++) {
+        int32_t sc = rc_strip_src_col(g_cam_x, sx, s->delta, wc->sw, wc->wrap);
+        if (sc < 0) { s_xmap[sx] = -1; continue; }
+        /* 周期平铺带：缓存列 i ↔ 源列 mod(ax+i, sw)（见 wc_fill_cache 的 wrap 分支），
+         * 故源列 sc 的缓存列为 mod(sc−ax, sw)——**整带入窗（cw ≥ sw）也一样**：
+         * 旧写法此处直接用 sc，锚点 ax≠0 时整条带相位错位一整段（ax 段）。 */
+        int32_t cx = wc->wrap ? rc_mod(sc - wc->ax, wc->sw) : (sc - wc->ax);
+        s_xmap[sx] = (cx >= 0 && cx < wc->cw) ? (int16_t)cx : (int16_t)-1;
+    }
+    for (int32_t sy = y; sy < y + h; sy++) {
+        int32_t srow = rc_world_of_screen(sy, g_cam_y) - (int32_t)s->y;
+        if (srow < 0 || srow >= wc->sh) continue;
+        int32_t cy = srow - wc->ay;
+        if (cy < 0 || cy >= wc->ch) continue;
+        const uint16_t *crow = wc->px + (size_t)cy * wc->cw;
+        uint16_t *drow = g_fb + (size_t)sy * g_sw;
+        for (int32_t sx = x; sx < x + w; sx++) {
+            int16_t cx = s_xmap[sx];
+            if (cx < 0) continue;
+            if (wc->cov && !wc_cov_get(wc, cx, cy)) continue;
+            drow[sx] = crow[cx];
+        }
+    }
+}
+
+/* ── 整图条带装载（流式：句柄常开 + 行直读，不整幅入 PSRAM）── */
+static int strip_load_world(rc_strip_t *s, const char *path, const mpak_strip_t *hdr)
+{
+    memset(s, 0, sizeof *s);
+    mpak_t pm;
+    int rc = mpak_open(&pm, path, 0, MPAK_KIND_PARTS);
+    if (rc != MPAK_OK) return rc;
+    if (pm.parts_count < 1 || !pm.parts_tab) { mpak_close(&pm); return MPAK_ERR_FMT; }
+    const mpak_part_t *p = &pm.parts_tab[0];
+    int32_t pw = p->w, ph = p->h;              /* 先落值：mpak_close 会释放 parts_tab */
+
+    strlcpy(s->path, path, sizeof s->path);   /* 像素走按需 pread（见 cam_strip_sync） */
+    s->w = (uint16_t)pw;
+    s->h = (uint16_t)ph;
+    s->wc.sw = pw;
+    /* 【整图条带全不绘制 · 真机根因 2026-10-01】源 IO 描述（px_off/row_bytes/cov_off）
+     * **必须在 wc_alloc 之后落值**：wc_alloc 首行是 memset(wc,0,sizeof *wc)，此前写入的
+     * 三个字段会被清零 → 所有裸 pread 落到「偏移 0 + 行距 0」（每行都读文件头同一段
+     * 字节）⇒ 掩码读成近乎全 0（真机探针：应 48518 位为 1 的窗口实读 3427）
+     * ⇒ cam_strip_compose 逐像素被掩码跳过 ⇒ 4 条条带一个都不画（只见 static+tile）。
+     * 探针实证：首个掩码读的绝对偏移 byte_off=14（正确值 377478 = cov_off+14）。
+     * 故这里先落局部变量，待 wc_alloc 之后再写回缓存结构（见下方写回处）。 */
+    uint32_t px_off    = pm.payload_off + pm.parts_bmp_base + p->offset;
+    uint32_t row_bytes = rc_align4((uint32_t)pw * 2u);
+    uint32_t cov_off   = px_off + (uint32_t)ph * row_bytes;   /* 掩码紧随像素区 */
+    bool has_cov = ((hdr->blend & 1u) != 0) && p->has_alpha;
+
+    s->y       = hdr->y;
+    s->speed_x = hdr->speed_x;
+    s->rx      = hdr->rx_parallax;
+    s->blend   = hdr->blend;
+    s->world   = true;
+    /* 带宽 ≥ vw = 世界对齐层（服务端 AssetExporter 明示"整幅从世界 x=0 起绘制，不平铺"）；
+     * 带宽 < vw 的滚动带：周期平铺，但相位锚在世界原点（见 rc_strip_src_col）。 */
+    bool wrap = (pw < g_cam_vw);
+    s->ok      = false;
+
+    mpak_close(&pm);                   /* 信封/长度校验已完成；不留常开句柄（p 至此失效） */
+    if (!wc_alloc(&s->wc, RC_WC_STRIP, pw, ph, has_cov, wrap)) {
+        return MPAK_ERR_NOMEM;
+    }
+    /* ← wc_alloc（内含 memset）之后写回源 IO 描述：顺序错误 = 条带全灭（根因见上） */
+    s->wc.px_off    = px_off;
+    s->wc.row_bytes = row_bytes;
+    s->wc.cov_off   = cov_off;
+    s->wc.fd = -1;
+    s->ok = true;
+    /* 每条带装载含 mpak_open（信封 + ≤4MB 包的全量 CRC）+ 窗口缓存分配，
+     * 整图 4 条带叠加可 >5s → 同样喂狗（见 wc_fill_cache 的说明）。 */
+    watchdog_kick();
+    ESP_LOGI(TAG, "整图条带：y=%d h=%d speed=%d rx=%d%s 源 %dx%d px_off=%u row_bytes=%u "
+                  "cov_off=%u 窗口缓存 %dx%d%s（%u KB）",
+             (int)s->y, (int)s->h, (int)s->speed_x, (int)s->rx,
+             wrap ? " 周期平铺" : " 世界对齐",
+             (int)pw, (int)ph, (unsigned)px_off, (unsigned)row_bytes, (unsigned)cov_off,
+             (int)s->wc.cw, (int)s->wc.ch, has_cov ? " +掩码" : "",
+             (unsigned)(((size_t)s->wc.cw * s->wc.ch * 2u +
+                         (has_cov ? (((size_t)s->wc.cw + 7u) / 8u) * s->wc.ch : 0)) / 1024u));
+    return MPAK_OK;
+}
+
+/* ── 整图场景装载（RENDER_OK = 接管 bm 所有权：g_bgmap 常开供流式读 + 地面表）── */
+static int cam_scene_load(mpak_t *bm, const mpak_bgmap_t *bg,
+                          const char *strip_parts_paths[], int strip_count,
+                          uint32_t ground_off, uint32_t ground_len)
+{
+    g_cam_fov_w = g_sw / RC_SCALE;
+    g_cam_fov_h = g_sh / RC_SCALE;
+    if (RC_CAM_CACHE_W < g_cam_fov_w || RC_CAM_CACHE_H < g_cam_fov_h) {
+        ESP_LOGE(TAG, "窗口缓存 %dx%d < 可见窗口 %dx%d（屏 %dx%d 过宽）→ 不支持相机",
+                 RC_CAM_CACHE_W, RC_CAM_CACHE_H, (int)g_cam_fov_w, (int)g_cam_fov_h,
+                 (int)g_sw, (int)g_sh);
+        return RENDER_ERR_UNSUPPORTED;
+    }
+    g_cam_vw = bg->vw;
+    g_cam_vh = bg->vh;
+    /* 参考相机中心 = 窗口居中时的窗口中心（P0-2 同源口径；服务端整图导出相机 = 地图中心，
+     * bbox 原点下二者恒等，见 rc_cam_ref_center 的恒等式注释与 host 断言）。 */
+    g_cam_ref_cx = rc_cam_ref_center((int32_t)bg->vw, g_cam_fov_w);
+    g_cam_max_x = (int32_t)bg->vw - g_cam_fov_w;
+    g_cam_max_y = (int32_t)bg->vh - g_cam_fov_h;
+    if (g_cam_max_x < 0) g_cam_max_x = 0;
+    if (g_cam_max_y < 0) g_cam_max_y = 0;
+    g_cam_static_off = bg->static_back_off;
+    g_cam_tile_off   = bg->tile_layer_off;
+    uint32_t stride_b = rc_align4((uint32_t)bg->vw * 2u);
+    g_cam_mask_off   = bg->tile_layer_off + (uint32_t)bg->vh * stride_b;
+    g_cam_ground_off = ground_off;
+    g_cam_ground_len = ground_len;
+    g_cam_ground_on  = (ground_off != 0 && ground_len >= (uint32_t)bg->vw * 2u);
+    /* 起始相机 = 窗口居中（与 rc_cam_ref_center/置中同一口径） */
+    g_cam_x = rc_cam_clamp_axis(rc_cam_home(g_cam_vw, g_cam_fov_w), g_cam_vw, g_cam_fov_w);
+    g_cam_y = rc_cam_clamp_axis(rc_cam_home(g_cam_vh, g_cam_fov_h), g_cam_vh, g_cam_fov_h);
+
+    uint32_t cache_kb = 0;
+    if (!wc_alloc(&g_wc_static, RC_WC_STATIC, bg->vw, bg->vh, false, false)) {
+        ESP_LOGE(TAG, "static 窗口缓存分配失败（%dx%d）", RC_CAM_CACHE_W, RC_CAM_CACHE_H);
+        return RENDER_ERR_NOMEM;
+    }
+    cache_kb += (uint32_t)((size_t)g_wc_static.cw * g_wc_static.ch * 2u / 1024u);
+
+    g_cam_tile_on = false;
+    if (bg->tile_layer_len > (uint32_t)bg->vh * stride_b) {
+        if (wc_alloc(&g_wc_tile, RC_WC_TILE, bg->vw, bg->vh, true, false)) {
+            g_cam_tile_on = true;
+            cache_kb += (uint32_t)(((size_t)g_wc_tile.cw * g_wc_tile.ch * 2u +
+                                    ((size_t)g_wc_tile.cw + 7u) / 8u * g_wc_tile.ch) / 1024u);
+        } else {
+            ESP_LOGE(TAG, "tile 窗口缓存分配失败 → 降级（static + 条带，无 tile）");
+        }
+    }
+
+    if (strip_count > 0) {
+        g_strips = psram((size_t)strip_count * sizeof(rc_strip_t));
+        if (!g_strips) {
+            ESP_LOGE(TAG, "条带表分配失败（%d 条）→ 无条带", strip_count);
+            strip_count = 0;
+        }
+        g_strip_n = strip_count;
+        for (int i = 0; i < strip_count; i++) {
+            int rc = strip_load_world(&g_strips[i], strip_parts_paths[i], &bg->strips[i]);
+            if (rc != MPAK_OK) {
+                ESP_LOGE(TAG, "整图条带 %d 装载失败（%s）rc=%d", i, strip_parts_paths[i], rc);
+                g_strips[i].ok = false;
+            } else {
+                cache_kb += (uint32_t)(((size_t)g_strips[i].wc.cw * g_strips[i].wc.ch * 2u +
+                                        (g_strips[i].wc.cov ?
+                                         ((size_t)g_strips[i].wc.cw + 7u) / 8u * g_strips[i].wc.ch : 0)) / 1024u);
+            }
+        }
+    }
+
+    g_bgmap = *bm;                    /* FILE* 所有权转移：常开（勿再 mpak_close(bm)） */
+    g_bgmap_ok = true;
+    g_wc_static.pkg = &g_bgmap;
+    g_wc_static.row_bytes = stride_b;
+    g_wc_tile.pkg = &g_bgmap;
+    g_wc_tile.row_bytes = stride_b;
+    g_wc_tile.cov_off = g_bgmap.payload_off + g_cam_mask_off;   /* 桥接位图直读用 */
+    g_cam_on = true;
+
+    ESP_LOGI(TAG, "整图相机：vw=%d vh=%d 窗口 %dx%d 相机支持=1 范围 dx[0,%d] dy[0,%d] "
+                  "起始相机 (%d,%d) 地面表=%s 分块读接口=%s",
+             (int)g_cam_vw, (int)g_cam_vh, (int)g_cam_fov_w, (int)g_cam_fov_h,
+             (int)g_cam_max_x, (int)g_cam_max_y, (int)g_cam_x, (int)g_cam_y,
+             g_cam_ground_on ? "有" : "无",
+             cam_rect_api_ready() ? "mpak(真)" : "桥接行读(等价)");
+    ESP_LOGI(TAG, "整图缓存：static %dx%d + tile %s + %d 条带 = %u KB（PSRAM 常驻，预算 ≤1200KB；"
+                  "旧口径屏尺寸层 949KB 不再分配）",
+             (int)g_wc_static.cw, (int)g_wc_static.ch, g_cam_tile_on ? "有" : "无",
+             g_strip_n, (unsigned)cache_kb);
+    /* P0-1 判据：条带像素走按需 pread（读毕即关），稳态常开句柄只有 BGMAP 这 1 个；
+     * 既有常驻 7（时钟/FONT×3/纸娃娃/LAYOUT≤2）+ 1 = 8 ≤ SD_MAX_FILES 10（见 sd_tf.c）。 */
+    ESP_LOGI(TAG, "整图句柄：常开 1 个（budget ≤3；BGMAP 供分块读+地面表，%d 条带 = 0 常开，"
+                  "像素按需 pread）+ 既有常驻 7 = 8 ≤ SD_MAX_FILES 10", g_strip_n);
+    return RENDER_OK;
+}
+
+/* ── 整图相机对外 API（契约 §3.2）── */
+bool render_cam_supported(void) { return g_cam_on; }
+
+void render_cam_range(int32_t *max_dx, int32_t *max_dy)
+{
+    int32_t mx = g_cam_max_x, my = g_cam_max_y;
+    if (!g_cam_on) { mx = 0; my = 0; }
+    if (max_dx) *max_dx = mx;
+    if (max_dy) *max_dy = my;
+}
+
+void render_cam_get(int32_t *world_x, int32_t *world_y)
+{
+    rc_lock();                        /* 成对读（x/y 同一相机时刻；跨任务调用方） */
+    int32_t x = g_cam_x, y = g_cam_y;
+    rc_unlock();
+    if (world_x) *world_x = x;
+    if (world_y) *world_y = y;
+}
+
+void render_cam_set(int32_t world_x, int32_t world_y)
+{
+    rc_lock();
+    if (!g_cam_on) { rc_unlock(); return; }
+    int32_t cx = rc_cam_clamp_axis(world_x, g_cam_vw, g_cam_fov_w);
+    int32_t cy = rc_cam_clamp_axis(world_y, g_cam_vh, g_cam_fov_h);
+    if (cx != g_cam_x || cy != g_cam_y) {
+        g_cam_x = cx;
+        g_cam_y = cy;
+        /* 相机平移 = 全屏变 ⇒ 整屏标脏走整屏重合成路径（R2 §5.4.6）；只标局部必留残影。
+         * 不做同帧内联重合成：本函数由 input 任务按触摸频率调用，内联 TF 读 + 整屏 blit
+         * 会阻塞输入；标脏后由渲染任务在下一个 33ms tick 完成（≤1 帧延迟，视觉即时）。 */
+        mark_rect_locked(0, 0, g_sw, g_sh);
+        ESP_LOGI(TAG, "rc: 相机 → (%d,%d) 夹取范围 dx[0,%d] dy[0,%d]",
+                 (int)cx, (int)cy, (int)g_cam_max_x, (int)g_cam_max_y);
+    }
+    rc_unlock();
+}
+
+void render_cam_center(void)
+{
+    rc_lock();
+    if (g_cam_on) {
+        g_cam_x = rc_cam_clamp_axis(rc_cam_home(g_cam_vw, g_cam_fov_w), g_cam_vw, g_cam_fov_w);
+        g_cam_y = rc_cam_clamp_axis(rc_cam_home(g_cam_vh, g_cam_fov_h), g_cam_vh, g_cam_fov_h);
+        mark_rect_locked(0, 0, g_sw, g_sh);
+        ESP_LOGI(TAG, "rc: 相机置中 (%d,%d) 窗口中心 %d（= 参考相机中心 %d）",
+                 (int)g_cam_x, (int)g_cam_y, (int)(g_cam_x + g_cam_fov_w / 2), (int)g_cam_ref_cx);
+    }
+    rc_unlock();
+}
+
+int32_t render_ground_screen_y(int32_t screen_x)
+{
+    if (!g_inited) return -1;
+    if (screen_x < 0) screen_x = 0;
+    if (screen_x >= g_sw) screen_x = g_sw - 1;
+    rc_lock();
+    int32_t ret = -1;
+    if (g_cam_on && g_bgmap_ok && g_cam_ground_on) {
+        int32_t wx = rc_world_of_screen(screen_x, g_cam_x);
+        int32_t wy = INT32_MIN;
+        if (mpak_bgmap_ground_y) {
+            wy = mpak_bgmap_ground_y(&g_bgmap, wx);
+        } else if (g_cam_ground_off && g_cam_ground_len >= (uint32_t)(wx + 1) * 2u) {
+            /* 桥接：地面表 = vw × u16 小端（0xFFFF = 该列无 foothold），F1 接口未落地时直读 */
+            uint16_t v = 0xFFFFu;
+            if (wx >= 0)
+                mpak_read_at(&g_bgmap, g_bgmap.payload_off + g_cam_ground_off + (uint32_t)wx * 2u,
+                             &v, sizeof v);
+            if (v != 0xFFFFu) wy = (int32_t)v;
+        }
+        if (wy != INT32_MIN) {
+            int32_t sy = rc_screen_of_world(wy, g_cam_y);
+            int32_t lim = g_sh - RC_GROUND_UP_PX;      /* 夹进画面（与旧地面表同口径） */
+            if (sy > lim) sy = lim;
+            if (sy < 0) sy = 0;
+            ret = sy;
+            /* 限频：站位链可能逐帧问（值不变时不重复打日志） */
+            static int32_t s_glog_wx = INT32_MIN, s_glog_wy = INT32_MIN;
+            if (wx != s_glog_wx || wy != s_glog_wy) {
+                s_glog_wx = wx;
+                s_glog_wy = wy;
+                ESP_LOGI(TAG, "rc: 地面线来源：整图地面表 world_x=%d → world_y=%d（屏 y=%d）",
+                         (int)wx, (int)wy, (int)sy);
+            }
+        }
+    } else if (!g_cam_on && g_ground_tbl_on) {
+        ret = ground_line_y_at(screen_x);              /* 旧包内置段表（设备像素，口径不变） */
+    }
+    rc_unlock();
+    return ret;
+}
+
+/* 相机平移时的条带标脏（世界系 y）：按当前相机算该带在屏上可见的行区间。
+ * 整段持锁（rc_lock 可重入）：读 g_cam_y 与标脏之间若被 input 任务的
+ * render_cam_set 插入，会按旧相机标脏 → 新相机下的那几行漏标 = 残影。 */
+static bool cam_strip_mark_dirty(const rc_strip_t *s)
+{
+    rc_lock();
+    int32_t sy0 = rc_screen_of_world((int32_t)s->y, g_cam_y);
+    int32_t sy1 = sy0 + ((int32_t)s->h << RC_SCALE_SHIFT);
+    if (sy0 < 0) sy0 = 0;
+    if (sy1 > g_sh) sy1 = g_sh;
+    bool any = (sy1 > sy0);
+    if (any) mark_rect_locked(0, sy0, g_sw, sy1 - sy0);
+    rc_unlock();
+    return any;
+}
+
+/* 场景释放（整图部分；旧包字段不受影响） */
+static void cam_scene_free(void)
+{
+    wc_free(&g_wc_static);
+    wc_free(&g_wc_tile);
+    if (g_strips) {
+        for (int i = 0; i < g_strip_n; i++) wc_free(&g_strips[i].wc);   /* 条带无常开句柄 */
+    }
+    if (g_bgmap_ok) { mpak_close(&g_bgmap); g_bgmap_ok = false; }
+    g_cam_on = false;
+    g_cam_tile_on = false;
+    g_cam_ground_on = false;
+    g_cam_vw = g_cam_vh = 0;
+    g_cam_x = g_cam_y = 0;
+    g_cam_max_x = g_cam_max_y = 0;
+    g_cam_static_off = g_cam_tile_off = g_cam_mask_off = 0;
+    g_cam_ground_off = g_cam_ground_len = 0;
+}
+
 static void compose_region(int32_t x, int32_t y, int32_t w, int32_t h)
 {
     if (x < 0) { w += x; x = 0; }
@@ -1429,20 +2423,31 @@ static void compose_region(int32_t x, int32_t y, int32_t w, int32_t h)
      * 开始，铺底必须同样从第 x 列起写——此前 drow/源均从第 0 列起，脏区
      * [x, x+w) 的 framebuffer 内容从未被重铺，blit 发出的是上一帧陈旧像素
      * （= 旧位置实体图像）→ 残留。背景接近纯色时错位拷贝肉眼看不出，
-     * 实体移动后才暴露。 */
-    for (int32_t r = y; r < y + h; r++) {
-        uint16_t *drow = g_fb + (size_t)r * g_sw + x;
-        if (g_static) memcpy(drow, g_static + (size_t)r * g_sw + x, (size_t)w * 2u);
-        else memset(drow, 0, (size_t)w * 2u);
+     * 实体移动后才暴露。
+     * 整图口径（g_cam_on）：先把三层窗口缓存搬到当前相机需要的窗口（命中零 IO），
+     * 再按世界对齐 2× 最近邻采样 —— 旧包路径（下面 else 分支）逐字节不变。 */
+    if (g_cam_on) {
+        cam_scene_sync();
+        cam_static_compose(x, y, w, h);
+    } else {
+        for (int32_t r = y; r < y + h; r++) {
+            uint16_t *drow = g_fb + (size_t)r * g_sw + x;
+            if (g_static) memcpy(drow, g_static + (size_t)r * g_sw + x, (size_t)w * 2u);
+            else memset(drow, 0, (size_t)w * 2u);
+        }
     }
 
-    /* 2) 条带（x 向循环平铺） */
-    for (int i = 0; i < g_strip_n; i++)
-        strip_blit(&g_strips[i], x, y, w, h);
+    /* 2) 条带（旧包：x 向循环平铺；整图：世界系 y + 世界对齐采样） */
+    for (int i = 0; i < g_strip_n; i++) {
+        if (g_strips[i].world) cam_strip_compose(&g_strips[i], x, y, w, h);
+        else                   strip_blit(&g_strips[i], x, y, w, h);
+    }
 
     /* 3) tile_layer（1bit alpha 叠加；列偏移与 static_back 同理必须 +x，
      * 否则脏区 [x, x+w) 铺的是第 0 列起的陈旧内容） */
-    if (g_tile) {
+    if (g_cam_on) {
+        cam_tile_compose(x, y, w, h);
+    } else if (g_tile) {
         for (int32_t r = y; r < y + h; r++) {
             const uint16_t *srow = g_tile + (size_t)r * g_sw;
             const uint8_t  *mrow = g_tile_mask ?
@@ -1683,7 +2688,7 @@ static void flush_dirty(void)
      * 分块指纹发现（指纹只覆盖本次 flush 的区域）。这里以 1s 限频统计残留像素数
      * 与包围盒并打 WARN，把"屏上是否干净"变成可回归的事实。
      * 排除：当前实体矩形（外扩 16）、顶部横幅带、BGM 半屏条、气泡矩形。 */
-    if (!g_static) {
+    if (!g_static && !g_cam_on) {
         static int64_t s_ghost_ms;
         int64_t now_ms = esp_timer_get_time() / 1000;
         if (now_ms - s_ghost_ms > 1000) {
@@ -1822,6 +2827,11 @@ static void blit_be(int32_t x, int32_t y, int32_t w, int32_t h,
 static void ground_cam_shift_layers(void)
 {
     if (s_ground_shift_px <= 0) return;    /* 板A=0（定稿原景）；板B profile 可开 */
+    if (g_cam_on) {                        /* 整图口径：相机由 render_cam_* 管，不做整层位移 */
+        ESP_LOGW(TAG, "相机下移实验跳过：整图包（ground_cam_shift_px=%d 仅旧窗口包生效）",
+                 (int)s_ground_shift_px);
+        return;
+    }
     {
     if (!g_ground_tbl_on) return;
     const int32_t sh = s_ground_shift_px;
@@ -1878,6 +2888,7 @@ static void full_recompose(void)
 
 static void scene_free(void)
 {
+    cam_scene_free();                  /* 整图：窗口缓存 + 常开句柄（含条带 PARTS） */
     if (g_static)    { heap_caps_free(g_static);    g_static = NULL; }
     if (g_tile)      { heap_caps_free(g_tile);      g_tile = NULL; }
     if (g_tile_mask) { heap_caps_free(g_tile_mask); g_tile_mask = NULL; }
@@ -2504,8 +3515,15 @@ void render_tick(void)
         for (int i = 0; i < g_strip_n; i++) {
             if (!g_strips[i].ok) continue;
             int32_t off = strip_offset(&g_strips[i], now_us);
-            if (off != g_strips[i].last_off && strip_window) {
-                g_strips[i].last_off = off;
+            if (off == g_strips[i].last_off) continue;
+            if (!strip_window) continue;      /* 刷新窗口未开：相位保持不动（缓存/绘制同源） */
+            g_strips[i].last_off = off;
+            if (g_strips[i].world) {
+                /* 整图：off_q = 量化后的时间/IMU 相位（P1-1）——缓存搬移与绘制都用它，
+                 * 变化时按"该带在屏上可见的那段行"（相机决定，世界系 y）标脏。 */
+                g_strips[i].off_q = off;
+                if (cam_strip_mark_dirty(&g_strips[i])) any = true;
+            } else {
                 mark_rect(0, (int32_t)g_strips[i].y << RC_SCALE_SHIFT,
                           g_sw, (int32_t)g_strips[i].h << RC_SCALE_SHIFT);
                 any = true;
@@ -2553,6 +3571,20 @@ void render_tick(void)
             ESP_LOGI("probe", "drag old(%" PRId32 ",%" PRId32 ")->new(%"
                      PRId32 ",%" PRId32 ") tilt=%" PRId32,
                      poldx, poldy, ox, oy, g_tilt_mdeg / 1000);
+        }
+    }
+
+    /* 4b) 【整图相机】render_cam_set 由 input 任务调用（只改状态 + 标脏），
+     * 本 tick 必须据此把整屏纳入本次重合成 —— 否则"相机变了但本帧无其它脏区"
+     * 时 flush 会被 any=false 跳过（画面停在旧相机，拖拽表现为不跟手）。
+     * 相移 = 全屏变 ⇒ 整屏重合成（R2 §5.4.6；只标局部必留残影）。 */
+    if (g_cam_on) {
+        static int32_t s_last_cam_x = INT32_MIN, s_last_cam_y = INT32_MIN;
+        if (g_cam_x != s_last_cam_x || g_cam_y != s_last_cam_y) {
+            s_last_cam_x = g_cam_x;
+            s_last_cam_y = g_cam_y;
+            mark_rect(0, 0, g_sw, g_sh);
+            any = true;
         }
     }
 
@@ -2710,6 +3742,10 @@ static void render_force_redraw_nolock(void)
     full_recompose();
 }
 
+/* 旧口径（非整图包）单层一次性装载上限：合法旧包 ≤ 整屏口径 480×480×2 = 460KB，
+ * 留 6× 余量；超过即拒绝（必然失败的 8MB 级分配 + PSRAM 碎片，见 P0-3）。 */
+#define RC_LEGACY_LAYER_MAX  (3u * 1024u * 1024u)
+
 /* 【花屏二分已结案 2026-10-01】true=只装载静态层（调试遗留，fbceb82 带入）：
  * 真机实证后果=条带段（树冠/房子/丘陵）与 tile 地形全不装载 → 只剩天空
  * static（用户报障"地图渲染有问题/背景只剩天空"）。新分段导出格式下
@@ -2746,7 +3782,75 @@ static int render_set_map_nolock(const char *bgmap_path,
              bg->vw, bg->vh, bg->static_back_off, bg->static_back_len,
              bg->tile_layer_len, bg->tile_layer_off, bg->strip_count);
 
+    /* ══ 整图（R2）扩展块探测（契约 §3.1 / mpak.h 冻结布局）══════════════════
+     * 位置 = align4(tile_layer_off + tile_layer_len)；[magic u32][ground_len u32]
+     * [ground_off u32][flags u32]，flags bit0 = 整图包。旧包此处越界 ⇒ 不是整图。
+     * 自证解析与 F1 的 parse_bgmap 等价（两侧都认：bg->full_map || 自证），
+     * 于是 mpak 层未落地时整图路径也能真机跑通；两者同时可用时取真接口读像素。 */
+    uint32_t det_ground_off = 0, det_ground_len = 0;
+    bool full = bg->full_map;
+    if (bg->tile_layer_len > 0) {
+        uint32_t ext_off = rc_align4(bg->tile_layer_off + bg->tile_layer_len);
+        if (ext_off + MPAK_BGMAP_EXT_HDR_LEN <= bm.payload_len) {
+            uint32_t hdr[4] = { 0, 0, 0, 0 };
+            if (mpak_read_at(&bm, bm.payload_off + ext_off, hdr, sizeof hdr) == MPAK_OK &&
+                hdr[0] == MPAK_BGMAP_EXT_MAGIC) {
+                det_ground_len = hdr[1];
+                det_ground_off = hdr[2];
+                if (hdr[3] & MPAK_BGMAP_FLAG_FULL_MAP) full = true;
+            }
+        }
+    }
+    uint32_t ground_off = bg->ground_off ? bg->ground_off : det_ground_off;
+    uint32_t ground_len = bg->ground_len ? bg->ground_len : det_ground_len;
+
     scene_free();
+
+    /* ══ 整图口径（相机可平移）══════════════════════════════════════════════
+     * 条带必须先算好 vw（strip 的 wrap 判定依赖），装载成功即接管 bm；失败则
+     * 落到下面的旧窗口口径兜底（宁可给中心窗，也不黑屏）。 */
+    if (full && !g_map_static_only && bg->static_back_len > 0) {
+        rc = cam_scene_load(&bm, bg, strip_parts_paths, strip_count,
+                            ground_off, ground_len);
+        if (rc == RENDER_OK) {
+            g_ground_tbl_on = false;      /* 整图走 mpak 世界系地面表（非内置段表） */
+            ESP_LOGI(TAG, "地面线来源：%s（map_id=%s vw=%u）",
+                     g_cam_ground_on ? "整图地面表(vw 列)" : "通用线(屏底-20)",
+                     bg->map_id, bg->vw);
+            g_map_epoch_us = esp_timer_get_time();
+            g_map_ok = true;
+            if (g_ent_cbox_ok) { g_stand_done = true; ent_stand_on_ground_locked(); }
+            full_recompose();
+            return RENDER_OK;
+        }
+        cam_scene_free();
+        /* 【P0-3】整图包失败**绝不**回退旧口径：旧路径会把整幅层读进一次性临时缓冲
+         * （len = vh×align4(vw×2)，本例 1807×4540 = 8,203,780 B），8MB PSRAM 必然分配失败
+         * → 静默黑屏 + 大块分配失败留下的 PSRAM 碎片。改为：黑底 + 明确 ERROR（带原因与
+         * 内存水位），把失败码交回上层（asset_dl/状态机可重试或提示）。 */
+        ESP_LOGE(TAG, "整图装载失败 rc=%d（map=%s vw=%u vh=%u static=%u B）→ 黑底，"
+                      "不做整幅回退（旧口径需 %u B 临时缓冲）。PSRAM 空闲 %u B / 最大块 %u B",
+                 rc, bg->map_id, bg->vw, bg->vh, bg->static_back_len,
+                 (unsigned)((uint32_t)bg->vh * rc_align4((uint32_t)bg->vw * 2u)),
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
+        scene_free();
+        g_map_ok = false;
+        g_map_epoch_us = 0;
+        mpak_close(&bm);
+        full_recompose();
+        return rc;
+    }
+
+    /* 【P0-3 附带】非整图包但单层体量超"一次性装载上限"：拒绝，避免必然失败的大分配
+     * 与 PSRAM 碎片（合法旧包最大 = 整屏口径 480×480×2 ≈ 460KB，远低于此上限）。 */
+    if (bg->static_back_len > RC_LEGACY_LAYER_MAX) {
+        ESP_LOGE(TAG, "旧口径拒绝：static_back %u B > 上限 %u B（vw=%u vh=%u 疑似整图包但缺扩展块）",
+                 bg->static_back_len, (unsigned)RC_LEGACY_LAYER_MAX, bg->vw, bg->vh);
+        mpak_close(&bm);
+        full_recompose();
+        return MPAK_ERR_FMT;
+    }
 
     g_static = layer_rgb_load(&bm, bg->static_back_off, bg->static_back_len,
                               bg->vw, bg->vh);
@@ -2789,10 +3893,11 @@ static int render_set_map_nolock(const char *bgmap_path,
     /* 【相机下移实验】装载完成后把各层上移，底部缺失行用内嵌地面带补 */
     ground_cam_shift_layers();
     /* 【缩放器取证】打印静态层首行前 8 像素（与 PC 端导出文件期望值比对） */
-    ESP_LOGW(TAG, "static row0: %04x %04x %04x %04x %04x %04x %04x %04x | row1: %04x %04x %04x %04x",
-             g_static[0], g_static[1], g_static[2], g_static[3],
-             g_static[4], g_static[5], g_static[6], g_static[7],
-             g_static[g_sw], g_static[g_sw + 1], g_static[g_sw + 2], g_static[g_sw + 3]);
+    if (g_static)
+        ESP_LOGW(TAG, "static row0: %04x %04x %04x %04x %04x %04x %04x %04x | row1: %04x %04x %04x %04x",
+                 g_static[0], g_static[1], g_static[2], g_static[3],
+                 g_static[4], g_static[5], g_static[6], g_static[7],
+                 g_static[g_sw], g_static[g_sw + 1], g_static[g_sw + 2], g_static[g_sw + 3]);
 
     g_map_epoch_us = esp_timer_get_time();
     g_map_ok = true;
@@ -3263,4 +4368,20 @@ int render_screenshot_to_tf(void)
  *   ------------------------------------------------------------------
  *   固定峰值（无气泡）     ≈ 2.41 MB；典型全负载（含缓存/条带）≈ 3.4-4.0 MB
  *   （8MB PSRAM，与网络/音频共享；menu 与 poker 的 LVGL 缓冲常驻不切换释放）
+ *
+ * 【R2 整图相机（2026-10-01）另计 —— 与上面 static/tile/条带全驻留互斥】
+ *   整图模式**不分配**上面那三项（static 460,800 + tile 460,800 + mask 28,800
+ *   = 950,400 B），改分配窗口缓存（世界 px，实测 000010000 2270×1807 / 4 条带）：
+ *     static 窗口 336×336×2                225,792 B
+ *     tile   窗口 336×336×2 + 掩码 336×336/8 239,904 B
+ *     条带窗口（4 条，cw=min(带图宽,336)，ch=min(带高,336)）
+ *       枫树 336×222  149,184 + 9,324   158,508 B
+ *       丘陵 336×260  174,720 + 10,920  185,640 B
+ *       白云 336×125   84,000 + 5,250    89,250 B
+ *       远景 336×336  225,792 + 14,112  239,904 B
+ *     ------------------------------------------------------------------
+ *     合计 ≈ 1,138,998 B = **1.09 MiB**（契约硬预算 ≤1.2MB ✓）
+ *   ⇒ 整图模式相对旧窗口口径**净省 ≈ 384KB**（1.14MB − 950KB(旧屏尺寸层)），
+ *     且再省掉"旧包兼容"整幅 raw 临时缓冲（8.2MB，必然分配失败）。
+ *   条带源图全驻留需 5.9MB（2270×508 单条 2.45MB 实测）⇒ 采用句柄常开 + 行直读。
  */

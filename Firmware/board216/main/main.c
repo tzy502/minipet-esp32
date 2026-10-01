@@ -21,7 +21,7 @@
  *   队列：event_q（input→net 上报）/ cmd_q（net→render 执行）/
  *         audio_q（UI/net→bgm 控制；PCM 走 PSRAM 环形缓冲）
  */
-#define MP_TASK_PROBE 0   /* 任务存活取证（排障时置 1：poller 阶段/bgm 步骤/消息计数） */
+#define MP_TASK_PROBE 1   /* 任务存活取证（排障时置 1：poller 阶段/bgm 步骤/消息计数） */
 
 #include <stdio.h>
 #include <assert.h>
@@ -115,6 +115,11 @@ static void render_task(void *arg)
                 extern volatile int32_t  g_poll_last_status;
                 extern volatile uint32_t g_bgm_msgs, g_feeder_loops;
                 extern volatile uint32_t g_bgm_step;
+                extern volatile uint32_t g_bgm_drop_nodec, g_bgm_drop_offline,
+                                         g_bgm_drop_greyed, g_bgm_wr_err;
+                extern volatile uint32_t g_bgm_underruns, g_bgm_ring_min, g_bgm_wr_max_us;
+                extern volatile uint32_t g_bgm_gap_max_us, g_bgm_gap_over, g_bgm_gap_at_ms;
+                extern volatile uint32_t g_bgm_drop_bytes, g_bgm_drops;
                 extern volatile uint32_t g_pol_stage[10];
                 extern volatile int32_t  g_bgm_state_probe;
                 ESP_LOGW("tprobe", "poller 阶段=[%u %u %u %u %u %u %u %u %u] 门失败=%u 成功=%u 失败=%u | "
@@ -127,8 +132,26 @@ static void render_task(void *arg)
                          (unsigned)g_poll_ok, (unsigned)g_poll_fail,
                          (unsigned)g_bgm_msgs, (int)g_bgm_state_probe,
                          (unsigned)g_feeder_loops);
-                ESP_LOGW("tprobe", "bgm 步骤=%u（1入口 2拿到id 3codec 4表情 5表锁 6表建成 7会话返回）",
-                         (unsigned)g_bgm_step);
+                ESP_LOGW("tprobe", "bgm 步骤=%u（1入口 2拿到id 3codec 4表情 5表锁 6表建成 7会话返回）"
+                                   " 丢弃[无解码器=%u 断网=%u 置灰=%u] codec写失败=%u",
+                         (unsigned)g_bgm_step,
+                         (unsigned)g_bgm_drop_nodec, (unsigned)g_bgm_drop_offline,
+                         (unsigned)g_bgm_drop_greyed, (unsigned)g_bgm_wr_err);
+                /* 【卡顿取证】断供次数 / 周期内最低水位（样本）/ I2S 单次写最长耗时 */
+                ESP_LOGW("tprobe", "bgm 音频：断供=%u 最低水位=%d 样本（%d ms）| I2S 写最长=%u us | 音量=%u",
+                         (unsigned)g_bgm_underruns, (int)g_bgm_ring_min,
+                         (int)(g_bgm_ring_min == 0xFFFFFFFFu ? -1
+                               : (int32_t)((uint64_t)g_bgm_ring_min * 1000u /
+                                           (uint64_t)((bgm_rate_get() ? bgm_rate_get() : 44100) * 2u))),
+                         (unsigned)g_bgm_wr_max_us, (unsigned)bgm_volume_get());
+                ESP_LOGW("tprobe", "bgm 卡顿取证：写间隔最长=%u us @%ums | >150ms 次数=%u（DMA 深度 22.05k≈139ms）",
+                         (unsigned)g_bgm_gap_max_us, (unsigned)g_bgm_gap_at_ms,
+                         (unsigned)g_bgm_gap_over);
+                ESP_LOGW("tprobe", "bgm 丢数据取证：缓冲满丢弃 %u B / %u 次（大于 0 = 音乐被跳过，曲子会变短）",
+                         (unsigned)g_bgm_drop_bytes, (unsigned)g_bgm_drops);
+                g_bgm_ring_min = 0xFFFFFFFFu;
+                g_bgm_wr_max_us = 0;
+                g_bgm_gap_max_us = 0;
             }
         }
 #endif

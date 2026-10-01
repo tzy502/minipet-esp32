@@ -9,6 +9,51 @@
 
 ---
 
+## 〇C、2026-10-01 下午波次（地图迭代：整图相机 + 三功能子页 + 中文名；附带 BGM 两个根因）
+
+> 本波次是**四路并行 agent** 施工后的合并验收现场。BGM 部分：**codec 从未初始化**已定案并修复
+> （真机出声）；**播放中卡死**按用户指示只登记不修（见 B10）。
+
+### B10. BGM 播放中系统卡死 ⏸ 仅登记（用户指示：后续一并修复）
+
+- **用户口径**：「BGM播放的时候系统最后卡死，需要判断是不是内存有问题」。
+- **已拿到的证据链（2026-10-01 真机串口）**：
+  ```
+  I (5368) mpak: opened /sdcard/minipet/font/814c7165a001839f.mpk ...   ← px=16 成功
+  W (5373) sm: set_font px=24 开始 /sdcard/minipet/font/15438471dce64329.mpk
+  E (5374) sdmmc_cmd: sdmmc_read_sectors: not enough mem, err=0x101     ← 内部 DMA 堆分配失败
+  E (5375) diskio_sdmmc: sdmmc_read_blocks failed (0x101)
+  E (5375) mpak: open .../15438471dce64329.mpk failed
+  abort() was called at PC 0x40377273 on core 1                          ← newlib 直接 abort
+  Backtrace 反解：abort ← lock_init_generic ← __retarget_lock_init_recursive ← __sfp
+                 ← _fopen_r ← fopen ← mpak_open(mpak.c:1333) ← font_lazy_init
+                 ← render_set_font ← dispatch_manifest_synced ← app_cmd_dispatch ← render_task
+  ```
+- **根因（内存，不是 BGM 独有）**：**内部堆（尤其 DMA-capable 区）不足以支撑 SD 读 + newlib fopen**。
+  SDMMC 每次事务要 `heap_caps_malloc(SDMMC_IO_BLOCK_SIZE, MALLOC_CAP_DMA)`
+  （esp-idf `components/sdmmc/sdmmc_common.c:400`）；newlib 的 `fopen` 在 `__sfp` 里 malloc
+  FILE 结构失败时**不是返回 NULL 而是 abort()** —— 于是"内存紧"直接表现为**整机重启/卡死**。
+  真机本波次内部堆实测：`@全部任务创建后 空闲 24.7~27KB / 最大块 7.6~16.4KB`（boot 间随机），
+  已经在"随时炸"的边缘；BGM 播放叠加解码/流缓冲后余量更小。
+- **修复方向（未实施，待与其它内存项一并做）**：
+  1. 所有能进 PSRAM 的缓冲**一律 PSRAM**（核对新增整图窗口缓存 1.14MB 是否全 PSRAM、有无内部分配）；
+  2. `mpak_open`/`font_lazy_init`/任何 `fopen` 路径**前置内部堆门限**（现有 `asset: 内部堆 <24KB，
+     跳过 FONT px 读取（防 newlib abort）` 是同类先例，覆盖面不够）；
+  3. 给 SDMMC 预分配常驻对齐缓冲（避免每次事务 malloc）；
+  4. 查 newlib `__sfp` 路径能否改为不 abort（`CONFIG_NEWLIB_...`/自建 FILE 池）。
+- **判读锚点**：串口出现 `not enough mem, err=0x101` 或 `abort() was called` + 上面那条 fopen 链
+  = 本 bug；tprobe 的 `内部堆空闲/最大块` 是前置指标。
+
+### B11. BGM 起播即无声 ✅ 根因定案（codec 从未初始化）
+
+- 详见 `technical-reference.md` §四「音频（BGM）」表：`codec_es8311_init()` 全仓零调用，
+  `bgm_start()` 建栈后已补 `mp_codec_init(44100)`；feeder 的 `codec_write` 返回值不再丢弃。
+  真机日志：`es8311: ES8311 就绪 44100 Hz MCLK=256fs PA=46(off)` + `bgm: codec 初始化完成`。
+- 卡顿三处缓解（起播预缓冲 400ms / I2S DMA 8×512 / feeder 优先级 4→6）已上板，
+  用户复听口径：「还是卡，但比之前轻」→ 与 B10 的内存压力同源，**并入 B10 一起收**。
+
+---
+
 ## 〇B、2026-10-01 凌晨波次（预设推送/BGM/地图渲染 三大案闭环 + 滚筒菜单定稿）
 
 > 主线：模拟 Web 页面点击（BGM 播放 + 预设推送）对照串口自测整条链路 → 连环牵出

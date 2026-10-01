@@ -109,9 +109,9 @@ static inline bool mp_sd_mount(void)
 }
 
 /* ============================ codec 适配（帧数计数） =============== */
-static inline void mp_codec_init(uint32_t rate_hz)
+static inline esp_err_t mp_codec_init(uint32_t rate_hz)
 {
-    codec_es8311_init(rate_hz);   /* bgm_start 一次性调用（PA 默认关） */
+    return codec_es8311_init(rate_hz);   /* bgm_start 一次性调用（PA 默认关） */
 }
 /* 播放前按当前流采样率配置（init 之后调；44.1k/48k 都走 16bit 档） */
 static inline void mp_codec_start(uint32_t rate_hz)

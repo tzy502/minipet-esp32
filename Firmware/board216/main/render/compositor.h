@@ -53,6 +53,7 @@ extern "C" {
 /* 脏区网格 */
 #define RC_CELL             16
 #define RC_GRID_MAX         (32 * 32)   /* 支持屏 ≤ 512×512 */
+#define RC_MAX_W            512         /* 屏宽上限（render_init 同口径；屏幕列映射表用） */
 
 /* 部件位图缓存上限（PSRAM；当前装扮全部引用件 + 25 表情变体典型 <1MB） */
 #define RC_PART_CACHE_CAP   (2u * 1024u * 1024u)
@@ -92,6 +93,41 @@ static inline void rc_mask_set(uint8_t *mask, uint32_t idx)
     mask[idx >> 3] |= (uint8_t)(1u << (7 - (idx & 7)));
 }
 static inline uint32_t rc_align4(uint32_t n) { return (n + 3u) & ~3u; }
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * R2 整图相机（契约 docs/ai/map-fullmap-firmware-contract.md §3.2）
+ *
+ * 语义：整图包（vw/vh ≫ 屏）下相机可任意平移；相机 = **可见窗口左上角的世界坐标**
+ * （整图世界系，原点 = bbox 左上角）。窗口尺寸 = 屏/RC_SCALE（480 屏 → 240×240 世界 px）。
+ * 渲染硬约束：世界 1x → 屏 2x **整倍最近邻**（零插值、零半像素、比例恒定）；
+ * static/tile 由 PSRAM 窗口缓存流式供给（拖动只补新露出的边条，相机静止零 TF 读）。
+ * 旧包（非整图）= 不支持相机（render_cam_supported()==false），原路径视觉不变。
+ *
+ * ⚠️ 相机 UX 层（F3）请 #include "compositor.h" —— render.h 不转出本组接口。
+ * ⚠️ render_set_map() 装载整图包后相机置中（= 服务端导出参考相机）；
+ *    NVS 相机必须在 render_set_map 返回之后再 render_cam_set() 应用。
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+/* 窗口缓存尺寸（世界 px）：可见窗口 240×240 + 两侧各 48 余量。
+ * 余量内的小幅拖动 = 纯命中（零 TF 读）；超出后只补新露出的边条。 */
+#define RC_CAM_CACHE_W      336
+#define RC_CAM_CACHE_H      336
+
+/* 整图包（含可平移余量）→ true；旧窗口包/无地图 → false */
+bool render_cam_supported(void);
+/* 相机可平移范围（世界 px，含 0）：max = 图尺寸 − 可见窗口（不足则 0） */
+void render_cam_range(int32_t *max_dx, int32_t *max_dy);
+/* 设置相机（越界自动夹取；图小于窗口时居中）。变化 → 整屏标脏，下一帧整屏重合成。
+ * 读回实际值用 render_cam_get()。 */
+void render_cam_set(int32_t world_x, int32_t world_y);
+void render_cam_get(int32_t *world_x, int32_t *world_y);
+/* 相机置中（= 服务端整图导出参考相机；与 _ref 参考图同相位） */
+void render_cam_center(void);
+
+/* 站位地面线联动：用整图地面表（mpak_bgmap_ground_y）算 screen_x 处宠物脚踩的
+ * 屏幕 y（已按 2× 与当前相机换算，并夹进画面 [0, 屏底-RC_GROUND_UP_PX]）。
+ * 返回 -1 = 无地面表/越界/非整图（调用方回落通用线 ground_line_y_at 的口径不变）。 */
+int32_t render_ground_screen_y(int32_t screen_x);
 
 #ifdef __cplusplus
 }

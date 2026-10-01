@@ -35,6 +35,7 @@ static const char *TAG = "sm";
 #include "hal_contract.h"
 #include "watchdog.h"
 #include "provision.h"
+#include "nvs.h"              /* §3.3 相机 per-map 持久化（namespace "cam"） */
 #include "input_dispatch.h"   /* E7：切换后随机表情 */
 #include "clock_digits.h"    /* CLOCK_ANCHOR_AUTO（问题3 默认居中锚点） */
 #include "http_client.h"
@@ -42,6 +43,10 @@ static const char *TAG = "sm";
 #include "asset_dl.h"
 #include "ota.h"
 #include "bgm.h"
+/* 【契约 §3.2 相机接口】render_cam_supported/set（compositor.h 明示"相机 UX 层
+ * 请 #include compositor.h，render.h 不转出本组接口"）——本文件用于 §3.3 的
+ * 「装载地图 → 读 NVS 应用相机」= 全局加载。 */
+#include "compositor.h"
 
 static mp_state_t s_state = MP_ST_BOOT;
 static bool       s_online = false;       /* 服务端可达（poller 维护） */
@@ -559,6 +564,29 @@ void state_machine_handle(mp_sm_event_t ev)
     xSemaphoreGive(s_lock);
 }
 
+/* 【契约 §3.3】相机调参态入口专用：MENU→POKER 内部通道。
+ * 为什么不复用 state_machine_handle(MP_SM_EV_MENU_KEY)：那条事件带 **400ms 硬限速**
+ * （防实体键抖动把菜单关了又开，见上），而"菜单里确认②修改当前地图的摄像头"是
+ * **显式 UI 动作**，不该被"上一次按键 <400ms"吞掉——被吞的表现是屏上 `CAM BUSY - RETRY`
+ * 且调参态进不去。本函数不吃那条限速，也**不刷新**限速时间戳（不占用按键配额，
+ * 不改变既有按键手感）。语义 = MENU_KEY 在 MENU 态的分支（transition_locked(POKER)）。
+ * 返回 true = 确已迁到 POKER（调用方据此决定是否进入调参态）。 */
+bool state_machine_cam_enter_poker(void)
+{
+    if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(100)) != pdTRUE) {
+        ESP_LOGW(TAG, "相机入口：状态机锁超时，MENU→POKER 未执行");
+        return false;
+    }
+    if (s_state == MP_ST_MENU) transition_locked(MP_ST_POKER);
+    bool ok = (s_state == MP_ST_POKER);
+    xSemaphoreGive(s_lock);
+    if (!ok) {
+        ESP_LOGW(TAG, "相机入口：MENU→POKER 未生效（当前态 %s）",
+                 state_machine_name(state_machine_current()));
+    }
+    return ok;
+}
+
 void state_machine_tick_1hz(void)
 {
     /* 低电强制睡眠的持续钳制（防止交互又唤醒） */
@@ -652,6 +680,112 @@ static void dispatch_set_parts_by_hash(const char *hash)
 /* 是否已成功装载过 BGMAP（默认地图重投判据） */
 static bool g_map_loaded;
 
+/* ══ 【相机 UX · 契约 §3.3】per-map 相机持久化（namespace "cam"）══════════════
+ * docs/ai/map-fullmap-firmware-contract.md §3.3：
+ *   · key = per-map 键，与 asset_dl 的隐藏标识 / asset_dl_map_key() **同口径**
+ *     （map_id 优先，无 map_id → "h"+hash 前 14 位；恒 ≤15 字符 = NVS 键长上限）；
+ *   · value = 两个 int32（x,y）= 可见窗口左上角的**世界坐标**（1x 世界系，见 §1）；
+ *   · 「全局加载」= 装载地图成功路径读 NVS 应用（本文件 dispatch_map 末尾
+ *     cam_apply_for_map），不是"每次进相机页才读"；
+ *   · 清除点 = 菜单子页③「删除此地图」（隐藏标识置位处，lvgl_bridge.c 调
+ *     sm_cam_nvs_erase）。
+ * 注：菜单「Reset WiFi」不是出厂复位——provision_factory_reset() 只清配网键
+ * （provision.c），故不在此顺手清相机（避免"重置 WiFi 顺手丢用户调好的相机"）；
+ * 真·出厂（NVS 区整片擦除）自然连 cam 命名空间一起清。 */
+#define SM_CAM_NVS_NS  "cam"
+#define SM_CAM_KEY_MAX 15          /* NVS_KEY_NAME_MAX_SIZE-1（键名硬上限） */
+
+/* 【契约 §3.3】"脚踩地面线"结算：实现在 lvgl_bridge.c（相机 UX 层，掌握屏尺寸与
+ * 相机调参态的 pending 旗标）。本文件只负责在**地图装载成功之后**叫它一次——这是
+ * 站位链（render_set_map → ent_stand_on_ground_locked）与相机应用都已完成的最早时刻。 */
+extern void bridge_cam_settle_after_reload(void);
+
+/* 读该图相机：(x,y) 世界 px；无该键/命名空间不存在/长度不符 → false */
+bool sm_cam_nvs_get(const char *key, int32_t *x, int32_t *y)
+{
+    if (!key || !key[0] || !x || !y) return false;
+    nvs_handle_t h;
+    if (nvs_open(SM_CAM_NVS_NS, NVS_READONLY, &h) != ESP_OK) return false;
+    int32_t v[2] = { 0, 0 };
+    size_t len = sizeof(v);
+    esp_err_t e = nvs_get_blob(h, key, v, &len);
+    nvs_close(h);
+    if (e != ESP_OK || len != sizeof(v)) return false;
+    *x = v[0];
+    *y = v[1];
+    return true;
+}
+
+/* 写该图相机（8B blob：x,y 各 int32）→ true=已 commit 落地 */
+bool sm_cam_nvs_set(const char *key, int32_t x, int32_t y)
+{
+    if (!key || !key[0] || strlen(key) > SM_CAM_KEY_MAX) {
+        ESP_LOGE(TAG, "相机 NVS 写入拒绝：键非法（%s）", key ? key : "(null)");
+        return false;
+    }
+    nvs_handle_t h;
+    if (nvs_open(SM_CAM_NVS_NS, NVS_READWRITE, &h) != ESP_OK) {
+        ESP_LOGE(TAG, "相机 NVS：打开命名空间 %s 失败", SM_CAM_NVS_NS);
+        return false;
+    }
+    const int32_t v[2] = { x, y };
+    esp_err_t e = nvs_set_blob(h, key, v, sizeof(v));
+    if (e == ESP_OK) e = nvs_commit(h);
+    nvs_close(h);
+    if (e != ESP_OK) {
+        ESP_LOGE(TAG, "相机 NVS 写入失败 key=%s：%s", key, esp_err_to_name(e));
+        return false;
+    }
+    return true;
+}
+
+/* 清该图相机键（隐藏/删除地图时；键不存在视为成功）；true = 已确认干净 */
+bool sm_cam_nvs_erase(const char *key)
+{
+    if (!key || !key[0]) return false;
+    nvs_handle_t h;
+    if (nvs_open(SM_CAM_NVS_NS, NVS_READWRITE, &h) != ESP_OK) return true;  /* 无命名空间=无键 */
+    esp_err_t e = nvs_erase_key(h, key);
+    if (e == ESP_ERR_NVS_NOT_FOUND) e = ESP_OK;      /* 解除不存在的键 = 成功 */
+    if (e == ESP_OK) e = nvs_commit(h);
+    nvs_close(h);
+    return (e == ESP_OK);
+}
+
+/* 装载地图成功后应用该图相机 = 契约 §3.3 的「全局加载」：
+ *   非整图包（旧窗口包）→ render_cam_supported()==false → 整段跳过（旧包行为逐字节不变）；
+ *   整图包有 NVS → render_cam_set(保存值)；
+ *   整图包无 NVS → 不额外动作（render_set_map 装载时已置中 = 服务端导出参考相机）。 */
+static void cam_apply_for_map(const char *hash)
+{
+    if (!render_cam_supported()) {
+        ESP_LOGI(TAG, "相机：地图 %s 非整图包（无可平移余量）→ 跳过 NVS 相机", hash);
+        return;
+    }
+    char key[16];
+    if (!asset_dl_map_key(hash, key, sizeof(key))) {
+        ESP_LOGW(TAG, "相机：地图 %s 无 per-map 键 → 跳过 NVS 相机", hash);
+        return;
+    }
+    int32_t x = 0, y = 0;
+    if (sm_cam_nvs_get(key, &x, &y)) {
+        render_cam_set(x, y);          /* 越界由实现夹取（§3.2） */
+        ESP_LOGW(TAG, "sm: 地图 %s 应用相机 (%d,%d) [ns=%s key=%s]",
+                 hash, (int)x, (int)y, SM_CAM_NVS_NS, key);
+    } else {
+        /* 无 NVS：渲染层 render_set_map 装载整图包时已置中（compositor.h 明示），
+         * 无需再调 render_cam_center()；这里只留可判读的日志。 */
+        ESP_LOGI(TAG, "sm: 地图 %s 无 NVS 相机 → 保持装载置中（服务端导出参考相机）", hash);
+    }
+}
+
+/* 横幅收尾（相机调参退出后由 lvgl_bridge 调用）：恢复「无 WiFi 配置」常驻横幅，
+ * 已配网则隐藏——复用 POKER on_enter 的同一判据，绝不留下调参横幅 */
+void state_machine_banner_restore(void)
+{
+    post_banner_if_needed();
+}
+
 static void dispatch_map(const char *hash)
 {
     char bg[MP_MPK_PATH_MAX];
@@ -687,6 +821,17 @@ static void dispatch_map(const char *hash)
         ESP_LOGI(TAG, "地图条带 %d 条：%s | %s", n, strips[0], (n > 1) ? strips[1] : "-");
     ESP_LOGW(TAG, "地图装载 %s（条带 %d）rc=%d", hash, n, mrc);
     if (mrc == 0) g_map_loaded = true;
+
+    /* 【契约 §3.3 全局加载】装载成功 → 应用该图 NVS 相机（非整图包自动跳过）。
+     * 放在 render_set_map 之后：render_cam_* 的"当前图"口径以刚装入的包为准。 */
+    if (mrc == 0) {
+        cam_apply_for_map(hash);
+        /* 【§3.3「脚踩地面线」结算点】必须在**装载落地之后**：此刻 render_set_map 已
+         * 跑完站位链（宠物归屏心）、相机也已应用 → render_ground_screen_y(屏心x) 才是
+         * 收尾后的真值（在派发前采样会早一帧，取到的是旧相机下的地面线）。
+         * 非相机收尾触发的地图装载里这是空操作（lvgl_bridge 侧 pending 未置位）。 */
+        bridge_cam_settle_after_reload();
+    }
 
     /* 地图时钟锚点随地图切换预置（E9/R15；开关留待 CLOCK 指令）。
      * 问题3：无锚点 → CLOCK_ANCHOR_AUTO（渲染层整块居中屏幕 240,120） */
@@ -744,7 +889,26 @@ static void dispatch_manifest_synced(void)
     static const struct { render_font_t id; int px; } fonts[] = {
         { RENDER_FONT_16, 16 }, { RENDER_FONT_24, 24 }, { RENDER_FONT_32, 32 },
     };
-    for (size_t i = 0; i < sizeof(fonts) / sizeof(fonts[0]); i++) {
+    /* 【字体堆门控 2026-10-01 · 真机根因：整图包下载与字体装载抢内部堆】
+     * 证据（216 板内部 DRAM ~133KB，串口逐点打点）：
+     *   · 首启 sync 触发 17MB BGMAP 分块下载，下载在飞时并发跑本函数：
+     *     `set_font px=16` 期间内部堆 24,419 → 6,095（mpak_open rc=-1），
+     *     px=24 之后只剩 **299B / 最大块 4B**；
+     *   · 接着 SDMMC 连 512B DMA 缓冲都拿不到 → `sdmmc_read_sectors: not enough mem`
+     *     → `mpak: open /sdcard/minipet/bg/<整图包>.mpk failed` → 地图装载 rc=-1（黑屏）
+     *     → 素材绑定被 heap_ok_for_asset_load() 跳过 → 10s 一轮死循环；
+     *   · 对照：素材已下完的那次启动，同样三个字体装载后内部堆反而回到 38KB。
+     * 结论：字体装载本身不泄漏，是**与下载并发时内部堆不够**（老代码只护
+     * parts/layout 绑定，字体这一段是裸奔的）。
+     * 修法：字体装载吃同一道门——堆不足就整轮跳过（保留上一轮已装字体，屏上
+     * 不会缺字），10s 后随 sync 重试；下载完、堆回稳后自然装上。 */
+    bool heap_ok_font = heap_ok_for_asset_load();
+    if (!heap_ok_font) {
+        ESP_LOGW(TAG, "内部堆不足（%uB < %dKB）→ 跳过本轮字体装载（保上轮字体），随下轮 sync 重试",
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                 (int)CONFIG_MP_ASSET_HEAP_GATE_KB);
+    }
+    for (size_t i = 0; heap_ok_font && i < sizeof(fonts) / sizeof(fonts[0]); i++) {
         if (asset_dl_font_path(fonts[i].px, path, sizeof(path))) {
             ESP_LOGW(TAG, "set_font px=%d 开始 %s", fonts[i].px, path);
             render_set_font(fonts[i].id, path);
