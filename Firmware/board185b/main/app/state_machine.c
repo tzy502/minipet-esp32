@@ -628,6 +628,21 @@ void state_machine_tick_1hz(void)
     int64_t idle_ms = mp_now_ms() - s_last_activity_ms;
     uint32_t limit_ms = (uint32_t)g_mp_cfg.idle_to_clock_min * 60u * 1000u;
     if (limit_ms == 0) limit_ms = 5u * 60u * 1000u;
+    /* 【闲置计时取证 2026-10-01 · 临时】用户报障"好像没有根据通用设定进时钟"：
+     * 实测 6.5 分钟闲置未进 CLOCK_DOZE。本探针每 10s 打一行，直接看
+     * ①闲置计时是否被反复清零（值一直很小 = 有东西在刷 activity）
+     * ②阈值是多少（= 服务端下发的通用设定 idleToClockMin）
+     * ③当前状态是否在允许集合里。定位后删除本段。 */
+    {
+        static int64_t s_probe_last_ms;
+        int64_t now_ms = mp_now_ms();
+        if (now_ms - s_probe_last_ms >= 10000) {
+            s_probe_last_ms = now_ms;
+            ESP_LOGW(TAG, "闲置探针：态=%s 闲置=%lld s / 阈值=%u s（idleToClockMin=%u）",
+                     state_machine_name(s_state), (long long)(idle_ms / 1000),
+                     (unsigned)(limit_ms / 1000u), (unsigned)g_mp_cfg.idle_to_clock_min);
+        }
+    }
     if (idle_ms >= (int64_t)limit_ms) {
         state_machine_handle(MP_SM_EV_IDLE_TIMEOUT);
     }
@@ -701,6 +716,36 @@ static void font_retry_arm(void)
  * `::camtest <步数>,<步长>[,<档位>]`（已有 bubble 通道，无需部署服务端）。
  * ⚠️ 待 app_core.h 同步出 MP_CMD_CAM_PAN_TEST/CAM_SET 后，在此补回
  *    `case MP_CMD_CAM_PAN_TEST: cam_pan_test_run(...)`（见交付报告清单）。 */
+/* 【服务端相机挂起】见 MP_CMD_CAM_SET：地图没装好时先记住，装载成功后补上 */
+bool sm_cam_nvs_set(const char *key, int32_t x, int32_t y);   /* 定义在后段 */
+static bool    s_cam_pending;
+static int32_t s_cam_pending_x, s_cam_pending_y;
+static char    s_cam_pending_map[16];      /* 目标地图 id（空=不限定） */
+
+static void cam_pending_apply(void)
+{
+    if (!s_cam_pending || !render_cam_supported()) return;
+    /* 目标图校验：不等目标图装载完就不应用（防"应用到错误的图"） */
+    if (s_cam_pending_map[0]) {
+        char cur[16] = "";
+        const char *h = asset_dl_active_map_hash();
+        if (h) asset_dl_map_id_of(h, cur, sizeof cur);
+        if (strcmp(cur, s_cam_pending_map) != 0) return;
+    }
+    s_cam_pending = false;
+    render_cam_set(s_cam_pending_x, s_cam_pending_y);
+    int32_t gx = 0, gy = 0;
+    render_cam_get(&gx, &gy);
+    char key[16];
+    const char *ah = asset_dl_active_map_hash();
+    if (ah && asset_dl_map_key(ah, key, sizeof key)) {
+        sm_cam_nvs_set(key, gx, gy);
+        ESP_LOGW(TAG, "挂起的服务端相机已补上 (%d,%d)，已写入 NVS[key=%s]", (int)gx, (int)gy, key);
+    } else {
+        ESP_LOGW(TAG, "挂起的服务端相机已补上 (%d,%d)（无活动地图键，未持久化）", (int)gx, (int)gy);
+    }
+}
+
 static void cam_pan_test_run_ex(int steps, int step, int level);
 
 static void cam_pan_test_run(int steps, int step)
@@ -991,6 +1036,7 @@ static void dispatch_map(const char *hash)
     ESP_LOGW(TAG, "地图装载 %s（条带 %d）rc=%d", hash, n, mrc);
     if (mrc == 0) {
         g_map_loaded = true;
+        cam_pending_apply();          /* 服务端相机若在地图装载前到达，这里补上 */
         /* 装载成功即记忆（服务端推送 / 菜单选择 / 开机重投三条路径共用）：
          * 下次开机仍用这张图（用户口径"设置成某张图后重启还是它"）。 */
         char mid[32];
@@ -1356,22 +1402,39 @@ void app_cmd_dispatch(const mp_cmd_t *cmd)
         break;
     case MP_CMD_CAM_SET: {
         /* 服务端"选镜头"界面下发：应用到渲染层并写入该图 NVS（重启/断网后仍生效）。
-         * 与 216 同口径；非整图包（无平移余量）时明确拒绝并记日志。 */
-        if (!render_cam_supported()) {
-            ESP_LOGW(TAG, "服务端相机 %d,%d：当前图非整图包 → 忽略", (int)cmd->a, (int)cmd->b);
+         * 【时序兜底 2026-10-01】真机：指令常在**地图尚未装载完**时到达（长轮询
+         * 与启动/换图重叠）→ render_cam_supported() 还是 false → 之前直接丢弃，
+         * 用户在 Web 点了"上送"却没反应。改为**挂起记忆**：地图一装载成功就补上
+         * （见 dispatch_map 成功分支的 cam_pending_apply）。 */
+        /* 【目标图校验 2026-10-02】指令带 mapId 时必须等**那张图**装载完成再应用；
+         * 若当前显示的是别的图（或不支持平移），一律挂起（SET_MAP 已由 poller 先投）。 */
+        char want[16];
+        strlcpy(want, cmd->s, sizeof want);
+        char cur[16] = "";
+        const char *ah = asset_dl_active_map_hash();
+        if (ah) asset_dl_map_id_of(ah, cur, sizeof cur);
+        bool map_ok = (want[0] == 0) || (cur[0] && strcmp(want, cur) == 0);
+        if (!render_cam_supported() || !map_ok) {
+            s_cam_pending_x = cmd->a;
+            s_cam_pending_y = cmd->b;
+            s_cam_pending = true;
+            strlcpy(s_cam_pending_map, want, sizeof s_cam_pending_map);
+            ESP_LOGW(TAG, "服务端相机 %d,%d 目标图='%s'（当前='%s' 支持=%d）→ 挂起，"
+                          "待目标整图装载后自动补上", (int)cmd->a, (int)cmd->b,
+                     want[0] ? want : "(当前图)", cur[0] ? cur : "(无)",
+                     (int)render_cam_supported());
             break;
         }
         render_cam_set(cmd->a, cmd->b);
         int32_t gx = 0, gy = 0;
         render_cam_get(&gx, &gy);
         char key[16];
-        const char *ah = asset_dl_active_map_hash();
+        /* 当前活动地图的 NVS 键：activity map hash → map_id 派生（与相机 UX 同口径） */
         if (ah && asset_dl_map_key(ah, key, sizeof key)) {
             sm_cam_nvs_set(key, gx, gy);
-            ESP_LOGW(TAG, "服务端相机已应用并记忆：(%d,%d) key=%s", (int)gx, (int)gy, key);
+            ESP_LOGW(TAG, "服务端相机 → 应用 (%d,%d)，已写入 NVS[key=%s]", (int)gx, (int)gy, key);
         } else {
-            ESP_LOGW(TAG, "服务端相机已应用：(%d,%d)（无活动图/无 per-map 键 → 未记忆）",
-                     (int)gx, (int)gy);
+            ESP_LOGW(TAG, "服务端相机 → 应用 (%d,%d)（无活动地图键，未持久化）", (int)gx, (int)gy);
         }
         break;
     }

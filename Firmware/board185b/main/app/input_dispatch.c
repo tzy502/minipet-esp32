@@ -664,10 +664,27 @@ static bool touch_read_frame(touch_frame_t *f)
         int64_t now = mp_now_ms();
         if (s_last_ok_ms == 0) s_last_ok_ms = now;
         if (now - s_last_ok_ms > 3000) {           /* 3s 无成功帧 → 兜底复位 */
-            ESP_LOGW(TAG, "触摸 3s 无成功帧（累计 NACK %u）→ 兜底复位总线+IC",
-                     (unsigned)s_nack);
-            i2c_bus_hw_reset();
-            touch_cst816_recover();
+            /* ══ 【崩溃根因 · 去掉硬件总线复位 2026-10-01】══════════════════════════
+             * 真机 panic 取证（addr2line 解栈）：
+             *   refresh_task → esp_lcd_panel_draw_bitmap → spi_device_queue_trans
+             *   → esp_intr_enable → i2c_isr_receive_handler → i2c_ll_read_rxfifo
+             *   → StoreProhibited（EXCVADDR=0x1064）
+             * 触发条件：本行原本无条件调 `i2c_bus_hw_reset()`（i2c_master_bus_reset），
+             * 复位后 I2C ISR 在已失效的驱动/FIFO 状态上取数 → 空指针写 → Core0 panic
+             * → 设备每 ~94s 重启一次（**闲置计时永远攒不到阈值 → 待机时钟永不出现**，
+             * 用户报障"好像没有根据通用设定进时钟"的真因）。
+             * 注：总线锁是完备的（每个读写都持锁），所以不是软件并发，是复位 API 本身
+             * 在此硬件/驱动组合下不安全 → 本板不再使用它。
+             * 兜底仍保留 **IC 侧复位**（RST 引脚拉低/拉高 + 重探测），真机实证足以恢复
+             * （日志 "触摸自愈：复位+重探测成功 chipID=B5"）。
+             * 另加**全局退避**：自愈成功后 30s 内不再重复（避免空闲 NACK 引发周期性复位风暴）。 */
+            static int64_t s_heal_last_ms;
+            if (now - s_heal_last_ms > 30000) {
+                s_heal_last_ms = now;
+                ESP_LOGW(TAG, "触摸 3s 无成功帧（累计 NACK %u）→ IC 侧自愈（不再复位 I2C 总线）",
+                         (unsigned)s_nack);
+                touch_cst816_recover();
+            }
             s_last_ok_ms = now;
         }
         return false;

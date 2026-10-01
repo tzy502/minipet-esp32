@@ -190,10 +190,29 @@ static void handle_cmd(cJSON *jc)
         strlcpy(c.s, v, sizeof(c.s));
         mp_post_cmd(&c);
     } else if (strcmp(t, "cam") == 0 && v) {
-        /* 【服务端选镜头】{"type":"cam","value":"<x>,<y>"}（世界坐标）→ 应用并落 NVS。
-         * 服务端是主口径，本地卡只是辅助（断网时用 NVS 记忆）。 */
+        /* 【服务端选镜头】两种载荷（2026-10-01 自 216 同步，修真空机位 bug）：
+         *   "<x>,<y>"          旧：应用到**当前**地图（保留兼容）
+         *   "<mapId>,<x>,<y>"  新：**先切到该地图再定位**（服务端新版缺省发这种）
+         * 【为什么必须两种都认】真机事故（用户报障"没法调整坐标"）：服务端新版发的是
+         * 三段式 "867136122,600,400"，而本文件原只有 `sscanf("%d,%d")` 一个分支——
+         * **sscanf 对三段串会"成功"解析出前两段**（把 mapId 当 x、x 当 y，余下忽略），
+         * 于是机位被应用到错误坐标、还写进**当前那张图**的 NVS（用户看到"上送了但
+         * 位置不对/没反应"）。三分支顺序不能调：先试三段，再退两段。
+         * 服务端为主口径，本地卡只是辅助（断网时用 NVS 记忆）。 */
+        char mid[16] = "";
         int cx = 0, cy = 0;
-        if (sscanf(v, "%d,%d", &cx, &cy) == 2) {
+        if (sscanf(v, "%15[^,],%d,%d", mid, &cx, &cy) == 3) {
+            mp_cmd_t m = { 0 };                 /* ① 先切图（幂等：已在该图则无操作） */
+            m.type = MP_CMD_SET_MAP;
+            strlcpy(m.s, mid, sizeof(m.s));
+            mp_post_cmd(&m);
+            c.type = MP_CMD_CAM_SET;            /* ② 再应用机位（带 mapId：装载完成后校验） */
+            c.a = cx; c.b = cy;
+            strlcpy(c.s, mid, sizeof(c.s));
+            mp_post_cmd(&c);
+            ESP_LOGW(TAG, "服务端相机（带地图）：map=%s → (%d,%d) 已入队（先切图后定位）",
+                     mid, cx, cy);
+        } else if (sscanf(v, "%d,%d", &cx, &cy) == 2) {
             c.type = MP_CMD_CAM_SET;
             c.a = cx; c.b = cy;
             mp_post_cmd(&c);
