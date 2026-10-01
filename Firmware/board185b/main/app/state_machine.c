@@ -183,6 +183,8 @@ static void transition_locked(mp_state_t next)
     case MP_ST_CLOCK_DOZE:
         /* E9：待机时钟浮现（AMOLED 纯黑背景只数字发光，RTC 独立走时）；
          * fontTime 素材与地图锚点由 dispatch 查 asset_dl */
+        ESP_LOGW(TAG, "【待机时钟】进入 CLOCK_DOZE（闲置到点，idleToClockMin=%u）",
+                 (unsigned)g_mp_cfg.idle_to_clock_min);   /* 状态迁移取证：该态原先无日志 */
         cmd_simple(MP_CMD_CLOCK, NULL, 1, 0);
         cmd_simple(MP_CMD_SET_EXPRESSION, MP_EXPR_DEFAULT, 0, 0);
         break;
@@ -628,21 +630,6 @@ void state_machine_tick_1hz(void)
     int64_t idle_ms = mp_now_ms() - s_last_activity_ms;
     uint32_t limit_ms = (uint32_t)g_mp_cfg.idle_to_clock_min * 60u * 1000u;
     if (limit_ms == 0) limit_ms = 5u * 60u * 1000u;
-    /* 【闲置计时取证 2026-10-01 · 临时】用户报障"好像没有根据通用设定进时钟"：
-     * 实测 6.5 分钟闲置未进 CLOCK_DOZE。本探针每 10s 打一行，直接看
-     * ①闲置计时是否被反复清零（值一直很小 = 有东西在刷 activity）
-     * ②阈值是多少（= 服务端下发的通用设定 idleToClockMin）
-     * ③当前状态是否在允许集合里。定位后删除本段。 */
-    {
-        static int64_t s_probe_last_ms;
-        int64_t now_ms = mp_now_ms();
-        if (now_ms - s_probe_last_ms >= 10000) {
-            s_probe_last_ms = now_ms;
-            ESP_LOGW(TAG, "闲置探针：态=%s 闲置=%lld s / 阈值=%u s（idleToClockMin=%u）",
-                     state_machine_name(s_state), (long long)(idle_ms / 1000),
-                     (unsigned)(limit_ms / 1000u), (unsigned)g_mp_cfg.idle_to_clock_min);
-        }
-    }
     if (idle_ms >= (int64_t)limit_ms) {
         state_machine_handle(MP_SM_EV_IDLE_TIMEOUT);
     }
