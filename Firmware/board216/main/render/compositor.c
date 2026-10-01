@@ -2386,8 +2386,16 @@ int render_cam_adjust_get(void) { return g_cam_adjust_lvl; }
  * 由 input 任务调用（render_cam_set 的同一条路径上）。 */
 void render_cam_adjust_motion_notify(void)
 {
-    /* 仅时戳：渲染层据此认为"拖动仍在进行"（忙窗/横幅），但**不降级**渲染内容。 */
+    /* 拖动：刷新时间戳（安全网判活用），并确保档位不低于 level 1（跳条带层）。
+     * 用户口径"选择摄像机流程内不渲染 bac" ⇒ 拖动期间条带层既不合成也不补读；
+     * 保存/取消会显式回 0，另有 30s 安全网兜底（见 cam_adjust_tick）。 */
     g_cam_adj_motion_us = esp_timer_get_time();
+    if (g_inited && g_cam_adjust_lvl == RC_CAM_ADJ_OFF) {
+        rc_lock();
+        if (g_cam_adjust_lvl == RC_CAM_ADJ_OFF)
+            cam_adjust_apply_level(RC_CAM_ADJ_NO_STRIP, /*recompose=*/true);
+        rc_unlock();
+    }
 }
 
 void render_cam_adjust_motion(void)
@@ -2412,9 +2420,19 @@ static void cam_adjust_tick(int64_t now_us)
             rc_unlock();
         }
     }
-    /* 【不再自动回 level 0】用户定稿：整个"摄像机流程"内都不渲染条带层，
-     * 直到保存/取消（lvgl_bridge 的 cam_finish_core → render_cam_adjust_set(OFF)）。
-     * 否则松手 300ms 后条带就回来并触发 2~3s 重填，用户看到的还是"卡住"。 */
+    /* 【安全网 2026-10-02】用户报障："有的时候 bac 不渲染"——真因是跳条带档位
+     * （level ≥1）在**任何一次没走到"保存/取消"的退出路径**后会永久残留
+     * （漏按、被打断、异常重启），于是条带装饰层再也不画。
+     * 现在：只要 level ≥1 且 **30s 内没有任何相机活动**（拖动/设位都会刷新
+     * g_cam_adj_motion_us），就自动回 level 0 恢复全层渲染。
+     * 仍在调参中的用户不受影响：拖动会持续续命（见 render_cam_adjust_motion_notify）。 */
+    if (g_cam_adjust_lvl >= RC_CAM_ADJ_NO_STRIP &&
+        now_us - g_cam_adj_motion_us > 30LL * 1000000LL) {
+        rc_lock();
+        cam_adjust_apply_level(RC_CAM_ADJ_OFF, /*recompose=*/true);
+        rc_unlock();
+        ESP_LOGW(TAG, "调参档位安全网：30s 无相机活动 → 回 level 0（背景装饰层恢复）");
+    }
 }
 
 static void cam_scene_sync(void)
@@ -2922,6 +2940,11 @@ static int cam_scene_load(mpak_t *bm, const mpak_bgmap_t *bg,
                  RC_CAM_CACHE_W, RC_CAM_CACHE_H, (int)g_cam_fov_w, (int)g_cam_fov_h,
                  (int)g_sw, (int)g_sh);
         return RENDER_ERR_UNSUPPORTED;
+    }
+    /* 【换图强制回全层】避免上一次调参的跳条带档位带到新图（用户报障"bac 不渲染"） */
+    if (g_cam_adjust_lvl != RC_CAM_ADJ_OFF) {
+        ESP_LOGW(TAG, "装载新图：调参档位 %d → 0（恢复全层渲染）", g_cam_adjust_lvl);
+        g_cam_adjust_lvl = RC_CAM_ADJ_OFF;
     }
     g_cam_vw = bg->vw;
     g_cam_vh = bg->vh;
