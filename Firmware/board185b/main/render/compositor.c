@@ -1641,15 +1641,30 @@ static void ent_compose(int32_t x, int32_t y, int32_t w, int32_t h, int darken_p
  *   · 只在**渲染任务**里泵（其余任务的 mpak_open 不受影响）；
  *   · 时钟态（CLOCK_DOZE）/菜单态不泵（那两屏的整屏语义不同）。
  * ══════════════════════════════════════════════════════════════════════════ */
+/* ══ 【保活泵总开关 · 2026-10-02 因真机硬挂死而关闭（用户口径选 A）】══════════
+ * 关闭原因（**我的独立复验，与 agent 报告的"验证通过"相反**）：
+ *   推一张 **19.3MB** 整图（魔法密林）后设备**硬挂死**——串口 0 字节、连看门狗日志
+ *   都没有、服务端 online=false；esptool 硬复位才恢复。agent 的验证用的是 **4MB** 图
+ *   （让帧 57 次/推进 32 帧、9.25s、task_wdt 0 次），触发次数少所以没炸。
+ * 机理（代码级）：泵在**长重活循环内部**放锁→延时→加回，然后调用
+ *   `rc_anim_advance()` / `recompose_entity_locked()` / `ent_compose()` 写 g_fb —
+ *   这些是**渲染主循环的状态机**，此刻正被装载流程"从内部"调用 → 与装载自身的
+ *   整屏重合成 / 扁平缓冲重建**重入**。4MB 侥幸，19MB 触发次数×3 后暴露。
+ * 取舍（用户拍板）：**推图时宠物静止 ~8s（可接受）<< 永久挂死（不可接受）**。
+ * 重新启用方式：置 1（代码全保留；启用前必须先修掉重入面，见上面机理）。
+ * 关闭时行为 = 与加泵之前**逐字节等价**：rc_long_op_pump() 与开/关窗全是空操作，
+ * 且不再注册 mpak_long_op_hook（CRC 循环里的回调点也不会进）。 */
+#define RC_PUMP_ENABLE      0
+
 #define RC_PUMP_GAP_MS     120    /* 两次泵帧之间的最小间隔（按工作耗时计，不含让位） */
 #define RC_PUMP_PANEL_MS    20    /* 每次泵帧让位时长（≈ 持续刷新任务一轮全屏扫描） */
 #define RC_PUMP_GRACE_MS  2500    /* 装载返回后的宽限：覆盖"首帧相位回正"那一笔填充 */
 
 static volatile int64_t g_pump_until_us;   /* 0/过去时刻 = 关；>now = 窗口内 */
-static int64_t  g_pump_last_us;
+static __attribute__((unused)) int64_t  g_pump_last_us;
 static TaskHandle_t g_render_task;         /* 渲染任务句柄（只在它里面泵帧） */
-static int32_t  g_pump_rx, g_pump_ry, g_pump_rw, g_pump_rh;   /* 上一拍泵帧的实体矩形 */
-static uint32_t g_pump_n, g_pump_frames;   /* 本装载窗口内：让帧次数 / 实际推进的动画帧数 */
+static __attribute__((unused)) int32_t  g_pump_rx, g_pump_ry, g_pump_rw, g_pump_rh;   /* 上一拍泵帧的实体矩形 */
+static __attribute__((unused)) uint32_t g_pump_n, g_pump_frames;   /* 本装载窗口内：让帧次数 / 实际推进的动画帧数 */
 
 /* 放开本任务持有的帧锁 → 让一拍 → 原层数加回。仅当持锁者==本任务才做：
  * 否则会"给出不属于自己的锁"，破坏递归锁的所有权语义。 */
@@ -1669,6 +1684,9 @@ static void pump_yield_panel(void)
 /* 泵一帧（长重活循环里周期性调用；窗口外/非渲染任务/菜单/时钟 = 立即返回） */
 void rc_long_op_pump(void)
 {
+#if !RC_PUMP_ENABLE
+    return;                     /* 【2026-10-02 已关闭】真机 19MB 整图硬挂死，见宏处说明 */
+#else
     if (!g_inited || g_menu) return;
     int64_t now = esp_timer_get_time();
     if (now >= g_pump_until_us) return;
@@ -1713,21 +1731,29 @@ void rc_long_op_pump(void)
         }
     }
     rc_unlock();
+#endif  /* RC_PUMP_ENABLE */
 }
 
 /* 开窗：地图装载入口调用（装载期间的每一次唤醒都值得让一帧） */
 static void rc_pump_window_begin(void)
 {
+#if !RC_PUMP_ENABLE
+    return;                     /* 【2026-10-02 已关闭】见 RC_PUMP_ENABLE 处说明 */
+#else
     g_pump_last_us  = esp_timer_get_time();
     g_pump_until_us = INT64_MAX;
     g_pump_rw = 0;
     g_pump_n = 0; g_pump_frames = 0;
+#endif
 }
 /* 关窗：留一段宽限（装载返回后第一笔 flush 里还有"相位回正"的整窗重填）。
  * 打印本窗口的让帧计数 = 真机判据：装载这 N 秒里宠物动画被服务了多少次
  * （0 次 = 泵没生效，退回"整段静止"的老行为）。 */
 static void rc_pump_window_end(void)
 {
+#if !RC_PUMP_ENABLE
+    return;                     /* 【2026-10-02 已关闭】见 RC_PUMP_ENABLE 处说明 */
+#else
     if (g_pump_n) {
         ESP_LOGW(TAG, "装载期保活泵：本窗口让帧 %u 次 / 推进动画 %u 帧（装载窗口内宠物不停；"
                       "未让帧时 = 老行为：整段静止）",
@@ -1735,6 +1761,7 @@ static void rc_pump_window_end(void)
     }
     g_pump_until_us = esp_timer_get_time() + (int64_t)RC_PUMP_GRACE_MS * 1000;
     g_pump_rw = 0;
+#endif
 }
 
 /* ══════════════════════════════════════════════════════════════════════════
@@ -4328,7 +4355,13 @@ int render_init(const minipet_profile_t *profile)
     /* 【装载期保活泵】把让帧钩子交给 mpak：全量 CRC32C 是秒级同步读（整图 BGMAP
      * 单次 ≈3.5s），钩子让渲染任务在这段时间里继续出帧（见"地图装载期保活泵"）。
      * 钩子内部自带门禁（装载窗口 / 渲染任务 / 菜单 / 时钟），窗口外零成本。 */
+#if RC_PUMP_ENABLE
     mpak_long_op_hook = rc_long_op_pump;
+#else
+    /* 【2026-10-02 已关闭】不注册钩子 → mpak CRC 分块循环里的回调点也不会进
+     * （连函数调用都省掉，与加泵之前逐字节等价） */
+    mpak_long_op_hook = NULL;
+#endif
 
     /* 问题3：屏尺寸/比例先行告知时钟模块（默认居中锚点与 get_rect 标脏依赖；
      * 旧实现 scale 在首次 compose 才赋值 → enable 后时钟矩形恒 0 永不标脏） */
