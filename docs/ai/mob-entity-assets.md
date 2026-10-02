@@ -146,6 +146,15 @@ D=<服务端>/data/cache/export/<deviceId>
   `ghcr.io/tzy502/minipet-esp32:latest`（含 `kind=mob`）。NAS 侧一条命令即可：
   `cd /volume2/docker/minipet && docker compose pull && docker compose up -d`
 - 两板固件均已烧录最新版（21101=185B / 21201=216），都在线。
+- **验收脚本（部署后一条命令）**：`scripts/verify-mob-e2e.py` —— 推送 → 等清单出现该实体
+  （并核对 `selector=mob`/`defaultAction`/`origin=[0,0]`）→ 下发切换 → 收设备 UDP 抓帧落 PNG。
+  ```bash
+  python3 scripts/verify-mob-e2e.py --server http://192.168.3.46:38090 \
+      --device dev-693ea4 --mob 100100            # 216：默认 --trigger shot
+  python3 scripts/verify-mob-e2e.py --server http://192.168.3.46:38090 \
+      --device dev-8d4afc --mob 100100 --trigger ::shot   # 185B：气泡魔数
+  ```
+  （脚本两半都已单独验证过：服务端三步打真服务端 PASS；收帧函数用 216 真机抓帧 330/330 包 PASS）
 - 验收清单（部署后逐条）：
   1. Web「素材 → 怪物」tab 点 📤 → 选设备 → 推送 → 提示"已受理"；
   2. 服务端日志出现 `资产登记完成（新打包）` + `切换实体 → mob:<id>`；
