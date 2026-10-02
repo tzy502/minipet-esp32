@@ -284,8 +284,14 @@ void display_set_frame_source(const uint16_t *fb, int stride)
         {
             int sw = s_fb_stride > 0 ? s_fb_stride : SW;
             int fov = (int)(((int64_t)RC_PANEL_FOV_PCT * sw) / 100);
-            ESP_LOGW(TAG, "缩放自证：源 %d px → 取中间 %d px（视场 %d%%）→ 面板 %d px",
-                     sw, fov, (int)RC_PANEL_FOV_PCT, (int)SW);
+            int step = (int)(((int64_t)fov << 16) / SW);
+            /* 【A1 定稿】1:1 判据 = step 恰为 65536（1.0 源px/面板px）。
+             * 现在 360 空间 → fov=360 → step=65536 → 恒等映射（sx = ox+i）。 */
+            ESP_LOGW(TAG, "缩放自证：源 %d px → 取中间 %d px（视场 %d%%）→ 面板 %d px，"
+                          "step=%d（%s）",
+                     sw, fov, (int)RC_PANEL_FOV_PCT, (int)SW, step,
+                     (step == 65536) ? "1:1 恒等映射，零采样零丢样"
+                                     : "非 1:1，存在最近邻采样/丢样");
         }
         ESP_LOGW(TAG, "持续全帧刷新已启动");
         }

@@ -28,9 +28,14 @@ const minipet_profile_t MINIPET_PROFILE_LCD185B = {
      * 重复图案（bring-up 坑档 §2.1 的症状）与画面整体比例失真。
      * 定稿依据见 docs/amoled185b-bringup-pitfalls.md §一/§五（480 合成器 →
      * 0.75 驱动取样 → 360 面板）。教训：板级差异走 profile 字段，但
-     * width/height 是**合成器空间**不是面板尺寸，改它等于改全局缩放契约。 */
-    .width  = 480,
-    .height = 480,
+     * width/height = **合成器空间 = 面板原生 360×360**（2026-10-01 定稿 A1）。
+     * 为什么改成 360：原 480 空间靠驱动层 0.75 最近邻缩到面板 → **每 4 列丢 1 列**
+     * （480→360，step_fp=87381），资产像素与面板像素是 1.5:1 且周期性丢样。
+     * 改 360 后 step_fp=(360<<16)/360=65536 → **恒等映射：一个像素不丢不重（真 1:1）**。
+     * 连带口径：世界视场 = 屏/RC_SCALE = 360 世界 px（原 240）；娃娃按资产原始
+     * 1x 尺寸上屏（原 ×2）→ 占屏比变小、可视地图范围变大（用户口径选 A1）。 */
+    .width  = 360,
+    .height = 360,
     .shape  = MINIPET_SHAPE_ROUND,
     .shape_name = "round",
     .psram_mb  = 8,

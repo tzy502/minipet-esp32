@@ -481,6 +481,18 @@ static bool do_poll_once(void)
 
     cJSON *jls = cJSON_GetObjectItem(root, "lastSeq");
     uint32_t last_seq = jls ? (uint32_t)cJSON_GetNumberValue(jls) : 0;
+    if (jls) {
+        /* ══ 【游标只推到"实收"seq —— 修静默丢指令 2026-10-02 真机实证】════════
+         * 旧策略：本轮没收到指令时把游标推到响应里的 lastSeq（"取空了，安全推进"）。
+         * 但服务端是**先组装 commands、后读 lastSeq**（DeviceEndpoints.HandlePoll），
+         * 两者之间新入队的指令会出现在 lastSeq 里却不在 commands 里 —— 游标这一跳就
+         * 把它**永久跳过**：指令留在服务端 pending，而设备 since 已 ≥ 它的 seq ⇒
+         * 服务端认为"没有新指令" ⇒ **长轮询挂满 55s**，设备侧表现为
+         * `poller 阶段`冻结、`成功=0 失败=0`（一次 poll 都没完成），用户在 Web 上
+         * 点任何东西都"没反应"（真机 185B 实测：18 条积压指令一条都送不到）。
+         * 现口径：**游标只跟着"实际收到并派发过的最大 seq"走**；没收到就不动
+         * （下轮同 since 再问一次，代价只是一次空轮询）。 */
+    }
 
     /* ══ 【游标超前 = 服务端队列已重置/换实例 → 归零重取 2026-10-02 真机实证】══
      * 设备把指令游标持久化在 NVS（poll_since），服务端队列的 seq 则从 1 起单调增。
@@ -500,7 +512,9 @@ static bool do_poll_once(void)
     }
     /* 收到指令：只推到实际收到的最大 seq（可能落后于 lastSeq，下轮再取后续的）；
      * 没收到指令：说明本轮到 lastSeq 为止都取空了，可以安全推进到 lastSeq。 */
-    uint32_t adv = (max_rx_seq > 0) ? max_rx_seq : last_seq;
+    /* 【只推实收 seq】原为 `(max_rx_seq > 0) ? max_rx_seq : last_seq` —— 后半段的
+     * "空响应也推到 lastSeq"正是上面注释里那条竞态的来源，已去掉（见上）。 */
+    uint32_t adv = max_rx_seq;
     if (adv > s_since) {
         s_since = adv;
         mp_nvs_set_u32("poll_since", s_since);   /* 断电续读（尽力而为） */

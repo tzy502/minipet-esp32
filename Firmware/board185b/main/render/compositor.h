@@ -19,8 +19,14 @@ extern "C" {
 #endif
 
 /* 480 屏 = 世界 1x × 2（PARTS 包内存 1x，设备端 nearest 放大） */
-#define RC_SCALE            2
-#define RC_SCALE_SHIFT      1
+/* 【A1 定稿 2026-10-01】世界 1x → 合成器 1x（原为 2x）。
+ * 与 profile 360 空间配合 = 资产像素 ↔ 面板像素**真 1:1**（驱动层恒等映射）。
+ * ⚠️ 本值必须是整数（全代码用 <<RC_SCALE_SHIFT / >>RC_SCALE_SHIFT 位移），
+ * 所以"1.5x 保持观感"这条路在本工程里不存在——要么 1x（1:1）要么 2x（丢样）。
+ * 改动连带：世界视场 = 屏/RC_SCALE（240→360）、实体展开 1:1、条带 1:1、
+ * 站位/拖拽/时钟锚点换算全部随之变化（均为统一口径，不需逐处改）。 */
+#define RC_SCALE            1
+#define RC_SCALE_SHIFT      0
 
 /*
  * 实体缓冲（像素 = 屏幕像素；内容为世界 1x 经 2x nearest 展开后的图）。
@@ -28,8 +34,10 @@ extern "C" {
  * 底部对齐留 40px 边距 → 显示高 ≤ 480-40=440 → 世界高 ≤220。
  * 超出此世界的画布（极端特效件）在缓冲边缘裁剪（与旧 200×260 窗口同策略，窗口更大）。
  */
-#define RC_ENT_W            480
-#define RC_ENT_H            440
+/* 实体（娃娃）暂存画布：合成器空间大小。360 空间下改为 360×360
+ * （原 480×440 是为 480 空间留的余量；1:1 后不再需要放大余量）。 */
+#define RC_ENT_W            360
+#define RC_ENT_H            360
 #define RC_ENT_COV_BYTES    ((RC_ENT_W * RC_ENT_H + 7) / 8)
 
 /* ------------------------------------------------------------------------
@@ -62,7 +70,7 @@ extern "C" {
 #define RC_TILT_PX_PER_DEG  4
 
 /* 气泡位图上限（RGB565，不透明矩形） */
-#define RC_BUBBLE_MAX_W     460
+#define RC_BUBBLE_MAX_W     340   /* 360 空间下留边距（原 460 配 480 空间） */
 #define RC_BUBBLE_MAX_H     160
 
 /* 未配网常驻横幅（问题4：POKER 态顶部 480×28 深色底白字，5x7 字体 ×2）
