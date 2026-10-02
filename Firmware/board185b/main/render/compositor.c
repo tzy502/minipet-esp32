@@ -3674,7 +3674,9 @@ static void compose_region(int32_t x, int32_t y, int32_t w, int32_t h)
 
     /* 5) 实体缓冲（1bit 覆盖；显示区 = clamp 后的摆放矩形，与 mark_ent_at
      * 完全同源（ent_screen_rect_at），右缘 480 处标脏/绘制不再分歧） */
-    ent_compose(x, y, w, h, doze ? RC_SLEEP_DARKEN : 0);
+    /* 【待机人物不加黑遮罩 2026-10-02 用户口径】原为 doze ? RC_SLEEP_DARKEN : 0
+     * （睡眠降亮）；用户定稿"人物不需要加黑遮罩" ⇒ 待机与常态一律原亮度。 */
+    ent_compose(x, y, w, h, 0);
 
     /* 5.5) CLOCK_DOZE：时钟数字叠在最上层（待机背景 = 上面这一整幅场景） */
     if (doze) clock_digits_compose(g_fb, g_sw, RC_SCALE, x, y, w, h);
