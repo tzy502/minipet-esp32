@@ -161,6 +161,21 @@ public sealed class CommandQueue
     /// 队列空时挂起等待新指令，最长 maxWait（端点层传 ≤55s）。
     /// 取消（客户端断开）返回已到手的（通常为空）。
     /// </summary>
+    /// <summary>
+    /// 【游标被跳过检测 2026-10-02】pending 里是否存在 seq ≤ since 的指令。
+    /// 语义：这些指令设备"还没执行过"（它们仍在 pending，被服务端保留），但设备的
+    /// 游标已推到它们之上 ⇒ 按 `Seq > since` 取永远取不到 ⇒ 双方互等（服务端长轮询
+    /// 挂 55s、设备侧表现为一次 poll 都完不成）。真机实证：185B 积压 18 条全送不到。
+    /// 成因是固件旧策略"空响应也把游标推到 lastSeq"，而服务端是**先取 commands 后读
+    /// lastSeq**（两者之间新入队的指令会被那次推进跳过）。固件已修（只推实收 seq），
+    /// 这里再加一道**服务端兜底**：老固件在网也能自愈。
+    /// </summary>
+    public bool HasSkipped(string deviceId, long since)
+    {
+        var st = GetState(deviceId);
+        lock (st.Gate) return st.Pending.Any(c => c.Seq <= since);
+    }
+
     public async Task<List<DeviceCommand>> PollAsync(string deviceId, long since, TimeSpan maxWait, CancellationToken ct)
     {
         var deadline = DateTime.UtcNow + maxWait;

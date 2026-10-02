@@ -216,7 +216,30 @@ public static class DeviceEndpoints
             eventLog.Append(deviceId, "设备上线（poll 心跳）");
 
         var sw = Stopwatch.StartNew();
-        var commands = await queue.PollAsync(deviceId, since, PollMaxWait, ctx.RequestAborted);
+        /* ══ 【设备游标超前 → 立即回全部 pending，绝不长轮询 2026-10-02 真机实证】══
+         * 场景：服务端换容器/换实例（queue 文件没随卷带过来）或设备被指向另一台服务端，
+         * 服务端 seq 从 1 重来，而设备 NVS 里的 poll_since 还是旧的大值（真机：设备 ≈420
+         * vs 服务端 lastSeq=22）。此时 Pending.Where(c.Seq > since) 恒空 ⇒ 旧实现会走
+         * **长轮询挂满 55s** ⇒ 设备 HTTP 客户端先超时 ⇒ 重试 ⇒ 再挂 —— 设备拿不到任何
+         * 响应体，连"我游标超前了"都无从得知（固件侧那条 lastSeq<since 的归零修复因此
+         * 永远触发不了，真机表现：Web 点了没反应、素材却照常同步）。
+         * 修法：识别到 since > lastSeq 就**立即**把全部 pending 当"游标归零"返回
+         * （等价 since=0），设备据此执行指令并把游标对齐；不依赖固件版本。 */
+        long lastSeqNow = queue.GetLastSeq(deviceId);
+        /* 两种"取不到但确实有积压"的形态（都要**立即**回全部 pending，绝不长轮询）：
+         *   ① 游标超前：since > lastSeq（服务端队列被重置/换实例，seq 从头开始）；
+         *   ② 游标被跳过：pending 里有 seq ≤ since 的指令（老固件"空响应也推进游标"
+         *      的竞态把新入队指令跳过了，见 CommandQueue.HasSkipped 注释）。
+         * 两者都让 `Seq > since` 恒空 ⇒ 旧实现长轮询挂 55s，设备侧一次 poll 都完不成。 */
+        bool cursorAhead = since > lastSeqNow;
+        bool skipped = !cursorAhead && queue.HasSkipped(deviceId, since);
+        var commands = (cursorAhead || skipped)
+            ? await queue.PollAsync(deviceId, 0, TimeSpan.Zero, ctx.RequestAborted)
+            : await queue.PollAsync(deviceId, since, PollMaxWait, ctx.RequestAborted);
+        if (cursorAhead || skipped)
+            Console.WriteLine($"[Poll] 设备 {deviceId} 游标 {since} / 队列 lastSeq {lastSeqNow}"
+                              + $"（{(cursorAhead ? "队列重置/换实例" : "游标跳过了积压指令")}）"
+                              + $"→ 立即回 {commands.Count} 条 pending");
         sw.Stop();
 
         return Results.Json(new
