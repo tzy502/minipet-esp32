@@ -85,7 +85,8 @@ void render_force_redraw(void);
 /* 实体屏幕锚点（世界 1x 坐标，映射到屏幕中心偏移；默认 0,0） */
 void render_set_entity_pos(int16_t world_x, int16_t world_y);
 
-/* 地图时钟：fontTime PARTS 包 + clock_table 锚点（世界 1x）；path=NULL 仅改锚点/开关 */
+/* 地图时钟：fontTime PARTS 包 + clock_table 锚点（世界 1x）；path=NULL 仅改锚点/开关。
+ * 锚点传 CLOCK_ANCHOR_AUTO（clock_digits.h）= 无地图锚点 → 整块严格居中屏幕中心。 */
 int  render_set_clock(const char *fonttime_parts_path,
                       int16_t anchor_world_x, int16_t anchor_world_y, bool enable);
 

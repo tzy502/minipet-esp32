@@ -2,7 +2,10 @@
  * clock_digits.c — fontTime 地图时钟实现
  *
  * 13 张小图（0-9/am/pm/comma）在 configure 时一次性读入 PSRAM（共 ~24KB），
- * 合成零 IO。世界 1x 坐标 ×scale 进入屏幕（480 屏 scale=2）。
+ * 合成零 IO。世界 1x 坐标 ×scale 进入屏幕（【A1】185B = 360 屏 scale=1，1:1）。
+ * 位置口径（两条路径，见 block_origin）：
+ *   · 地图锚点（clock_table 命中）→ 锚点 + 官方偏移 (21,83)（世界 1x）；
+ *   · 无锚点（CLOCK_ANCHOR_AUTO）→ 整块严格居中屏幕中心 (sw/2, sh/2)。
  *
  * 时间源（spec 六.2）：系统 time()（SNTP 直写场景）→ PCF85063 RTC
  * （UTC 口径，经 hal_contract mp_rtc_get_time，每次渲染实时读、无缓存）
@@ -38,7 +41,7 @@ typedef struct {
 static struct {
     bool     enabled;
     bool     loaded;
-    bool     centered;          /* 问题3：无地图锚点 → 整块居中屏幕 (240,120) */
+    bool     centered;          /* 问题3：无地图锚点 → 整块居中屏幕中心 (sw/2,sh/2) */
     mpak_t   mpk;
     cg_t     g[CLOCK_GLYPHS];
     int16_t  anchor_wx, anchor_wy;
@@ -59,6 +62,9 @@ void clock_digits_set_screen(int32_t w, int32_t h)
     s_ck.sh = h;
     if (s_ck.scale <= 0) s_ck.scale = RC_SCALE;
 }
+
+/* 布局自证日志（定义在 block_origin 之后；configure 末尾调用） */
+static void ck_log_layout(void);
 
 static uint32_t cg_stride(uint16_t w) { return ((uint32_t)w * 2u + 3u) & ~3u; }
 
@@ -135,11 +141,12 @@ int clock_digits_configure(const char *parts_path, int16_t anchor_wx,
     }
     s_ck.anchor_wx = anchor_wx;
     s_ck.anchor_wy = anchor_wy;
-    /* 问题3：无地图锚点（AUTO 哨兵）→ 整块居中屏幕 (240,120)，忽略官方地图偏移 */
+    /* 问题3：无地图锚点（AUTO 哨兵）→ 整块居中**屏幕中心**，忽略官方地图偏移 */
     s_ck.centered = (anchor_wx == CLOCK_ANCHOR_AUTO && anchor_wy == CLOCK_ANCHOR_AUTO);
     if (s_ck.scale <= 0) s_ck.scale = RC_SCALE;
     s_ck.enabled   = enable && s_ck.loaded;
     s_ck.rect_valid = false;
+    if (s_ck.enabled) ck_log_layout();      /* 布局自证（AUTO 下中心 == 屏中心） */
     return MPAK_OK;
 }
 
@@ -241,6 +248,62 @@ static bool time_split(int *disp_h, bool *is_am, int *minute, int *parity)
 }
 
 /*
+ * 整块左缘/顶（世界 1x）——**居中口径的唯一计算点**（绘制 glyph_seq 与自证日志
+ * ck_log_layout 共用，避免两处公式漂移）。
+ *   · 有地图锚点（centered=false）：锚点 + 官方偏移 CLOCK_OFF_X/OFF_Y（世界 1x）。
+ *   · AUTO（centered=true）：整块中心 = **屏幕中心** (sw/2, sh/2)（屏 px，
+ *     clock_digits_set_screen 告知）→ 除 scale 回世界 1x 再退半个块。
+ * 【A1 修复】中心原先读硬编码 CLOCK_CENTER_SCREEN_X/Y = (240,120)（480 空间
+ * 口径）→ 360 空间下整块右偏 60px、上偏 60px（用户报障"时钟不在中间"）。
+ * 现在 360 屏 scale=1 → (180,180)；480 屏 scale=2 → (120,120) 世界 = 240 屏 px，
+ * 两种空间都严格居中。
+ */
+static void block_origin(int32_t w_world, int32_t h_world,
+                         int32_t *out_x, int32_t *out_y0)
+{
+    if (!s_ck.centered) {
+        *out_x  = (int32_t)s_ck.anchor_wx + CLOCK_OFF_X;
+        *out_y0 = (int32_t)s_ck.anchor_wy + CLOCK_OFF_Y;
+        return;
+    }
+    int32_t scale = (s_ck.scale > 0) ? s_ck.scale : RC_SCALE;
+    int32_t sw = (s_ck.sw > 0) ? s_ck.sw : CLOCK_CENTER_FALLBACK_W;
+    int32_t sh = (s_ck.sh > 0) ? s_ck.sh : CLOCK_CENTER_FALLBACK_H;
+    *out_x  = sw / (2 * scale) - w_world / 2;
+    *out_y0 = sh / (2 * scale) - h_world / 2;
+}
+
+/*
+ * 布局自证日志（每次 configure 一条，低频）——真机核对"居中/锚点"用：
+ *   · AUTO：整块中心应 == 屏中心 (sw/2, sh/2)。360×360 屏 scale=1、字形
+ *     26×35/22×20/17×35（clock: glyph part 日志）→ 整块 155×35 屏 px，
+ *     落点 x=[103,258) y=[163,198)（= 中心 180,180）。
+ *   · 锚点：左缘应 == clock_table 锚点 + (CLOCK_OFF_X, CLOCK_OFF_Y) × scale。
+ * 块宽按**数字字形最大宽**估（WZ fontTime 十张数字统一 26 宽，实测一致）。
+ */
+static void ck_log_layout(void)
+{
+    int32_t dw = 0, dh = 0;
+    for (int i = 0; i < 10; i++) {
+        if (s_ck.g[i].w > dw) dw = s_ck.g[i].w;
+        if (s_ck.g[i].h > dh) dh = s_ck.g[i].h;
+    }
+    int32_t w_world = s_ck.g[10].w + CLOCK_AMPM_GAP + dw * 4 + s_ck.g[12].w;
+    int32_t scale = (s_ck.scale > 0) ? s_ck.scale : RC_SCALE;
+    int32_t x, y0;
+    block_origin(w_world, dh, &x, &y0);
+    ESP_LOGI(TAG, "布局自证：%s anchor=(%d,%d) 屏 %dx%d scale=%d → 整块世界(%d,%d %dx%d) "
+                  "屏(%d,%d %dx%d)；屏中心(%d,%d)",
+             s_ck.centered ? "AUTO 居中屏幕" : "地图锚点",
+             (int)s_ck.anchor_wx, (int)s_ck.anchor_wy,
+             (int)s_ck.sw, (int)s_ck.sh, (int)scale,
+             (int)x, (int)y0, (int)w_world, (int)dh,
+             (int)(x * scale), (int)(y0 * scale),
+             (int)(w_world * scale), (int)(dh * scale),
+             (int)(s_ck.sw / 2), (int)(s_ck.sh / 2));
+}
+
+/*
  * 当前时间的字形序列（7 槽；comma 奇秒 → NULL 跳过但保留间距位）。
  * 返回序列长度；out_x 各槽世界 1x 左缘；out_y0 块顶世界 1x y（居中/锚点统一）。
  * *time_ok=false = 无有效时间：几何照常（用数字字形占位定框），compose 把
@@ -262,23 +325,13 @@ static int glyph_seq(const cg_t *out_g[7], int32_t out_x[7], bool *comma_on,
     const cg_t *m2 = &s_ck.g[mm % 10];
     const cg_t *comma = &s_ck.g[12];
 
-    int32_t scale = (s_ck.scale > 0) ? s_ck.scale : RC_SCALE;
+    /* 整块尺寸（世界 1x）：含 am/pm 槽与 comma 槽的常驻宽度 → comma 闪烁、
+     * am/pm 缺席（占位模式）都不改块宽，居中不跳位。 */
+    int32_t w_world = g_am->w + CLOCK_AMPM_GAP +
+                      d1->w + d2->w + comma->w + m1->w + m2->w;
+    int32_t h_world = d2->h;                      /* 数字槽高（am/pm 更矮，不参与） */
     int32_t x, y0;
-    if (s_ck.centered) {
-        /* 问题3 默认锚点：整块（含 comma 恒占宽）居中于屏幕 (240,120)（屏 px）。
-         * 屏 px → 世界 1x（除 scale），comma 常驻宽度参与计算 → 闪烁不移位。 */
-        int32_t w_world = g_am->w + CLOCK_AMPM_GAP +
-                          d1->w + d2->w + comma->w + m1->w + m2->w;
-        int32_t h_world = d2->h;
-        int32_t cx_world = (int32_t)CLOCK_CENTER_SCREEN_X / scale;
-        int32_t cy_world = (int32_t)CLOCK_CENTER_SCREEN_Y / scale;
-        x  = cx_world - w_world / 2;
-        y0 = cy_world - h_world / 2;
-    } else {
-        /* 地图 clock_table 锚点 + 官方偏移（clock-display-spec） */
-        x  = (int32_t)s_ck.anchor_wx + CLOCK_OFF_X;
-        y0 = (int32_t)s_ck.anchor_wy + CLOCK_OFF_Y;
-    }
+    block_origin(w_world, h_world, &x, &y0);
 
     /* am|pm → GAP=12 → H1 → H2 → comma → M1 → M2（数字间无额外间距） */
     int n = 0;

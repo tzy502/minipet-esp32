@@ -891,9 +891,12 @@ static void dispatch_entity(const char *entity)
     ESP_LOGW(TAG, "实体绑定路径：parts=%s | layout=%s(%s)", ppath, lpath, act[0] ? act : "-");
     s_entity_bound = (prc == 0 && lrc == 0);
     if (s_entity_bound) { s_entity_retry_cnt = 0; s_entity_retry_last_ms = 0; }
-    ESP_LOGW(TAG, "形象切换%s → %s（parts rc=%d）默认动作 %s（layout rc=%d）",
+    ESP_LOGW(TAG, "形象切换%s → %s（parts rc=%d）默认动作 %s（layout rc=%d）"
+                  "｜内部堆 空闲=%u 最大块=%u",
              changed ? "" : "（同实体重绑）", s_entity, prc,
-             act[0] ? act : "(无)", lrc);
+             act[0] ? act : "(无)", lrc,
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
     if (!s_entity_bound) {
         char last_want[40];
         strlcpy(last_want, s_entity, sizeof last_want);
@@ -906,8 +909,22 @@ static void dispatch_entity(const char *entity)
          * 现改为：活动实体退回纸娃娃（**NVS 里的意图保留**）→ 动作一律回纸娃娃通道路径；
          * 同时请求一次素材同步，MANIFEST_SYNCED 时 entity_restore() 会按 NVS 意图重试。 */
         ESP_LOGW(TAG, "实体 %s 绑定失败 → 活动实体回退纸娃娃（NVS 意图保留，待素材同步重试）",
-                 s_entity);
+                 last_want);
         s_entity[0] = 0;
+        /* 【回滚必须把渲染层也复位 2026-10-02 用户报"人物渲染可能出问题"核查补强】
+         * 上面只清了"活动实体"这个**状态**：如果失败发生在
+         * 「PARTS 已绑上、默认动作 LAYOUT 打开失败」这个窗口，渲染层此刻是
+         * **实体 PARTS + 纸娃娃 LAYOUT** 的混合态 —— 两边 part_id 都从 1 开始但含义
+         * 完全不同 ⇒ 整帧部件解析失败（用户看到的就是"人物渲染出问题/缺件"）。
+         * 现在失败即**主动重绑纸娃娃**（parts + stand1），把渲染层也拉回一致状态。 */
+        if (prc == 0 || lrc != 0) {
+            char pp[MP_MPK_PATH_MAX], ll[MP_MPK_PATH_MAX];
+            int prc2 = asset_dl_parts_path(NULL, pp, sizeof pp) ? render_set_parts(pp) : -1;
+            int lrc2 = asset_dl_layout_path(MP_ACTION_STAND, ll, sizeof ll)
+                           ? render_set_layout(ll, true) : -1;
+            ESP_LOGW(TAG, "实体绑定失败回滚：重绑纸娃娃 parts rc=%d layout rc=%d（parts=%s）",
+                     prc2, lrc2, pp);
+        }
         /* 重试节流：绑定失败会请求素材同步，而同步收尾又会调 entity_restore() 重试 ——
          * 不节流就是"失败→同步→失败"的热循环（每轮一次 HTTP + 一串日志）。
          * 同一实体最多自动重试 3 次、间隔 ≥30s；用尽即停（显式切换/重启会重置）。 */
@@ -1277,7 +1294,9 @@ static void dispatch_map(const char *hash)
     }
 
     /* 地图时钟锚点随地图切换预置（E9/R15；开关留待 CLOCK 指令）。
-     * 问题3：无锚点 → CLOCK_ANCHOR_AUTO（渲染层整块居中屏幕 240,120） */
+     * 问题3：无锚点 → CLOCK_ANCHOR_AUTO（渲染层整块**居中屏幕中心**：
+     * 360 空间 = (180,180)；不再硬编码 480 口径的 (240,120) —— 见
+     * clock_digits.c block_origin 【A1 修复 2026-10-02】） */
     char ft[MP_MPK_PATH_MAX];
     int16_t ax = 0, ay = 0;
     bool has_anchor = asset_dl_clock_anchor(&ax, &ay);
