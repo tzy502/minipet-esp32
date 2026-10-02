@@ -224,3 +224,18 @@ D=<服务端>/data/cache/export/<deviceId>
 - 怪物**漫游/战斗**（随机出现、走近、hit1/die1 交互）不在本次范围 —— 本次只做
   「资产可用 = 形象可切换、动画可播」。
 - 实体专属表情：怪物/NPC 没有表情维度，实体态下表情指令被忽略（设计如此）。
+
+## 12. 选镜头页的「时钟绿框 / 人物红框」（2026-10-02 用户口径）
+
+用户口径：「时钟根据参数，时钟在绿框里；人物固定在红框正中心」——「设备视角」面板上叠两个框，
+口径必须与固件逐字一致（否则预览骗人）：
+
+| 框 | 含义 | 口径（与固件同源） |
+|---|---|---|
+| **绿框** | 时钟落点，**由该图参数决定** | `clock_table[mapId]=[x,y]`（世界 1x 屏幕坐标）→ 框起点 = `(x+CLOCK_OFF_X=21, y+CLOCK_OFF_Y=83)`，块 `155×26` 世界像素（am22+GAP12+H1 26+H2 26+comma17+M1 26+M2 26）。**该图没配参数时设备走 AUTO = 整块居中屏心**（`CLOCK_CENTER_SCREEN_X/Y=240/120` 屏 px ÷ RC_SCALE），预览照搬同一分支。常量出处：`Firmware/board*/main/render/clock_digits.h` |
+| **红框** | 人物锚点，**固定屏心** | 固件把实体锚点钉在屏幕正中 ⇒ 换机位只换背景、人物永远落在框的正中心（框心画十字）。与实体画布大小无关 |
+
+实现：`Server .../CameraService.CameraMapInfo.Clock`（新增字段，读 `ConfigService.Clock.MapOffsets`，
+null = AUTO）+ `Web/src/components/CameraPicker.vue` 的两层叠加（`PANEL_ZOOM=2`）。
+真机口径验证：真 Chrome 截图（`/tmp/cam_boxes.png`）里绿框落在窗口上中（AUTO 屏 px 240/120 ÷2），
+红框+十字落在窗口正中；标签分别显示「时钟（AUTO 居中）/（按该图参数）」与「人物（固定屏心）」。

@@ -157,6 +157,51 @@ watch(viewportUrl, (url) => {
   im.src = url
 })
 
+/* ══ 叠加框（2026-10-02 用户口径）══════════════════════════════════════════
+ * 「时钟根据参数，时钟在绿框里；人物固定在红框正中心」：
+ *  · 绿框 = 该图 clock_table 参数决定的**时钟落点**。口径与固件 clock_digits.h 完全一致：
+ *    起点 = 锚点 + (CLOCK_OFF_X=21, CLOCK_OFF_Y=83)（世界 1x），块宽 = am22+GAP12+H1 26+H2 26+
+ *    comma17+M1 26+M2 26 = 155，高 26；**没有该图参数时设备走 AUTO = 整块居中屏心
+ *    (winW/2, CLOCK_CENTER_SCREEN_Y/scale)** —— 预览必须和设备一致，所以这里也照搬。
+ *  · 红框 = **人物锚点**：固件把实体锚点钉在屏幕正中（compositor 的屏心），换机位只换背景，
+ *    人物永远落在框的正中心 ⇒ 框心画十字，操作者能一眼看出"人物会站哪"。
+ * 两块都按面板显示倍数（×2 就近放大）换算。 */
+const PANEL_ZOOM = 2
+const CLOCK_OFF_X = 21, CLOCK_OFF_Y = 83
+const CLOCK_W = 155, CLOCK_H = 26
+const clockBoxStyle = computed(() => {
+  const m = map.value
+  if (!m || !winW.value || !winH.value) return { display: 'none' }
+  const c = m.clock
+  let x, y
+  if (c && c.length >= 2) {
+    x = c[0] + CLOCK_OFF_X
+    y = c[1] + CLOCK_OFF_Y
+  } else {
+    /* AUTO：整块居中屏心（固件 CLOCK_CENTER_SCREEN_X/Y ÷ RC_SCALE = win/2, winH/4） */
+    x = winW.value / 2 - CLOCK_W / 2
+    y = winH.value / 4 - CLOCK_H / 2
+  }
+  return {
+    left: `${x * PANEL_ZOOM}px`,
+    top: `${y * PANEL_ZOOM}px`,
+    width: `${CLOCK_W * PANEL_ZOOM}px`,
+    height: `${CLOCK_H * PANEL_ZOOM}px`,
+  }
+})
+const clockIsAuto = computed(() => !(map.value && map.value.clock && map.value.clock.length >= 2))
+const petBoxStyle = computed(() => {
+  const m = map.value
+  if (!m || !winW.value || !winH.value) return { display: 'none' }
+  const size = 48 * PANEL_ZOOM          /* 人物可视块的示意尺寸（锚点在图心，与实体画布无关） */
+  return {
+    left: `${(winW.value / 2) * PANEL_ZOOM - size / 2}px`,
+    top: `${(winH.value / 2) * PANEL_ZOOM - size / 2}px`,
+    width: `${size}px`,
+    height: `${size}px`,
+  }
+})
+
 // ── 拖动 / 键盘 / 输入 ──────────────────────────────────────────────────
 const dragging = ref(false)
 let grabDx = 0
@@ -518,6 +563,11 @@ watch(mapId, () => { imgLoaded.value = false; imgW.value = 0 })
         <div class="cam-right">
           <div class="cam-vp-title">
             设备视角 <span class="hint">（{{ winW }}×{{ winH }} 世界像素 ×2 就近放大 = 实机观感）</span>
+            <div class="hint" style="margin-top: 2px">
+              <b style="color: #ff6b6b">红框</b> = 人物（锚点固定屏心，拖机位只换背景）；
+              <b style="color: #6bd968">绿框</b> = 时钟落点（{{ clockIsAuto ? '该图没配参数 → 设备 AUTO 居中屏心' : '按该图 clock_table 参数' }}，口径同固件
+              <code>clock_digits.h</code>：锚点 +(21,83)，块 155×26 世界像素）
+            </div>
           </div>
           <div class="cam-vp-frame">
             <img
@@ -529,6 +579,15 @@ watch(mapId, () => { imgLoaded.value = false; imgW.value = 0 })
               alt="设备视角"
             >
             <div v-else class="cam-vp-empty hint">渲染中…</div>
+            <!-- 人物框（红）：锚点恒在屏心 —— 换机位只换背景，人物永远落在这个框的正中心 -->
+            <div v-if="viewportUrl" class="cam-pet-box" :style="petBoxStyle">
+              <span class="cam-pet-cross" />
+              <span class="cam-pet-label">人物（固定屏心）</span>
+            </div>
+            <!-- 时钟框（绿）：落点由该图 clock_table 参数决定（无参数 = 设备 AUTO 居中屏心） -->
+            <div v-if="viewportUrl" class="cam-clock-box" :style="clockBoxStyle">
+              <span class="cam-clock-label">时钟{{ clockIsAuto ? '（AUTO 居中）' : '（按该图参数）' }}</span>
+            </div>
           </div>
 
           <n-space align="center" :size="8" class="cam-coord">
@@ -671,7 +730,55 @@ watch(mapId, () => { imgLoaded.value = false; imgW.value = 0 })
 .cam-tip code, .cam-note code, .cam-range code { background: rgba(128, 128, 140, 0.16); padding: 0 3px; border-radius: 3px; }
 
 .cam-vp-title { font-size: 13px; font-weight: 600; }
+/* 人物框（红）：虚线 + 中心十字 = "人物一定站这儿" */
+.cam-pet-box {
+  position: absolute;
+  border: 1px dashed #ff6b6b;
+  border-radius: 3px;
+  pointer-events: none;
+  box-sizing: border-box;
+}
+.cam-pet-cross {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 12px;
+  height: 12px;
+  margin: -6px 0 0 -6px;
+  border-left: 1px solid #ff6b6b;
+  border-top: 1px solid #ff6b6b;
+  transform: rotate(45deg);
+}
+.cam-pet-label {
+  position: absolute;
+  left: 0;
+  top: -16px;
+  font-size: 11px;
+  color: #ff6b6b;
+  white-space: nowrap;
+  text-shadow: 0 0 3px #000;
+}
+/* 时钟框（绿）：实线 = 该图参数决定的时钟落点 */
+.cam-clock-box {
+  position: absolute;
+  border: 1px solid #6bd968;
+  border-radius: 2px;
+  background: rgba(107, 217, 104, 0.10);
+  pointer-events: none;
+  box-sizing: border-box;
+}
+.cam-clock-label {
+  position: absolute;
+  left: 0;
+  top: -15px;
+  font-size: 11px;
+  color: #6bd968;
+  white-space: nowrap;
+  text-shadow: 0 0 3px #000;
+}
+
 .cam-vp-frame {
+  position: relative;
   width: 100%;
   min-height: 120px;
   display: flex;

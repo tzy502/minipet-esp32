@@ -60,12 +60,16 @@ public sealed class CameraService
     private readonly Dictionary<string, byte[]> _viewportCache = new(StringComparer.Ordinal);
     private readonly Queue<string> _viewportOrder = new();
 
-    public CameraService(ServerPaths paths, WzService wz, DeviceRegistry reg, CameraPlanStore store)
+    private readonly ConfigService? _cfg;
+
+    public CameraService(ServerPaths paths, WzService wz, DeviceRegistry reg, CameraPlanStore store,
+                         ConfigService? cfg = null)
     {
         _paths = paths ?? throw new ArgumentNullException(nameof(paths));
         _wz = wz ?? throw new ArgumentNullException(nameof(wz));
         _reg = reg ?? throw new ArgumentNullException(nameof(reg));
         _store = store ?? throw new ArgumentNullException(nameof(store));
+        _cfg = cfg;   /* 时钟锚点只读（clock_table 同一份配置）；为 null 时 Web 绿框回退 AUTO 口径 */
         _map = new MapService(_wz, new CacheManager());
     }
 
@@ -94,6 +98,12 @@ public sealed class CameraService
         public bool Pannable { get; set; }
         public int WinW { get; set; }
         public int WinH { get; set; }
+        /// <summary>
+        /// 【时钟锚点 2026-10-02】该图的 clock_table 参数（世界 1x 屏幕坐标，null = 表里没有
+        /// → 设备走 AUTO：时钟整块居中屏心）。Web「设备视角」按它画绿框（时钟落点 = 锚点 +
+        /// 官方偏移 (21,83)，块宽 155×26 世界像素；沿用固件 clock_digits.h 的定稿值）。
+        /// </summary>
+        public int[]? Clock { get; set; }
         /// <summary>机位取值上限：x ∈ [0, MaxX]、y ∈ [0, MaxY]（= vw−WinW / vh−WinH，下限 0）。</summary>
         public int MaxX { get; set; }
         public int MaxY { get; set; }
@@ -165,6 +175,9 @@ public sealed class CameraService
                 Saved = pos != null,
                 UpdatedUtc = pos?.UpdatedUtc,
                 ThumbUrl = $"/api/admin/thumb?type=map&id={Uri.EscapeDataString(mapId)}",
+                /* 时钟锚点（null = 该图没配 → 设备 AUTO 居中屏心） */
+                Clock = (_cfg?.Current.Clock.MapOffsets.TryGetValue(mapId, out var cxy) == true
+                         && cxy is { Length: >= 2 }) ? new[] { cxy[0], cxy[1] } : null,
             });
         }
 
