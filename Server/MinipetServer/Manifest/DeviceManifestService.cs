@@ -242,6 +242,11 @@ public sealed class DeviceManifestService
         if (_cfg.Current.Clock.MapOffsetsByDevice.TryGetValue(deviceId, out var devClock))
             foreach (var (mapId, xy) in devClock) PutClock(mapId, xy);
         root["clock_table"] = clock;
+        // 待机专用背景图（空串 = 不切图；按设备可覆盖）——固件进 CLOCK_DOZE 时切过去、
+        // 退出时切回原图，见 ClockConfig.DozeMapId 注释
+        var dozeMap = _cfg.Current.Clock.DozeMapIdByDevice.TryGetValue(deviceId, out var dm) && !string.IsNullOrWhiteSpace(dm)
+            ? dm : _cfg.Current.Clock.DozeMapId;
+        root["doze_map"] = dozeMap ?? "";
 
         return root.ToJsonString(new JsonSerializerOptions
         {

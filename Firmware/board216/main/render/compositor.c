@@ -3352,6 +3352,11 @@ static void mark_banner_band_dirty(void)
     mark_rect(0, RC_BANNER_Y, g_sw, RC_BANNER_H);
 }
 
+/* 【待机半透明遮罩 2026-10-02 用户口径】"全屏除了时钟打上遮罩半透明"：
+ * 待机合成时把背景（地图各层）整块压暗到此百分比（55 = 保留 55% 亮度 ≈ 45% 黑罩）；
+ * 时钟最后叠（不受影响），人物保持原亮度（用户明确"人物不需要加黑遮罩"）。 */
+#define RC_DOZE_MASK_PCT 55
+
 static void compose_region(int32_t x, int32_t y, int32_t w, int32_t h)
 {
     if (x < 0) { w += x; x = 0; }

@@ -80,6 +80,11 @@ int asset_dl_map_strips(const char *bg_path,
 /* 当前地图的 clock_table 锚点（世界 1x 坐标，E9/R15）；
  * 无当前地图/表无项 → false（渲染层自行居中待机时钟） */
 bool asset_dl_clock_anchor(int16_t *world_x, int16_t *world_y);
+/* 【待机专用背景图 2026-10-02】manifest doze_map：进 CLOCK_DOZE 时切过去当背景、
+ * 退出时切回原图；返回 false = 没配（保持当前图）。 */
+bool asset_dl_doze_map(char *out, size_t cap);
+/* 当前活动图 id（进待机时记下来、唤醒切回用；false = 未知） */
+bool asset_dl_active_map_id(char *out, size_t cap);
 
 /* 记录当前地图（cmd SET_MAP 时调用；驱动 clock 锚点与地图 LRU） */
 void asset_dl_set_active_map(const char *hash);

@@ -104,6 +104,17 @@ public sealed class ClockConfig
     public Dictionary<string, Dictionary<string, int[]>> MapOffsetsByDevice { get; set; }
         = new(StringComparer.Ordinal);
 
+    /// <summary>
+    /// 【待机背景专用地图 2026-10-02 用户口径】进 CLOCK_DOZE 时把背景**直接切成这张图**
+    /// （"背景直接换到我给你的升降场那张图"），退出待机再切回用户原来的图。
+    /// 空串 = 不切换（保持当前图，= 旧行为）。随 manifest 下发字段 `doze_map`。
+    /// 与锚点一样按设备可覆盖（见 MapOffsetsByDevice）。
+    /// </summary>
+    public string DozeMapId { get; set; } = "";
+
+    /// <summary>按设备的待机专用图（缺省回落 DozeMapId）。</summary>
+    public Dictionary<string, string> DozeMapIdByDevice { get; set; } = new(StringComparer.Ordinal);
+
     /// <summary>校准口径版本（ClockTableSeeder 写入）：小于当前口径时启动校准全量重算覆盖，
     /// 等于时只补缺失条目（Web 手改的值永不覆盖）。Web 保存回传请原样携带。</summary>
     public int Calib { get; set; }

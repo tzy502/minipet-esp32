@@ -107,6 +107,7 @@ static int             s_files_cap = 1;        /* 可写槽位上限（=1 时只
 static int          s_file_cnt;
 static uint32_t     s_local_rev;
 static char         s_active_map[32];          /* 当前地图 id（clock 锚点/LRU） */
+static char         s_doze_map[32];            /* 【待机专用背景图 2026-10-02】manifest doze_map */
 static char         s_active_map_hash[20];     /* 当前地图内容 hash（隐藏判定用，见 map_is_active） */
 
 /* clock_table（E9/R15：[x,y] = 烘焙视口内屏幕坐标，世界 1x 口径下发给渲染层） */
@@ -935,6 +936,12 @@ static void load_local_manifest(void)
                 s_local_rev = 0;
             }
         }
+    }
+
+    /* 待机专用背景图（空串 = 不切图）。解析失败/缺失一律置空 = 旧行为 */
+    {
+        const char *dm = cJSON_GetStringValue(cJSON_GetObjectItem(root, "doze_map"));
+        strlcpy(s_doze_map, dm ? dm : "", sizeof(s_doze_map));
     }
 
     cJSON *ct = cJSON_GetObjectItem(root, "clock_table");
@@ -2521,6 +2528,29 @@ void asset_dl_set_active_map(const char *hash)
     }
     save_local_manifest_locked();
     xSemaphoreGive(s_lock);
+}
+
+/* 【待机专用背景图 2026-10-02 用户口径】进 CLOCK_DOZE 时切到这张图当背景。
+ * 返回 false = 没配（保持当前图，旧行为）。 */
+/* 当前活动图 id（进待机时记下来，唤醒切回用） */
+bool asset_dl_active_map_id(char *out, size_t cap)
+{
+    bool ok;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    ok = s_active_map[0] != 0;
+    if (ok) strlcpy(out, s_active_map, cap);
+    xSemaphoreGive(s_lock);
+    return ok;
+}
+
+bool asset_dl_doze_map(char *out, size_t cap)
+{
+    bool ok;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    ok = s_doze_map[0] != 0;
+    if (ok) strlcpy(out, s_doze_map, cap);
+    xSemaphoreGive(s_lock);
+    return ok;
 }
 
 bool asset_dl_clock_anchor(int16_t *world_x, int16_t *world_y)

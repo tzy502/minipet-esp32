@@ -49,6 +49,12 @@ static const char *TAG = "sm";
  * 「装载地图 → 读 NVS 应用相机」= 全局加载。 */
 #include "compositor.h"
 
+/* ══ 【本轮新增的静态状态】（2026-10-02）
+ * s_map_before_doze：待机专用背景图（manifest doze_map）切换前的当前图，唤醒切回用；
+ * s_redraw_done   ：首次绑定后是否已做过整屏重绘（"素材未变 → 跳过重绘（防闪）"用）。 */
+static char s_map_before_doze[32];
+static bool s_redraw_done;
+
 /* ══ 【气泡整体去除 2026-10-01 · 用户口径（两板同口径）】════════════════════
  * "整体去除气泡 效果不好" → 桌宠不再显示任何对话气泡；1.85B 同步同改。
  * 所有气泡渲染收敛到下面的包装函数，CONFIG_MP_BUBBLE_ENABLE=n（默认）时整段不画。
@@ -236,6 +242,15 @@ static void transition_locked(mp_state_t next)
         if (prev == MP_ST_CLOCK_DOZE) {
             cmd_simple(MP_CMD_CLOCK, NULL, 0, 0);               /* 收时钟 */
             cmd_simple(MP_CMD_SET_EXPRESSION, MP_EXPR_BLINK, 0, 0);  /* 唤醒瞬目 */
+            /* 【待机专用背景图】唤醒即切回进待机前那张图 */
+            if (s_map_before_doze[0]) {
+                mp_cmd_t mc = { 0 };
+                mc.type = MP_CMD_SET_MAP;
+                strlcpy(mc.s, s_map_before_doze, sizeof(mc.s));
+                mp_post_cmd(&mc);
+                ESP_LOGW(TAG, "唤醒切回原图：%s", s_map_before_doze);
+                s_map_before_doze[0] = 0;
+            }
         }
         post_banner_if_needed();     /* 问题4：无配置 → 常驻配网横幅 */
         /* 闲置计时只由用户交互/用户可达的场景切换刷新（boot/自检/菜单/唤醒/
@@ -253,8 +268,24 @@ static void transition_locked(mp_state_t next)
         break;
 
     case MP_ST_CLOCK_DOZE:
-        /* E9：待机时钟浮现（AMOLED 纯黑背景只数字发光，RTC 独立走时）；
-         * fontTime 素材与地图锚点由 dispatch 查 asset_dl */
+        /* E9：待机时钟浮现；fontTime 素材与地图锚点由 dispatch 查 asset_dl。
+         * 【待机背景专用图 2026-10-02】先切到 doze_map（用户口径："背景直接换到我
+         * 给你的升降场那张图"），并记住当前图以便唤醒时切回。 */
+        {
+            char dm[32];
+            if (asset_dl_doze_map(dm, sizeof dm) && asset_dl_map_is_active(dm) == false) {
+                /* 记当前图（拿不到就不切回，免得切到空） */
+                extern bool asset_dl_active_map_id(char *out, size_t cap);
+                if (asset_dl_active_map_id(s_map_before_doze, sizeof(s_map_before_doze))) {
+                    mp_cmd_t mc = { 0 };
+                    mc.type = MP_CMD_SET_MAP;
+                    strlcpy(mc.s, dm, sizeof(mc.s));
+                    mp_post_cmd(&mc);
+                    ESP_LOGW(TAG, "待机背景切图：%s → %s（唤醒后切回）",
+                             s_map_before_doze, dm);
+                }
+            }
+        }
         cmd_simple(MP_CMD_CLOCK, NULL, 1, 0);
         cmd_simple(MP_CMD_SET_EXPRESSION, MP_EXPR_DEFAULT, 0, 0);
         break;
@@ -859,6 +890,7 @@ static bool action_maybe_camtest(const char *action)
 #define SM_ENTITY_NVS_KEY "entity"
 
 static char s_entity[40];               /* "" = 纸娃娃；否则 "mob:<id>"/"npc:<id>" */
+
 static bool s_entity_bound;            /* 该实体已成功绑到渲染层（幂等：避免每次 manifest 同步重开包） */
 /* 【闪烁治理 2026-10-02】每次 manifest 同步都"重绑 + 整屏重绘"会在屏上闪一下：
  * 大素材下载期每 30s 一轮同步 ⇒ 肉眼可见的周期性闪。这里记住上次成功绑定的
@@ -866,7 +898,8 @@ static bool s_entity_bound;            /* 该实体已成功绑到渲染层（�
 static char s_bound_parts[MP_MPK_PATH_MAX];
 static char s_bound_layout[MP_MPK_PATH_MAX];
 static bool s_bound_once;
-static bool s_redraw_done;
+
+
 static int64_t s_entity_retry_last_ms; /* 绑定失败后的自动重试节流（见 dispatch_entity 失败分支） */
 static int     s_entity_retry_cnt;
 
