@@ -860,6 +860,13 @@ static bool action_maybe_camtest(const char *action)
 
 static char s_entity[40];               /* "" = 纸娃娃；否则 "mob:<id>"/"npc:<id>" */
 static bool s_entity_bound;            /* 该实体已成功绑到渲染层（幂等：避免每次 manifest 同步重开包） */
+/* 【闪烁治理 2026-10-02】每次 manifest 同步都"重绑 + 整屏重绘"会在屏上闪一下：
+ * 大素材下载期每 30s 一轮同步 ⇒ 肉眼可见的周期性闪。这里记住上次成功绑定的
+ * 路径 + 是否已重绘过，只有"素材真的换了/第一次绑"才重绘整屏。 */
+static char s_bound_parts[MP_MPK_PATH_MAX];
+static char s_bound_layout[MP_MPK_PATH_MAX];
+static bool s_bound_once;
+static bool s_redraw_done;
 static int64_t s_entity_retry_last_ms; /* 绑定失败后的自动重试节流（见 dispatch_entity 失败分支） */
 static int     s_entity_retry_cnt;
 
@@ -1009,11 +1016,13 @@ static void dispatch_entity(const char *entity)
          * **正常中间态**：只做 ≥30s 节流的同步请求（催下载），**不动** retry_cnt，
          * 下完那次 MANIFEST_SYNCED 会自然重绑。只有"文件已在 TF 却仍打不开"才算真失败。 */
         if (!asset_dl_entity_ready(last_want)) {
+            /* 【不再催同步 2026-10-02】下载本来就在 asset 任务里飞着，下完它自己会
+             * post MANIFEST_SYNCED → entity_restore 重绑；这里再 request_sync 只会
+             * 每 30s 触发一轮同步 → 每轮一次整屏重绘 ⇒ 屏上周期闪（用户报"闪烁"）。 */
             if (s_entity_retry_last_ms == 0 || now_ms - s_entity_retry_last_ms >= 30000) {
                 s_entity_retry_last_ms = now_ms;
-                ESP_LOGW(TAG, "实体 %s 的包还没下完（大包分钟级）→ 等异步下载，不消耗重试预算",
+                ESP_LOGW(TAG, "实体 %s 的包还没下完（大包分钟级）→ 等异步下载完成自动绑定",
                          last_want);
-                asset_dl_request_sync();
             }
             return;
         }
@@ -1380,6 +1389,8 @@ static void dispatch_manifest_synced(void)
      * 216 板（GRAM）该 API 为空操作，本段零行为变化。 */
     display_refresh_suspend();
     bind_heap_probe("绑定段入口");
+    /* 本轮是否真的换了素材（决定结尾要不要整屏重绘；见 s_bound_* 注释） */
+    bool bind_changed = false;
 
     /* 字体三档（气泡 24 / 列表 16 / 标题 32，E12） */
     static const struct { render_font_t id; int px; } fonts[] = {
@@ -1441,11 +1452,17 @@ static void dispatch_manifest_synced(void)
                 esp_timer_start_periodic(s_bind_retry_timer, 10ULL * 1000000ULL);
         }
     } else if (asset_dl_parts_path(NULL, path, sizeof(path))) {
-        int prc = render_set_parts(path);
-        if (prc != 0) {
-            vTaskDelay(pdMS_TO_TICKS(50));
+        int prc = 0;
+        if (s_bound_once && strcmp(path, s_bound_parts) == 0) {
+            ESP_LOGI(TAG, "parts 未变（%s）→ 跳过重复绑定（防闪）", path);
+        } else {
             prc = render_set_parts(path);
-            ESP_LOGW(TAG, "parts 首开失败（TF 争用?）重试 rc=%d", prc);
+            if (prc != 0) {
+                vTaskDelay(pdMS_TO_TICKS(50));
+                prc = render_set_parts(path);
+                ESP_LOGW(TAG, "parts 首开失败（TF 争用?）重试 rc=%d", prc);
+            }
+            if (prc == 0) { strlcpy(s_bound_parts, path, sizeof(s_bound_parts)); bind_changed = true; }
         }
         ESP_LOGW(TAG, "parts 路径=%s rc=%d", path, prc);
         if (s_bind_retry_timer && !s_font_pending) {   /* 绑定+字体都好了：停自愈重试 */
@@ -1464,11 +1481,17 @@ static void dispatch_manifest_synced(void)
     bool l_ok = asset_dl_layout_path("stand1", path, sizeof(path));
     int lrc = -1;
     if (l_ok) {
-        lrc = render_set_layout(path, true);
-        if (lrc != 0) {
-            vTaskDelay(pdMS_TO_TICKS(50));
+        if (s_bound_once && strcmp(path, s_bound_layout) == 0) {
+            lrc = 0;
+            ESP_LOGI(TAG, "layout 未变（%s）→ 跳过重复绑定（防闪）", path);
+        } else {
             lrc = render_set_layout(path, true);
-            ESP_LOGW(TAG, "layout 首开失败（TF 争用?）重试 rc=%d", lrc);
+            if (lrc != 0) {
+                vTaskDelay(pdMS_TO_TICKS(50));
+                lrc = render_set_layout(path, true);
+                ESP_LOGW(TAG, "layout 首开失败（TF 争用?）重试 rc=%d", lrc);
+            }
+            if (lrc == 0) { strlcpy(s_bound_layout, path, sizeof(s_bound_layout)); bind_changed = true; }
         }
         ESP_LOGW(TAG, "layout 路径=%s rc=%d", path, lrc);
     }
@@ -1633,8 +1656,16 @@ static void dispatch_manifest_synced(void)
     }
 
     /* 素材全量重绑后强制一次全屏重绘：清除面板自检色块/旧画面残留
-     * （无 BGMAP → 全屏填黑；有 BGMAP → static_back+tile），此后每帧走脏区 */
-    render_force_redraw();
+     * （无 BGMAP → 全屏填黑；有 BGMAP → static_back+tile），此后每帧走脏区。
+     * 【闪烁治理 2026-10-02】只在"真的换了素材"或"首次绑定"时做 —— 否则每次
+     * manifest 同步（大包下载期每 30s 一轮）都整屏重绘 = 屏上周期性闪一下。 */
+    if (bind_changed || !s_redraw_done) {
+        render_force_redraw();
+        s_redraw_done = true;
+        if (bind_changed) s_bound_once = true;
+    } else {
+        ESP_LOGI(TAG, "素材未变 → 跳过整屏重绘（防闪）");
+    }
 
     /* 素材全绑完后的内部堆水位（可观测性：文件描述符/字模/位图都在内部堆或 PSRAM，
      * 真机曾因 max_files 用尽导致后续 mpak_open 全失败 → 一条水位日志能提前发现） */

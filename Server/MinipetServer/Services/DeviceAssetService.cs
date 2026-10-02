@@ -279,11 +279,36 @@ public sealed class DeviceAssetService
             }
             root["assets"] = assetsObj;
             WriteIndex(deviceDir, root);
+            /* 【摘条目的同时把包文件删掉 2026-10-02 用户口径"页面上删除地图要把设备的
+             * 资源删掉"】旧实现只摘索引不删文件 —— 服务端导出目录里那几十 MB 的
+             * BGMAP/条带/缩略图会一直躺着（216 设备目录一度堆到 200MB+）。
+             * 只删本次真正摘掉的 hash（被引用保留的 KeptAssets 不动）；
+             * 顺带清理同名的 .tmp / .mpak.tmp 残留。删除失败只记日志，不回滚索引。 */
+            long freed = 0; int filesDeleted = 0;
+            foreach (var a in result.RemovedAssets.Append(new DeletedAsset { Hash = result.BgmapHash ?? "" }))
+            {
+                if (string.IsNullOrEmpty(a.Hash)) continue;
+                foreach (var ext in new[] { ".mpak", ".mpak.tmp", ".png" })
+                {
+                    var f = Path.Combine(deviceDir, a.Hash + ext);
+                    try
+                    {
+                        if (!File.Exists(f)) continue;
+                        var len = new FileInfo(f).Length;
+                        File.Delete(f);
+                        filesDeleted++; freed += len;
+                    }
+                    catch (Exception ex) { Console.Error.WriteLine($"[DeviceAsset] 删文件失败 {f}: {ex.Message}"); }
+                }
+            }
             result.Removed = true;
+            result.FilesDeleted = filesDeleted;
+            result.BytesFreed = freed;
             result.RemainingMaps = CountBgmapMaps(assetsObj);
             Console.WriteLine($"[DeviceAsset] 设备 {deviceId} 删除地图 {mapId}（{result.Label}）："
                               + $"摘除 BGMAP {mainHashes.Count} 条 + 派生素材 {result.RemovedAssets.Count} 条"
-                              + $"（保守保留 {result.KeptAssets.Count} 条），剩余地图 {result.RemainingMaps} 张");
+                              + $"（保守保留 {result.KeptAssets.Count} 条），**物理删除 {filesDeleted} 个文件、"
+                              + $"释放 {freed / 1024}KB**，剩余地图 {result.RemainingMaps} 张");
             return result;
         }
     }
@@ -303,6 +328,9 @@ public sealed class DeviceAssetService
         public List<DeletedAsset> KeptAssets { get; set; } = new();
         /// <summary>删完该设备清单里还剩几张 BGMAP 地图。</summary>
         public int RemainingMaps { get; set; }
+        /// <summary>本次物理删除的包文件数（.mpak/.tmp/.png）与释放字节数。</summary>
+        public int FilesDeleted { get; set; }
+        public long BytesFreed { get; set; }
     }
 
     /// <summary>被删/被保留的派生条目（hash + kind + label + 中文判据）。</summary>

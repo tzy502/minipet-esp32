@@ -199,7 +199,9 @@ public static class CameraEndpoints
                 // 长轮询立即返回；设备收到新清单即对账剪除本地条目）
                 rev = mfst.BumpRev(id, $"删除地图 {mid}（用户操作）");
                 eventLog.Append(id, $"删除地图 {mid}（{result.Label}）：摘除 BGMAP 1 条 + 派生素材 "
-                                    + $"{result.RemovedAssets.Count} 条，剩余 {result.RemainingMaps} 张");
+                                    + $"{result.RemovedAssets.Count} 条，物理删除 {result.FilesDeleted} 个文件"
+                                    + $"（{result.BytesFreed / 1024}KB），剩余 {result.RemainingMaps} 张"
+                                    + "；设备端下次同步即对账删文件");
                 Console.WriteLine($"[MapDelete] 设备 {id} 删除地图 {mid}：派生 {result.RemovedAssets.Count} 条"
                                   + $"（保留 {result.KeptAssets.Count}），剩余 {result.RemainingMaps} 张，rev={rev}");
             }
@@ -224,6 +226,9 @@ public static class CameraEndpoints
                 keptAssets = result.KeptAssets,
                 keptCount = result.KeptAssets.Count,
                 remainingMaps = result.RemainingMaps,
+                /** 【2026-10-02 用户口径】本次**物理删除**的包文件数 + 释放字节（服务端导出目录） */
+                filesDeleted = result.FilesDeleted,
+                bytesFreed = result.BytesFreed,
                 manifestRev = rev,
                 activeMapId = lastMapId,
                 /** true = 本次是"强制删除正在使用的图"（force=true，页面二次确认后才带） */

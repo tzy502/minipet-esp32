@@ -298,10 +298,14 @@ async function doDelete(m, force = false) {
     const r = await deleteCameraMap(props.deviceId, m.mapId, force)
     const left = r?.remainingMaps ?? 0
     if (r?.removed) {
+      /* 【2026-10-02 用户口径"页面上删除地图要把设备的资源删掉"】服务端现在连**包文件**
+       * 一起物理删除（导出目录），设备下次同步对账时也会删掉自己 TF 上的同名包 ——
+       * 文案把释放量说清楚，别让人以为只摘了索引。 */
+      const freed = r?.bytesFreed ? `，服务端已删除 ${r.filesDeleted ?? 0} 个包文件、释放 ${(r.bytesFreed / 1048576).toFixed(1)}MB` : ''
       message.success(
-        `已删除「${m.label}」：移除 BGMAP 主包 + ${r?.removedCount ?? 0} 个专用素材，`
-        + `清单还剩 ${left} 张图（设备下次同步后生效）`,
-        { duration: 6000 }
+        `已删除「${m.label}」：移除 BGMAP 主包 + ${r?.removedCount ?? 0} 个专用素材${freed}，`
+        + `清单还剩 ${left} 张图（设备下次同步时对账并删除本地包）`,
+        { duration: 8000 }
       )
     } else {
       message.info(`「${m.label}」本来就不在清单里（幂等）：清单还剩 ${left} 张图`)

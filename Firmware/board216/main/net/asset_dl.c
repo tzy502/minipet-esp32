@@ -1146,21 +1146,57 @@ static bool verify_and_commit(dl_ctx_t *c, const char *dir, const char *hash)
  * 同步后宠物从屏幕消失，critical_ready 却=1，"后台补齐"反复绑死包空转）。
  * 每次拿到完整清单（含 rev 相等早退前）都以服务端 assets 为准剪除不在清单内
  * 的行。须持 s_lock 调用；返回剪除数。 */
+/* kind → 渲染侧目录（与 render_dir_of 同口径，但这里要的是**真删文件**用的路径） */
+static const char *kind_dir_for_delete(const char *kind);
+
 static int prune_stale_locked(const cJSON *assets)
 {
-    int kept = 0, removed = 0;
+    int kept = 0, removed = 0, files_deleted = 0;
+    long long bytes_freed = 0;
     for (int i = 0; i < s_file_cnt; i++) {
         if (cJSON_GetObjectItem(assets, s_files[i].hash)) {
             s_files[kept++] = s_files[i];
         } else {
+            /* 【服务端删了就要连文件一起删 2026-10-02 用户口径】
+             * 原实现只剪内存/清单条目，TF 上的 <hash>.mpk 永远留着 —— 用户看到的
+             * "设备里堆着一堆以前调试期不能用的图"（占 TF、还可能被菜单/计数算进去）。
+             * 现在对账时**物理删除**：先删 .mpk（已落盘的正式包），再删同名 .mpk.tmp
+             * （未完成的断点续传残留）。删除失败只告警，不影响对账结果。 */
+            const char *dir = kind_dir_for_delete(s_files[i].kind);
+            if (dir) {
+                char p[MP_MPK_PATH_MAX];
+                snprintf(p, sizeof(p), "%s/%s.mpk", dir, s_files[i].hash);
+                struct stat st;
+                if (stat(p, &st) == 0) {
+                    if (unlink(p) == 0) { files_deleted++; bytes_freed += (long long)st.st_size; }
+                    else ESP_LOGW(TAG, "陈旧包删除失败 %s: %s", p, strerror(errno));
+                }
+                snprintf(p, sizeof(p), "%s/%s.mpk.tmp", dir, s_files[i].hash);
+                if (stat(p, &st) == 0) {
+                    if (unlink(p) == 0) { files_deleted++; bytes_freed += (long long)st.st_size; }
+                }
+            }
             removed++;
         }
     }
     s_file_cnt = kept;
     if (removed > 0)
-        ESP_LOGW(TAG, "清单对账：剪除 %d 个已不被服务的陈旧条目（保留 %d）",
-                 removed, kept);
+        ESP_LOGW(TAG, "清单对账：剪除 %d 个已不被服务的陈旧条目（保留 %d），"
+                      "物理删除 %d 个文件、释放 %lld KB",
+                 removed, kept, files_deleted, bytes_freed / 1024);
     return removed;
+}
+
+/* kind → 目录（删文件用）。与 kind_dir()/render_dir_of() 同一张表，但固定用 TF 根：
+ * 对账删的是 TF 上的缓存，出厂分区（只读）里的文件不该、也删不掉。 */
+static const char *kind_dir_for_delete(const char *kind)
+{
+    if (strcasecmp(kind, "PARTS") == 0)      return MP_TF_MINIPET_DIR "/parts";
+    if (strcasecmp(kind, "LAYOUT") == 0)     return MP_TF_MINIPET_DIR "/layout";
+    if (strcasecmp(kind, "BGMAP") == 0)      return MP_TF_MINIPET_DIR "/bg";
+    if (strcasecmp(kind, "FONT") == 0)       return MP_TF_MINIPET_DIR "/font";
+    if (strcasecmp(kind, "AUDIO_META") == 0) return MP_TF_MINIPET_DIR "/audio";
+    return NULL;
 }
 
 /* 元数据登记/刷新（不下载）；返回该 hash 本地是否已有文件。
