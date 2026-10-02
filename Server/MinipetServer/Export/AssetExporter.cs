@@ -1415,6 +1415,47 @@ public sealed class AssetExporter
                 });
             }
             if (layoutFrames.Count == 0) { Warn($"{cnName} {entityIdStr} 动作 {action} 无有效帧，跳过"); continue; }
+            /* ══ 【单动作位图必须装得进固件部件缓存，否则逐帧重载 = 持续卡顿】══════════
+             * 固件 RC_PART_CACHE_CAP = 2MB（compositor.h）：一个动作的全部帧位图
+             * （帧数 × (cell 像素 + 1bit 掩码)）超过它时，逐帧推进会不断淘汰/重读 TF
+             * ⇒ 真机体感"卡顿/一顿一顿"。真机实测口径见 docs/ai/mob-entity-assets.md §9。
+             * 处置：超过 1.5MB（留 0.5MB 余量给其它动作的帧）**跳过该动作**（记录告警），
+             * 保住默认动作与其余轻量动作的可玩性；若连**默认动作**都超限 → 整只拒绝，
+             * 避免"切过去就一直卡"。 */
+            /* 【二级降采样：按部件缓存反推 2026-10-02】窗口缩放后若该动作的全部帧位图
+             * 仍装不进固件部件缓存（2MB，留 0.5MB 余量取 1.5MB），逐帧推进会不断淘汰/重读
+             * TF ⇒ 真机"持续卡顿"。这里按面积比再降一次 k（k2 = sqrt(cap/bytes)），
+             * 让动作**可用**而不是直接拒绝 —— 大怪也能玩，只是略小。 */
+            {
+                long ActionBytes(int w, int h) => (long)layoutFrames.Count
+                    * ((((long)w * 2 + 3) / 4 * 4) * h + ((long)w * h + 7) / 8);
+                const long kActionBitmapMaxBytes = 1536 * 1024;
+                long bytes = ActionBytes(scw, sch);
+                if (bytes > kActionBitmapMaxBytes)
+                {
+                    double k2 = Math.Sqrt((double)kActionBitmapMaxBytes / bytes);
+                    k *= k2;
+                    scw = Math.Max(1, (int)Math.Round(cw * k));
+                    sch = Math.Max(1, (int)Math.Round(ch * k));
+                    sox = (int)Math.Round(strip.OriginX * k);
+                    soy = (int)Math.Round(strip.OriginY * k);
+                    Warn($"{cnName} {entityIdStr} 动作 {action} 位图 {bytes / 1024}KB 超部件缓存余量"
+                         + $" {kActionBitmapMaxBytes / 1024}KB → 再降采样 ×{k2:0.###} 至 {scw}×{sch}"
+                         + "（防逐帧重载卡顿）");
+                    bytes = ActionBytes(scw, sch);
+                }
+                /* 兜底：降到我方仍 ≥12px 才算可用；否则跳过（默认动作超限则整只拒绝，
+                 * 因为切过去就是持续卡/看不清）。 */
+                if (Math.Min(scw, sch) < 12)
+                {
+                    Warn($"{cnName} {entityIdStr} 动作 {action} 降采样后仅 {scw}×{sch}（<12px）→ 跳过");
+                    if (string.Equals(action, defaultAction, StringComparison.Ordinal))
+                        throw new InvalidOperationException(
+                            $"{cnName} {entityIdStr} 默认动作 {action} 位图过大且降采样后不可用"
+                            + "（<12px）—— 换一只怪");
+                    continue;
+                }
+            }
             nextPartId += (uint)frames;
 
             layoutPayloads.Add((action, LayoutPackWriter.Build(new LayoutPackWriter.LayoutInput
