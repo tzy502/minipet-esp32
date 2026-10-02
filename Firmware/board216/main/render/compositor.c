@@ -719,9 +719,15 @@ static void drag_clamp(int32_t *px, int32_t *py)
      *   右边：left + dw ≥ sw - dw/2  ⇒ px ≥  sw - dw - dw/2 - base_x
      * 与 ent_bounce_if_offscreen 的"可见面积 <50% 就弹回"同口径（那条是面积兜底）。 */
     if (px) {
+        /* 【公式修正 2026-10-02】设显示矩形左边 = base_x + px，要求"至少一半可见"：
+         *   左边界：left ≥ -dw/2                ⇒ px ≥ -dw/2 - base_x            （下界 lo）
+         *   右边界：left ≤ sw - dw/2            ⇒ px ≤ sw - dw/2 - base_x        （上界 hi）
+         * 上一版误写成 `sw - dw - dw/2` 并把上下界标反 ⇒ 真机表现为"只能往一个方向挪
+         * 二十几像素、上下完全拖不动"（用户报"上下拖动还是不行"）。
+         * 校验（dw=214, base_x≈133, sw=480）：lo=-240 / hi=+240 ⇒ 左右各可拖满 240 ✓ */
         int32_t half = dw / 2;
-        int32_t hi = half - base_x;
-        int32_t lo = g_sw - dw - half - base_x;
+        int32_t lo = -half - base_x;
+        int32_t hi = g_sw - half - base_x;
         if (hi < lo) hi = lo;                    /* 画布比屏还宽：贴左 */
         if (*px < lo) *px = lo;
         if (*px > hi) *px = hi;
@@ -738,9 +744,11 @@ static void drag_clamp(int32_t *px, int32_t *py)
          *   上边：top ≤ dh/2            ⇒ py ≤  dh/2 - base_y
          *   下边：bottom ≥ sh - dh/2    ⇒ py ≥  sh - dh - dh/2 - base_y
          * （原口径是"上边不许出、下边可到屏底"，即上下不对称；现按用户要求统一为 50%）。 */
+        /* 同横向修正：上边界 py ≥ -dh/2 - base_y；下边界 py ≤ sh - dh/2 - base_y。
+         * 校验（dh=168, base_y≈156, sh=480）：lo=-240 / hi=+240 ⇒ 上下各可拖满 240 ✓ */
         int32_t halfh = dh / 2;
-        int32_t hi = halfh - base_y;
-        int32_t lo = g_sh - dh - halfh - base_y;
+        int32_t lo = -halfh - base_y;
+        int32_t hi = g_sh - halfh - base_y;
         if (hi < lo) hi = lo;
         if (*py < lo) *py = lo;
         if (*py > hi) *py = hi;
