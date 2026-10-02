@@ -231,11 +231,16 @@ public sealed class DeviceManifestService
         root["entities"] = entities;
 
         // clock_table：E9 魔法值表（Web 可改 → rev+1）
+        // 【按设备覆盖 2026-10-02】先铺全局默认，再用 deviceId 专属条目覆盖 —— 两板窗口不同
+        // （216=240 世界 / 185B=360 世界），同一张图的钟锚点必须能各配一套（见 ClockConfig 注释）。
         var clock = new JsonObject();
-        foreach (var (mapId, xy) in _cfg.Current.Clock.MapOffsets)
+        void PutClock(string mapId, int[] xy)
         {
             clock[mapId] = new JsonArray(xy.Select(x => (JsonNode)x!).ToArray());
         }
+        foreach (var (mapId, xy) in _cfg.Current.Clock.MapOffsets) PutClock(mapId, xy);
+        if (_cfg.Current.Clock.MapOffsetsByDevice.TryGetValue(deviceId, out var devClock))
+            foreach (var (mapId, xy) in devClock) PutClock(mapId, xy);
         root["clock_table"] = clock;
 
         return root.ToJsonString(new JsonSerializerOptions

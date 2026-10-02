@@ -93,6 +93,17 @@ public sealed class ClockConfig
 
     public Dictionary<string, int[]> MapOffsets { get; set; } = new(StringComparer.Ordinal);
 
+    /// <summary>
+    /// 【按设备覆盖 2026-10-02 用户口径"216 的记得也要做"】deviceId → mapId → [x,y]。
+    /// 为什么必须按设备：时钟锚点是**世界 1x 的屏幕坐标**，而两板的可见窗口不同
+    /// （216 = 240×240 世界，RC_SCALE 2；185B = 360×360 世界，RC_SCALE 1）——
+    /// 同一张图、同一块钟面板，两台设备要的锚点**不一样**（实测 104020110：
+    /// 216 需 (13,-60)、185B 需 (77,-34)）。查找顺序：设备条目优先，缺省回落
+    /// `MapOffsets`（全局默认，仍然是老行为的唯一来源）。
+    /// </summary>
+    public Dictionary<string, Dictionary<string, int[]>> MapOffsetsByDevice { get; set; }
+        = new(StringComparer.Ordinal);
+
     /// <summary>校准口径版本（ClockTableSeeder 写入）：小于当前口径时启动校准全量重算覆盖，
     /// 等于时只补缺失条目（Web 手改的值永不覆盖）。Web 保存回传请原样携带。</summary>
     public int Calib { get; set; }

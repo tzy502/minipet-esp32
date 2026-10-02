@@ -176,8 +176,7 @@ public sealed class CameraService
                 UpdatedUtc = pos?.UpdatedUtc,
                 ThumbUrl = $"/api/admin/thumb?type=map&id={Uri.EscapeDataString(mapId)}",
                 /* 时钟锚点（null = 该图没配 → 设备 AUTO 居中屏心） */
-                Clock = (_cfg?.Current.Clock.MapOffsets.TryGetValue(mapId, out var cxy) == true
-                         && cxy is { Length: >= 2 }) ? new[] { cxy[0], cxy[1] } : null,
+                Clock = PickClock(deviceId, mapId),
             });
         }
 
@@ -276,6 +275,17 @@ public sealed class CameraService
     /// 窗口包（vw/vh == 窗口尺寸，无平移余量）时按导出相机的同一规则取景（有 clock 锚点用锚点，
     /// 否则地图中心）——否则"设备看到的那一屏"根本无从谈起。
     /// </summary>
+    /// <summary>该设备该图的时钟锚点：设备专属优先，缺省回落全局（与 manifest clock_table 同口径）。</summary>
+    private int[]? PickClock(string deviceId, string mapId)
+    {
+        if (_cfg == null) return null;
+        if (_cfg.Current.Clock.MapOffsetsByDevice.TryGetValue(deviceId, out var dev)
+            && dev.TryGetValue(mapId, out var dxy) && dxy is { Length: >= 2 })
+            return new[] { dxy[0], dxy[1] };
+        return _cfg.Current.Clock.MapOffsets.TryGetValue(mapId, out var cxy) && cxy is { Length: >= 2 }
+            ? new[] { cxy[0], cxy[1] } : null;
+    }
+
     public byte[]? RenderViewportPng(string deviceId, CameraMapInfo mapInfo, int x, int y)
     {
         var (x2, y2) = ClampCamera(mapInfo, x, y);
