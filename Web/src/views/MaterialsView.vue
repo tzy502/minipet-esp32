@@ -244,7 +244,7 @@ function openPush(it) {
 /** 错误分支文案（400/404/503 是服务端 push 端点明确定义的三种拒绝）。 */
 function pushErrorHint(status) {
   switch (status) {
-    case 400: return '请求参数被拒：kind 必须是 map|mob|npc，id 不能为空'
+    case 400: return '请求参数被拒：kind 必须是 map|mob|npc，id 不能为空；怪物需有可导出动作（空壳 id 会被拒）'
     case 404: return '设备不存在（可能已被移除，刷新设备列表后重选）'
     case 503: return 'WZ 未加载：到「设置」页配置 WZ 路径后重试'
     case 500: return '服务端处理异常（资产打包失败，详见服务端日志）'

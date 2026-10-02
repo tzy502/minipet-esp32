@@ -565,6 +565,24 @@ public static class AdminEndpoints
                 if (!wz.IsLoaded)
                     return Results.Json(new { error = "WZ 未加载（到「设置」页配置后重试）" }, statusCode: 503);
 
+                /* 【同步预检：怪物必须有可导出动作 2026-10-02，UI 实测暴露】
+                 * Web「怪物」tab 的 id 直接来自 WZ 目录子节点，其中混着**空壳 id**
+                 * （例如 100000 vs 真身 100100：前者 7 位补零后指向没有有效帧的 img）。
+                 * 以前这类 id 会正常返回 202，然后在后台导出时抛
+                 * 「怪物 X 无可导出动作（WZ 数据缺失？）」——用户界面上只看到"已受理"，
+                 * 实际什么都没发生（真机 UI 实测第一格就是这种 id）。
+                 * 现在同步查一次动作表（单只怪，毫秒级，不打包）→ 明确 400 说明原因。 */
+                if (kind == "mob")
+                {
+                    List<string> acts;
+                    try { acts = wz.GetActionList(assetId, "Mob"); }
+                    catch (Exception ex) { acts = new List<string>(); Console.Error.WriteLine($"[DevicePush] 预检 {assetId} 动作表异常: {ex.Message}"); }
+                    if (acts.Count == 0)
+                        return Results.Json(new
+                        {
+                            error = $"怪物 {assetId} 在 WZ 里没有可导出动作（多半是空壳 id：试 100100 这类真身编号）",
+                        }, statusCode: 400);
+                }
                 bool switchAfter = body?.Switch != false;
                 // R2 整图口径开关；仅 map 生效。
                 // 【2026-10-01 默认翻转】原先缺省 false（= 240×240 窗口包），但：
