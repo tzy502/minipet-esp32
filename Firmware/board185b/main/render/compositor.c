@@ -285,6 +285,8 @@ static int64_t g_banner_expire_us;         /* 定时横幅到期时刻（us；0=
                                             * render_banner_show_for 用，render_tick 到期自动隐藏） */
 
 static void mark_rect(int32_t x, int32_t y, int32_t w, int32_t h);   /* 前向声明（校准层先于定义使用） */
+/* 前向声明：拖动中心锚点换算（render_drag_to_screen 在 ent_screen_pos_at 之前定义） */
+static void ent_screen_pos_at(int32_t tilt_mdeg, int32_t *sx, int32_t *sy);
 
 /* ===== BGM 半屏控制条（E6 定稿）=====
  * 需求原文：「BGM 播放控制 = 触摸（半屏控制条：播放/暂停/切歌/音量），由选择器内
@@ -701,7 +703,9 @@ static void drag_clamp(int32_t *px, int32_t *py)
     int32_t dw, dh;
     ent_disp_size(&dw, &dh);
     if (dw <= 0 || dh <= 0) return;              /* 画布未就绪：不限制 */
-    /* 未加 drag 时的基准（与 ent_screen_pos_at 同源，含 tilt 与 base 偏移） */
+    /* 未加 drag 时的基准（与 ent_screen_pos_at 同源，含 tilt 与 base 偏移）。
+     * 注：drag 的**锚点语义**见 render_drag_to_screen（画布中心跟手）；本函数只管
+     * "显示矩形最多一半出屏"的边界，与锚点取哪个点无关。 */
     int32_t base_x = g_sw / 2 - (g_ent_ox - g_ent_cx0) * RC_SCALE + RC_ENT_CENTER_OFF_X
                      + (g_ent_base_wx << RC_SCALE_SHIFT)
                      + ent_tilt_off_px(g_tilt_mdeg);
@@ -747,6 +751,31 @@ void render_set_drag_off_y(int32_t py)
     rc_lock();
     drag_clamp(NULL, &py);
     g_drag_off_y = py;
+    rc_unlock();
+}
+
+/* ══ 拖动锚点 = 画布中心（2026-10-02 用户口径）═══════════════════════════════
+ * 用户原话：「拖动的时候默认都是用左上角当锚点，修改为中心点当锚点」。
+ * 旧口径：input 层按"手指 − 屏心"算偏移（render_set_drag_off(f.x-240)），
+ * 等价于让**画布坐标 (origin) 那一点**贴住手指 —— origin 缺失/为 0 时就是
+ * **画布左上角**贴手指（正是用户体感到的"左上角当锚点"）；而且 1.85B 屏宽
+ * 360 时算式里仍写死 240 ⇒ 拖动整体偏 60px（两板共用同一份 input 代码）。
+ * 新口径：**画布（可见包围盒）中心**跟手——手指按在哪，宠物中心就到哪。
+ * 计算收敛在合成器内（它才知道画布尺寸/落点/tilt 偏移），input 层不再自己减屏心。
+ * 线程契约：与 render_set_drag_off 同（input 任务调用，内部 rc_lock）。 */
+void render_drag_to_screen(int32_t sx, int32_t sy)
+{
+    rc_lock();
+    int32_t dw = 0, dh = 0;
+    ent_disp_size(&dw, &dh);
+    if (dw <= 0 || dh <= 0) { rc_unlock(); return; }   /* 画布未就绪：保持不动 */
+    int32_t bx = 0, by = 0;
+    ent_screen_pos_at(g_tilt_mdeg, &bx, &by);          /* 当前缓冲左上角（含现有 drag/tilt） */
+    int32_t nx = g_drag_off_x + ((sx - dw / 2) - bx);  /* 令中心落到 (sx,sy) 的增量 */
+    int32_t ny = g_drag_off_y + ((sy - dh / 2) - by);
+    drag_clamp(&nx, &ny);
+    g_drag_off_x = nx;
+    g_drag_off_y = ny;
     rc_unlock();
 }
 

@@ -382,7 +382,11 @@ static void tilt_fsm_tick(const imu_accel_t *a)
     }
     if (entered & MP_TILT_UP) {
         mp_post_event_simple(MP_EVT_TILT_ENTER, MP_TILT_UP, 0, NULL);
-        post_action(MP_ACTION_FLY);               /* 上倾 → fly（E6） */
+        /* 【2026-10-02 用户口径】「设备倾斜的时候只用 walk 不用 fly」——
+         * 上倾不再进 fly（E6 原口径），与左右倾斜同一条 walk1（怪物/NPC 形象下
+         * 由状态机映射到 move）。拿起/翻转（PICKUP，偏离水平 35°+ 持续）另属
+         * 一个手势，未在本条口径内，保持原样。 */
+        post_action(MP_ACTION_WALK);
     }
     if (exited & MP_TILT_UP) {
         mp_post_event_simple(MP_EVT_TILT_EXIT, MP_TILT_UP, 0, NULL);
@@ -859,8 +863,10 @@ static void touch_tick(void)
             int64_t now = mp_now_ms();
             if (now - last_apply >= 66) {
                 last_apply = now;
-                render_set_drag_off((int)f.x - 240);
-                render_set_drag_off_y((int)f.y - 240);
+                /* 【2026-10-02 用户口径】锚点 = 画布中心（原来的 f.x-240 是
+                 * "origin/左上角贴手指"，且 1.85B 屏宽 360 时 240 是错的屏心）。
+                 * 由合成器按真实画布尺寸换算，input 层不再自己减屏心。 */
+                render_drag_to_screen((int)f.x, (int)f.y);
                 note_interaction();
             }
             return;

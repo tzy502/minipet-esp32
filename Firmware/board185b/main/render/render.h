@@ -141,6 +141,10 @@ bool render_bgm_bar_take_menu_request(void);
 
 /* ---------------- IMU 视差（input 任务可异步调用；int32 对齐写原子） --- */
 void render_input_tilt(float tilt_deg);
+/* 【2026-10-02 用户口径】拖动跟手 = **画布（可见包围盒）中心**落到手指位置。
+ * 取代 input 层原来的 render_set_drag_off(f.x-屏心)（那是"origin/左上角贴手指"，
+ * 且 1.85B 屏宽 360 时写死 240 会整体偏 60px）。画布未就绪时为安全 no-op。 */
+void render_drag_to_screen(int32_t sx, int32_t sy);
 /* 拖拽跟手：人物屏幕 x 偏移（px，1:1，clamp ±160）；get 供输入侧增量累计 */
 void render_set_drag_off(int32_t px);
 int32_t render_get_drag_off(void);
