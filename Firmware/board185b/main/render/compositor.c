@@ -1570,8 +1570,14 @@ static void banner_fill_block(int32_t px0, int32_t py0, int32_t grow,
 /* 实体层合成（POKER 常规路径与 CLOCK_DOZE 睡眠态共用）。
  * darken_pct>0：整体降亮 = 睡眠观感（RGB565 各通道按比例缩放，黑底上近似
  * 屏幕调光，省电语义不变）。覆盖位图 g_ent_cov 为 1bit，未覆盖处保持底层像素。 */
+/* 换装期隐藏开关（定义在文件后部的 render_rebind_* 处） */
+static bool g_rebind_hidden;
+
 static void ent_compose(int32_t x, int32_t y, int32_t w, int32_t h, int darken_pct)
 {
+    /* 【换装期隐藏 2026-10-02】parts/layout 分两次换的窗口里不出人 —— 用户口径：
+     * "渲染没结束的时候会错乱，看看是不是先隐藏人物"。宁可短暂无人，不出错配帧。 */
+    if (g_rebind_hidden) return;
     int32_t bx, by, ex, ey, dw, dh;
     ent_screen_rect_at(g_tilt_mdeg, &bx, &by, &ex, &ey, &dw, &dh);
     if (dw <= 0 || dh <= 0) return;
@@ -4266,6 +4272,47 @@ int render_set_layout(const char *mpk_path, bool loop)
     rc_unlock();
     return r;
 }
+
+/* ══ 【原子换装：parts + layout 一次锁内换完 2026-10-02 用户口径】════════════════
+ * 用户报（185B）"推送人物，渲染没结束的时候会错乱，是不是先隐藏人物"。
+ * 根因不是"没隐藏"，而是**两次调用之间有缝**：旧流程先 render_set_parts(新包) 再
+ * render_set_layout(新包)，各自加锁 —— 两次之间合成器可以正常出一帧，那一帧是
+ * **新 PARTS + 旧 LAYOUT**：两边 part_id 都从 1 开始但含义完全不同 ⇒ 整帧部件错配
+ * （画面"错乱"）。修法比"先隐藏"更彻底：两包在**同一把锁内**换完，中间不产生帧。
+ * 返回 0 = 两包都换成功；任一失败由调用方回滚。 */
+int render_set_parts_layout(const char *parts_path, const char *layout_path, bool loop,
+                            int *parts_rc, int *layout_rc)
+{
+    rc_lock();
+    int prc = parts_path ? render_set_parts_nolock(parts_path) : 0;
+    int lrc = (prc == 0 && layout_path) ? render_set_layout_nolock(layout_path, loop) : -1;
+    rc_unlock();
+    if (parts_rc)  *parts_rc = prc;
+    if (layout_rc) *layout_rc = lrc;
+    return (prc == 0 && lrc == 0) ? 0 : -1;
+}
+
+/* ── 换装期隐藏（用户口径"渲染没结束之前先隐藏人物"）────────────────────────
+ * parts/layout 不是同一次调用能换完的路径（例如"parts 先绑、layout 后绑"的老流程），
+ * 用 begin/end 把这段窗口里的人**整体不合成**：宁可短暂没有人，也不出半新半旧的错乱帧。
+ * end 时强制一次全屏重绘（把上一个人留下的像素清掉）。 */
+void render_rebind_begin(void)
+{
+    rc_lock();
+    g_rebind_hidden = true;
+    rc_unlock();
+    ESP_LOGW(TAG, "换装期：先隐藏人物（防【新 PARTS + 旧 LAYOUT】错乱帧）");
+}
+void render_rebind_end(void)
+{
+    rc_lock();
+    g_rebind_hidden = false;
+    rc_unlock();
+    render_force_redraw();
+    ESP_LOGW(TAG, "换装期结束：放回人物（已整屏重绘）");
+}
+bool render_rebind_hidden(void) { return g_rebind_hidden; }
+
 
 int render_set_expression(const char *name)
 {

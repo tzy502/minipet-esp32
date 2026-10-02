@@ -13,6 +13,7 @@
  * 「时间未同步」日志，绝不显示错误时间。
  */
 #include "clock_digits.h"
+#include "esp_timer.h"   /* 时钟落点取证日志用（限频 30s） */
 
 #include "compositor.h"   /* rc_mask_bit（tight bitpack：bit = y*w+x） */
 
@@ -341,6 +342,59 @@ static int glyph_seq(const cg_t *out_g[7], int32_t out_x[7], bool *comma_on,
     int32_t h_world = d2->h;                      /* 数字槽高（am/pm 更矮，不参与） */
     int32_t x, y0;
     block_origin(w_world, h_world, &x, &y0);
+
+    /* ══ 【魔法值越界兜底 2026-10-02】════════════════════════════════════════
+     * 真机取证：clock_table 里那批 [240,240] 是**屏 px 口径**（240 = 480 屏的屏心），
+     * 当"世界 1x"用会算成 (261,323) 世界 = 屏 (522,646) ⇒ **整块落在屏外、时钟隐身**
+     * （用户口径"时钟在绿框里"，结果连看都看不见）。这里做兜底：算出的块**与屏幕完全
+     * 不相交**就退回 AUTO 居中屏心并告警 —— 宁可位置不是你要的，也不能没有时钟。
+     * 正确做法是用「选镜头」页的点选放置把该图锚点调到位（写 clock.mapOffsets）。 */
+    {
+        int32_t sc2 = (s_ck.scale > 0) ? s_ck.scale : RC_SCALE;
+        int32_t bx = x * sc2, by = y0 * sc2;
+        int32_t bw2 = (g_am->w + CLOCK_AMPM_GAP + d1->w + d2->w + comma->w + m1->w + m2->w) * sc2;
+        int32_t bh2 = d2->h * sc2;
+        /* 185B 没有 216 那两个常量：屏尺寸缺省用 360（本板面板）兜底 */
+        int32_t scr_w = s_ck.sw > 0 ? s_ck.sw : 360;
+        int32_t scr_h = s_ck.sh > 0 ? s_ck.sh : 360;
+        if (!s_ck.centered && (bx + bw2 <= 0 || by + bh2 <= 0 || bx >= scr_w || by >= scr_h)) {
+            static int64_t s_oob_ms;
+            int64_t now2 = esp_timer_get_time() / 1000;
+            if (now2 - s_oob_ms > 30000) {
+                s_oob_ms = now2;
+                ESP_LOGW(TAG, "时钟锚点越界：anchor=(%d,%d) → 块 屏=(%d,%d %dx%d) 完全在屏外"
+                              " → 退回 AUTO 居中屏心（请用选镜头页点选放置重新标定）",
+                         (int)s_ck.anchor_wx, (int)s_ck.anchor_wy, (int)bx, (int)by,
+                         (int)bw2, (int)bh2);
+            }
+            s_ck.centered = true;
+            int32_t w_w = g_am->w + CLOCK_AMPM_GAP + d1->w + d2->w + comma->w + m1->w + m2->w;
+            int32_t h_w = d2->h;
+            /* 185B 的 AUTO 口径是"整块居中屏幕中心"（见 block_origin），直接复用它的实现，
+             * 保证兜底落点与正常 AUTO 完全一致 */
+            block_origin(w_w, h_w, &x, &y0);
+        }
+    }
+
+    /* 【时钟落点取证 2026-10-02 用户口径"待机的时候时钟就这么显示"】限频 30s 打一行：
+     * 锚点来源（表/AUTO）、锚点原值、块左上（世界 1x 与屏 px）—— 待机验证不必抓屏，
+     * 串口这一行就能判定"时钟有没有落在那张图的框里"。 */
+    {
+        static int64_t s_ck_log_ms;
+        int64_t now_ms = esp_timer_get_time() / 1000;
+        if (now_ms - s_ck_log_ms > 30000) {
+            s_ck_log_ms = now_ms;
+            int32_t sc = (s_ck.scale > 0) ? s_ck.scale : RC_SCALE;
+            /* 块宽/高就地算（不同板本实现里 w_world/h_world 的作用域不同，别依赖它） */
+            int32_t bw = g_am->w + CLOCK_AMPM_GAP + d1->w + d2->w + comma->w + m1->w + m2->w;
+            int32_t bh = d2->h;
+            ESP_LOGI(TAG, "时钟落点：%s anchor=(%d,%d) 块左上 世界=(%d,%d) 屏=(%d,%d) 块=%dx%d scale=%d",
+                     s_ck.centered ? "AUTO 居中屏心" : "按该图 clock_table",
+                     (int)s_ck.anchor_wx, (int)s_ck.anchor_wy,
+                     (int)x, (int)y0, (int)(x * sc), (int)(y0 * sc),
+                     (int)bw, (int)bh, (int)sc);
+        }
+    }
 
     /* am|pm → GAP=12 → H1 → H2 → comma → M1 → M2（数字间无额外间距） */
     int n = 0;

@@ -68,6 +68,13 @@ void render_note_activity(void);
 int  render_set_parts(const char *mpk_path);
 /* 换动作：LAYOUT 包；loop=false 的单次动作播完自动回退最近一次 loop 布局（stand1） */
 int  render_set_layout(const char *mpk_path, bool loop);
+/* 原子换装（parts+layout 同一把锁内换完，中间不出帧）—— 用户报"推送人物渲染没结束会错乱" */
+int  render_set_parts_layout(const char *parts_path, const char *layout_path, bool loop,
+                             int *parts_rc, int *layout_rc);
+/* 换装期隐藏：此窗口内不出人（宁可短暂无人，也不出半新半旧帧）；end 会整屏重绘 */
+void render_rebind_begin(void);
+void render_rebind_end(void);
+bool render_rebind_hidden(void);
 /* 表情切换（按名，作用于当前动作的 expression 列表；blink 由本地定时器插播） */
 int  render_set_expression(const char *name);
 /*

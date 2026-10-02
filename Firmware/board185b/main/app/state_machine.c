@@ -1371,6 +1371,10 @@ static void dispatch_manifest_synced(void)
     bind_heap_probe("绑定段入口");
     /* 本轮是否真的换了素材（决定结尾要不要整屏重绘；见 s_bound_* 注释） */
     bool bind_changed = false;
+    /* 【换装期隐藏 2026-10-02 用户口径】parts 与 layout 分两次换的窗口里先不出人：
+     * 否则中间那一帧是"新 PARTS + 旧 LAYOUT"（part_id 同名不同义）= 用户看到的错乱。
+     * 窗口结束（或失败回滚）后 render_rebind_end() 会整屏重绘把人放回来。 */
+    render_rebind_begin();
 
     /* 字体三档（气泡 24 / 列表 16 / 标题 32，E12） */
     static const struct { render_font_t id; int px; } fonts[] = {
@@ -1475,6 +1479,14 @@ static void dispatch_manifest_synced(void)
         }
         ESP_LOGW(TAG, "layout 路径=%s rc=%d", path, lrc);
     }
+    /* 换装窗口收尾：layout 失败 = 半新半旧，先把 parts 回滚到上次成功的一对再放人出来 */
+    if (!l_ok || lrc != 0) {
+        if (s_bound_once && s_bound_parts[0]) {
+            int rrc = render_set_parts(s_bound_parts);
+            ESP_LOGW(TAG, "换装失败回滚：parts 回到上次成功的一对（%s）rc=%d", s_bound_parts, rrc);
+        }
+    }
+    render_rebind_end();
     bind_heap_probe("layout 绑定之后");
     if (!l_ok || lrc != 0 ||
         !asset_dl_parts_path(NULL, path, sizeof(path))) {
