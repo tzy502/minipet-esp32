@@ -26,6 +26,8 @@ import {
 } from 'naive-ui'
 import {
   cameraPreviewUrl, cameraViewportUrl, deleteCameraMap, errText, getCameraMaps, saveCameraPosition, sendCameraCommand,
+  getSettings,
+  putSettings,
 } from '../api/client'
 import { fmtTime } from '../utils/format'
 
@@ -168,11 +170,61 @@ watch(viewportUrl, (url) => {
  * 两块都按面板显示倍数（×2 就近放大）换算。 */
 const PANEL_ZOOM = 2
 const CLOCK_OFF_X = 21, CLOCK_OFF_Y = 83
+
+/* ── 点选放置时钟锚点（2026-10-02 用户口径"时钟根据参数"的落地交互）──────────────
+ * 语义与固件 clock_digits.h 一致：**锚点 + (21,83) = 时钟块左上角**（世界 1x 屏幕坐标）。
+ * 所以"点哪儿 = 时钟块的左上角落哪儿"，反推锚点 = 点击点 − (21,83)。
+ * 保存走 Web 已有的设置通道（PUT /admin/settings 全量回传）：写 clock.mapOffsets[mapId]
+ * → 服务端配置热更 → clock_table 变 → manifest rev+1 → 设备拉新清单即生效（无需新端点）。 */
+const placeMode = ref(false)          /* true = 下一次点"设备视角"是放时钟 */
+const clockEdit = ref(null)           /* [x,y] 待保存的锚点（null = 无改动） */
+const clockSaving = ref(false)
+const clockIsAutoRef = computed(() => clockIsAuto.value)
+
+function clockAnchorOf(m) {
+  const c = m?.clock
+  if (c && c.length >= 2) return [c[0], c[1]]
+  /* AUTO 口径：整块居中屏心 → 反推等价锚点，方便用户从"当前落点"微调 */
+  return [Math.round(winW.value / 2 - CLOCK_W / 2 - CLOCK_OFF_X),
+          Math.round(winH.value / 4 - CLOCK_H / 2 - CLOCK_OFF_Y)]
+}
+
+function onVpClick(ev) {
+  if (!placeMode.value || !map.value) return
+  const rect = ev.currentTarget.getBoundingClientRect()
+  const wx = (ev.clientX - rect.left) / PANEL_ZOOM     /* 显示 px → 世界 1x */
+  const wy = (ev.clientY - rect.top) / PANEL_ZOOM
+  clockEdit.value = [Math.round(wx - CLOCK_OFF_X), Math.round(wy - CLOCK_OFF_Y)]
+  placeMode.value = false
+}
+
+async function saveClockAnchor(clear = false) {
+  if (!map.value || clockSaving.value) return
+  clockSaving.value = true
+  try {
+    const cur = await getSettings()
+    const cfg = cur?.config ?? {}
+    cfg.clock = { ...(cfg.clock ?? {}), mapOffsets: { ...((cfg.clock ?? {}).mapOffsets ?? {}) } }
+    if (clear) delete cfg.clock.mapOffsets[map.value.mapId]
+    else cfg.clock.mapOffsets[map.value.mapId] = clockEdit.value
+    await putSettings(cfg)
+    message.success(clear
+      ? `已清除「${map.value.label}」的时钟锚点 → 设备回 AUTO（整块居中屏心），清单 rev+1 已下发`
+      : `时钟锚点已保存 ${clockEdit.value?.[0]},${clockEdit.value?.[1]} → clock_table 变更、rev+1，设备下次同步生效`,
+      { duration: 7000 })
+    clockEdit.value = null
+    await load(false)
+  } catch (e) {
+    message.error(`保存时钟锚点失败：${e?.response?.data?.error ?? e?.message ?? e}`)
+  } finally {
+    clockSaving.value = false
+  }
+}
 const CLOCK_W = 155, CLOCK_H = 26
 const clockBoxStyle = computed(() => {
   const m = map.value
   if (!m || !winW.value || !winH.value) return { display: 'none' }
-  const c = m.clock
+  const c = clockEdit.value ?? m.clock
   let x, y
   if (c && c.length >= 2) {
     x = c[0] + CLOCK_OFF_X
@@ -189,7 +241,8 @@ const clockBoxStyle = computed(() => {
     height: `${CLOCK_H * PANEL_ZOOM}px`,
   }
 })
-const clockIsAuto = computed(() => !(map.value && map.value.clock && map.value.clock.length >= 2))
+const clockIsAuto = computed(() => !(clockEdit.value ?? (map.value && map.value.clock))
+                                    || !((clockEdit.value ?? map.value?.clock)?.length >= 2))
 const petBoxStyle = computed(() => {
   const m = map.value
   if (!m || !winW.value || !winH.value) return { display: 'none' }
@@ -569,7 +622,11 @@ watch(mapId, () => { imgLoaded.value = false; imgW.value = 0 })
               <code>clock_digits.h</code>：锚点 +(21,83)，块 155×26 世界像素）
             </div>
           </div>
-          <div class="cam-vp-frame">
+          <div
+            class="cam-vp-frame"
+            :class="{ 'place-mode': placeMode }"
+            @click="onVpClick"
+          >
             <img
               v-if="viewportUrl && viewportImgOk"
               class="cam-vp-img"
@@ -585,10 +642,41 @@ watch(mapId, () => { imgLoaded.value = false; imgW.value = 0 })
               <span class="cam-pet-label">人物（固定屏心）</span>
             </div>
             <!-- 时钟框（绿）：落点由该图 clock_table 参数决定（无参数 = 设备 AUTO 居中屏心） -->
-            <div v-if="viewportUrl" class="cam-clock-box" :style="clockBoxStyle">
-              <span class="cam-clock-label">时钟{{ clockIsAuto ? '（AUTO 居中）' : '（按该图参数）' }}</span>
+            <div v-if="viewportUrl" class="cam-clock-box" :class="{ pending: !!clockEdit }" :style="clockBoxStyle">
+              <span class="cam-clock-label">
+                时钟{{ clockEdit ? '（待保存）' : clockIsAuto ? '（AUTO 居中）' : '（按该图参数）' }}
+              </span>
             </div>
           </div>
+
+          <!-- 时钟锚点：点选放置 + 保存下发（写 clock.mapOffsets → clock_table → rev+1） -->
+          <n-space align="center" :size="8" style="margin-top: 6px">
+            <n-button
+              size="tiny"
+              :type="placeMode ? 'warning' : 'default'"
+              :disabled="!map || clockSaving"
+              @click="placeMode = !placeMode"
+            >
+              {{ placeMode ? '请点「设备视角」放时钟…' : '放置时钟（点选）' }}
+            </n-button>
+            <n-button
+              size="tiny"
+              type="primary"
+              :disabled="!clockEdit || clockSaving"
+              :loading="clockSaving"
+              @click="saveClockAnchor(false)"
+            >
+              保存锚点{{ clockEdit ? ` ${clockEdit[0]},${clockEdit[1]}` : '' }}
+            </n-button>
+            <n-button size="tiny" :disabled="!clockEdit || clockSaving" @click="clockEdit = null">取消</n-button>
+            <n-button
+              size="tiny"
+              :disabled="!map || clockSaving || clockIsAutoRef"
+              @click="saveClockAnchor(true)"
+            >
+              清除（回 AUTO）
+            </n-button>
+          </n-space>
 
           <n-space align="center" :size="8" class="cam-coord">
             <span class="cam-coord-label">x</span>
@@ -759,6 +847,8 @@ watch(mapId, () => { imgLoaded.value = false; imgW.value = 0 })
   text-shadow: 0 0 3px #000;
 }
 /* 时钟框（绿）：实线 = 该图参数决定的时钟落点 */
+.cam-vp-frame.place-mode { cursor: crosshair; box-shadow: 0 0 0 2px #6bd968 inset; }
+.cam-clock-box.pending { border-style: dashed; background: rgba(107, 217, 104, 0.18); }
 .cam-clock-box {
   position: absolute;
   border: 1px solid #6bd968;

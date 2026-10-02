@@ -239,3 +239,24 @@ D=<服务端>/data/cache/export/<deviceId>
 null = AUTO）+ `Web/src/components/CameraPicker.vue` 的两层叠加（`PANEL_ZOOM=2`）。
 真机口径验证：真 Chrome 截图（`/tmp/cam_boxes.png`）里绿框落在窗口上中（AUTO 屏 px 240/120 ÷2），
 红框+十字落在窗口正中；标签分别显示「时钟（AUTO 居中）/（按该图参数）」与「人物（固定屏心）」。
+
+### 12.1 点选放置时钟锚点（2026-10-02 收口）
+
+「选镜头」设备视角面板新增交互（**不改服务端状态模型**，复用既有设置通道）：
+
+1. 点「放置时钟（点选）」→ 面板进入放置模式（绿色描边 + 十字光标）；
+2. 在「设备视角」上点一下 = **时钟块的左上角落点** → 绿框即时跟随并标「待保存」；
+   反推锚点 = 点击点 − (CLOCK_OFF_X=21, CLOCK_OFF_Y=83)（与固件 `clock_digits.h` 同口径）；
+3. 「保存锚点 39,-43」→ `PUT /admin/settings` 全量回传，写 `Clock.MapOffsets[mapId]`
+   （PascalCase 落 `data/config/appsettings.json`）→ 配置热更 → `clock_table` 变 → **manifest rev+1
+   → 设备下次同步生效**（配置变更由 DeviceManifestService 订阅 `BumpAllRev`，无需新端点）；
+4. 「清除（回 AUTO）」→ 删该图条目 → 设备走 AUTO（整块居中屏心）。
+
+实测（本地 dev server + 真 Chrome）：
+- 点 (世界 60,40) → 绿框 `left:120px; top:80px`（×2 显示）✓，保存按钮文案 `保存锚点 39,-43` ✓
+- 保存后 toast「时钟锚点已保存 39,-43 → clock_table 变更、rev+1，设备下次同步生效」✓，
+  绿框标签转「时钟（按该图参数）」✓
+- 服务端核对：manifest `clock_table['004000032']=[39,-43]`、`rev=27` ✓
+
+⚠️ 该交互依赖服务端 `camera/maps` 返回的 `clock` 字段（本轮新增）→ **需重新部署服务端**才在正式环境可见；
+`Clock.MapOffsets` 的官方默认 26 条一直存在（设置页 JSON 框仍可直接批量编辑）。
