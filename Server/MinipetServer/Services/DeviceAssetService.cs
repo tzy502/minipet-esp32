@@ -382,7 +382,14 @@ public sealed class DeviceAssetService
         {
             var deviceDir = DeviceDir(deviceId);
             var root = ReadIndex(Path.Combine(deviceDir, ManifestBuilder.AssetsManifestFileName));
-            if (HasEntry(root, selector: "npc", key: "entity", value: $"npc:{npcId}")) return false;
+            string entity = $"npc:{npcId}";
+            /* 【导出器版本判据 2026-10-02】只看 selector+entity 会永远跳过重导 ——
+             * 帧切片修复前的 NPC 包（每动作只有第 0 帧有像素）就再也换不掉。
+             * 版本不符 → 清掉旧的一套条目后重导（同 entity 只留一套）。 */
+            if (EntityUpToDate(root, "npc", entity)) return false;
+            int dropped = RemoveEntityEntries(root, "npc", entity);
+            if (dropped > 0)
+                Console.WriteLine($"[DeviceAsset] {deviceId} {entity} 旧条目 {dropped} 条（导出器版本过旧）→ 重导替换");
 
             var warnings = new List<string>();
             var assets = new AssetExporter(_wz).ExportNpcAssets(npcId, warnings);
@@ -405,7 +412,11 @@ public sealed class DeviceAssetService
         {
             var deviceDir = DeviceDir(deviceId);
             var root = ReadIndex(Path.Combine(deviceDir, ManifestBuilder.AssetsManifestFileName));
-            if (HasEntry(root, selector: "mob", key: "entity", value: $"mob:{mobId}")) return false;
+            string entity = $"mob:{mobId}";
+            if (EntityUpToDate(root, "mob", entity)) return false;
+            int dropped = RemoveEntityEntries(root, "mob", entity);
+            if (dropped > 0)
+                Console.WriteLine($"[DeviceAsset] {deviceId} {entity} 旧条目 {dropped} 条（导出器版本过旧）→ 重导替换");
 
             var warnings = new List<string>();
             var assets = new AssetExporter(_wz).ExportMobAssets(mobId, warnings);
@@ -489,6 +500,61 @@ public sealed class DeviceAssetService
         }
         root["assets"] = assetsObj;
         WriteIndex(deviceDir, root);
+    }
+
+    /// <summary>
+    /// 实体导出器版本（写进 PARTS/LAYOUT 条目 extra.exporterRev）。
+    /// 为什么要有：实体登记的幂等键是「selector + entity」，只看键会**永远跳过重导** ——
+    /// 真问题（2026-10-02）：帧切片修复前导出的 NPC 包，每个动作只有第 0 帧有像素
+    /// （`DrawBitmap(bmp, f*cw, 0)` 在 x&gt;0 时不绘制）；用户重推同一个 NPC 时旧实现
+    /// 直接跳过 → 设备永远拿不到修好的包。现在版本号一变就重导 + 换掉旧条目。
+    /// 改导出格式/像素口径时 +1（AppendOnly：旧包在新版本下会被替换，不需要手工清库）。
+    /// </summary>
+    public const int EntityExporterRev = 2;
+
+    /// <summary>实体在该设备索引里是否已按**当前导出器版本**登记（PARTS 条目判定）。</summary>
+    private static bool EntityUpToDate(JsonObject root, string selector, string entity)
+    {
+        if (root["assets"] is not JsonObject ao) return false;
+        foreach (var kv in ao)
+        {
+            if (kv.Value is not JsonObject e) continue;
+            if (!string.Equals(e["selector"]?.GetValue<string>(), selector, StringComparison.Ordinal)) continue;
+            if (!string.Equals(e["entity"]?.GetValue<string>(), entity, StringComparison.Ordinal)) continue;
+            if (!string.Equals(e["kind"]?.GetValue<string>(), "PARTS", StringComparison.Ordinal)) continue;
+            /* 容错读：EntryOf 的 extra 通用分支会把非 string/int[] 的值写成**字符串**
+             * （未列类型走 v.ToString()）——真机验证时正是这样写出了 "2"，而
+             * GetValue<int?>() 遇到 JsonValue(String) 会抛
+             * "An element of type 'String' cannot be converted to 'System.Nullable<int>'"，
+             * 整个 push 后台任务失败。这里数字/字符串两种形态都认（也兼容旧写法）。 */
+            var jv = e["exporterRev"];
+            int? rev = null;
+            if (jv is JsonValue val)
+            {
+                if (val.TryGetValue<int>(out var iv)) rev = iv;
+                else if (val.TryGetValue<string>(out var sv) && int.TryParse(sv, out var pv)) rev = pv;
+            }
+            return rev == EntityExporterRev;
+        }
+        return false;
+    }
+
+    /// <summary>摘掉该实体在索引里的全部条目（PARTS + 各动作 LAYOUT）——重导前清场，
+    /// 防"同 entity 两套包"被设备端任选其一（旧坏包）；包文件留在磁盘，由设备端
+    /// 清单对账（prune_stale_locked）自然淘汰。</summary>
+    private static int RemoveEntityEntries(JsonObject root, string selector, string entity)
+    {
+        if (root["assets"] is not JsonObject ao) return 0;
+        var doomed = new List<string>();
+        foreach (var kv in ao)
+        {
+            if (kv.Value is not JsonObject e) continue;
+            if (!string.Equals(e["selector"]?.GetValue<string>(), selector, StringComparison.Ordinal)) continue;
+            if (!string.Equals(e["entity"]?.GetValue<string>(), entity, StringComparison.Ordinal)) continue;
+            doomed.Add(kv.Key);
+        }
+        foreach (var k in doomed) ao.Remove(k);
+        return doomed.Count;
     }
 
     /// <summary>
@@ -613,6 +679,11 @@ public sealed class DeviceAssetService
         {
             if (v is string sv) o[k] = sv;
             else if (v is int[] ia) { var arr = new JsonArray(); foreach (var i in ia) arr.Add(i); o[k] = arr; }
+            /* 数值/布尔按原生类型写（此前一律 ToString() → 数字变成字符串 "2"，
+             * 读回时 GetValue<int?>() 直接抛异常：真机验证踩到） */
+            else if (v is int iv) o[k] = iv;
+            else if (v is long lv) o[k] = lv;
+            else if (v is bool bv) o[k] = bv;
             else if (v != null) o[k] = v.ToString() ?? "";
         }
         return o;

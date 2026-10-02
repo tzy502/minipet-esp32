@@ -1418,6 +1418,10 @@ public sealed class AssetExporter
             {
                 ["entity"] = entity,
                 ["defaultAction"] = defaultAction,
+                /* 导出器版本（DeviceAssetService.EntityExporterRev 同值）：设备端不读，
+                 * 仅供服务端判"这套包是不是当前口径导出的"——帧切片修复(2026-10-02)
+                 * 前的包每动作只有第 0 帧有像素，重推时必须重导而不是幂等跳过。 */
+                ["exporterRev"] = DeviceAssetService.EntityExporterRev,
             }));
         foreach (var (action, payload, cw, ch, ox, oy) in layoutPayloads)
         {
@@ -1427,6 +1431,7 @@ public sealed class AssetExporter
                     ["entity"] = entity,
                     ["action"] = action,
                     ["defaultAction"] = defaultAction,
+                    ["exporterRev"] = DeviceAssetService.EntityExporterRev,
                     ["bounds"] = new[] { cw, ch }, // cell（帧画布）[w,h]，1x 像素
                     /* origin 恒 (0,0)：piece x/y 已是"相对锚点"坐标 ⇒ 画布坐标 0 点 = 实体锚点，
                      * 固件把该点钉到屏心。下发 cell 内锚点会让固件重复计一次原点（见方法注释）。
