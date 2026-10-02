@@ -1412,6 +1412,25 @@ public sealed class AssetExporter
         foreach (var e in partEntries) e.Bitmap.Dispose(); // Build 内已编码落 payload，位图即弃
         partEntries.Clear();
 
+        /* ══ 体量/画布预警（仅日志，不改产物）2026-10-02 ══════════════════════════
+         * 真机实测口径（本地导出量测）：
+         *   · 小怪（100100 蜗牛）PARTS 44KB、中怪（210100）176KB、大怪（5130100）465KB；
+         *   · BOSS（8500000）PARTS **3.2MB**，单件 277×462 @1x —— 两个硬边界都被它踩到：
+         *       ① 固件实体画布窗口 = 240×220 世界 px（480×440 屏 ÷2x）⇒ 超出的部分被裁；
+         *       ② 固件部件位图缓存 RC_PART_CACHE_CAP = 2MB ⇒ 一个动作的帧位图总量超过它
+         *          时，逐帧推进可能反复淘汰/重读（体感为"动起来很慢"）。
+         * 这里只**告警**（不缩图不改包：缩图会改变用户看到的形象，属产品决策）；
+         * 告警进 Console.Error 与 warnings 列表，排障时一眼能看到是哪只怪踩的线。 */
+        {
+            int maxCellW = layoutPayloads.Count > 0 ? layoutPayloads.Max(x => x.CellW) : 0;
+            int maxCellH = layoutPayloads.Count > 0 ? layoutPayloads.Max(x => x.CellH) : 0;
+            if (maxCellW > 240 || maxCellH > 220)
+                Warn($"{cnName} {entityIdStr} 画布 {maxCellW}×{maxCellH} @1x 超出固件实体窗口 "
+                     + "240×220（会被裁切；用户口径如需完整显示需产品决策：缩放或扩窗）");
+            if (partsPayload.Length > 1_500_000)
+                Warn($"{cnName} {entityIdStr} PARTS {partsPayload.Length / 1024}KB 偏大"
+                     + "（固件部件缓存 2MB；大动作逐帧推进可能反复重载，体感偏慢）");
+        }
         string entity = $"{selector}:{entityIdStr}";
         result.Add(AddAsset(summary, MpakKind.Parts, partsPayload, label, selector: selector,
             extra: new Dictionary<string, object?>
