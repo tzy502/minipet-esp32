@@ -481,6 +481,23 @@ static bool do_poll_once(void)
 
     cJSON *jls = cJSON_GetObjectItem(root, "lastSeq");
     uint32_t last_seq = jls ? (uint32_t)cJSON_GetNumberValue(jls) : 0;
+
+    /* ══ 【游标超前 = 服务端队列已重置/换实例 → 归零重取 2026-10-02 真机实证】══
+     * 设备把指令游标持久化在 NVS（poll_since），服务端队列的 seq 则从 1 起单调增。
+     * 一旦出现下面任一情形，服务端 seq 会**回退到比设备游标更小**：
+     *   · 服务端换容器/重部署（queue 文件没随卷带过来）；
+     *   · 设备改了 srv_url（指向另一台服务器，如本地 dev 服务）。
+     * 此时 `Pending.Where(c.Seq > since)` 永不成立 ⇒ **所有指令静默丢失**
+     * （真机形态：since≈290、服务端 lastSeq=8；manifest 照常同步——因为 mrev 不看
+     * 游标——用户看到的就是"Web 点了没反应，素材却又在更新"）。
+     * 判据：响应里的 lastSeq < 本地游标 ⇒ 认定服务端队列重置，游标归零重取
+     * （服务端只保留 pending，重取不会重复执行历史指令）。 */
+    if (last_seq < s_since) {
+        ESP_LOGW(TAG, "服务端 seq(%lu) < 本地游标(%lu)：服务端队列已重置/换实例 → 游标归零重取",
+                 (unsigned long)last_seq, (unsigned long)s_since);
+        s_since = 0;
+        mp_nvs_set_u32("poll_since", 0);
+    }
     /* 收到指令：只推到实际收到的最大 seq（可能落后于 lastSeq，下轮再取后续的）；
      * 没收到指令：说明本轮到 lastSeq 为止都取空了，可以安全推进到 lastSeq。 */
     uint32_t adv = (max_rx_seq > 0) ? max_rx_seq : last_seq;

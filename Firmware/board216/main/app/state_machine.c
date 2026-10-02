@@ -1046,7 +1046,17 @@ static bool entity_restore(void)
     char ent[40] = "";
     if (!mp_nvs_get_str(SM_ENTITY_NVS_KEY, ent, sizeof ent) || !ent[0]) return false;
     if (!asset_dl_entity_exists(ent)) {
-        ESP_LOGW(TAG, "NVS 记住的实体 %s 不在当前清单 → 清除，回纸娃娃", ent);
+        /* 【开机清单还是旧的，别急着清意图 2026-10-02 真机踩到】开机时本地清单是
+         * 上一次同步的产物（网络同步往往还没收尾）——此时新推送的怪物/NPC 当然
+         * "不存在"。旧实现在这里直接清 NVS：真机现象 = 指向新服务器后首次开机，
+         * mob 意图被清掉，等同步真把包拉下来时已经没人记得要切它了。
+         * 现口径：清单里还没有 → **保留意图**，等 MANIFEST_SYNCED（下载完成后一定会
+         * 再来一次）重试；只有"重试预算已用尽且仍不在清单"才认定服务端已摘除并清除。 */
+        if (s_entity_retry_cnt < 3) {
+            ESP_LOGW(TAG, "实体 %s 还不在本地清单（同步未收尾？）→ 保留意图待重试", ent);
+            return false;
+        }
+        ESP_LOGW(TAG, "NVS 记住的实体 %s 不在当前清单（重试预算已用尽）→ 清除，回纸娃娃", ent);
         mp_nvs_set_str(SM_ENTITY_NVS_KEY, "");
         return false;
     }

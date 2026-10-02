@@ -71,7 +71,7 @@ Web 素材页「怪物」tab 📤
 - 锚点查询必须**按包 hash**（`asset_dl_layout_origin_of`）：怪物与纸娃娃动作名会重名
   （都有 `fly`/`hit`），按动作名查清单会取到另一实体的 origin ⇒ 形象跳位。
 
-## 5. 排障：三个真因（都已修，别再踩）
+## 5. 排障：真因清单（都已修，别再踩）
 
 1. **`expression_count == 0` 被固件拒收**（`mpak.c`）
    LAYOUT 解析旧校验 `expr_count == 0 → MPAK_ERR_FMT` ⇒ **实体 LAYOUT 整包打不开**，
@@ -84,6 +84,27 @@ Web 素材页「怪物」tab 📤
 3. **动作名不是纸娃娃那套**：怪物/NPC 用 `stand/move/fly/hit1/die1`，纸娃娃是
    `stand1/walk1/fly/alert/hit`。固件 `entity_action_of()` 做映射，映射不到就回落
    **该实体的默认动作**（绝不去查纸娃娃的 LAYOUT，否则会出现跨实体部件错配）。
+4. **PARTS 与 LAYOUT 路径共用缓冲**（真机 185B 实证，2026-10-02）：
+   `asset_dl_entity_parts_path(..., path, ...)` 之后又用同一个 `path` 调
+   `entity_default_layout_path()` ⇒ LAYOUT 路径把 PARTS 路径盖掉 ⇒
+   `render_set_parts()` 打开的是 LAYOUT 包 ⇒ `mpak_open` 返回 `MPAK_ERR_KIND(-7)`。
+   真机日志：`形象切换 → npc:2100000（parts rc=-7）默认动作 stand（layout rc=-1）`。
+   修法：**两条路径各用独立缓冲**（仓库里早有同款警告，见 dispatch_manifest_synced
+   的出厂降级绑定段）。
+5. **绑定失败后仍留"活动实体"**：紧接着 `dispatch_action("stand1")` 会走实体分支，
+   把没绑上的实体 LAYOUT 配到纸娃娃部件上（混合态，合成器判定错配并反复请求同步）。
+   修法：失败即回滚活动实体到纸娃娃（**NVS 意图保留**）+ 动作路由加 `s_entity_bound`
+   判据 + 失败重试节流（同一实体最多自动重试 3 次、间隔 ≥30s）。
+6. **开机清单还旧时就清掉形象意图**（真机 185B 实证）：`entity_restore()` 在开机阶段
+   跑（本地清单还是上一次同步的产物，网络同步未收尾）→ 新推的 mob 当然"不在清单" →
+   旧实现直接清 NVS ⇒ 等真把包拉下来时已经没人记得要切它了。
+   修法：清单里没有 → **保留意图**等 MANIFEST_SYNCED 重试；只有重试预算用尽且仍不在
+   清单才认定服务端已摘除。
+7. **指令游标超前 = 指令静默全丢**（真机 185B 实证，非本功能引入但会掩盖一切）：
+   设备把 `poll_since` 存 NVS，服务端换容器/换 srv_url 后 seq 从 1 重来，设备仍用旧大
+   游标（真机 since≈290 vs 服务端 lastSeq=8）⇒ `c.Seq > since` 永不成立 ⇒ 所有指令
+   丢弃（manifest 照常同步，因为 mrev 不看游标 ⇒ 用户看到"Web 点了没反应，素材却在更新"）。
+   修法：poller 检测 `lastSeq < since` → 游标归零重取。
 
 ## 6. 取证（都是真跑过的）
 
@@ -95,6 +116,10 @@ Web 素材页「怪物」tab 📤
 | 包能否解析/能否画 | `tools/test_mob_pack.c`（gcc 直编 `mpak.c` + 真实 .mpak） | **44 项断言全过**：16 部件位图+掩码全可读；4 个 LAYOUT 共 16 帧逐帧合成非空（`/tmp/mob_<action>_f<n>.bmp`） |
 | 渲染颜色对不对 | 与 `GET /api/admin/thumb?type=mob&id=100100` 参考图对比 | 一致（绿壳/蓝白头/紫足） |
 | 两板编译 | `idf.py -B build build`（board216 / board185b） | 均 **0 error** |
+| **真机：怪物上屏（185B）** | 185B 临时指向本机 dev 服务（`MPCONF SRV`）→ Web/API `push {kind:"mob",id:"100100",switch:true}` → 设备帧经 UDP `:9999` 抓回（`tools` 无侵入，不拔卡） | 设备日志：`实体绑定路径：parts=…dfa7f36730c61355.mpak \| layout=…eb0f91a734c24964.mpak(stand)` + `形象切换 → mob:100100（parts rc=0）默认动作 stand（layout rc=0）`；抓回的帧里**屏上就是那只蜗牛** |
+| **真机：持久化恢复（185B）** | 重启设备（串口一开即触发） | `开机/素材同步后恢复实体形象：mob:100100` + `parts rc=0`；帧上仍是怪物 |
+| **真机：切回纸娃娃** | `action: entity:paperdoll` | 帧上恢复纸娃娃；设备已还原到用户服务器（dev-8d4afc online） |
+| **真机：实体锚点口径** | 设备端 30s 探针 | `实体锚点：origin=(0,0)`、`画布=(-18,-26 37x26)`、`落点=(86,188 74x52) drag=(-118,0)`：纵向 188 与"锚点贴屏心"预期一致；横向 -118 来自 185B 触摸 IC 的**幻触**（I2C NACK 风暴期老问题，`drag` 被写成 -118），与本功能无关 |
 
 复跑 host 对拍：
 
