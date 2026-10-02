@@ -15,6 +15,16 @@ public sealed class DeviceProfile
     public string Shape { get; set; } = "";
     public int Psram { get; set; }
     public bool Audio { get; set; }
+
+    /// <summary>
+    /// 世界→屏 缩放系数（合成器 RC_SCALE），设备 hello 的 profile.rcScale 上报。
+    /// **可见窗口(世界px) = W / RcScale** —— 相机机位夹取、预览窗口、「设备视角」图
+    /// 全部以它为准。0/缺失 = 旧固件 → 按 2 兜底（= 480 屏/2 = 240 窗口，历史行为）。
+    /// 为什么需要它：1.85B 做 A1（合成器 480→360、RC_SCALE 2→1）后窗口是 360 而非 240，
+    /// 服务端硬编码 PlacementMath.Scale=2 会让夹取范围/预览与实际设备所见不符
+    /// （用户报障："摄像机可以展示的地图大了但是对应服务端推送的没修改"）。
+    /// </summary>
+    public int RcScale { get; set; }
 }
 
 public sealed class DeviceBgmPrefs

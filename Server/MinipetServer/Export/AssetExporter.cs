@@ -1337,6 +1337,29 @@ public sealed class AssetExporter
             int cw = strip.FrameWidth, ch = strip.FrameHeight;
             int frames = Math.Min(strip.FrameCount, stripBmp.Width / cw);
 
+            /* ══ 【超大实体自动缩放 = 只保"看得见"的那部分 2026-10-02】══════════════
+             * 真机/真导出实证：9602606 是 701×357 @1x BOSS，导出 PARTS **24MB** ——
+             * 固件侧两条硬线（实体窗口 240×220、部件缓存 2MB）全爆，下载几分钟后
+             * 报"下载失败"（用户原话："这个是不是太大了显示下载失败"）。
+             * 但**超出窗口的部分本来就会被裁掉**：不缩的话，24MB 里绝大部分是永远
+             * 不可见的像素。这里按窗口尺寸等比降采样（最近邻，不引入插值模糊）：
+             *   k = min(1, 240/cw, 220/ch)
+             * 帧画布、锚点（piece x/y = -origin）一起按 k 换算 —— 视觉 = 整只怪按比例
+             * 缩小后完整放进窗口，包体按面积平方缩小（701×357 → 240×122，24MB → ~2.8MB）。
+             * 取值与固件 compositor 的 RC_ENT_W/H ÷ RC_SCALE、以及 216 板 2× 口径一致；
+             * 185B（新 360/1:1 空间）窗口更大，这里取"两板都安全"的较小值。 */
+            const int kEntWinW = 240, kEntWinH = 220;
+            double k = 1.0;
+            if (cw > kEntWinW || ch > kEntWinH)
+                k = Math.Min(1.0, Math.Min((double)kEntWinW / cw, (double)kEntWinH / ch));
+            int scw = Math.Max(1, (int)Math.Round(cw * k));
+            int sch = Math.Max(1, (int)Math.Round(ch * k));
+            int sox = (int)Math.Round(strip.OriginX * k);
+            int soy = (int)Math.Round(strip.OriginY * k);
+            if (k < 1.0)
+                Warn($"{cnName} {entityIdStr} 动作 {action} 画布 {cw}×{ch} 超出固件实体窗口 "
+                     + $"{kEntWinW}×{kEntWinH} → 按 {k:0.###} 自动缩放为 {scw}×{sch}（避免导出永远看不见的像素）");
+
             // 帧 → PARTS 部件：条带按 cell 切片（cell 内锚点 = strip.Origin，跨帧/跨动作同口径）
             // LAYOUT 帧：单 piece = 整 cell；piece x/y = 位图左上角(0,0) 相对锚点(OriginX,OriginY)
             //   = (-OriginX, -OriginY)（帧恒定——条带合成已把每帧 origin 对齐到该点）
@@ -1344,7 +1367,7 @@ public sealed class AssetExporter
             var layoutFrames = new List<LayoutPackWriter.LayoutFrame>();
             for (int f = 0; f < frames; f++)
             {
-                var cell = new SKBitmap(new SKImageInfo(cw, ch, SKColorType.Bgra8888, SKAlphaType.Unpremul));
+                var cell = new SKBitmap(new SKImageInfo(scw, sch, SKColorType.Bgra8888, SKAlphaType.Unpremul));
                 using (var c = new SKCanvas(cell))
                 {
                     c.Clear(SKColors.Transparent);
@@ -1353,18 +1376,19 @@ public sealed class AssetExporter
                      * f=0 有 712 px、f≥1 全 0），于是每个动作只有第 0 帧有内容、其余帧全是
                      * 空部件 —— 怪物/NPC 包"下得下来、动不起来"的第二个真因（host 对拍
                      * tools/test_mob_pack.c 抓出）。显式给 source/dest 矩形后逐帧像素数与
-                     * 条带 PNG 各 cell 完全一致（679/681/672/695）。 */
+                     * 条带 PNG 各 cell 完全一致（679/681/672/695）。
+                     * dest 尺寸 = scw×sch：需要缩放时 Skia 默认最近邻采样（不插值、不糊）。 */
                     c.DrawBitmap(stripBmp,
                         new SKRect(f * cw, 0, f * cw + cw, ch),
-                        new SKRect(0, 0, cw, ch));
+                        new SKRect(0, 0, scw, sch));
                 }
                 partEntries.Add(new PartPackWriter.PartEntry
                 {
                     PartId = basePartId + (uint)f,
                     ExprGroup = 0,
                     Bitmap = cell,
-                    OriginX = strip.OriginX,
-                    OriginY = strip.OriginY,
+                    OriginX = sox,
+                    OriginY = soy,
                 });
 
                 uint delay = (uint)Math.Max(1,
@@ -1382,8 +1406,8 @@ public sealed class AssetExporter
                         {
                             PartId = basePartId + (uint)f,
                             ExprIndex = LayoutPackWriter.ExprNone,
-                            X = (short)Math.Clamp(-strip.OriginX, short.MinValue, short.MaxValue),
-                            Y = (short)Math.Clamp(-strip.OriginY, short.MinValue, short.MaxValue),
+                            X = (short)Math.Clamp(-sox, short.MinValue, short.MaxValue),
+                            Y = (short)Math.Clamp(-soy, short.MinValue, short.MaxValue),
                             Flip = 0,
                             Z = 0,
                         },
@@ -1398,7 +1422,7 @@ public sealed class AssetExporter
                 EntityId = entityId,
                 Action = action,
                 Frames = layoutFrames,
-            }), cw, ch, strip.OriginX, strip.OriginY));
+            }), scw, sch, sox, soy));
         }
 
         if (partEntries.Count == 0 || layoutPayloads.Count == 0)
@@ -1430,6 +1454,15 @@ public sealed class AssetExporter
             if (partsPayload.Length > 1_500_000)
                 Warn($"{cnName} {entityIdStr} PARTS {partsPayload.Length / 1024}KB 偏大"
                      + "（固件部件缓存 2MB；大动作逐帧推进可能反复重载，体感偏慢）");
+            /* 硬上限（缩放后仍超）：宁可**明确失败**也不让设备白下几分钟再报"下载失败"。
+             * 6MB 的依据：设备 TF 有效写速 ~230KB/s ⇒ 25s 级；再大就进入"菜单下载超时/
+             * 频繁重试"的体感区（真机 24MB 那只就是这么失败的）。 */
+            const int kEntityPartsMaxBytes = 6 * 1024 * 1024;
+            if (partsPayload.Length > kEntityPartsMaxBytes)
+                throw new InvalidOperationException(
+                    $"{cnName} {entityIdStr} 素材过大：PARTS {partsPayload.Length / 1024}KB > "
+                    + $"{kEntityPartsMaxBytes / 1024}KB 上限（设备端下载/缓存吃不消）。"
+                    + "已按固件实体窗口自动缩放仍超限 —— 换一只怪，或后续做进一步抽帧/降采样策略");
         }
         string entity = $"{selector}:{entityIdStr}";
         result.Add(AddAsset(summary, MpakKind.Parts, partsPayload, label, selector: selector,

@@ -488,6 +488,15 @@ int mpak_font_read_glyph_bmp(const mpak_t *m, const mpak_glyph_t *g, uint8_t *ds
  * 供回放校验工具与测试复用 */
 uint32_t mpak_crc32c(uint32_t crc, const uint8_t *data, size_t len);
 
+/* ── 【长任务让帧钩子】可选，默认 NULL（= 行为与从前逐字节一致）──────────────
+ * mpak_open 对 payload ≤ MPAK_CRC_SKIP_BYTES(4MB) 的包做**全量 CRC32C**（实测
+ * ≈1.06MB/s）：整图 BGMAP（4.06MB）单次 open ≈3.5s、4 条带再加 ≈1.3s，而它跑在
+ * 渲染任务里 ⇒ 这段时间宠物动画整段停住（真机 185B 复现"推图后人物卡死"）。
+ * 上层（compositor.c）注册一个"让一帧"回调后，本文件的 CRC 分块循环每 ~128KB 调
+ * 一次，让调用方在长同步读里保持出帧。回调自带门禁（装载窗口 / 渲染任务），
+ * 未注册或窗口外均为空操作。 */
+extern void (*mpak_long_op_hook)(void);
+
 #ifdef __cplusplus
 }
 #endif

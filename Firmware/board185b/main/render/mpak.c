@@ -22,6 +22,11 @@
 
 static const char *TAG = "mpak";
 
+/* 【长任务让帧钩子】默认未注册（NULL）= 行为与从前逐字节一致；上层（合成器）
+ * 在地图装载窗口内注册，让全量 CRC32C 这段秒级同步读里渲染任务仍能出帧
+ * （真机 185B"推图后人物卡死"根因之一）。声明见 mpak.h。 */
+void (*mpak_long_op_hook)(void) = NULL;
+
 static void mpak_layout_free(mpak_layout_t *lt); /* 前置声明 */
 
 static int u32_cmp(const void *a, const void *b)
@@ -391,11 +396,16 @@ static int envelope_check(mpak_t *m, uint64_t expect_hash, uint64_t expect_kind)
         uint32_t crc = mpak_crc32c(0, hdr, sizeof hdr);
         if (fseek(m->f, (long)sizeof hdr, SEEK_SET) != 0) return MPAK_ERR_IO;
         uint32_t remain = payload_len;
+        uint32_t nchunk = 0;
         while (remain) {
             uint32_t n = remain > sizeof chunk ? (uint32_t)sizeof chunk : remain;
             if (rd_exact(m->f, chunk, n)) return MPAK_ERR_IO;
             crc = mpak_crc32c(crc, chunk, n);
             remain -= n;
+            /* 【长任务让帧】每 64 块（= 128KB ≈ 120ms @1.06MB/s）给上层一次机会：
+             * 上层注册了 mpak_long_op_hook 时，渲染任务能在这段秒级同步 CRC 里
+             * 继续出帧（宠物动画不停）。未注册 = 空操作，行为与从前一致。 */
+            if (mpak_long_op_hook && ((++nchunk & 63u) == 0)) mpak_long_op_hook();
         }
         uint8_t trailer[MPAK_TRAILER_LEN];
         if (rd_exact(m->f, trailer, sizeof trailer)) return MPAK_ERR_IO;

@@ -185,13 +185,22 @@ public sealed class CameraService
         return maps.FirstOrDefault(m => string.Equals(m.MapId, mapId, StringComparison.Ordinal));
     }
 
-    /// <summary>设备可见窗口（世界像素）= 屏宽/2（PlacementMath.Scale=2 是导出/固件的硬契约）。</summary>
+    /// <summary>
+    /// 设备可见窗口（世界像素）= **屏宽 / 该设备上报的缩放系数**。
+    /// 系数来源：设备 hello 的 `profile.rcScale`（= 固件合成器的 RC_SCALE）；
+    /// 0/缺失 = 旧固件 → 回落 PlacementMath.Scale（= 2，历史硬契约）。
+    /// 【2026-10-01 修正】原实现写死除以 2，1.85B 做 A1（合成器 480→360、RC_SCALE=1）
+    /// 后窗口应为 360 却仍按 240 算 → 机位夹取范围（1560 vs 实际 148）、预览窗口、
+    /// 「设备视角」图全部与真机不符（用户报障："摄像机可以展示的地图大了但是对应
+    /// 服务端推送的没修改"）。现在按设备上报值算，两端口径自动一致。
+    /// </summary>
     public (int w, int h) WindowSize(string deviceId)
     {
         var p = _reg.Get(deviceId)?.Profile;
-        int w = p?.W is > 0 ? p.W / PlacementMath.Scale : 480 / PlacementMath.Scale;
-        int h = p?.H is > 0 ? p.H / PlacementMath.Scale : 480 / PlacementMath.Scale;
-        return (Math.Max(1, w), Math.Max(1, h));
+        int scale = p?.RcScale is > 0 ? p.RcScale : PlacementMath.Scale;
+        int sw = p?.W is > 0 ? p.W : 480;
+        int sh = p?.H is > 0 ? p.H : 480;
+        return (Math.Max(1, sw / scale), Math.Max(1, sh / scale));
     }
 
     /// <summary>机位夹取：x ∈ [0, MaxX]、y ∈ [0, MaxY]（设备侧 render_cam_set 同样夹取，两边一致）。</summary>

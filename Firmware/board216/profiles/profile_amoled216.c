@@ -24,6 +24,7 @@ const minipet_profile_t MINIPET_PROFILE_AMOLED216 = {
     .has_sd    = true,   /* microSD（SPI + FATFS） */
     .has_key   = true,   /* Key3 = GPIO18 */
     .ground_cam_shift_px = 0,  /* 定稿：原景（蘑菇屋场景）+宠物站地面线，不下移 */
+    .world_scale = 2,          /* 原契约：世界 1x → 屏 2x */
     .pins = {
         .i2c  = { .scl = 14, .sda = 15 }, /* 五器件共享：CST9220/AXP2101/QMI8658/PCF85063/ES8311 */
         .lcd  = { .sio0 = 4, .sio1 = 5, .sio2 = 6, .sio3 = 7,

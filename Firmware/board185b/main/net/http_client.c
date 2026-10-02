@@ -464,6 +464,10 @@ int mp_http_hello(void)
     cJSON_AddStringToObject(pr, "shape", prof->shape_name);   /* "round"/"square" */
     cJSON_AddNumberToObject(pr, "psram", prof->psram_mb);
     cJSON_AddBoolToObject(pr, "audio", prof->has_audio);
+    /* 【世界→屏 缩放上报 2026-10-01】服务端据此算设备可见窗口
+     * （window = w / rcScale）。不上报的老固件由服务端按 2 兜底，行为不变。
+     * 1.85B A1 后 = 1（世界 1x 直落面板），216 = 2。见 profile.world_scale 注释。 */
+    cJSON_AddNumberToObject(pr, "rcScale", prof->world_scale ? prof->world_scale : 2);
     cJSON_AddItemToObject(root, "profile", pr);
 
     char *body = cJSON_PrintUnformatted(root);

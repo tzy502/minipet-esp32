@@ -45,6 +45,17 @@ public static class DeviceEndpoints
         public string? Shape { get; set; }
         public int Psram { get; set; }
         public bool Audio { get; set; }
+
+        /// <summary>
+        /// 世界→屏 缩放系数（固件合成器 RC_SCALE），hello 的 profile.rcScale 字段。
+        /// **可见窗口(世界px) = W / RcScale** —— 相机机位夹取/预览/「设备视角」的权威口径。
+        /// 0/缺失 = 旧固件 → 服务端按 PlacementMath.Scale(2) 兜底（= 240 窗口，历史行为）。
+        /// 【2026-10-01 补】此前本 DTO 没有该字段 → 固件上报的 rcScale 被**静默丢弃**
+        /// （反序列化忽略未知字段），服务端仍按 2 算 → 1.85B A1（RC_SCALE=1、窗口 360）
+        /// 之后夹取范围/预览与真机不符（用户报障："摄像机可以展示的地图大了但是对应
+        /// 服务端推送的没修改"）。
+        /// </summary>
+        public int RcScale { get; set; }
     }
 
     public sealed class HelloRequest
@@ -117,6 +128,7 @@ public static class DeviceEndpoints
                 Shape = body.Profile.Shape ?? "",
                 Psram = body.Profile.Psram,
                 Audio = body.Profile.Audio,
+                RcScale = body.Profile.RcScale,     /* 0 = 旧固件 → 服务端按 2 兜底 */
             };
         }
 

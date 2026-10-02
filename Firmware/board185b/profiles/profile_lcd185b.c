@@ -52,6 +52,7 @@ const minipet_profile_t MINIPET_PROFILE_LCD185B = {
     .ground_cam_shift_px = 248, /* 185B 实验：各层上移248行，底部接真 foothold 地面带
                                  * （单位=合成器 px；整图包路径自动跳过，见 compositor） */
 
+    .world_scale = 1,          /* A1：世界 1x = 屏 1x（1:1 定稿） */
     .pins = {
         .i2c  = { .scl = 10, .sda = 11 },
         .lcd  = { .sio0 = 46, .sio1 = 45, .sio2 = 42, .sio3 = 41,

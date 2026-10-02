@@ -76,13 +76,28 @@ static bool g_inited, g_menu;
  * ══════════════════════════════════════════════════════════════════════════ */
 static SemaphoreHandle_t s_rlock;
 
+/* 【装载期保活泵用】持锁者/层数镜像记录（见"地图装载期保活泵"）：递归锁本身
+ * 不暴露层数，而"让面板上屏"必须把**本任务**持有的锁整层放开再原样加回。
+ * 只在持锁者==本任务时使用，跨任务交接处同步更新（加锁后写 owner/depth，
+ * 解锁前先减 depth、归零再清 owner），语义与 xSemaphore 的所有权一致。 */
+static TaskHandle_t s_lock_owner;
+static volatile int s_lock_depth;
+
 static void rc_lock(void)
 {
-    if (s_rlock) xSemaphoreTakeRecursive(s_rlock, portMAX_DELAY);
+    if (s_rlock) {
+        xSemaphoreTakeRecursive(s_rlock, portMAX_DELAY);
+        s_lock_owner = xTaskGetCurrentTaskHandle();
+        s_lock_depth++;
+    }
 }
 static void rc_unlock(void)
 {
-    if (s_rlock) xSemaphoreGiveRecursive(s_rlock);
+    if (s_rlock) {
+        if (s_lock_depth > 0) s_lock_depth--;
+        if (s_lock_depth == 0) s_lock_owner = NULL;
+        xSemaphoreGiveRecursive(s_rlock);
+    }
 }
 
 
@@ -1574,6 +1589,138 @@ static void ent_compose(int32_t x, int32_t y, int32_t w, int32_t h, int darken_p
 }
 
 /* ══════════════════════════════════════════════════════════════════════════
+ * 【地图装载期"宠物不停"保活泵】2026-10-02 · 185B 推图卡死根因修复
+ *
+ * 问题（真机 185B 串口实测，一次服务端推图 → 地图 004000010 整图包）：
+ * render_set_map 在**渲染任务**里同步跑完整条装载链，全程 render_tick 不返回
+ * ⇒ 宠物动画（帧推进 + 合成 + 上屏）整段停住。真机时间账（uptime ms 直读）：
+ *   · mpak_open(BGMAP) 全量 CRC32C ≈ **3.5s**
+ *     （payload 4.06MB < MPAK_CRC_SKIP_BYTES(4MB) ⇒ 不跳 CRC；~1.06MB/s）
+ *     日志判据：`cmd 派发 type=4`（120148）到 `mpak: bgmap …`（123688）静默 3.5s；
+ *   · 4 条带 mpak_open（各自全量 CRC）≈ **1.3s**（124172→125431）；
+ *   · 首帧窗口缓存整窗填充（wc_fill_cache）+ 扁平缓冲重建 ≈ **2.3s**
+ *     （`rc: 相机 → (74,755) 窗口读 3996 行 / 1931 KB（2248 ms）`）；
+ *   · 紧随其后的"相位回正 4 带"再 ≈ **0.7s**（`重建 692 ms`）。
+ * 合计 ≈ 7.8s：这段里屏上是同一张静止画面 = 用户口径"图推送后人物疑似卡死"。
+ *
+ * 为什么必须"分片 + 让锁"两件事一起做：本板显示通路**只有一条**——驱动层持续
+ * 刷新任务（display_st77916.c refresh_task，CONFIG_MP_LCD_CONTINUOUS_REFRESH=y）
+ * 按 2 行一块把 g_fb 刷到面板，而 display_blit 在该模式下直接 return（空操作）。
+ * 该任务每块都要拿**帧锁**（= 本文件 rc_lock）读 g_fb，所以只要渲染任务持着锁
+ * （地图装载正好整段持锁：render_set_map 一层 + full_recompose 一层），
+ * 面板就冻结 —— 光"分片"不"放锁"依旧一帧都上不去。
+ *
+ * 本泵做的事（只在装载窗口 g_pump_until_us 内生效，其余时刻零成本）：
+ *   ① 放锁 → vTaskDelay(RC_PUMP_PANEL_MS) → 按原层数加回（pump_yield_panel）；
+ *   ② rc_anim_advance 推进动画帧（含 finished → 回绑 standby，与 render_tick 同口径）
+ *      + recompose_entity_locked 重合成实体缓冲；
+ *   ③ **只**把实体层叠进 g_fb（复用 ent_compose = compose_region 第 5 步），
+ *      不铺背景、不碰脏区/flush/mapfb 路径 ⇒ 不会重入正在进行的整屏重合成，
+ *      不触发任何 TF 读，也不改变任何图层内容；
+ *   ④ 上一拍画过的矩形标脏（装载收尾的 full_recompose 会整屏洗净残影）。
+ *
+ * 调用点（都是"秒级同步重活"的循环里，见各处的 rc_long_op_pump）：
+ *   · wc_fill_cache 的按带读循环 / 逐行读循环（整窗填充）；
+ *   · mpak.c 的全量 CRC 分块循环（经 mpak_long_op_hook，覆盖三条 mpak_open）；
+ *   · cam_scene_load 的逐条带装载循环、layer_rgb_load 的整层直读前后。
+ *
+ * 代价与边界：
+ *   · 装载总时长增加 ≈ 20ms/120ms ≈ 17%（7.8s → ~9s），换来这 9s 里宠物每
+ *     ~140ms 动一次（≈7fps）而不是整段静止；
+ *   · 泵帧只画实体层，背景沿用 g_fb 里装载前的那一帧 ⇒ 动画位移大的动作
+ *     （walk）在装载期可能留 1~3px 浅拖影（收尾 full_recompose 洗净）；
+ *   · 只在**渲染任务**里泵（其余任务的 mpak_open 不受影响）；
+ *   · 时钟态（CLOCK_DOZE）/菜单态不泵（那两屏的整屏语义不同）。
+ * ══════════════════════════════════════════════════════════════════════════ */
+#define RC_PUMP_GAP_MS     120    /* 两次泵帧之间的最小间隔（按工作耗时计，不含让位） */
+#define RC_PUMP_PANEL_MS    20    /* 每次泵帧让位时长（≈ 持续刷新任务一轮全屏扫描） */
+#define RC_PUMP_GRACE_MS  2500    /* 装载返回后的宽限：覆盖"首帧相位回正"那一笔填充 */
+
+static volatile int64_t g_pump_until_us;   /* 0/过去时刻 = 关；>now = 窗口内 */
+static int64_t  g_pump_last_us;
+static TaskHandle_t g_render_task;         /* 渲染任务句柄（只在它里面泵帧） */
+static int32_t  g_pump_rx, g_pump_ry, g_pump_rw, g_pump_rh;   /* 上一拍泵帧的实体矩形 */
+static uint32_t g_pump_n, g_pump_frames;   /* 本装载窗口内：让帧次数 / 实际推进的动画帧数 */
+
+/* 放开本任务持有的帧锁 → 让一拍 → 原层数加回。仅当持锁者==本任务才做：
+ * 否则会"给出不属于自己的锁"，破坏递归锁的所有权语义。 */
+static void pump_yield_panel(void)
+{
+    if (!s_rlock) return;
+    TaskHandle_t me = xTaskGetCurrentTaskHandle();
+    if (s_lock_owner != me || s_lock_depth <= 0) return;   /* 没持锁：无需让位 */
+    int depth = s_lock_depth;
+    for (int i = 0; i < depth; i++) xSemaphoreGiveRecursive(s_rlock);
+    s_lock_depth = 0; s_lock_owner = NULL;
+    vTaskDelay(pdMS_TO_TICKS(RC_PUMP_PANEL_MS));
+    for (int i = 0; i < depth; i++) xSemaphoreTakeRecursive(s_rlock, portMAX_DELAY);
+    s_lock_owner = me; s_lock_depth = depth;
+}
+
+/* 泵一帧（长重活循环里周期性调用；窗口外/非渲染任务/菜单/时钟 = 立即返回） */
+void rc_long_op_pump(void)
+{
+    if (!g_inited || g_menu) return;
+    int64_t now = esp_timer_get_time();
+    if (now >= g_pump_until_us) return;
+    if (g_render_task && xTaskGetCurrentTaskHandle() != g_render_task) return;
+    if (now - g_pump_last_us < (int64_t)RC_PUMP_GAP_MS * 1000) return;
+    g_pump_last_us = now;
+    g_pump_n++;
+
+    /* ① 先放锁：下面写进 g_fb 的像素要等持续刷新任务读到才看得见 */
+    pump_yield_panel();
+    /* 时钟态是"黑底 + 数字"整屏语义（compose_region 的 0 分支），叠实体不对 */
+    if (clock_digits_active()) return;
+
+    rc_lock();
+    rc_anim_ev_t ev;
+    if (rc_anim_advance(&g_anim, esp_timer_get_time(), &ev)) {
+        g_pump_frames++;
+        if (ev.finished) {
+            /* 与 render_tick 第 1 步同口径：单次动作播完 → 回退 standby 循环布局 */
+            mark_ent_at(g_tilt_mdeg);
+            mpak_close(&g_lt_once);
+            g_lt_once_ok = false;
+            bind_active_layout(esp_timer_get_time(), false);
+        }
+        recompose_entity_locked();
+        int32_t bx, by, ex, ey, dw, dh;
+        ent_screen_rect_at(g_tilt_mdeg, &bx, &by, &ex, &ey, &dw, &dh);
+        if (dw > 0 && dh > 0) {
+            if (g_pump_rw > 0 && (g_pump_rx != ex || g_pump_ry != ey ||
+                                  g_pump_rw != dw || g_pump_rh != dh))
+                mark_rect_locked(g_pump_rx, g_pump_ry, g_pump_rw, g_pump_rh);
+            ent_compose(ex, ey, dw, dh, 0);      /* 只叠实体层：不铺背景/不碰地图路径 */
+            g_pump_rx = ex; g_pump_ry = ey; g_pump_rw = dw; g_pump_rh = dh;
+        }
+    }
+    rc_unlock();
+}
+
+/* 开窗：地图装载入口调用（装载期间的每一次唤醒都值得让一帧） */
+static void rc_pump_window_begin(void)
+{
+    g_pump_last_us  = esp_timer_get_time();
+    g_pump_until_us = INT64_MAX;
+    g_pump_rw = 0;
+    g_pump_n = 0; g_pump_frames = 0;
+}
+/* 关窗：留一段宽限（装载返回后第一笔 flush 里还有"相位回正"的整窗重填）。
+ * 打印本窗口的让帧计数 = 真机判据：装载这 N 秒里宠物动画被服务了多少次
+ * （0 次 = 泵没生效，退回"整段静止"的老行为）。 */
+static void rc_pump_window_end(void)
+{
+    if (g_pump_n) {
+        ESP_LOGW(TAG, "装载期保活泵：本窗口让帧 %u 次 / 推进动画 %u 帧（装载窗口内宠物不停；"
+                      "未让帧时 = 老行为：整段静止）",
+                 (unsigned)g_pump_n, (unsigned)g_pump_frames);
+    }
+    g_pump_until_us = esp_timer_get_time() + (int64_t)RC_PUMP_GRACE_MS * 1000;
+    g_pump_rw = 0;
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
  * R2 整图相机 + 分块流式窗口缓存（契约 docs/ai/map-fullmap-firmware-contract.md §3.2）
  *
  * 用户硬约束（需求 §5.2）：整图包（vw/vh ≫ 屏，如 000010000 = 2270×1807）下
@@ -2045,6 +2192,7 @@ static int wc_fill_cache(rc_wincache_t *wc, int32_t cx0, int32_t cy0, int32_t w,
             const int32_t cstart = x0 + (sx0 - s0);
             for (int32_t cy = y0; cy < y1; ) {
                 watchdog_kick();
+                rc_long_op_pump();     /* 【装载期保活】整窗填充是秒级重活：让宠物继续动 */
                 int32_t band = y1 - cy;
                 if (band > 32) band = 32;
                 int32_t sy = wc->ay + cy;
@@ -2096,6 +2244,7 @@ static int wc_fill_cache(rc_wincache_t *wc, int32_t cx0, int32_t cy0, int32_t w,
          * 三振熔断（监控任务 vTaskSuspend(render_task)）→ 设备"卡死"。
          * 这是**合法长任务**，必须主动喂狗：每 16 行一次（≈100ms 粒度）。 */
         if ((cy & 15) == 0) watchdog_kick();
+        rc_long_op_pump();             /* 【装载期保活】wrap 层逐行读同上 */
         memset(wc->px + (size_t)cy * wc->cw + x0, 0, (size_t)(x1 - x0) * 2u);
         if (wc->cov) wc_cov_clear_range(wc, cy, x0, x1 - x0);
         int32_t sy = wc->ay + cy;
@@ -3050,6 +3199,7 @@ static int cam_scene_load(mpak_t *bm, const mpak_bgmap_t *bg,
         }
         g_strip_n = strip_count;
         for (int i = 0; i < strip_count; i++) {
+            rc_long_op_pump();     /* 【装载期保活】每条带的 mpak_open 都带全量 CRC（百 ms 级） */
             int rc = strip_load_world(&g_strips[i], strip_parts_paths[i], &bg->strips[i]);
             if (rc != MPAK_OK) {
                 ESP_LOGE(TAG, "整图条带 %d 装载失败（%s）rc=%d", i, strip_parts_paths[i], rc);
@@ -3889,6 +4039,7 @@ static uint16_t *layer_rgb_load(const mpak_t *m, uint32_t off, uint32_t len,
     }
     uint8_t *raw = psram(len);
     if (!raw) { heap_caps_free(dst); return NULL; }
+    rc_long_op_pump();      /* 【装载期保活】整层直读是一次同步大读（旧口径 ≤460KB ≈0.5s） */
     if (mpak_read_at((mpak_t *)m, m->payload_off + off, raw, len) != MPAK_OK) {
         heap_caps_free(raw); heap_caps_free(dst);
         return NULL;
@@ -4154,6 +4305,11 @@ int render_init(const minipet_profile_t *profile)
 
     rc_anim_init(&g_anim);
 
+    /* 【装载期保活泵】把让帧钩子交给 mpak：全量 CRC32C 是秒级同步读（整图 BGMAP
+     * 单次 ≈3.5s），钩子让渲染任务在这段时间里继续出帧（见"地图装载期保活泵"）。
+     * 钩子内部自带门禁（装载窗口 / 渲染任务 / 菜单 / 时钟），窗口外零成本。 */
+    mpak_long_op_hook = rc_long_op_pump;
+
     /* 问题3：屏尺寸/比例先行告知时钟模块（默认居中锚点与 get_rect 标脏依赖；
      * 旧实现 scale 在首次 compose 才赋值 → enable 后时钟矩形恒 0 永不标脏） */
     clock_digits_set_screen(g_sw, g_sh);
@@ -4373,6 +4529,9 @@ static void ent_bounce_if_offscreen(void)
 void render_tick(void)
 {
     if (!g_inited) return;
+    /* 【装载期保活泵】记住渲染任务：地图装载也在本任务里跑（cmd_q 排空），
+     * 泵帧只允许在本任务出现，避免别的任务（net 侧 mpak_open 的 CRC）误泵。 */
+    if (!g_render_task) g_render_task = xTaskGetCurrentTaskHandle();
     int64_t now_us = esp_timer_get_time();
 
     /* 【调参档自动回落 2026-10-01】拖动停止 → level 2 回 1（补 tile/条带缓存内容）
@@ -4977,7 +5136,11 @@ static int render_set_map_nolock(const char *bgmap_path,
 {
     if (!g_inited || !bgmap_path) return RENDER_ERR_ARG;
     render_busy_banner("MAP LOADING - PLEASE WAIT", true);
+    /* 【装载期保活】开泵窗：本函数体内（包 CRC / 逐条带装载 / 首帧整窗填充）都是
+     * 秒级同步重活，泵让宠物动画继续推进+上屏（见"地图装载期保活泵"）。 */
+    rc_pump_window_begin();
     int rc = render_set_map_body(bgmap_path, strip_parts_paths, strip_count);
+    rc_pump_window_end();
     render_busy_banner(NULL, false);      /* 关横幅 + 置忙尾（终结期按键同样丢弃） */
     return rc;
 }

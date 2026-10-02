@@ -121,9 +121,18 @@ static void cg_free(cg_t *g)
 
 void clock_digits_unload(void)
 {
+    /* 【A1 修复 2026-10-02】屏幕尺寸/比例是渲染层初始化时**一次性告知**的常驻
+     * 信息（clock_digits_set_screen，render_init 调用），不属于"包状态"。
+     * 原实现整块 memset → 把它一起抹掉；而 configure(path) 开头必调 unload()
+     * ⇒ 进入待机时钟那一次 configure 之后 sw/sh 已经=0，AUTO 居中只能退回兜底
+     * 常量（本板兜底恰好 = 360×360 才没露馅；换屏/换板就偏）。这里按值保留。 */
+    int32_t sw = s_ck.sw, sh = s_ck.sh, scale = s_ck.scale;
     for (int i = 0; i < CLOCK_GLYPHS; i++) cg_free(&s_ck.g[i]);
     if (s_ck.loaded) mpak_close(&s_ck.mpk);
     memset(&s_ck, 0, sizeof s_ck);
+    s_ck.sw = sw;
+    s_ck.sh = sh;
+    s_ck.scale = scale;
 }
 
 int clock_digits_configure(const char *parts_path, int16_t anchor_wx,
