@@ -209,7 +209,9 @@ void render_cam_adjust_motion_notify(void);
  *      否则用户"卡完再按"的那一下正好落进队列形成积压）；
  *   ③ 相机调参极限档（= 正在拖动/吸附）或显式 loading 窗口（相机收尾重派发地图）。
  * 只读、可从任意任务调用（内部全是 volatile 标量）。 */
-#define RC_BUSY_TAIL_MS     200
+/* 【2026-10-02 200→120】用户报"无法正常保存/退出"：忙尾过长时按键被连续丢弃，
+ * 体感就是"按键失灵"。120ms 仍能覆盖"重活刚结束那一下"，但不再吃掉正常按键。 */
+#define RC_BUSY_TAIL_MS     120
 bool render_busy(void);
 /* 重活窗口（可嵌套；只在渲染任务/持有 rc_lock 的路径调用）。why = 横幅文案前缀。 */
 void render_busy_enter(const char *why);

@@ -186,7 +186,11 @@ static int64_t          g_busy_t0_us;         /* 重活起点：只有真"重"�
  * 满屏"忙窗结算：LOADING ... 82 ms ≥ 60 ms → 之后 200ms 内丢弃按键/触摸"）。
  * 提到 250ms：只有真正的长任务（地图装载、相机落盘重派发、整幅失效重建）
  * 才置忙；常态帧不再锁输入。 */
-#define RC_BUSY_HEAVY_US 250000
+/* 【2026-10-02 再放宽】用户报"无法正常保存/退出"：忙窗太大 + 忙尾太长时，按键会被
+ * 连续丢弃（设计如此，但过宽就像"按键失灵"）。250ms→400ms、忙尾 200→120ms：
+ * 仍能挡住地图装载/相机落盘这类秒级重活（那才是"攒着一口气执行"的根源），
+ * 但常态帧（compose 6~13ms + blit 13~38ms ≈ 20~50ms）绝不再误判。 */
+#define RC_BUSY_HEAVY_US 400000
 #define RC_BANNER_TEXT_CAM_MOVE "CAM MOVING - PLEASE WAIT"
 #define RC_BANNER_TEXT_LOADING  "LOADING - PLEASE WAIT"
 
@@ -4334,7 +4338,12 @@ static void ent_bounce_if_offscreen(void)
     int32_t oy = (y1 < g_sh ? y1 : g_sh) - (by > 0 ? by : 0);
     if (ox < 0) ox = 0;
     if (oy < 0) oy = 0;
-    if ((int64_t)ox * oy * 2 >= (int64_t)dw * dh) return;   /* 可见 ≥50%：不弹 */
+    /* 【口径统一 2026-10-02】原判据是**面积** ≥50%（ox*oy*2 ≥ dw*dh）。但用户口径是
+     * "上下左右都不允许超过 50% 在屏外"= **单轴**各 ≥50% 可见。两者在角落不兼容：
+     * 单轴各露一半 ⇒ 面积只剩 25% ⇒ 面积判据立刻把宠物弹回去，用户体感就是
+     * "拖动以后无法全屏拉动 / 被拉回来"（真机报障）。现改为与 drag_clamp 完全同口径：
+     * **单轴可见长度各 ≥ 一半即合法**。 */
+    if (ox * 2 >= dw && oy * 2 >= dh) return;               /* 单轴各 ≥50%：不弹 */
     int32_t px = g_drag_off_x, py = g_drag_off_y;
     drag_clamp(&px, &py);
     if (px != g_drag_off_x || py != g_drag_off_y) {
