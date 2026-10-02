@@ -260,7 +260,8 @@ async function doApply(saveFirst = false) {
   if (saveFirst && !(await doSave(true))) return
   busy.value = 'apply'
   try {
-    const r = await sendCameraCommand(props.deviceId, x.value, y.value)
+    // 带上当前选中的图：否则服务端只能回退 lastMapId，可能把机位应用到别的图
+    const r = await sendCameraCommand(props.deviceId, x.value, y.value, mapId.value)
     lastSeq.value = r?.seq ?? null
     statusText.value = `已下发设备：cam=${r?.value ?? `${x.value},${y.value}`}`
       + (r?.seq != null ? `（seq ${r.seq}）` : '')

@@ -13,8 +13,9 @@
  *   状态与读写共享 Web/src/utils/favorites.js（设备选择器的「最近+收藏」分组读同一份）。
  * - 「推送到设备」（T3/E4/E7）：📤 推送是真正上机动作 ——
  *   选目标设备 → POST /admin/devices/{id}/push {kind,id,switch} → 202 后台打包，
- *   完成后服务端 bump manifest rev + 自动下发切图指令（设备自动切换）。服务端 push 仅
- *   支持 kind=map|npc（AdminEndpoints.cs:254-329），故 mob/纸娃娃 tab 只给禁用态说明。
+ *   完成后服务端 bump manifest rev + 自动下发指令（map=切图；mob/npc=把宠物形象切成该实体）。
+ *   服务端 push 支持 kind=map|mob|npc（AdminEndpoints /devices/{id}/push），
+ *   仅纸娃娃部件 tab 无对应 push 分支（装扮走纸娃娃编辑器的换装通道）→ 只给禁用态说明。
  */
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import {
@@ -209,8 +210,10 @@ const pushSwitch = ref(true) // 仅 kind=map 生效（服务端分支）；勾�
 const pushing = ref(false)
 const pushResult = ref(null) // { type: 'success'|'error', text }
 
-/** 当前 tab 是否可推送：服务端只接受 map|npc。 */
-const pushableKind = computed(() => (activeTab.value === 'map' || activeTab.value === 'npc' ? activeTab.value : null))
+/** 当前 tab 是否可推送：服务端接受 map|mob|npc（mob/npc = 设备端怪物/NPC 形象切换）。 */
+const pushableKind = computed(() =>
+  (activeTab.value === 'map' || activeTab.value === 'mob' || activeTab.value === 'npc' ? activeTab.value : null)
+)
 const deviceOptions = computed(() =>
   devicesStore.devices.map((d) => ({
     label: `${d.name || '未命名设备'}（${d.deviceId}）${d.online ? ' · 在线' : ' · 离线'}`,
@@ -220,7 +223,7 @@ const deviceOptions = computed(() =>
 
 function openPush(it) {
   if (!pushableKind.value) {
-    message.warning('服务端推送端点仅支持地图 / NPC（kind=map|npc）')
+    message.warning('该分类不可推送：服务端 push 支持地图 / 怪物 / NPC（kind=map|mob|npc）')
     return
   }
   pushTarget.value = { kind: activeTab.value, id: it.id, name: it.name }
@@ -241,7 +244,7 @@ function openPush(it) {
 /** 错误分支文案（400/404/503 是服务端 push 端点明确定义的三种拒绝）。 */
 function pushErrorHint(status) {
   switch (status) {
-    case 400: return '请求参数被拒：kind 必须是 map|npc，id 不能为空'
+    case 400: return '请求参数被拒：kind 必须是 map|mob|npc，id 不能为空'
     case 404: return '设备不存在（可能已被移除，刷新设备列表后重选）'
     case 503: return 'WZ 未加载：到「设置」页配置 WZ 路径后重试'
     case 500: return '服务端处理异常（资产打包失败，详见服务端日志）'
@@ -260,10 +263,13 @@ async function doPush() {
   try {
     const r = await pushMaterial(pushDeviceId.value, pushTarget.value.kind, pushTarget.value.id, pushSwitch.value)
     const text = `已受理（HTTP 202）：${r?.note || '后台打包中'}`
-    pushResult.value = {
-      type: 'success',
-      text: `${text}${pushSwitch.value && pushTarget.value.kind === 'map' ? '；资产登记完成后服务端自动下发切图指令' : ''}`,
-    }
+    const kind = pushTarget.value.kind
+    const tail = !pushSwitch.value
+      ? ''
+      : kind === 'map'
+        ? '；资产登记完成后服务端自动下发切图指令'
+        : '；资产登记完成后服务端自动下发切换指令（设备端把宠物形象切成该实体）'
+    pushResult.value = { type: 'success', text: `${text}${tail}` }
     message.success(text)
   } catch (e) {
     const status = e?.response?.status
@@ -327,7 +333,7 @@ onBeforeUnmount(() => clearTimeout(searchTimer))
             </div>
           </n-tooltip>
           <n-button v-if="syncState === 'ok'" size="tiny" secondary :loading="syncing" @click="syncNow">同步到服务端</n-button>
-          <span class="hint">★ 收藏已喂给设备选择器（「最近+收藏」）；📤 推送才是上机动作（服务端 push 支持地图/NPC）</span>
+          <span class="hint">★ 收藏已喂给设备选择器（「最近+收藏」）；📤 推送才是上机动作（服务端 push 支持地图/怪物/NPC）</span>
         </n-space>
         <n-checkbox v-model:checked="onlyFav">只看收藏（{{ favCount }}）</n-checkbox>
       </n-space>
@@ -398,18 +404,18 @@ onBeforeUnmount(() => clearTimeout(searchTimer))
               >
                 {{ isFav(favBucket, it.id) ? '★' : '☆' }}
               </n-button>
-              <!-- 推送到设备：map/npc 可推；mob/纸娃娃服务端无对应 push 分支 → 禁用态说明 -->
-              <n-tooltip v-if="tab.key === 'map' || tab.key === 'npc'" trigger="hover">
+              <!-- 推送到设备：map/mob/npc 可推（mob/npc = 设备端切成该怪物/NPC 形象）；纸娃娃无 push 分支 -->
+              <n-tooltip v-if="tab.key !== 'paperdoll'" trigger="hover">
                 <template #trigger>
                   <n-button class="push" size="tiny" circle secondary type="primary" @click="openPush(it)">📤</n-button>
                 </template>
-                推送到设备（{{ tab.key === 'map' ? '地图' : 'NPC' }}资产登记 + 自动切换）
+                推送到设备（{{ tab.key === 'map' ? '地图' : tab.key === 'mob' ? '怪物' : 'NPC' }}资产登记 + 自动生效）
               </n-tooltip>
               <n-tooltip v-else trigger="hover">
                 <template #trigger>
                   <n-button class="push" size="tiny" circle secondary disabled>📤</n-button>
                 </template>
-                服务端 push 端点只支持 kind=map|npc（{{ tab.key === 'mob' ? '怪物' : '纸娃娃部件' }}暂无可推送资产类型）
+                纸娃娃部件无 push 分支（装扮请在「纸娃娃编辑器」里换装下发）
               </n-tooltip>
             </div>
           </div>
@@ -434,7 +440,9 @@ onBeforeUnmount(() => clearTimeout(searchTimer))
     >
       <n-space vertical :size="12">
         <n-space align="center" :size="8">
-          <n-tag :bordered="false" type="info">{{ pushTarget?.kind === 'map' ? '地图' : 'NPC' }}</n-tag>
+          <n-tag :bordered="false" type="info">
+            {{ pushTarget?.kind === 'map' ? '地图' : pushTarget?.kind === 'mob' ? '怪物' : 'NPC' }}
+          </n-tag>
           <b>{{ pushTarget?.name || '—' }}</b>
           <span class="hint">{{ pushTarget?.id }}</span>
         </n-space>
@@ -453,12 +461,13 @@ onBeforeUnmount(() => clearTimeout(searchTimer))
         </div>
 
         <n-checkbox v-model:checked="pushSwitch" :disabled="pushing">
-          登记后立即切换（仅地图生效；NPC 只登记资产）
+          登记后立即生效（地图=切图；怪物/NPC=设备端把宠物形象切成该实体）
         </n-checkbox>
 
         <div class="hint">
           推送 = 服务端把该素材打包进此设备 manifest（数秒，HTTP 202 受理）→ 设备轮询到 rev
-          变化后自动拉包 → 完成后自动切换。收藏（★）以本机 localStorage 为真源
+          变化后自动拉包 → 完成后自动切换（怪物/NPC 走 PARTS+LAYOUT 实体通道，固件选中即换形象）。
+          收藏（★）以本机 localStorage 为真源
           <template v-if="syncState === 'ok'">，并已同步到服务端</template>
           <template v-else>（服务端收藏端点缺失 → 仅本机）</template>，且已喂给设备详情页的地图选择器。
         </div>

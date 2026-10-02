@@ -122,8 +122,16 @@ export const DEVICE_COMMAND_CAM = 'cam'
  * 服务端白名单已放行 cam，并转成固件**旧口径** {t:"cam",v:"x,y"}（固件的 cam 分支只在
  * handle_cmd 里，现代 {type,payload} 分支没有它）。设备收到即 render_cam_set(x,y) 并写 NVS。
  */
-export function sendCameraCommand(deviceId, x, y) {
-  return sendDeviceCommand(deviceId, DEVICE_COMMAND_CAM, `${Math.round(Number(x))},${Math.round(Number(y))}`)
+export function sendCameraCommand(deviceId, x, y, mapId) {
+  /* 【必须带 mapId 2026-10-02】真机事故：用户在页面选了 A 图推机位，而设备当时显示的
+   * 是 B 图 ⇒ 只带 x,y 的旧口径会把坐标应用到**错误的图**上（还写进那张图的 NVS），
+   * 用户现象就是"上送了但位置不对/像失败"。服务端支持 body.mapId，固件支持
+   * "<mapId>,<x>,<y>"（先切图再定位，装载完成校验目标图一致才应用）。
+   * 不传 mapId 时服务端会回退到"最近一次选过的图"（camera-positions.json 的 lastMapId），
+   * 那对"用户刚在页面上换了图但没保存"的场景是错的 —— 所以这里显式传。 */
+  const opts = mapId ? { mapId: String(mapId) } : {}
+  return sendDeviceCommand(deviceId, DEVICE_COMMAND_CAM,
+    `${Math.round(Number(x))},${Math.round(Number(y))}`, opts)
 }
 
 // ── 设备（E13）───────────────────────────────────────────────────────────
@@ -194,6 +202,8 @@ export function sendDeviceCommand(deviceId, type, value, opts = {}) {
   // 点播通道：服务端把源内 key 折算成 u32（XxHash32，与设备曲目表同口径）再发 n
   if (opts.trackId != null) body.trackId = String(opts.trackId)
   if (opts.trackTitle != null) body.trackTitle = String(opts.trackTitle)
+  /* cam 专用：目标地图 id（服务端 DeviceCommandRequest.MapId → 指令带 mapId） */
+  if (opts.mapId != null) body.mapId = String(opts.mapId)
   if (opts.source != null) body.source = String(opts.source)
   return http.post(`/admin/devices/${encodeURIComponent(deviceId)}/command`, body).then((r) => r.data)
 }
