@@ -833,11 +833,153 @@ static bool action_maybe_camtest(const char *action)
     return true;
 }
 
+/* ══ 实体（怪物 / NPC）形象 2026-10-02 ══════════════════════════════════════
+ * 用户口径：「怪物页选中 = 宠物形象变成这只怪物」，216 与 1.85B 同口径。
+ * 实现 = 复用纸娃娃那条渲染通道（PARTS + LAYOUT），只是包从 entity 上取：
+ *   · 服务端 kind=mob 导出 selector=mob/entity="mob:<id>" 的包（Web 怪物 tab 📤 推送）；
+ *   · 设备把该实体当"另一套装扮"绑上（render_set_parts + render_set_layout）；
+ *   · 动作名不同（mob: stand/move/fly/hit1，纸娃娃: stand1/walk1/fly/alert/hit）→
+ *     下面 entity_action_of() 做映射，查不到就回落到实体默认动作（不黑屏）；
+ *   · 选择写 NVS（"entity"），重启后自动恢复；包还没下完则先记意图，
+ *     MANIFEST_SYNCED（素材同步完成）时自动补绑。
+ * 为什么不是"新渲染分支"：合成器只认 PARTS/LAYOUT 两种包，实体包与纸娃娃包**逐字节
+ * 同构**（同一 PartPackWriter/LayoutPackWriter），多一条分支只会多一处漂移风险。 */
+#define SM_ENTITY_NVS_KEY "entity"
+
+static char s_entity[40];               /* "" = 纸娃娃；否则 "mob:<id>"/"npc:<id>" */
+static bool s_entity_bound;            /* 该实体已成功绑到渲染层（幂等：避免每次 manifest 同步重开包） */
+
+const char *sm_active_entity(void) { return s_entity; }
+
+/* 纸娃娃动作名 → 实体动作名。实体 WZ 动作用的是 stand/move/fly/hit1 这套命名，
+ * 直接拿 stand1/walk1 去查实体的 LAYOUT 必然查不到（真机表现会是"切过去就静止"）。 */
+static const char *entity_action_of(const char *pd_action)
+{
+    if (!pd_action || !pd_action[0]) return NULL;
+    if (strcmp(pd_action, MP_ACTION_STAND) == 0) return "stand";
+    if (strcmp(pd_action, MP_ACTION_WALK)  == 0) return "move";
+    if (strcmp(pd_action, MP_ACTION_FLY)   == 0) return "fly";
+    if (strcmp(pd_action, MP_ACTION_ALERT) == 0) return "stand";
+    if (strcmp(pd_action, MP_ACTION_HIT)   == 0) return "hit1";
+    return pd_action;                       /* 服务端直发实体动作名时按原名试 */
+}
+
+/* 实体动作是否循环播（与 dispatch_action 的纸娃娃口径一致：站立/走路/飞=循环） */
+static bool entity_action_loops(const char *a)
+{
+    return a && (strcmp(a, "stand") == 0 || strcmp(a, "move") == 0 ||
+                 strcmp(a, "fly") == 0 || strcmp(a, "walk") == 0 ||
+                 strcmp(a, "stand0") == 0 || strcmp(a, "move0") == 0);
+}
+
+/* 实体默认动作 → LAYOUT 路径（清单无 defaultAction 时 asset_dl 回退首个动作）。 */
+static bool entity_default_layout_path(const char *entity, char *path, size_t cap, char *act_out,
+                                       size_t act_cap)
+{
+    char act[32];
+    if (!asset_dl_entity_default_action(entity, act, sizeof act)) return false;
+    if (!asset_dl_entity_layout_path(entity, act, path, cap)) return false;
+    if (act_out) strlcpy(act_out, act, act_cap);
+    return true;
+}
+
+/* 实体切换（MP_CMD_SET_ENTITY / 开机恢复）。entity 空或 "paperdoll*" = 回纸娃娃。 */
+static void dispatch_entity(const char *entity)
+{
+    const char *want = entity ? entity : "";
+
+    /* ── 回纸娃娃 ── */
+    if (!want[0] || strncmp(want, "paperdoll", 9) == 0) {
+        bool was = (s_entity[0] != 0);
+        s_entity[0] = 0;
+        s_entity_bound = false;
+        mp_nvs_set_str(SM_ENTITY_NVS_KEY, "");
+        if (!heap_ok_for_asset_load()) {
+            ESP_LOGW(TAG, "内部堆不足，跳过回纸娃娃绑定（防 fopen abort）");
+            return;
+        }
+        char pp[MP_MPK_PATH_MAX], ll[MP_MPK_PATH_MAX];
+        int prc = asset_dl_parts_path(NULL, pp, sizeof(pp)) ? render_set_parts(pp) : -1;
+        int lrc = asset_dl_layout_path(MP_ACTION_STAND, ll, sizeof(ll))
+                      ? render_set_layout(ll, true) : -1;
+        ESP_LOGW(TAG, "形象切回纸娃娃（was_entity=%d）parts rc=%d layout rc=%d", (int)was, prc, lrc);
+        return;
+    }
+
+    if (!heap_ok_for_asset_load()) {
+        ESP_LOGW(TAG, "内部堆不足，跳过形象切换 %s（防 fopen abort）", want);
+        return;
+    }
+    /* 意图先落地（NVS + 内存）：包可能还在下载 —— 记住它，素材同步完成后自动补绑 */
+    bool changed = (strcmp(s_entity, want) != 0);
+    strlcpy(s_entity, want, sizeof s_entity);
+    mp_nvs_set_str(SM_ENTITY_NVS_KEY, s_entity);
+
+    /* 全有才绑：PARTS 与**默认动作 LAYOUT** 必须都在本地 —— 只绑一半会让渲染层出现
+     * "怪物 PARTS + 纸娃娃 LAYOUT"的错配帧（合成器会按"部件解析失败"自愈并刷日志，
+     * 用户看到的是形象错乱）。缺任一包 → 只记住意图，等 MANIFEST_SYNCED 重试。 */
+    char path[MP_MPK_PATH_MAX], act[32] = "";
+    if (!asset_dl_entity_parts_path(s_entity, path, sizeof path) ||
+        !entity_default_layout_path(s_entity, path, sizeof path, act, sizeof act)) {
+        ESP_LOGW(TAG, "实体 %s 的 PARTS/默认动作布局还没下全 → 先记住，素材同步后自动切",
+                 s_entity);
+        return;
+    }
+    int prc = render_set_parts(path);
+    if (prc != 0) {
+        vTaskDelay(pdMS_TO_TICKS(50));           /* TF 争用重试（同 parts 首开口径） */
+        prc = render_set_parts(path);
+    }
+    int lrc = -1;
+    if (prc == 0) {
+        if (!asset_dl_entity_layout_path(s_entity, act, path, sizeof path)) {
+            ESP_LOGW(TAG, "实体 %s 默认动作 %s 的布局路径消失（被淘汰？）", s_entity, act);
+        } else {
+            lrc = render_set_layout(path, entity_action_loops(act));
+            if (lrc != 0) {
+                vTaskDelay(pdMS_TO_TICKS(50));
+                lrc = render_set_layout(path, entity_action_loops(act));
+            }
+        }
+    }
+    s_entity_bound = (prc == 0 && lrc == 0);
+    ESP_LOGW(TAG, "形象切换%s → %s（parts rc=%d）默认动作 %s（layout rc=%d）",
+             changed ? "" : "（同实体重绑）", s_entity, prc,
+             act[0] ? act : "(无)", lrc);
+    if (prc != 0 || lrc != 0) {
+        /* 绑定失败：保留 NVS 意图 + 请求一次素材同步（同"部件错配自愈"通道），
+         * 下轮 MANIFEST_SYNCED 会再试一次；屏上保留旧画面，不黑屏。 */
+        extern void asset_dl_request_sync(void);
+        asset_dl_request_sync();
+    }
+}
+
 static void dispatch_action(const char *action)
 {
     char path[MP_MPK_PATH_MAX];
     if (!heap_ok_for_asset_load()) {
         ESP_LOGW(TAG, "内部堆不足，跳过动作切换 %s（防 fopen abort）", action);
+        return;
+    }
+    /* ── 实体态：动作从该实体自己的 LAYOUT 里取（先映射名字，再回落默认动作）── */
+    if (s_entity[0]) {
+        const char *want = entity_action_of(action);
+        char use[32] = "";
+        bool ok = false;
+        if (want && want[0]) {
+            ok = asset_dl_entity_layout_path(s_entity, want, path, sizeof(path));
+            if (ok) strlcpy(use, want, sizeof use);
+        }
+        if (!ok) {
+            /* 该实体没有这个动作（多数怪物没有 alert/hit）→ 回落默认动作，
+             * 绝不去查纸娃娃的布局（那会让怪物突然变成纸娃娃的姿势/部件错配）。 */
+            ok = entity_default_layout_path(s_entity, path, sizeof(path), use, sizeof use);
+        }
+        if (!ok) {
+            ESP_LOGW(TAG, "实体 %s 无可用布局（动作 %s）→ 保留当前画面", s_entity, action);
+            return;
+        }
+        render_set_layout(path, entity_action_loops(use));
         return;
     }
     if (!asset_dl_layout_path(action, path, sizeof(path))) {
@@ -847,6 +989,23 @@ static void dispatch_action(const char *action)
                  strcmp(action, MP_ACTION_WALK) == 0 ||
                  strcmp(action, MP_ACTION_FLY) == 0);
     render_set_layout(path, loop);
+}
+
+/* 开机恢复上次选的实体（NVS）。清单里已无该实体（被服务端摘掉/换设备）→ 清掉意图，
+ * 保持纸娃娃（不黑屏）。返回是否已接管形象（true = 调用方不要再绑纸娃娃）。 */
+static bool entity_restore(void)
+{
+    char ent[40] = "";
+    if (!mp_nvs_get_str(SM_ENTITY_NVS_KEY, ent, sizeof ent) || !ent[0]) return false;
+    if (!asset_dl_entity_exists(ent)) {
+        ESP_LOGW(TAG, "NVS 记住的实体 %s 不在当前清单 → 清除，回纸娃娃", ent);
+        mp_nvs_set_str(SM_ENTITY_NVS_KEY, "");
+        return false;
+    }
+    /* 已接管且实体没变 → 不重复开包（manifest 每次同步都会走这里） */
+    if (s_entity_bound && strcmp(s_entity, ent) == 0) return true;
+    dispatch_entity(ent);
+    return s_entity_bound;
 }
 
 /* 按 hash 换装扮（E13）：hash → parts 路径 → render_set_parts */
@@ -876,6 +1035,19 @@ static void dispatch_set_parts_by_hash(const char *hash)
         return;
     }
     int rc = render_set_parts(path);
+    /* 【与实体形象的互斥 2026-10-02】服务端下发换装 = 用户要的是**纸娃娃这套衣服**：
+     * 若当前正显示怪物/NPC，必须先退出实体态，并立刻把布局重绑回 stand1 ——
+     * 否则实体的 LAYOUT（part_id 属于怪物包）配新纸娃娃 PARTS ⇒ 整帧部件解析失败
+     * ⇒ 屏上"人物消失"（合成器会误判错配并反复请求同步）。 */
+    if (s_entity[0]) {
+        ESP_LOGW(TAG, "收到换装（纸娃娃）→ 退出实体形象 %s，布局重绑 stand1", s_entity);
+        s_entity[0] = 0;
+        s_entity_bound = false;
+        mp_nvs_set_str(SM_ENTITY_NVS_KEY, "");
+        char lp[MP_MPK_PATH_MAX];
+        if (asset_dl_layout_path(MP_ACTION_STAND, lp, sizeof(lp)))
+            render_set_layout(lp, true);
+    }
     ESP_LOGI(TAG, "换装 %s rc=%d", path, rc);
 }
 
@@ -1288,7 +1460,16 @@ static void dispatch_manifest_synced(void)
             return;
         }
     }
-    dispatch_action(MP_ACTION_STAND);
+    /* 【实体形象恢复 2026-10-02】上次选的是怪物/NPC（NVS "entity"）→ 用它的
+     * PARTS + 默认动作接管形象。纸娃娃的 parts/stand1 上面已经绑好 = 天然回落：
+     * 实体包缺失/打开失败时屏上仍是纸娃娃，不会黑屏。 */
+    if (entity_restore()) {
+        /* 实体已接管形象（dispatch_entity 内部已绑默认动作循环布局）→ 不再叠一次
+         * stand1（那是纸娃娃的动作名；实体态下只会多开一次包） */
+        ESP_LOGW(TAG, "开机/素材同步后恢复实体形象：%s", s_entity);
+    } else {
+        dispatch_action(MP_ACTION_STAND);
+    }
 
     /* 字体绑定完成后重显配对码（hello 早于字体加载，首显气泡会是空） */
     {
@@ -1386,7 +1567,17 @@ void app_cmd_dispatch(const mp_cmd_t *cmd)
         if (action_maybe_camtest(cmd->s)) break;   /* 压测魔数（见上） */
         dispatch_action(cmd->s);
         break;
+    case MP_CMD_SET_ENTITY:
+        /* 怪物/NPC 形象切换（服务端 push kind=mob|npc / 菜单怪物页） */
+        dispatch_entity(cmd->s);
+        break;
     case MP_CMD_SET_EXPRESSION:
+        /* 实体（怪物/NPC）的 LAYOUT 没有表情维度（导出契约：ExprIndex=255）→
+         * 表情指令对它无意义，静默跳过（真机日志留一条，便于"表情没反应"取证）。 */
+        if (s_entity[0]) {
+            ESP_LOGD(TAG, "实体 %s 无表情维度，忽略表情指令 %s", s_entity, cmd->s);
+            break;
+        }
         render_set_expression(cmd->s);
         break;
     case MP_CMD_BUBBLE:

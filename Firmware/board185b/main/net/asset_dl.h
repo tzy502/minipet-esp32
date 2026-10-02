@@ -112,11 +112,36 @@ int asset_dl_bgmap_list(char hashes[][20], char labels[][32], bool *cached, int 
  * （selector=="clock"）与地图条带小包（条带 PARTS 无 selector——旧实现会把
  * 条带混进换装列表） */
 int asset_dl_parts_list(char hashes[][20], char labels[][32], bool *cached, int max);
-/* NPC 实体列表（T2）：selector=="npc" 或 entity "npc:*"，按 entity 去重
- * （服务端一个 NPC = 1 个 PARTS + N 个 LAYOUT）。hashes[i] = 该 NPC 的 PARTS
- * 包 hash；entities[i] = "npc:<id>"。无 NPC 条目 → 返回 0（菜单显示空态）。 */
+/* ══ 实体（怪物 / NPC）形象列表（T2 / 2026-10-02 扩展）══════════════════════
+ * selector=="mob"（Mob.wz）或 "npc"，或 entity 前缀 "mob:"/"npc:"，按 entity 去重
+ * （服务端一个实体 = 1 个 PARTS + N 个 LAYOUT）。hashes[i] = 该实体的 PARTS 包
+ * hash；entities[i] = "mob:<id>" / "npc:<id>"。无条目 → 返回 0（菜单显示空态）。
+ * 未下载的条目也在列（cached=false）→ 菜单据此给下载入口。 */
+int asset_dl_entity_list(char entities[][40], char hashes[][20], char labels[][32],
+                         bool *cached, int max);
+/* 旧名兼容：等价于 asset_dl_entity_list（现在含怪物）。 */
 int asset_dl_npc_list(char entities[][40], char hashes[][20], char labels[][32],
                       bool *cached, int max);
+
+/* ── 实体 → 包路径（怪物/NPC 形象切换用；与纸娃娃同一条渲染通道）────────────
+ * 语义：实体的 PARTS = 整套形象；实体 + 动作名 = 该实体自己的 LAYOUT。
+ * **必须先按 entity 圈定再按动作名查**——动作名跨实体重名（怪物 "fly" vs 纸娃娃
+ * "fly"），裸按动作名查会绑到别的实体的包上。 */
+bool asset_dl_entity_exists(const char *entity);
+bool asset_dl_entity_parts_path(const char *entity, char *path, size_t cap);
+bool asset_dl_entity_layout_path(const char *entity, const char *action, char *path, size_t cap);
+/* 该实体某动作的 LAYOUT 是否已在 TF（元数据 + access(F_OK)；与 layout_path 同差别：
+ * 文件被 LRU 淘汰后 layout_path 仍返回 true，本函数返回 false） */
+bool asset_dl_entity_layout_cached(const char *entity, const char *action);
+/* 实体默认动作（PARTS 条目 extra.defaultAction；缺则回退该实体第一个 LAYOUT 动作） */
+bool asset_dl_entity_default_action(const char *entity, char *out, size_t cap);
+/* 该实体清单里的全部动作名（≤ max 条，每条形如 "stand"/"move"/"hit1"） */
+int  asset_dl_entity_actions(const char *entity, char (*actions)[32], int max);
+
+/* LAYOUT origin：按**包内容 hash**（16 hex 小写）精确匹配 —— 合成器装载完 LAYOUT
+ * 包后用它查"画布内 body 锚点"，避免按动作名查时跨实体串台。找不到返回 false
+ * （调用方回落 asset_dl_layout_origin(action)）。 */
+bool asset_dl_layout_origin_of(const char *hash_hex, int16_t *out_x, int16_t *out_y);
 /* LAYOUT：该动作是否已有本地文件（元数据 + access(F_OK)）。不能用
  * asset_dl_layout_path 代替——它只查元数据，文件被 LRU 淘汰后仍返回 true。 */
 bool asset_dl_layout_cached(const char *action);

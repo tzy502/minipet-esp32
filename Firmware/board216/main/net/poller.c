@@ -189,6 +189,13 @@ static void handle_cmd(cJSON *jc)
         c.type = MP_CMD_SET_MAP;
         strlcpy(c.s, v, sizeof(c.s));
         mp_post_cmd(&c);
+    } else if (strcmp(t, "entity") == 0 && v) {
+        /* 【怪物/NPC 形象切换 2026-10-02】服务端 push(kind=mob|npc, switch!=false)
+         * 下发 {"entity":"mob:100100"}；v 口径（"entity" + 实体名）同样认。
+         * 设备侧按 entity 在本地清单里找 PARTS/LAYOUT（见 state_machine dispatch_entity）。 */
+        c.type = MP_CMD_SET_ENTITY;
+        strlcpy(c.s, v, sizeof(c.s));
+        mp_post_cmd(&c);
     } else if (strcmp(t, "cam") == 0 && v) {
         /* 【服务端选镜头】两种载荷：
          *   "<x>,<y>"        旧：应用到**当前**地图（保留兼容）
@@ -410,6 +417,17 @@ static bool do_poll_once(void)
                     }
                     mp_cmd_t c = { 0 }; c.type = MP_CMD_SET_MAP;
                     strlcpy(c.s, mid, sizeof(c.s)); mp_post_cmd(&c);
+                } else if (strcmp(tbuf, "entity") == 0) {
+                    /* 现代口径 {"type":"entity","payload":{"entity":"mob:100100","action":"stand"}}。
+                     * action 只是提示（设备以清单里的 defaultAction 为准），故只取 entity。 */
+                    cJSON *pe = payload ? cJSON_GetObjectItem(payload, "entity") : NULL;
+                    const char *ent = cJSON_IsString(pe) ? pe->valuestring
+                                    : cJSON_IsString(vitem) ? vitem->valuestring : NULL;
+                    if (ent && ent[0]) {
+                        mp_cmd_t c = { 0 }; c.type = MP_CMD_SET_ENTITY;
+                        strlcpy(c.s, ent, sizeof(c.s)); mp_post_cmd(&c);
+                        ESP_LOGW(TAG, "poll 收到形象切换指令 entity=%s", c.s);
+                    }
                 } else if (strcmp(tbuf, "brightness") == 0 && pn) {
                     mp_cmd_t c = { 0 }; c.type = MP_CMD_BRIGHTNESS;
                     c.a = (int32_t)cJSON_GetNumberValue(pn); mp_post_cmd(&c);

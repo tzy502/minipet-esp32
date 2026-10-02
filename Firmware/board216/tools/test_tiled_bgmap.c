@@ -11,8 +11,9 @@
  *   ③ 统计：整窗填充 / 拖动补一列各读了几块、命中几块、多少 KB（判据口径）。
  *
  * 编译/运行（仓库根 = Firmware/board216）：
- *   gcc -std=c11 -O2 -Wall -Wextra -I main/render -I tools/stubs \
+ *   gcc -std=c11 -O2 -Wall -Wextra -I tools/stubs -I main/render -I main/app \
  *       tools/test_tiled_bgmap.c main/render/mpak.c -o /tmp/test_tiled_bgmap
+ *   （stubs 必须排在 main/app 之前：mpak.c 的 watchdog.h 要取替身，否则链接缺符号）
  *   /tmp/test_tiled_bgmap
  */
 #include <fcntl.h>

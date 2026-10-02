@@ -151,6 +151,10 @@ typedef enum {
     MP_CMD_BUBBLE,          /* s=UTF-8 文本        → render_bubble_show       */
     MP_CMD_SET_MAP,
     MP_CMD_SET_PARTS,       /* s=parts hash → 换装扮（E13 每设备独立装扮） */         /* s=bg hash           → render_set_map(+条带)    */
+    /* s=实体名（"mob:100100" / "npc:2100000"；空串或 "paperdoll" = 回纸娃娃）→
+     * 把宠物形象切成该怪物/NPC：绑它的 PARTS + 默认动作 LAYOUT（同一条渲染通道）。
+     * 服务端 push(kind=mob|npc) 与菜单「怪物」页都发这条。 */
+    MP_CMD_SET_ENTITY,
     MP_CMD_BRIGHTNESS,      /* a=0..100            → display_brightness       */
     MP_CMD_REBOOT,          /* 服务端指令重启                                 */
     MP_CMD_OTA_BEGIN,       /* a=0..100 阶段提示   → render 气泡               */

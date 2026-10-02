@@ -683,8 +683,13 @@ static int parse_layout(mpak_t *m)
     cur_u32(&c, &expr_count);
     heap_caps_free(buf);
 
+    /* 【expr_count == 0 合法 2026-10-02】表情是**纸娃娃专属维度**：怪物/NPC 实体包
+     * （selector=mob|npc）的 piece 全是 expr_index=255（无 face 变体）→ 导出器按
+     * 契约写 expression_count=0。旧校验 `expr_count == 0 → MPAK_ERR_FMT` 会把这类
+     * 包**整包拒收**（真机后果：LAYOUT 永远打不开 ⇒ 怪物/NPC 资产"下得下来、用不了"，
+     * 也正是当年 NPC 页"只下载不渲染"长期没人发现的原因）。帧区非空校验照旧。 */
     if (frame_count == 0 || frame_count > MPAK_LAYOUT_MAX_FRAMES ||
-        expr_count == 0 || expr_count > MPAK_LAYOUT_MAX_EXPR) {
+        expr_count > MPAK_LAYOUT_MAX_EXPR) {
         ESP_LOGE(TAG, "layout %s counts f=%" PRIu32 " e=%" PRIu32 " invalid",
                  action, frame_count, expr_count);
         return MPAK_ERR_FMT;
@@ -698,10 +703,11 @@ static int parse_layout(mpak_t *m)
     lt->frame_count      = frame_count;
     lt->expression_count = expr_count;
 
-    lt->expr_names = psram_alloc((size_t)expr_count * (MPAK_NAME_LEN + 1));
-    if (!lt->expr_names) goto nomem;
-    /* 读表情名区（44 + e*32） */
-    {
+    lt->expr_names = NULL;
+    if (expr_count > 0) {                       /* 实体包 = 0：不分配、不读名字区 */
+        lt->expr_names = psram_alloc((size_t)expr_count * (MPAK_NAME_LEN + 1));
+        if (!lt->expr_names) goto nomem;
+        /* 读表情名区（44 + e*32） */
         uint8_t *nb = payload_read(m, 44, (uint32_t)(expr_count * MPAK_NAME_LEN));
         if (!nb) goto io;
         cur_t nc = { nb, (size_t)expr_count * MPAK_NAME_LEN, 0 };

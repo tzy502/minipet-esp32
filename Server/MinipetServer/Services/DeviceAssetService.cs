@@ -392,6 +392,73 @@ public sealed class DeviceAssetService
     }
 
     /// <summary>
+    /// 为单个**怪物**产出并登记设备资产（PARTS 整包 + 每动作 LAYOUT，selector=mob、
+    /// entity=mob:{id}）。与 EnsureNpcAsync 完全同模式（幂等键 = selector + entity），
+    /// 只换成 Mob.wz 导出路径 —— 固件「怪物」页选中后就是按 entity 找这两个包渲染。
+    /// 返回是否实际生成新包（false = 已登记，幂等跳过）。
+    /// </summary>
+    public bool EnsureMobAsync(string deviceId, string mobId)
+    {
+        ValidateIds(deviceId, mobId, "怪物 id");
+        mobId = mobId.Trim();
+        lock (_deviceLocks.GetOrAdd(deviceId, _ => new object()))
+        {
+            var deviceDir = DeviceDir(deviceId);
+            var root = ReadIndex(Path.Combine(deviceDir, ManifestBuilder.AssetsManifestFileName));
+            if (HasEntry(root, selector: "mob", key: "entity", value: $"mob:{mobId}")) return false;
+
+            var warnings = new List<string>();
+            var assets = new AssetExporter(_wz).ExportMobAssets(mobId, warnings);
+            MergeAndWrite(deviceDir, root, assets);
+            return true;
+        }
+    }
+
+    /// <summary>
+    /// 查该设备索引里某实体（"mob:100100"/"npc:2100000"/"paperdoll:default"）的 PARTS 包内容 hash
+    /// （16 hex 小写）。用途：推送怪物/NPC 后给设备下发**切换实体**指令前的核对/日志。
+    /// 固件按 entity 字符串在本地清单里找 PARTS/LAYOUT，指令载荷只需带 entity。找不到返回 null。
+    /// </summary>
+    public string? FindEntityPartsHash(string deviceId, string entity)
+    {
+        var e = FindEntityEntry(deviceId, entity);
+        return e?.Key;
+    }
+
+    /// <summary>该实体（mob:/npc:）默认动作名（PARTS 条目 extra.defaultAction）；无则 null。</summary>
+    public string? FindEntityDefaultAction(string deviceId, string entity)
+    {
+        var e = FindEntityEntry(deviceId, entity);
+        var da = e?.Value["defaultAction"]?.GetValue<string>();
+        return string.IsNullOrEmpty(da) ? null : da;
+    }
+
+    /// <summary>索引里某实体的 PARTS 条目（key = 内容 hash 16 hex）；无则 null。</summary>
+    private KeyValuePair<string, JsonObject>? FindEntityEntry(string deviceId, string entity)
+    {
+        try
+        {
+            var indexPath = Path.Combine(DeviceDir(deviceId), ManifestBuilder.AssetsManifestFileName);
+            if (!File.Exists(indexPath)) return null;
+            var root = JsonNode.Parse(File.ReadAllText(indexPath)) as JsonObject;
+            if (root?["assets"] is not JsonObject assets) return null;
+            foreach (var kv in assets)
+            {
+                if (kv.Value is not JsonObject e) continue;
+                if (!string.Equals(e["kind"]?.GetValue<string>(), "PARTS", StringComparison.Ordinal)) continue;
+                if (!string.Equals(e["entity"]?.GetValue<string>(), entity, StringComparison.Ordinal)) continue;
+                return new KeyValuePair<string, JsonObject>(kv.Key, e);
+            }
+            return null;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[DeviceAsset] 查实体 {entity} 失败: {ex.Message}");
+            return null;
+        }
+    }
+
+    /// <summary>
     /// 写 mpak + 合并索引（**不删旧条目**——地图/NPC 累积收藏语义，与装扮替换语义不同；
     /// 同 hash 覆盖无害）。调用方须已持有该设备的锁。
     /// </summary>

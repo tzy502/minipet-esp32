@@ -1262,26 +1262,61 @@ public sealed class AssetExporter
     /// 渲染期告警追加进 warnings；无任何可导出动作/全部动作条带失败时抛 InvalidOperationException。
     /// </summary>
     public List<ExportedAsset> ExportNpcAssets(string npcId, List<string>? warnings = null)
+        => ExportEntityAssets(npcId, "Npc", "npc", "NPC", warnings);
+
+    /// <summary>
+    /// 为单个**怪物**产出设备资产（PARTS 整包 + 每动作一个 LAYOUT，形态与 NPC/纸装扮完全一致）。
+    /// selector=mob、extra.entity=mob:{mobId} —— 固件侧「怪物页选中即换形象」就是靠这两个字段
+    /// 把 PARTS/LAYOUT 包绑到实体上（与 NPC 同一条渲染通道，无新包格式）。
+    /// 动作集 = WzService.GetActionList(mobId, "Mob") 实测有效帧动作；默认动作优先
+    /// stand → move → 首个（固件 idle 用它循环）。
+    /// </summary>
+    public List<ExportedAsset> ExportMobAssets(string mobId, List<string>? warnings = null)
+        => ExportEntityAssets(mobId, "Mob", "mob", "怪物", warnings);
+
+    /// <summary>
+    /// 实体（怪物 / NPC）资产导出核心：条带（BuildSpriteStrip）合成统一 cell 后逐帧切成
+    /// PARTS 部件、每动作一个 LAYOUT；manifest extras 带 entity/defaultAction/bounds/origin。
+    /// 直连固件契约（compositor 摆放）：
+    ///   · piece x/y = 位图左上角**相对锚点**坐标（= -Origin），故画布坐标 0 点即实体锚点；
+    ///   · 因此 origin extra 必须下发 **(0,0)**（= 锚点在画布内的位置），固件把画布
+    ///     坐标 0 点钉到屏心 ⇒ 怪物锚点落在屏心（再叠加"站地面线"）。
+    ///     历史坑：NPC 旧版下发的是条带 cell 内锚点 (OriginX,OriginY)，而 piece 又是
+    ///     -Origin 起算 ⇒ 固件 (origin - canvasMin) 重复计一次原点，实体整体偏 2×Origin
+    ///     （NPC 从未渲染过所以没暴露）。现在统一为 0,0。
+    ///   · bounds extra 仍 = cell [w,h]（诊断/Web 预览用，不参与固件定位）。
+    /// </summary>
+    private List<ExportedAsset> ExportEntityAssets(string entityIdStr, string wzType, string selector,
+        string cnName, List<string>? warnings)
     {
-        if (string.IsNullOrWhiteSpace(npcId)) throw new ArgumentException("NPC id 不能为空", nameof(npcId));
+        if (string.IsNullOrWhiteSpace(entityIdStr)) throw new ArgumentException($"{cnName} id 不能为空", nameof(entityIdStr));
         if (!_wz.IsLoaded) throw new InvalidOperationException("WZ 未加载（先调用 WzService.LoadWz）");
-        npcId = npcId.Trim();
+        entityIdStr = entityIdStr.Trim();
         var warns = warnings ?? new List<string>();
         void Warn(string msg) { warns.Add(msg); Console.Error.WriteLine($"[AssetExporter] {msg}"); }
 
         // 动作探测：GetActionList 已过滤无画面空动作（口径同 ExportSpriteStrip 的 >1×1 有效帧）
-        var actions = _wz.GetActionList(npcId, "Npc");
+        var actions = _wz.GetActionList(entityIdStr, wzType);
         if (actions.Count == 0)
-            throw new InvalidOperationException($"NPC {npcId} 无可导出动作（WZ 数据缺失？）");
+            throw new InvalidOperationException($"{cnName} {entityIdStr} 无可导出动作（WZ 数据缺失？）");
         string defaultAction = actions.Contains("stand") ? "stand"
             : actions.Contains("move") ? "move" : actions[0];
 
-        string npcName = "";
-        try { npcName = _wz.GetNpcName(npcId) ?? ""; } catch { /* 目录服务未预热时名称可缺省 */ }
-        string label = string.IsNullOrEmpty(npcName) ? $"NPC {npcId}" : $"{npcName}（{npcId}）";
+        string entName = "";
+        try
+        {
+            entName = (wzType == "Mob" ? _wz.GetMobName(entityIdStr) : _wz.GetNpcName(entityIdStr)) ?? "";
+        }
+        catch { /* 目录服务未预热时名称可缺省 */ }
+        /* label 恒为 ASCII 前缀 + （id）：固件菜单是烘焙 CJK 子集，动态中文名常缺字，
+         * 会回落到 entity 串（"mob:100100"）——那就等于白干。这里直接把中文名放在
+         * id 之后：缺字时回落仍有 id 可读，字体覆盖时中文名也在。 */
+        string label = string.IsNullOrEmpty(entName)
+            ? $"{cnName} {entityIdStr}"
+            : $"{cnName} {entityIdStr} {entName}";
 
         // LAYOUT entity_id（u32；设备端按 manifest 元数据 entity 字符串检索，此字段仅随包展示）
-        uint entityId = uint.TryParse(npcId, out var idNum) ? idNum : 0;
+        uint entityId = uint.TryParse(entityIdStr, out var idNum) ? idNum : 0;
 
         var partEntries = new List<PartPackWriter.PartEntry>();
         var layoutPayloads = new List<(string Action, byte[] Payload, int CellW, int CellH, int Ox, int Oy)>();
@@ -1290,14 +1325,14 @@ public sealed class AssetExporter
         foreach (var action in actions)
         {
             // 单次遍历同时产出条带 PNG + SpriteStrip 元数据（WzService 内部锁内读 WZ）
-            var (png, strip, _) = _wz.BuildSpriteStrip(npcId, action, "Npc");
+            var (png, strip, _) = _wz.BuildSpriteStrip(entityIdStr, action, wzType);
             if (png == null || strip == null || strip.FrameCount <= 0 || strip.FrameWidth <= 0 || strip.FrameHeight <= 0)
             {
-                Warn($"NPC {npcId} 动作 {action} 条带导出为空，跳过");
+                Warn($"{cnName} {entityIdStr} 动作 {action} 条带导出为空，跳过");
                 continue;
             }
             using var stripBmp = SKBitmap.Decode(png);
-            if (stripBmp == null) { Warn($"NPC {npcId} 动作 {action} 条带 PNG 解码失败，跳过"); continue; }
+            if (stripBmp == null) { Warn($"{cnName} {entityIdStr} 动作 {action} 条带 PNG 解码失败，跳过"); continue; }
 
             int cw = strip.FrameWidth, ch = strip.FrameHeight;
             int frames = Math.Min(strip.FrameCount, stripBmp.Width / cw);
@@ -1313,7 +1348,15 @@ public sealed class AssetExporter
                 using (var c = new SKCanvas(cell))
                 {
                     c.Clear(SKColors.Transparent);
-                    c.DrawBitmap(stripBmp, f * cw, 0);
+                    /* 【必须用 source/dest 矩形 2026-10-02】原写法 `DrawBitmap(stripBmp, f*cw, 0)`
+                     * （float,float 偏移重载）在 x>0 时**一个像素都画不出来**（SkiaSharp 实测：
+                     * f=0 有 712 px、f≥1 全 0），于是每个动作只有第 0 帧有内容、其余帧全是
+                     * 空部件 —— 怪物/NPC 包"下得下来、动不起来"的第二个真因（host 对拍
+                     * tools/test_mob_pack.c 抓出）。显式给 source/dest 矩形后逐帧像素数与
+                     * 条带 PNG 各 cell 完全一致（679/681/672/695）。 */
+                    c.DrawBitmap(stripBmp,
+                        new SKRect(f * cw, 0, f * cw + cw, ch),
+                        new SKRect(0, 0, cw, ch));
                 }
                 partEntries.Add(new PartPackWriter.PartEntry
                 {
@@ -1347,7 +1390,7 @@ public sealed class AssetExporter
                     },
                 });
             }
-            if (layoutFrames.Count == 0) { Warn($"NPC {npcId} 动作 {action} 无有效帧，跳过"); continue; }
+            if (layoutFrames.Count == 0) { Warn($"{cnName} {entityIdStr} 动作 {action} 无有效帧，跳过"); continue; }
             nextPartId += (uint)frames;
 
             layoutPayloads.Add((action, LayoutPackWriter.Build(new LayoutPackWriter.LayoutInput
@@ -1360,7 +1403,7 @@ public sealed class AssetExporter
 
         if (partEntries.Count == 0 || layoutPayloads.Count == 0)
             throw new InvalidOperationException(
-                $"NPC {npcId} 条带导出失败（动作集: {string.Join(",", actions)}）: {string.Join("; ", warns)}");
+                $"{cnName} {entityIdStr} 条带导出失败（动作集: {string.Join(",", actions)}）: {string.Join("; ", warns)}");
 
         // PARTS 整包（全部动作全部帧一个包）+ 每动作一个 LAYOUT —— LAYOUT/PARTS 双包同纸装扮形态
         var summary = new ExportSummary();
@@ -1369,8 +1412,8 @@ public sealed class AssetExporter
         foreach (var e in partEntries) e.Bitmap.Dispose(); // Build 内已编码落 payload，位图即弃
         partEntries.Clear();
 
-        string entity = $"npc:{npcId}";
-        result.Add(AddAsset(summary, MpakKind.Parts, partsPayload, label, selector: "npc",
+        string entity = $"{selector}:{entityIdStr}";
+        result.Add(AddAsset(summary, MpakKind.Parts, partsPayload, label, selector: selector,
             extra: new Dictionary<string, object?>
             {
                 ["entity"] = entity,
@@ -1378,14 +1421,18 @@ public sealed class AssetExporter
             }));
         foreach (var (action, payload, cw, ch, ox, oy) in layoutPayloads)
         {
-            result.Add(AddAsset(summary, MpakKind.Layout, payload, $"布局 {action}", selector: "npc",
+            result.Add(AddAsset(summary, MpakKind.Layout, payload, $"布局 {action}", selector: selector,
                 extra: new Dictionary<string, object?>
                 {
                     ["entity"] = entity,
                     ["action"] = action,
                     ["defaultAction"] = defaultAction,
                     ["bounds"] = new[] { cw, ch }, // cell（帧画布）[w,h]，1x 像素
-                    ["origin"] = new[] { ox, oy }, // cell 内锚点（SpriteStrip 元数据，联调/Web 用）
+                    /* origin 恒 (0,0)：piece x/y 已是"相对锚点"坐标 ⇒ 画布坐标 0 点 = 实体锚点，
+                     * 固件把该点钉到屏心。下发 cell 内锚点会让固件重复计一次原点（见方法注释）。
+                     * ox/oy（条带 cell 内锚点）仍随包展示在 label 之外的 diagnostics 里。 */
+                    ["origin"] = new[] { 0, 0 },
+                    ["cellOrigin"] = new[] { ox, oy },
                 }));
         }
         return result;

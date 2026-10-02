@@ -540,12 +540,12 @@ public static class AdminEndpoints
             return Results.Json(new { queued = true, seq = cmd.Seq, ver = body.Ver, url });
         });
 
-        // ── 素材推送到设备（E7/E13：地图/NPC 资产登记进该设备 manifest，可选直接切图）──
-        // body { kind: "map"|"npc", id: "200000100", switch: true }：
+        // ── 素材推送到设备（E7/E13：地图/怪物/NPC 资产登记进该设备 manifest，可选直接切图/切形象）──
+        // body { kind: "map"|"mob"|"npc", id: "200000100", switch: true }：
         // 打包数秒（WZ 锁内）→ 后台 Task.Run，端点立即 202；顺序铁律 = 先登记资产 → 再
-        // BumpRev（设备长轮询被唤醒、拉到新 manifest）→ 最后 enqueue 切图指令（仅 map 且
-        // switch!=false；固件 poller.c 消费 {"t":"map","v":id} → MP_CMD_SET_MAP → dispatch_map），
-        // 反了设备会先收到切图指令而新 manifest 还没拉到。
+        // BumpRev（设备长轮询被唤醒、拉到新 manifest）→ 最后 enqueue 指令（map 且 switch!=false
+        // 发切图；mob/npc 且 switch!=false 发 entity 切换=宠物形象变成该怪物/NPC），
+        // 反了设备会先收到指令而新 manifest 还没拉到。
         g.MapPost("/devices/{id}/push", (string id, DevicePushRequest body, DeviceRegistry reg,
             DeviceAssetService assets, WzService wz, DeviceManifestService mfst, CommandQueue queue,
             DeviceEventLog eventLog, HealthReport health, Config.ServerPaths paths,
@@ -556,8 +556,8 @@ public static class AdminEndpoints
                 var dev = reg.Get(id);
                 if (dev == null) return NotFoundDevice(id);
                 var kind = body?.Kind?.Trim().ToLowerInvariant();
-                if (kind != "map" && kind != "npc")
-                    return Results.Json(new { error = "kind 必须是 map 或 npc" }, statusCode: 400);
+                if (kind != "map" && kind != "npc" && kind != "mob")
+                    return Results.Json(new { error = "kind 必须是 map / mob / npc" }, statusCode: 400);
                 var assetId = body?.Id?.Trim();
                 if (string.IsNullOrEmpty(assetId))
                     return Results.Json(new { error = "id 必填（素材编号，如地图 200000100）" }, statusCode: 400);
@@ -589,13 +589,18 @@ public static class AdminEndpoints
                         // 登记资产（幂等，内部 per-device 锁 + WZ 锁，打包数秒；同步方法，
                         // 调用方放后台线程）→ bump rev（设备长轮询被唤醒、拉到新 manifest）
                         // → 最后才 enqueue 切图指令（设备先拿到新 manifest 再收到 map 指令才稳）。
-                        bool generated = kind == "map"
-                            ? assets.EnsureMapAsync(id, assetId, fullMap, tiled)
-                            : assets.EnsureNpcAsync(id, assetId);
+                        bool generated = kind switch
+                        {
+                            "map" => assets.EnsureMapAsync(id, assetId, fullMap, tiled),
+                            "mob" => assets.EnsureMobAsync(id, assetId),
+                            _     => assets.EnsureNpcAsync(id, assetId),
+                        };
                         Console.WriteLine($"[DevicePush] 设备 {id} {kind} {assetId} 资产登记{(generated ? "完成（新打包）" : "跳过（已登记，幂等）")}");
                         // 登记成功必 bump：manifest-assets.json 变了，rev 不动设备感知不到。
                         // BumpRev 内部会往指令队列塞 manifest 唤醒指令 → 长轮询立即返回。
-                        mfst.BumpRev(id, kind == "map" ? $"资产变更：地图 {assetId}" : $"资产变更：NPC {assetId}");
+                        mfst.BumpRev(id, kind == "map"
+                            ? $"资产变更：地图 {assetId}"
+                            : kind == "mob" ? $"资产变更：怪物 {assetId}" : $"资产变更：NPC {assetId}");
                         if (kind == "map" && switchAfter)
                         {
                             // SET_MAP 指令载荷 = BGMAP 资产 hash（固件 dispatch_map 按 hash 匹配
@@ -627,9 +632,39 @@ public static class AdminEndpoints
                                 Console.Error.WriteLine($"[DevicePush] 设备 {id} 地图 {assetId} 未找到 BGMAP 条目，未发切图指令");
                             }
                         }
-                        eventLog.Append(id, kind == "map"
-                            ? $"推送地图 {assetId}（资产已登记{(fullMap ? "，整图口径" : "")}）"
-                            : $"推送 NPC {assetId}（资产已登记）");
+                        /* 【怪物/NPC = 可用的宠物形象 2026-10-02】kind=mob|npc 且 switch!=false：
+                         * 登记完资产后下发**切换实体**指令（固件 MP_CMD_SET_ENTITY）——设备按
+                         * entity 字符串在自己清单里找 PARTS（换形象）+ 默认动作 LAYOUT（起动画）。
+                         * 与切图同款"双发"：立即 + 15s 后重发（设备拉 manifest/包要几秒，
+                         * 指令先到时本地清单还没这个 entity，固件会挂起等 manifest 到了再绑，
+                         * 重发只是兜底；幂等切换无害）。 */
+                        else if ((kind == "mob" || kind == "npc") && switchAfter)
+                        {
+                            var entity = $"{kind}:{assetId}";
+                            var partsHash = assets.FindEntityPartsHash(id, entity);
+                            var defAction = assets.FindEntityDefaultAction(id, entity);
+                            if (partsHash != null)
+                            {
+                                queue.Enqueue(id, "entity", new { entity, action = defAction ?? "stand" });
+                                _ = Task.Run(async () =>
+                                {
+                                    await Task.Delay(TimeSpan.FromSeconds(15));
+                                    queue.Enqueue(id, "entity", new { entity, action = defAction ?? "stand" });
+                                });
+                                Console.WriteLine($"[DevicePush] 设备 {id} 切换实体 → {entity}"
+                                                  + $"（PARTS {partsHash}，默认动作 {defAction ?? "stand"}）");
+                            }
+                            else
+                            {
+                                Console.Error.WriteLine($"[DevicePush] 设备 {id} {entity} 未找到 PARTS 条目，未发切换指令");
+                            }
+                        }
+                        eventLog.Append(id, kind switch
+                        {
+                            "map" => $"推送地图 {assetId}（资产已登记{(fullMap ? "，整图口径" : "")}）",
+                            "mob" => $"推送怪物 {assetId}（资产已登记{(switchAfter ? "，已下发切换形象" : "")}）",
+                            _     => $"推送 NPC {assetId}（资产已登记{(switchAfter ? "，已下发切换形象" : "")}）",
+                        });
                     }
                     catch (Exception ex)
                     {
@@ -777,8 +812,11 @@ public static class AdminEndpoints
 
     public sealed class DevicePushRequest
     {
+        /// <summary>map（地图 BGMAP）/ mob（怪物 Mob.wz）/ npc（NPC Npc.wz）。</summary>
         public string? Kind { get; set; }
+        /// <summary>素材编号：地图 id / 怪物 id / NPC id（如 "200000100" / "100100" / "2100000"）。</summary>
         public string? Id { get; set; }
+        /// <summary>登记完成后是否自动生效：map=切图；mob/npc=把宠物形象切成该实体（默认 true）。</summary>
         public bool? Switch { get; set; }
         /// <summary>
         /// R2 整图口径（2026-10-01，**缺省/ false = 现网 240×240 窗口口径不变**）：

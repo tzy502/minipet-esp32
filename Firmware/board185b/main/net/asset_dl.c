@@ -70,7 +70,10 @@ typedef struct {
     char     hash[20];
     char     kind[12];        /* PARTS/LAYOUT/BGMAP/FONT/AUDIO_META */
     char     action[32];      /* LAYOUT：动作名 */
-    char     entity[40];      /* LAYOUT/PARTS：如 "paperdoll:default" */
+    /* PARTS：实体默认动作名（服务端 extra.defaultAction）——怪物/NPC 形象切换后
+     * idle 就用它（mob 是 "stand"/"move"，不是纸娃娃的 stand1/walk1）。 */
+    char     default_action[32];
+    char     entity[40];      /* LAYOUT/PARTS：如 "paperdoll:default" / "mob:100100" */
     char     map_id[32];      /* BGMAP：地图 id */
     char     selector[12];    /* map/paperdoll/npc/clock（无则空） */
     int16_t  origin_x, origin_y; /* LAYOUT：画布内 body 锚点（桌面 RenderFrame 同口径，1x） */
@@ -484,16 +487,34 @@ int asset_dl_parts_list(char hashes[][20], char labels[][32], bool *cached, int 
     return n;
 }
 
-int asset_dl_npc_list(char entities[][40], char hashes[][20], char labels[][32],
-                      bool *cached, int max)
+/* 前向声明：渲染根目录拼接（定义在本文件后段；实体路径查询要用） */
+static const char *render_dir_of(const char *kind);
+
+/* ══ 实体（怪物 / NPC）形象查询面 2026-10-02 ═══════════════════════════════
+ * 「实体」= manifest 里 selector=="mob" / "npc" 的一组包：
+ *   1 个 PARTS（entity="mob:<id>" / "npc:<id>"，带 defaultAction）
+ * + N 个 LAYOUT（同 entity，各自 action=<动作名>）。
+ * 设备端把它当"另一套装扮"渲染（PARTS→render_set_parts、LAYOUT→render_set_layout，
+ * 与纸娃娃同一条通道、同一套 mpak 解析），差别只在**查询必须先按 entity 圈定**——
+ * 动作名会跨实体重名（怪物 "fly" vs 纸娃娃 "fly"），按动作名裸查会绑错包。
+ * 未下载的条目也进列表（cached=false），菜单据此给出下载入口。 */
+
+/* 某行是否实体 PARTS 行（selector=mob/npc 或 entity 前缀 mob:/npc:） */
+static bool entity_row(const local_file_t *lf)
+{
+    return strcmp(lf->selector, "mob") == 0 || strcmp(lf->selector, "npc") == 0 ||
+           strncmp(lf->entity, "mob:", 4) == 0 || strncmp(lf->entity, "npc:", 4) == 0;
+}
+
+int asset_dl_entity_list(char entities[][40], char hashes[][20], char labels[][32],
+                         bool *cached, int max)
 {
     if (max <= 0) return 0;
     int n = 0;
     xSemaphoreTake(s_lock, portMAX_DELAY);
     for (int i = 0; i < s_file_cnt && n < max; i++) {
         if (strcasecmp(s_files[i].kind, "PARTS") != 0) continue;
-        if (!(strcmp(s_files[i].selector, "npc") == 0 ||
-              strncmp(s_files[i].entity, "npc:", 4) == 0)) continue;
+        if (!entity_row(&s_files[i])) continue;
         if (!s_files[i].entity[0]) continue;
 
         bool dup = false;                       /* entity 去重（1 PARTS + N LAYOUT） */
@@ -510,6 +531,147 @@ int asset_dl_npc_list(char entities[][40], char hashes[][20], char labels[][32],
     }
     xSemaphoreGive(s_lock);
     return n;
+}
+
+/* 兼容入口（旧名）：等价于 entity_list（现在含怪物）。 */
+int asset_dl_npc_list(char entities[][40], char hashes[][20], char labels[][32],
+                      bool *cached, int max)
+{
+    return asset_dl_entity_list(entities, hashes, labels, cached, max);
+}
+
+bool asset_dl_entity_exists(const char *entity)
+{
+    if (!entity || !entity[0]) return false;
+    bool ok = false;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    for (int i = 0; i < s_file_cnt; i++) {
+        if (strcasecmp(s_files[i].kind, "PARTS") != 0) continue;
+        if (strcmp(s_files[i].entity, entity) == 0) { ok = true; break; }
+    }
+    xSemaphoreGive(s_lock);
+    return ok;
+}
+
+bool asset_dl_entity_parts_path(const char *entity, char *path, size_t cap)
+{
+    if (!entity || !entity[0] || !path || cap == 0) return false;
+    bool ok = false;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    for (int i = 0; i < s_file_cnt; i++) {
+        if (strcasecmp(s_files[i].kind, "PARTS") != 0) continue;
+        if (strcmp(s_files[i].entity, entity) != 0) continue;
+        snprintf(path, cap, "%s/%s.mpk", render_dir_of("PARTS"), s_files[i].hash);
+        ok = true;
+        break;
+    }
+    xSemaphoreGive(s_lock);
+    return ok;
+}
+
+bool asset_dl_entity_layout_path(const char *entity, const char *action, char *path, size_t cap)
+{
+    if (!entity || !entity[0] || !action || !action[0] || !path || cap == 0) return false;
+    bool ok = false;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    for (int i = 0; i < s_file_cnt; i++) {
+        if (strcasecmp(s_files[i].kind, "LAYOUT") != 0) continue;
+        if (strcmp(s_files[i].entity, entity) != 0) continue;
+        if (strcmp(s_files[i].action, action) != 0) continue;
+        snprintf(path, cap, "%s/%s.mpk", render_dir_of("LAYOUT"), s_files[i].hash);
+        ok = true;
+        break;
+    }
+    xSemaphoreGive(s_lock);
+    return ok;
+}
+
+bool asset_dl_entity_layout_cached(const char *entity, const char *action)
+{
+    if (!entity || !entity[0] || !action || !action[0]) return false;
+    bool ok = false;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    for (int i = 0; i < s_file_cnt; i++) {
+        if (strcasecmp(s_files[i].kind, "LAYOUT") != 0) continue;
+        if (strcmp(s_files[i].entity, entity) != 0) continue;
+        if (strcmp(s_files[i].action, action) != 0) continue;
+        ok = file_cached_row(&s_files[i]);
+        break;
+    }
+    xSemaphoreGive(s_lock);
+    return ok;
+}
+
+bool asset_dl_entity_default_action(const char *entity, char *out, size_t cap)
+{
+    if (!entity || !entity[0] || !out || cap == 0) return false;
+    bool ok = false;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    for (int i = 0; i < s_file_cnt; i++) {
+        if (strcasecmp(s_files[i].kind, "PARTS") != 0) continue;
+        if (strcmp(s_files[i].entity, entity) != 0) continue;
+        if (s_files[i].default_action[0]) {
+            strlcpy(out, s_files[i].default_action, cap);
+            ok = true;
+        }
+        break;
+    }
+    /* 清单没带 defaultAction（旧登记）→ 回退该 entity 的第一个 LAYOUT 动作名 */
+    if (!ok) {
+        for (int i = 0; i < s_file_cnt; i++) {
+            if (strcasecmp(s_files[i].kind, "LAYOUT") != 0) continue;
+            if (strcmp(s_files[i].entity, entity) != 0) continue;
+            if (!s_files[i].action[0]) continue;
+            strlcpy(out, s_files[i].action, cap);
+            ok = true;
+            break;
+        }
+    }
+    xSemaphoreGive(s_lock);
+    return ok;
+}
+
+int asset_dl_entity_actions(const char *entity, char (*actions)[32], int max)
+{
+    if (!entity || !entity[0] || !actions || max <= 0) return 0;
+    int n = 0;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    for (int i = 0; i < s_file_cnt && n < max; i++) {
+        if (strcasecmp(s_files[i].kind, "LAYOUT") != 0) continue;
+        if (strcmp(s_files[i].entity, entity) != 0) continue;
+        if (!s_files[i].action[0]) continue;
+        bool dup = false;
+        for (int k = 0; k < n; k++) {
+            if (strcmp(actions[k], s_files[i].action) == 0) { dup = true; break; }
+        }
+        if (dup) continue;
+        strlcpy(actions[n], s_files[i].action, 32);
+        n++;
+    }
+    xSemaphoreGive(s_lock);
+    return n;
+}
+
+/* LAYOUT 条目的 origin：按**包内容 hash** 精确匹配。
+ * 为什么需要它：origin 决定画布坐标 0 点贴屏心的位置，而按动作名查会跨实体串台
+ * （怪物 "fly" 命中纸娃娃 "fly" 条目 → 锚点取了纸娃娃的值 → 怪物整体偏移）。
+ * 合成器手里有当前装载 LAYOUT 包的真实 content hash，用它查是唯一不串台的口径。
+ * 找不到（旧清单/hash 未登记）→ 返回 false，调用方回落按动作名查。 */
+bool asset_dl_layout_origin_of(const char *hash_hex, int16_t *out_x, int16_t *out_y)
+{
+    if (!hash_hex || !hash_hex[0]) return false;
+    bool ok = false;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    for (int i = 0; i < s_file_cnt; i++) {
+        if (strcasecmp(s_files[i].kind, "LAYOUT") != 0) continue;
+        if (strcasecmp(s_files[i].hash, hash_hex) != 0) continue;
+        if (out_x) *out_x = s_files[i].origin_x;
+        if (out_y) *out_y = s_files[i].origin_y;
+        ok = true;
+        break;
+    }
+    xSemaphoreGive(s_lock);
+    return ok;
 }
 
 static void ensure_dirs(void)
@@ -632,6 +794,8 @@ static void load_local_manifest(void)
             const char *s;
             if ((s = cJSON_GetStringValue(cJSON_GetObjectItem(jf, "action"))))
                 strlcpy(lf->action, s, sizeof(lf->action));
+            if ((s = cJSON_GetStringValue(cJSON_GetObjectItem(jf, "defaultAction"))))
+                strlcpy(lf->default_action, s, sizeof(lf->default_action));
             if ((s = cJSON_GetStringValue(cJSON_GetObjectItem(jf, "entity"))))
                 strlcpy(lf->entity, s, sizeof(lf->entity));
             if ((s = cJSON_GetStringValue(cJSON_GetObjectItem(jf, "map"))))
@@ -779,6 +943,10 @@ static void save_local_manifest_locked(void)
         cJSON_AddStringToObject(jf, "kind", s_files[i].kind);
         if (s_files[i].label[0]) cJSON_AddStringToObject(jf, "label", s_files[i].label);
         if (s_files[i].action[0])   cJSON_AddStringToObject(jf, "action", s_files[i].action);
+        /* 【实体默认动作必须回写 2026-10-02】同 origin 的教训：固件同步后会重写本地
+         * 清单，不回写就抹掉 → 下次开机怪物/NPC 的 idle 动作名丢失（只能瞎猜）。 */
+        if (s_files[i].default_action[0])
+            cJSON_AddStringToObject(jf, "defaultAction", s_files[i].default_action);
         if (s_files[i].entity[0])   cJSON_AddStringToObject(jf, "entity", s_files[i].entity);
         if (s_files[i].map_id[0])   cJSON_AddStringToObject(jf, "map", s_files[i].map_id);
         if (s_files[i].selector[0]) cJSON_AddStringToObject(jf, "selector", s_files[i].selector);
@@ -974,7 +1142,7 @@ static int prune_stale_locked(const cJSON *assets)
  * 没给则保留本地值（不退化成空）。UTF-8 整码点截断，防中文名截半个字。 */
 static bool upsert_meta(const char *hash, const char *kind, const char *action,
                         const char *entity, const char *map_id, const char *selector,
-                        const char *label)
+                        const char *label, const char *default_action)
 {
     bool found_file = false;
     char path[MP_MPK_PATH_MAX];
@@ -997,6 +1165,8 @@ static bool upsert_meta(const char *hash, const char *kind, const char *action,
     if (slot) {
         strlcpy(slot->kind, kind, sizeof(slot->kind));
         if (action)   strlcpy(slot->action, action, sizeof(slot->action));
+        if (default_action)
+            strlcpy(slot->default_action, default_action, sizeof(slot->default_action));
         if (entity)   strlcpy(slot->entity, entity, sizeof(slot->entity));
         if (map_id)   strlcpy(slot->map_id, map_id, sizeof(slot->map_id));
         if (selector) strlcpy(slot->selector, selector, sizeof(slot->selector));
@@ -1663,7 +1833,8 @@ static void sync_once(void)
                         cJSON_GetStringValue(cJSON_GetObjectItem(ja, "entity")),
                         cJSON_GetStringValue(cJSON_GetObjectItem(ja, "map")),
                         cJSON_GetStringValue(cJSON_GetObjectItem(ja, "selector")),
-                        cJSON_GetStringValue(cJSON_GetObjectItem(ja, "label")));
+                        cJSON_GetStringValue(cJSON_GetObjectItem(ja, "label")),
+                        cJSON_GetStringValue(cJSON_GetObjectItem(ja, "defaultAction")));
         }
         prune_stale_locked(assets);              /* 以本轮清单为准对账剪除 */
         xSemaphoreGive(s_lock);

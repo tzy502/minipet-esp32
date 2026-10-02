@@ -74,6 +74,10 @@ bool state_machine_menu_open(void);
 /* 是否处于「无网降级」运行（POKER/OFFLINE/DOZE 下均可能） */
 bool state_machine_offline_mode(void);
 
+/* 当前生效的**实体形象**（2026-10-02）："" = 纸娃娃；否则 "mob:<id>"/"npc:<id>"。
+ * 菜单「怪物」页据此给当前项打选中标记（[v]）。纯只读，任意任务可调。 */
+const char *sm_active_entity(void);
+
 #ifdef __cplusplus
 }
 #endif

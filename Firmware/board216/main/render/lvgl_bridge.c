@@ -160,6 +160,10 @@ typedef struct {
     /* T4：选中未缓存条目 → 请求单包下载 → tick 轮询落盘 → 成功再 post 指令 */
     bool          dl_active;
     char          dl_hash[20];
+    /* 落盘后要切换到的实体（MP_CMD_SET_ENTITY 专用："mob:100100"/"npc:2100000"）。
+     * 为什么不能复用 dl_hash：实体指令的载荷是 entity 字符串，而下载请求要的是
+     * PARTS 包 hash —— 两者不是一回事（旧实现"NPC 页只下载不派发"正是缺这个字段）。 */
+    char          dl_entity[40];
     mp_cmd_type_t dl_cmd;       /* 落盘后要发的指令（MP_CMD_NONE = 只下载） */
     int64_t       dl_deadline_ms;
     char          hint_once[40];/* 一次性提示（下载完成 → 重建后显示一格） */
@@ -632,15 +636,18 @@ static void menu_parts_collect(void)
     menu_items_cached_first();
 }
 
-/* Monsters(NPC) 页：selector=="npc" 的实体（entity 去重；服务端 1 PARTS + N LAYOUT）。
- * 固件无 NPC 实体渲染通道 → 本页只列/只下（见页头注释）。 */
-static void menu_npc_collect(void)
+/* 怪物页（原 Monsters/NPC）：manifest 里的**实体形象**条目 —— selector=="mob"
+ * （Mob.wz，Web 怪物 tab 📤 推送）与 "npc"（Npc.wz）都在列，按 entity 去重。
+ * 【2026-10-02 从"只缓存"升级为"可用"】点选 = MP_CMD_SET_ENTITY → 状态机把宠物
+ * 形象切成该实体（PARTS + 默认动作 LAYOUT，与纸娃娃同一条渲染通道）。
+ * 未缓存条目仍走"先下载再派发"（menu_dispatch_entity）。 */
+static void menu_entity_collect(void)
 {
     char entities[MENU_COLLECT_MAX][40] = { { 0 } };
     char hashes[MENU_COLLECT_MAX][20] = { { 0 } };
     char labels[MENU_COLLECT_MAX][32] = { { 0 } };
     bool cached[MENU_COLLECT_MAX] = { false };
-    int n = asset_dl_npc_list(entities, hashes, labels, cached, MENU_COLLECT_MAX);
+    int n = asset_dl_entity_list(entities, hashes, labels, cached, MENU_COLLECT_MAX);
     if (n < 0) n = 0;
     s_menu.truncated = (n > MENU_LIST_MAX);
     if (n > MENU_LIST_MAX) n = MENU_LIST_MAX;
@@ -838,11 +845,58 @@ static void menu_dispatch_hash(const char *hash, const char *label, bool cached,
              s_menu.dl_hash, (int)cmd, (int)back);
 }
 
-/* 列表页条目激活（Maps/Paperdoll 执行后回根页=既有行为；NPC 只下载） */
+/* 列表页条目激活（Maps/Paperdoll 执行后回根页=既有行为） */
 static void menu_activate_item(int idx, mp_cmd_type_t cmd)
 {
     const menu_item_t *it = &s_menu.items[idx];
     menu_dispatch_hash(it->hash, it->label, it->cached, idx, cmd, MENU_PAGE_ROOT);
+}
+
+/* 怪物页条目激活：点选 = 把宠物形象切成该实体（MP_CMD_SET_ENTITY）。
+ * 与 menu_dispatch_hash 的分工：下载要的是 PARTS 包 hash，而指令载荷要的是
+ * entity 字符串 —— 故多带一个 entity；其余（离线置灰/在途去重/超时）同一条路径。 */
+static void menu_dispatch_entity(const char *entity, const char *hash, const char *label,
+                                 bool cached, int log_idx)
+{
+    ESP_LOGI(TAG, "menu: 实体激活 idx=%d entity=%s cached=%d label=%.24s",
+             log_idx, entity ? entity : "", (int)cached, label ? label : "");
+    if (!entity || !entity[0]) return;
+
+    if (cached) {
+        mp_cmd_t c = { .type = MP_CMD_SET_ENTITY };
+        strlcpy(c.s, entity, sizeof(c.s));
+        mp_post_cmd(&c);
+        menu_goto(MENU_PAGE_ROOT);
+        return;
+    }
+    if (state_machine_offline_mode()) {
+        menu_hint_set("OFFLINE: NOT CACHED");
+        menu_status_flash("离线且未缓存");
+        return;
+    }
+    if (s_menu.dl_active) {
+        menu_hint_set("BUSY: DOWNLOAD IN PROGRESS");
+        menu_status_flash("已有下载在途");
+        return;
+    }
+    if (!hash || !hash[0] || !asset_dl_request_one(hash)) {
+        menu_hint_set("REQ FAILED (NOT IN MANIFEST)");
+        menu_status_flash("下载请求被拒");
+        ESP_LOGW(TAG, "menu: 实体下载请求被拒 entity=%s hash=%.16s", entity, hash ? hash : "");
+        return;
+    }
+    s_menu.dl_active     = true;
+    s_menu.dl_cmd        = MP_CMD_SET_ENTITY;
+    strlcpy(s_menu.dl_hash, hash, sizeof(s_menu.dl_hash));
+    strlcpy(s_menu.dl_entity, entity, sizeof(s_menu.dl_entity));
+    s_menu.dl_deadline_ms = mp_now_ms() + MENU_DL_TIMEOUT_MS;
+    s_menu.dl_back       = MENU_PAGE_ROOT;
+    s_menu.dl_goto_back  = true;
+    if (s_menu.hint_label) {
+        lv_label_set_text_fmt(s_menu.hint_label, "DOWNLOADING %.8s ... WAIT", hash);
+    }
+    menu_status_flash("下载中，请稍候");
+    ESP_LOGI(TAG, "menu: 实体下载中 %s（hash %.16s）→ 完成后切换形象", entity, hash);
 }
 
 /* ---------------- 地图功能子页（§4.1：三个功能 + 返回地图列表） ----------------
@@ -1426,8 +1480,12 @@ static void menu_activate(int idx)
         break;
 
     case MENU_PAGE_NPC:
-        /* 只下载：NPC 渲染通道缺失（渲染层单实体纸娃娃）→ 不 post 渲染指令 */
-        if (idx < s_menu.item_cnt) menu_activate_item(idx, MP_CMD_NONE);
+        /* 【2026-10-02 可用化】点选 = 把宠物形象切成该怪物/NPC（先下载后切换）。
+         * 菜单里同时保留"只缓存"的语义：已缓存→立刻切换；未缓存→下载完自动切换。 */
+        if (idx < s_menu.item_cnt) {
+            const menu_item_t *it = &s_menu.items[idx];
+            menu_dispatch_entity(it->entity, it->hash, it->label, it->cached, idx);
+        }
         break;
 
     case MENU_PAGE_ACTIONS:
@@ -1491,7 +1549,12 @@ static void menu_dl_poll(void)
     if (asset_dl_file_cached(s_menu.dl_hash)) {
         if (s_menu.dl_cmd != MP_CMD_NONE) {
             mp_cmd_t c = { .type = s_menu.dl_cmd };
-            strlcpy(c.s, s_menu.dl_hash, sizeof(c.s));
+            /* 实体切换的载荷是 entity 字符串（不是包 hash）；其余指令仍是 hash */
+            if (s_menu.dl_cmd == MP_CMD_SET_ENTITY && s_menu.dl_entity[0]) {
+                strlcpy(c.s, s_menu.dl_entity, sizeof(c.s));
+            } else {
+                strlcpy(c.s, s_menu.dl_hash, sizeof(c.s));
+            }
             mp_post_cmd(&c);
         }
         if (s_menu.dl_cmd != MP_CMD_NONE) {
@@ -1588,6 +1651,17 @@ static void menu_row_text(char *out, size_t cap, bool cached, bool enabled,
                           const char *label)
 {
     snprintf(out, cap, "[%s] %s",
+             cached ? "v" : (enabled ? " " : "x"),
+             (label && label[0]) ? label : "(no name)");
+}
+
+/* 行文本（实体页）：在通用 [v] 标记前再加一个 ">" = **当前正在显示的实体**
+ * （state_machine 的 NVS 形象状态）。[v] 仍表示包已缓存。 */
+static void menu_row_text_entity(char *out, size_t cap, bool cached, bool enabled,
+                                 const char *label, bool active)
+{
+    snprintf(out, cap, "%s[%s] %s",
+             active ? ">" : " ",
              cached ? "v" : (enabled ? " " : "x"),
              (label && label[0]) ? label : "(no name)");
 }
@@ -1841,6 +1915,32 @@ static void menu_build_list(lv_obj_t *scr, const char *empty_text, const char *h
     }
 }
 
+/* 怪物（实体形象）页的行式列表：与 menu_build_list 同构，多一个 ">" 标记 =
+ * **当前正在显示的那个实体**（state_machine 的 NVS 形象状态，sm_active_entity()）。
+ * 为什么需要：同一页里既有怪物又有 NPC，用户点完切走再回来必须一眼看出现在是哪只
+ * （旧页只有 [v] 缓存标记，无法区分"已缓存"和"正在用"）。 */
+static void menu_build_list_entities(lv_obj_t *scr, const char *empty_text, const char *hint)
+{
+    (void)hint;
+    int row = 0;
+    const char *cur = sm_active_entity();
+    if (s_menu.item_cnt <= 0) {
+        menu_add_row(scr, row++, empty_text, 78, 42, false);   /* 明确空态，非假数据 */
+    } else {
+        for (int i = 0; i < s_menu.item_cnt && row < MENU_ROWS_MAX; i++) {
+            bool en = s_menu.items[i].cached || !s_menu.offline;   /* T3 置灰判据 */
+            bool active = (cur && cur[0] && strcmp(cur, s_menu.items[i].entity) == 0);
+            char text[48];
+            menu_row_text_entity(text, sizeof(text), s_menu.items[i].cached, en,
+                                 s_menu.items[i].label, active);
+            menu_add_row(scr, row++, text, 78 + i * 46, 42, en);
+        }
+    }
+    menu_add_row(scr, row, "< Back", 78 + row * 46, 42, true);
+    s_menu.back_idx = row;
+    s_menu.row_cnt  = row + 1;
+}
+
 /* 选择页选项串打包：真实条目 + [v]/[x]/[ ] 缓存标记 + 末行 "< Back"。
  * LVGL roller 的选项 = 单个 '\n' 分隔串（asset_dl label 为 ASCII，不含 '\n'）。
  * en[i] = 该选项可否确认（离线未缓存 = false，T3 语义在滚筒上的等价物——
@@ -2061,11 +2161,11 @@ static void menu_rebuild(void)
                                   "TAP: PLAY  [v] CACHED  [ ] NO PACK");
         break;
     case MENU_PAGE_NPC:
-        /* 行式页（NPC 缓存用途清单，非"选择"语义），只统一羊皮纸配色 */
-        menu_npc_collect();
+        /* 怪物页（mob + npc 实体形象）：行式页 + ">" 当前形象 / [v] 已缓存标记 */
+        menu_entity_collect();
         menu_chrome_build(scr, "怪物");
-        menu_build_list(scr, "NO NPC ASSET (SERVER PUSH)",
-                        "NPC PACKS: TAP TO CACHE (NO RENDER)");
+        menu_build_list_entities(scr, "NO MOB ASSET (WEB PUSH)",
+                                "TAP: USE AS PET  [v] CACHED  > CURRENT");
         break;
     case MENU_PAGE_BGM: {
         /* 行式页（控制项非"选择"语义），配色统一羊皮纸；

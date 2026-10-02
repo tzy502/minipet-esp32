@@ -1055,6 +1055,16 @@ static const mpak_layout_t *active_layout(void)
     return NULL;
 }
 
+/* 与 active_layout() 同优先级的**包句柄**（取 content hash 用：见 ent_canvas_update
+ * 的 origin 查询 —— 按 hash 查锚点，才不会在"怪物 fly vs 纸娃娃 fly"这类跨实体
+ * 重名动作上串台）。 */
+static const mpak_t *active_layout_pkg(void)
+{
+    if (g_lt_once_ok) return &g_lt_once;
+    if (g_lt_loop_ok) return &g_lt_loop;
+    return NULL;
+}
+
 /* parts/layout 任一变化后失效，下次重合成前按新数据现算 */
 static void ent_canvas_invalidate(void)
 {
@@ -1109,9 +1119,26 @@ static void ent_canvas_update(void)
      * 缺字段（旧清单/未下发）→ 0,0，等价于"画布左上角对齐屏心"的旧行为。 */
     {
         extern bool asset_dl_layout_origin(const char *action, int16_t *x, int16_t *y);
+        extern bool asset_dl_layout_origin_of(const char *hash_hex, int16_t *x, int16_t *y);
         int16_t ox = 0, oy = 0;
-        if (asset_dl_layout_origin(lt->action, &ox, &oy)) {
+        /* 【按包 hash 查锚点 2026-10-02】origin 决定"画布坐标 0 点贴屏心"的位置。
+         * 旧口径按**动作名**查清单 → 跨实体会串台：怪物与纸娃娃都有 "fly"/"hit"
+         * 动作名，怪物切过去后锚点会取到纸娃娃那条目的值（实体整体偏移/跳位）。
+         * 现在的查询优先级：① 当前装载 LAYOUT 包的 content hash 精确匹配（唯一不
+         * 会串台的口径，纸娃娃/怪物/NPC 都走这条）→ ② 旧口径按动作名（兼容
+         * 未登记 hash 的旧清单）→ ③ (0,0)（旧行为）。 */
+        const mpak_t *ltpkg = active_layout_pkg();
+        char lh[20] = "";
+        bool got = false;
+        if (ltpkg) {
+            snprintf(lh, sizeof lh, "%016llx", (unsigned long long)mpak_content_hash(ltpkg));
+            got = asset_dl_layout_origin_of(lh, &ox, &oy);
+        }
+        if (!got) got = asset_dl_layout_origin(lt->action, &ox, &oy);
+        if (got) {
             g_ent_ox = ox; g_ent_oy = oy;
+            ESP_LOGD(TAG, "实体锚点 origin=(%d,%d)（来源 %s）", (int)ox, (int)oy,
+                     ltpkg ? "包 hash 匹配" : "动作名回退");
         } else {
             g_ent_ox = 0; g_ent_oy = 0;
         }

@@ -88,6 +88,7 @@ idf.py -p /dev/cu.usbmodem21201 flash
 | [docs/ai/clock-display-spec.md](docs/ai/clock-display-spec.md) | WZ 地图时钟显示规格（已定稿） |
 | [docs/ai/waveshare-wiki-ESP32-S3-Touch-AMOLED-2.16.md](docs/ai/waveshare-wiki-ESP32-S3-Touch-AMOLED-2.16.md) | 微雪官方 wiki 全量（GPIO 引脚表/外设速查） |
 | [docs/ai/deployment-design.md](docs/ai/deployment-design.md) | NAS Docker 部署设计（单容器定稿，文内含历史三容器稿） |
+| [docs/ai/mob-entity-assets.md](docs/ai/mob-entity-assets.md) | 怪物/NPC 实体资产全链路（契约/摆放口径/三个真因/取证） |
 
 ## 开发状态
 
@@ -99,6 +100,7 @@ idf.py -p /dev/cu.usbmodem21201 flash
 | 服务端（Server/） | 核心服务迁入 + 导出器 + 8 个设备端点 + 管理端点（素材推送/字体/指令/OTA） |
 | Web（Web/） | 设备卡片 / 素材浏览器 / 纸娃娃编辑器 / 曲库 / 设置 / 表情调试 / BGM 控制 |
 | 固件（Firmware/） | 双板独立工程（board216 / board185b，零共享文件）：渲染合成 + 触摸/IMU 交互 + 菜单选择器 + BGM 解码 + OTA 双分区回滚 |
+| 怪物形象（两板同口径） | 「怪物」页选中即把宠物形象切成该怪物/NPC（Mob.wz → PARTS+LAYOUT → 同一条渲染通道，NVS 记忆，可切回纸娃娃）：服务端 mob 导出/推送 + Web 怪物 tab 📤 + 固件实体形象通道；契约与取证见 [docs/ai/mob-entity-assets.md](docs/ai/mob-entity-assets.md) |
 
 真机联调遗留问题与逐条证据见 [docs/ai/selftest-report-2026-09-27.md](docs/ai/selftest-report-2026-09-27.md)
 与 [docs/ai/keys-touch-handoff.md](docs/ai/keys-touch-handoff.md)。
