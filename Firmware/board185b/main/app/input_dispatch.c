@@ -957,9 +957,10 @@ static void touch_tick(void)
             int64_t now = mp_now_ms();
             if (now - last_apply >= 66) {
                 last_apply = now;
-                /* 【2026-10-02 用户口径】锚点 = 画布中心（原来的 f.x-240 是
-                 * "origin/左上角贴手指"，且 1.85B 屏宽 360 时 240 是错的屏心）。
-                 * 由合成器按真实画布尺寸换算，input 层不再自己减屏心。 */
+                /* 【2026-10-02 用户口径】锚点 = 画布中心（原来的 f.x-240 等价于
+                 * "origin/左上角贴手指"；【勘误】240 本身对两板都成立——185B 触摸层
+                 * 已把 360 面板坐标 ×4/3 映射进 480 合成器空间）。由合成器按真实
+                 * 画布尺寸换算，input 层不再自己减屏心。 */
                 render_drag_to_screen((int)f.x, (int)f.y);
                 note_interaction();
             }

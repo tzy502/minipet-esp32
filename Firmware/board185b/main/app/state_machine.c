@@ -786,6 +786,8 @@ static void cam_pan_test_run_ex(int steps, int step, int level)
 
 static char s_entity[40];               /* "" = 纸娃娃；否则 "mob:<id>"/"npc:<id>" */
 static bool s_entity_bound;            /* 该实体已成功绑到渲染层（幂等：避免每次 manifest 同步重开包） */
+static int64_t s_entity_retry_last_ms; /* 绑定失败后的自动重试节流（见 dispatch_entity 失败分支） */
+static int     s_entity_retry_cnt;
 
 const char *sm_active_entity(void) { return s_entity; }
 
@@ -850,57 +852,108 @@ static void dispatch_entity(const char *entity)
     }
     /* 意图先落地（NVS + 内存）：包可能还在下载 —— 记住它，素材同步完成后自动补绑 */
     bool changed = (strcmp(s_entity, want) != 0);
+    if (changed) { s_entity_retry_cnt = 0; s_entity_retry_last_ms = 0; }   /* 新目标：重试预算重置 */
     strlcpy(s_entity, want, sizeof s_entity);
     mp_nvs_set_str(SM_ENTITY_NVS_KEY, s_entity);
 
     /* 全有才绑：PARTS 与**默认动作 LAYOUT** 必须都在本地 —— 只绑一半会让渲染层出现
      * "怪物 PARTS + 纸娃娃 LAYOUT"的错配帧（合成器会按"部件解析失败"自愈并刷日志，
-     * 用户看到的是形象错乱）。缺任一包 → 只记住意图，等 MANIFEST_SYNCED 重试。 */
-    char path[MP_MPK_PATH_MAX], act[32] = "";
-    if (!asset_dl_entity_parts_path(s_entity, path, sizeof path) ||
-        !entity_default_layout_path(s_entity, path, sizeof path, act, sizeof act)) {
+     * 用户看到的是形象错乱）。缺任一包 → 只记住意图，等 MANIFEST_SYNCED 重试。
+     * ⚠️ **两条路径必须各用独立缓冲**（仓库老坑，真机刚又踩一次 2026-10-02）：
+     *   共用 path 时 entity_default_layout_path() 会把 LAYOUT 路径盖掉 PARTS 路径，
+     *   随后 render_set_parts() 打开的是 LAYOUT 包 → mpak_open 返回 MPAK_ERR_KIND(-7)
+     *   （真机日志：`形象切换 → npc:2100000（parts rc=-7）`）。
+     *   同款警告见 dispatch_manifest_synced 的出厂降级绑定段。 */
+    char ppath[MP_MPK_PATH_MAX], lpath[MP_MPK_PATH_MAX], act[32] = "";
+    if (!asset_dl_entity_parts_path(s_entity, ppath, sizeof ppath) ||
+        !entity_default_layout_path(s_entity, lpath, sizeof lpath, act, sizeof act)) {
         ESP_LOGW(TAG, "实体 %s 的 PARTS/默认动作布局还没下全 → 先记住，素材同步后自动切",
                  s_entity);
         return;
     }
-    int prc = render_set_parts(path);
+    int prc = render_set_parts(ppath);
     if (prc != 0) {
         vTaskDelay(pdMS_TO_TICKS(50));           /* TF 争用重试（同 parts 首开口径） */
-        prc = render_set_parts(path);
+        prc = render_set_parts(ppath);
     }
     int lrc = -1;
     if (prc == 0) {
-        if (!asset_dl_entity_layout_path(s_entity, act, path, sizeof path)) {
+        if (!asset_dl_entity_layout_path(s_entity, act, lpath, sizeof lpath)) {
             ESP_LOGW(TAG, "实体 %s 默认动作 %s 的布局路径消失（被淘汰？）", s_entity, act);
         } else {
-            lrc = render_set_layout(path, entity_action_loops(act));
+            lrc = render_set_layout(lpath, entity_action_loops(act));
             if (lrc != 0) {
                 vTaskDelay(pdMS_TO_TICKS(50));
-                lrc = render_set_layout(path, entity_action_loops(act));
+                lrc = render_set_layout(lpath, entity_action_loops(act));
             }
         }
     }
+    ESP_LOGW(TAG, "实体绑定路径：parts=%s | layout=%s(%s)", ppath, lpath, act[0] ? act : "-");
     s_entity_bound = (prc == 0 && lrc == 0);
+    if (s_entity_bound) { s_entity_retry_cnt = 0; s_entity_retry_last_ms = 0; }
     ESP_LOGW(TAG, "形象切换%s → %s（parts rc=%d）默认动作 %s（layout rc=%d）",
              changed ? "" : "（同实体重绑）", s_entity, prc,
              act[0] ? act : "(无)", lrc);
-    if (prc != 0 || lrc != 0) {
-        /* 绑定失败：保留 NVS 意图 + 请求一次素材同步（同"部件错配自愈"通道），
-         * 下轮 MANIFEST_SYNCED 会再试一次；屏上保留旧画面，不黑屏。 */
+    if (!s_entity_bound) {
+        char last_want[40];
+        strlcpy(last_want, s_entity, sizeof last_want);
+        /* 【失败必须回滚"活动实体" 2026-10-02 真机实证】原实现失败后仍留 s_entity：
+         * 紧接着 dispatch_action("stand1") 会走实体分支，把**没绑上的实体的 LAYOUT**
+         * 绑到渲染层 ⇒ 屏上是"纸娃娃部件 + 实体布局"的混合态（部件 id 全对不上，
+         * 合成器还会判定错配反复请求同步）。真机日志形态：
+         *   sm: 形象切换 → npc:2100000（parts rc=-7）默认动作 stand（layout rc=-1）
+         *   mpak: opened …/layout/dd0839cdc3e56ad2.mpk（= 实体布局被绑上了）
+         * 现改为：活动实体退回纸娃娃（**NVS 里的意图保留**）→ 动作一律回纸娃娃通道路径；
+         * 同时请求一次素材同步，MANIFEST_SYNCED 时 entity_restore() 会按 NVS 意图重试。 */
+        ESP_LOGW(TAG, "实体 %s 绑定失败 → 活动实体回退纸娃娃（NVS 意图保留，待素材同步重试）",
+                 s_entity);
+        s_entity[0] = 0;
+        /* 重试节流：绑定失败会请求素材同步，而同步收尾又会调 entity_restore() 重试 ——
+         * 不节流就是"失败→同步→失败"的热循环（每轮一次 HTTP + 一串日志）。
+         * 同一实体最多自动重试 3 次、间隔 ≥30s；用尽即停（显式切换/重启会重置）。 */
         extern void asset_dl_request_sync(void);
-        asset_dl_request_sync();
+        int64_t now_ms = mp_now_ms();
+        if (s_entity_retry_cnt < 3 &&
+            (s_entity_retry_last_ms == 0 || now_ms - s_entity_retry_last_ms >= 30000)) {
+            s_entity_retry_last_ms = now_ms;
+            s_entity_retry_cnt++;
+            ESP_LOGW(TAG, "实体绑定失败 → 请求素材同步重试（第 %d/3 次）", s_entity_retry_cnt);
+            asset_dl_request_sync();
+        } else if (s_entity_retry_cnt >= 3) {
+            ESP_LOGE(TAG, "实体 %s 连续 %d 次绑定失败 → 停止自动重试（等显式切换或重启）",
+                     last_want, s_entity_retry_cnt);
+        }
     }
+}
+
+/* 【实体形象远程切换通道 2026-10-02】action 值 "entity:mob:100100" /
+ * "entity:npc:2100000"（"entity:paperdoll" = 切回纸娃娃）→ MP_CMD_SET_ENTITY。
+ * 为什么留这条：Web 的 push(kind=mob) 要**服务端升级后**才存在；既有 action
+ * 指令通道（/devices/{id}/command {"type":"action"}）任何版本都有，真机验证与
+ * 排障都靠它。正常动作名不含 ':'，不会误触。
+ * （216 侧同一魔数在 action_maybe_camtest() 里；185b 无该函数，故在此拦截。） */
+static bool action_maybe_entity(const char *action)
+{
+    if (!action || strncmp(action, "entity:", 7) != 0) return false;
+    mp_cmd_t c = { .type = MP_CMD_SET_ENTITY };
+    strlcpy(c.s, action + 7, sizeof(c.s));
+    mp_post_cmd(&c);
+    ESP_LOGW(TAG, "action 魔数：切换实体形象 → %s", c.s[0] ? c.s : "(纸娃娃)");
+    return true;
 }
 
 static void dispatch_action(const char *action)
 {
     char path[MP_MPK_PATH_MAX];
+    if (action_maybe_entity(action)) return;
     if (!heap_ok_for_asset_load()) {
         ESP_LOGW(TAG, "内部堆不足，跳过动作切换 %s（防 fopen abort）", action);
         return;
     }
-    /* ── 实体态：动作从该实体自己的 LAYOUT 里取（先映射名字，再回落默认动作）── */
-    if (s_entity[0]) {
+    /* ── 实体态：动作从该实体自己的 LAYOUT 里取（先映射名字，再回落默认动作）──
+     * 判据用 s_entity_bound（真正绑上了）而不是 s_entity：绑定失败时绝不能把实体
+     * 布局配到纸娃娃部件上（部件 id 全对不上 = 屏上形象消失）。 */
+    if (s_entity[0] && s_entity_bound) {
         const char *want = entity_action_of(action);
         char use[32] = "";
         bool ok = false;
