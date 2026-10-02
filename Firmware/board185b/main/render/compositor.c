@@ -3506,21 +3506,15 @@ static void compose_region(int32_t x, int32_t y, int32_t w, int32_t h)
     if (y + h > g_sh) h = g_sh - y;
     if (w <= 0 || h <= 0) return;
 
-    /* 0) CLOCK_DOZE（问题3/E9）：AMOLED 纯黑背景只数字发光——
-     * 时钟激活即 doze 语义（enable 仅由 CLOCK_DOZE 进出指令驱动）。
-     *
-     * 【E9 缺口补齐 2026-09-27】需求原文：「无人交互 N 分钟 → **宠物睡眠态**
-     * + WZ 数字时钟浮现 … AMOLED 纯黑背景只数字发光（省电）」。
-     * 此前本分支画完数字就 return：宠物完全不画（缺口核对记为 E9 未实现项
-     * 「sleep-pet state」），真机表现是黑屏上只有时间，用户看不到宠物睡了。
-     * 现改为：黑底 → 时钟数字 → 宠物（darken 降亮=睡眠观感，省电语义保持）。 */
-    if (clock_digits_active()) {
-        for (int32_t r = y; r < y + h; r++)
-            memset(g_fb + (size_t)r * g_sw + x, 0, (size_t)w * 2u);
-        clock_digits_compose(g_fb, g_sw, RC_SCALE, x, y, w, h);
-        ent_compose(x, y, w, h, RC_SLEEP_DARKEN);
-        return;
-    }
+    /* 0) CLOCK_DOZE（问题3/E9）——【待机背景改口径 2026-10-02 用户定稿】
+     * 用户原话：「设备视角里的其他内容也要一起渲染，这个就是以后待机的背景了」。
+     * 旧口径是 AMOLED 纯黑底 + 时钟数字 + 睡眠宠物（原需求"纯黑背景只数字发光"），
+     * 代价是**进待机地图整段消失**（黑屏）。现口径：**待机 = 正常场景一整幅**
+     * （static/条带/tile + 对象层 + 宠物）+ 时钟数字叠在最上层 —— 即"设备视角"
+     * 看到什么，待机就显示什么；宠物仍按 RC_SLEEP_DARKEN 降亮保留睡眠观感。
+     * 实现：这里不再清黑、不再提前 return；只记一个 doze 标志，时钟改到本函数
+     * 末尾（宠物/气泡之后）叠加，保证时钟永远在最上层不被背景盖掉。 */
+    const bool doze = clock_digits_active();
 
     /* 1) static_back（不动底；无地图 → 黑底）
      * 根因修复（拖动小人后旧位置图像永久残留，三轮未修的真凶）：脏区从第 x 列
@@ -3680,7 +3674,10 @@ static void compose_region(int32_t x, int32_t y, int32_t w, int32_t h)
 
     /* 5) 实体缓冲（1bit 覆盖；显示区 = clamp 后的摆放矩形，与 mark_ent_at
      * 完全同源（ent_screen_rect_at），右缘 480 处标脏/绘制不再分歧） */
-    ent_compose(x, y, w, h, 0);
+    ent_compose(x, y, w, h, doze ? RC_SLEEP_DARKEN : 0);
+
+    /* 5.5) CLOCK_DOZE：时钟数字叠在最上层（待机背景 = 上面这一整幅场景） */
+    if (doze) clock_digits_compose(g_fb, g_sw, RC_SCALE, x, y, w, h);
 
     /* 6) 气泡（不透明矩形位图） */
     if (g_bub.active) {
