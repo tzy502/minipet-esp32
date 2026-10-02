@@ -338,6 +338,18 @@ function matLabel(id) {
   return hit ? `${hit.name || '—'} [${id}]` : `[${id}]`
 }
 
+/** 类型中文名（推送确认文案用；2026-10-02 补 mob —— 原先只认 map/npc，
+ *  怪物推送在这个页面既选不到、确认框里也只有编号没有中文名）。 */
+function kindCn(k) {
+  return k === 'map' ? '地图' : k === 'mob' ? '怪物' : 'NPC'
+}
+
+/** 素材中文名（目录里查不到就回退编号 —— 保证确认框里始终"有名字"）。 */
+function matName(id) {
+  const hit = matAll.value.find((it) => it.id === String(id))
+  return hit?.name || `#${id}`
+}
+
 /**
  * 设备选择器选项（分组）：★ 收藏 → 🕘 最近 → 全部目录。
  * 同一 id 只出现一次（上面出现过的从「全部目录」里剔除）；收藏/最近里的 id 即使不在目录中
@@ -763,10 +775,20 @@ async function sendBubble() {
       </n-card>
 
       <!-- 素材推送（T3/E7）：选择器 = E4「最近+收藏」，推送是真正让素材上机的动作 -->
-      <n-card title="素材推送（地图 / NPC 上机，E7）" size="small">
+      <n-card title="素材推送（地图 / 怪物 / NPC 上机，E7）" size="small">
         <n-space vertical :size="10">
           <n-space align="center" :size="8" style="width: 100%">
-            <n-select v-model:value="pushKind" :options="[{ label: '地图 map', value: 'map' }, { label: 'NPC npc', value: 'npc' }]" size="small" style="width: 130px" :disabled="pushBusy" />
+            <n-select
+              v-model:value="pushKind"
+              :options="[
+                { label: '地图 map', value: 'map' },
+                { label: '怪物 mob', value: 'mob' },
+                { label: 'NPC npc', value: 'npc' },
+              ]"
+              size="small"
+              style="width: 130px"
+              :disabled="pushBusy"
+            />
             <n-select
               v-model:value="pushId"
               filterable
@@ -780,13 +802,15 @@ async function sendBubble() {
               placeholder="搜索目录或直接输入素材编号（如 200000100）"
               @update:show="(v) => v && loadMatOptions()"
             />
-            <n-checkbox v-model:checked="pushSwitch" :disabled="pushBusy">登记后立即切换（仅地图）</n-checkbox>
+            <n-checkbox v-model:checked="pushSwitch" :disabled="pushBusy">登记后立即生效（地图=切图；怪物/NPC=切成该实体）</n-checkbox>
             <n-popconfirm @positive-click="doPushMaterial">
               <template #trigger>
                 <n-button type="primary" size="small" :loading="pushBusy" :disabled="!pushId">推送到本设备</n-button>
               </template>
-              把 {{ pushKind === 'map' ? '地图' : 'NPC' }} {{ pushId }} 推送到 {{ device.name || device.deviceId }} ？
-              服务端后台打包（HTTP 202 受理）→ 设备拉到新 manifest → 完成后自动切换。
+              把 {{ kindCn(pushKind) }} <b>{{ matName(pushId) }}</b> {{ pushId }} 推送到
+              {{ device.name || device.deviceId }} ？
+              {{ pushKind === 'map' ? '服务端后台打包 → 设备切图' : '服务端后台打包 → 设备把宠物形象切成该实体' }}
+              （HTTP 202 受理，异步生效；大素材下载在设备后台进行，不阻塞操作）。
             </n-popconfirm>
           </n-space>
           <n-alert

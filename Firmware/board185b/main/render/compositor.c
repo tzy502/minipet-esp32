@@ -1490,7 +1490,7 @@ static void strip_blit(const rc_strip_t *s, int32_t rx0, int32_t ry0,
             if (m < 0) m += period;
             int32_t src_x = m >> RC_SCALE_SHIFT;
             uint32_t bit0 = (uint32_t)src_y * s->w + (uint32_t)src_x;   /* tight 位索引 */
-            int32_t max_src = (rx0 + rw - sx) >> 1;                     /* 本组最多几个源列 */
+            int32_t max_src = (rx0 + rw - sx) / RC_SCALE;               /* 本组最多几个源列（4:1 → /4） */
             if (max_src <= 0) max_src = 1;
             int32_t run = 8 - (int32_t)(bit0 & 7u);                     /* 到字节边界 */
             if (run > max_src) run = max_src;
@@ -1516,24 +1516,33 @@ static void strip_blit(const rc_strip_t *s, int32_t rx0, int32_t ry0,
                      * cdaf31a153002311 是 240×240 全屏背景层，掩码整字节 0xFF 占比
                      * 85% / 49% ⇒ 几乎**整屏**都走这条错路径 = 用户照片里"地图区
                      * 整片细竖条纹"。现按 2x 展开：每源像素写两份。 */
+                    /* 【4:1 试验 2026-10-01】原为 2x 硬编码展开（d[2k]/d[2k+1] + sx+=2*run）；
+                     * RC_SCALE 改成 4 后必须按 RC_SCALE 泛化，否则条带层横向只画一半宽度
+                     * （右半屏变成旧像素/黑），纵向同理由 band_h 位移保证。
+                     * 展开语义与逐像素回退分支一致：每个源像素横向复制 RC_SCALE 份。 */
                     uint16_t *d = drow + sx;
                     const uint16_t *sp = srow + src_x;
+                    const int32_t lim = rx0 + rw;
                     for (int32_t k = 0; k < run; k++) {
                         uint16_t v = sp[k];
-                        d[2 * k] = v;
-                        d[2 * k + 1] = v;
+                        int32_t base = sx + k * RC_SCALE;
+                        for (int32_t rp = 0; rp < RC_SCALE; rp++) {
+                            if (base + rp < lim) d[k * RC_SCALE + rp] = v;
+                        }
                     }
-                    sx += 2 * run;
+                    sx += RC_SCALE * run;
                     continue;
                 }
             }
             for (int32_t k = 0; k < run; k++) {
                 uint32_t b = bit0 + (uint32_t)k;
                 if (!s->mask || ((s->mask[b >> 3] >> (7 - (b & 7))) & 1u)) {
-                    drow[sx] = srow[src_x + k];
-                    if (sx + 1 < rx0 + rw) drow[sx + 1] = srow[src_x + k];
+                    uint16_t v = srow[src_x + k];
+                    for (int32_t rp = 0; rp < RC_SCALE; rp++) {   /* 4:1：横向复制 RC_SCALE 份 */
+                        if (sx + rp < rx0 + rw) drow[sx + rp] = v;
+                    }
                 }
-                sx += 2;
+                sx += RC_SCALE;
             }
         }
     }
@@ -1667,6 +1676,14 @@ void rc_long_op_pump(void)
     if (now - g_pump_last_us < (int64_t)RC_PUMP_GAP_MS * 1000) return;
     g_pump_last_us = now;
     g_pump_n++;
+
+    /* ⚠️ 必须喂狗（E14）：本板渲染心跳超时 = 5s（watchdog.c MP_WDT_TIMEOUT_MS），
+     * 超时 → 计振 → 前两振 esp_restart()。真机实测：整图 BGMAP 的全量 CRC 3.5s
+     * 本就贴着 5s 线，保活泵的让位（+14%）把它推过线 → `task_wdt: render` 报警 +
+     * 一次重启（185B 21:29 那次 dump 即此）。泵每 ~140ms 一次 ⇒ 这里补喂一次，
+     * 心跳间隔始终 ≤RC_PUMP_GAP_MS+让位，与窗口填充循环里的 watchdog_kick 同口径
+     * （都是"合法长任务主动喂狗"）。装载真卡住时泵本身也不会被调到 → 照旧熔断。 */
+    watchdog_kick();
 
     /* ① 先放锁：下面写进 g_fb 的像素要等持续刷新任务读到才看得见 */
     pump_yield_panel();
@@ -3952,15 +3969,18 @@ static void ground_cam_shift_layers(void)
         for (int32_t r = 0; r + sh < g_sh; r++)
             memcpy(g_static + (size_t)r * g_sw, g_static + (size_t)(r + sh) * g_sw,
                    (size_t)g_sw * 2u);
-        /* 底部 sh 行 ← 地面带（1x → 2x 最近邻展开） */
+        /* 底部 sh 行 ← 地面带（1x → RC_SCALE 倍最近邻展开）
+         * 【4:1 试验】原为硬编码 2x（>>1）；改 RC_SCALE 泛化，否则 4x 下地面带只铺半屏宽/半高。 */
         const uint16_t *band = (const uint16_t *)(const void *)ground_band_000010000_bin_start;
         for (int32_t r = g_sh - sh; r < g_sh; r++) {
-            int32_t by = (r - (g_sh - sh)) >> 1;
+            int32_t by = (r - (g_sh - sh)) / RC_SCALE;
             if (by >= MP_GROUND_BAND_H) by = MP_GROUND_BAND_H - 1;
             uint16_t *drow = g_static + (size_t)r * g_sw;
             const uint16_t *brow = band + (size_t)by * MP_GROUND_BAND_W;
-            for (int32_t x = 0; x < g_sw; x++)
-                drow[x] = brow[(x >> 1) < MP_GROUND_BAND_W ? (x >> 1) : MP_GROUND_BAND_W - 1];
+            for (int32_t x = 0; x < g_sw; x++) {
+                int32_t bx = x / RC_SCALE;
+                drow[x] = brow[bx < MP_GROUND_BAND_W ? bx : MP_GROUND_BAND_W - 1];
+            }
         }
     }
     if (g_tile) {

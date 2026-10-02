@@ -652,6 +652,35 @@ int asset_dl_entity_actions(const char *entity, char (*actions)[32], int max)
     return n;
 }
 
+
+/* 实体是否已下载可用：PARTS 行与"默认动作"LAYOUT 行的文件都在 TF 上。
+ * 只看元数据不够（元数据在清单里就有，文件可能还在下）——必须 access(F_OK)。 */
+bool asset_dl_entity_ready(const char *entity)
+{
+    if (!entity || !entity[0]) return false;
+    bool parts_ok = false, layout_ok = false;
+    char def_act[32] = "";
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    for (int i = 0; i < s_file_cnt; i++) {
+        if (strcmp(s_files[i].entity, entity) != 0) continue;
+        if (strcasecmp(s_files[i].kind, "PARTS") == 0) {
+            parts_ok = file_cached_row(&s_files[i]);
+            if (s_files[i].default_action[0])
+                strlcpy(def_act, s_files[i].default_action, sizeof def_act);
+        }
+    }
+    for (int i = 0; i < s_file_cnt; i++) {
+        if (strcasecmp(s_files[i].kind, "LAYOUT") != 0) continue;
+        if (strcmp(s_files[i].entity, entity) != 0) continue;
+        if (def_act[0] ? strcmp(s_files[i].action, def_act) == 0 : true) {
+            layout_ok = file_cached_row(&s_files[i]);
+            if (layout_ok) break;
+        }
+    }
+    xSemaphoreGive(s_lock);
+    return parts_ok && layout_ok;
+}
+
 /* LAYOUT 条目的 origin：按**包内容 hash** 精确匹配。
  * 为什么需要它：origin 决定画布坐标 0 点贴屏心的位置，而按动作名查会跨实体串台
  * （怪物 "fly" 命中纸娃娃 "fly" 条目 → 锚点取了纸娃娃的值 → 怪物整体偏移）。

@@ -133,6 +133,10 @@ bool asset_dl_entity_layout_path(const char *entity, const char *action, char *p
 /* 该实体某动作的 LAYOUT 是否已在 TF（元数据 + access(F_OK)；与 layout_path 同差别：
  * 文件被 LRU 淘汰后 layout_path 仍返回 true，本函数返回 false） */
 bool asset_dl_entity_layout_cached(const char *entity, const char *action);
+/* 实体是否**已下载可用**（PARTS + 默认动作 LAYOUT 两个文件都在 TF 上）。
+ * 用途：把"包还没下完（等后台异步下载）"与"下完了但打开失败（真错误）"分开计 ——
+ * 大包（自动缩放后仍可达 8MB）下载是分钟级，按"失败次数"计会把重试预算烧光。 */
+bool asset_dl_entity_ready(const char *entity);
 /* 实体默认动作（PARTS 条目 extra.defaultAction；缺则回退该实体第一个 LAYOUT 动作） */
 bool asset_dl_entity_default_action(const char *entity, char *out, size_t cap);
 /* 该实体清单里的全部动作名（≤ max 条，每条形如 "stand"/"move"/"hit1"） */

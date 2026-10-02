@@ -1455,9 +1455,12 @@ public sealed class AssetExporter
                 Warn($"{cnName} {entityIdStr} PARTS {partsPayload.Length / 1024}KB 偏大"
                      + "（固件部件缓存 2MB；大动作逐帧推进可能反复重载，体感偏慢）");
             /* 硬上限（缩放后仍超）：宁可**明确失败**也不让设备白下几分钟再报"下载失败"。
-             * 6MB 的依据：设备 TF 有效写速 ~230KB/s ⇒ 25s 级；再大就进入"菜单下载超时/
-             * 频繁重试"的体感区（真机 24MB 那只就是这么失败的）。 */
-            const int kEntityPartsMaxBytes = 6 * 1024 * 1024;
+             * 8MB 的依据：设备 TF 有效写速 ~230KB/s ⇒ ~35s；固件侧菜单下载超时已同步
+             * 抬到 180s（`MENU_DL_TIMEOUT_MS`），所以 8MB 稳落在"能下完"的窗口内。
+             * 实测：8500000（BOSS）缩放后 800KB；9602606 缩放后 7.2MB ⇒ 都放行；
+             * 再大（>8MB）就是"抽帧/进一步降采样"的产品决策区，宁可**明确失败**也不让
+             * 设备白下几分钟再报"下载失败"（真机 24MB 那只的原症状）。 */
+            const int kEntityPartsMaxBytes = 8 * 1024 * 1024;
             if (partsPayload.Length > kEntityPartsMaxBytes)
                 throw new InvalidOperationException(
                     $"{cnName} {entityIdStr} 素材过大：PARTS {partsPayload.Length / 1024}KB > "

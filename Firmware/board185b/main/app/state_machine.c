@@ -930,6 +930,19 @@ static void dispatch_entity(const char *entity)
          * 同一实体最多自动重试 3 次、间隔 ≥30s；用尽即停（显式切换/重启会重置）。 */
         extern void asset_dl_request_sync(void);
         int64_t now_ms = mp_now_ms();
+        /* 【大包 = 异步等待，不烧重试预算 2026-10-02 用户口径"推送的时候最好异步下载"】
+         * 包还没下完（自动缩放后仍可达 8MB，TF ~230KB/s ⇒ 分钟级）时，绑定失败是
+         * **正常中间态**：只做 ≥30s 节流的同步请求（催下载），**不动** retry_cnt，
+         * 下完那次 MANIFEST_SYNCED 会自然重绑。只有"文件已在 TF 却仍打不开"才算真失败。 */
+        if (!asset_dl_entity_ready(last_want)) {
+            if (s_entity_retry_last_ms == 0 || now_ms - s_entity_retry_last_ms >= 30000) {
+                s_entity_retry_last_ms = now_ms;
+                ESP_LOGW(TAG, "实体 %s 的包还没下完（大包分钟级）→ 等异步下载，不消耗重试预算",
+                         last_want);
+                asset_dl_request_sync();
+            }
+            return;
+        }
         if (s_entity_retry_cnt < 3 &&
             (s_entity_retry_last_ms == 0 || now_ms - s_entity_retry_last_ms >= 30000)) {
             s_entity_retry_last_ms = now_ms;

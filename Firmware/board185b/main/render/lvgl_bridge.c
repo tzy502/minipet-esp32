@@ -97,7 +97,11 @@ typedef enum {
 #define MENU_ROWS_MAX   8       /* 单页可选行上限（含 Back/Exit 行） */
 #define MENU_LIST_MAX   6       /* 列表页真实条目上限（+Back(+空态行) ≤ 8） */
 #define MENU_COLLECT_MAX (MENU_LIST_MAX + 1)  /* 多收 1 条用于探测「还有更多」 */
-#define MENU_DL_TIMEOUT_MS 30000  /* T4：单包下载轮询超时（tick 100ms 轮询落盘） */
+/* 【T4 单包下载轮询超时 2026-10-02 由 30s 抬到 180s】用户口径："推送的时候最好异步下载"、
+ * 以及实测：超大怪（9602606 自动缩放后仍 7.2MB）在 ~230KB/s 的 TF 写速下要 ~35s，
+ * 30s 必然判超时 → 菜单报"下载超时"（用户原话"显示下载失败"）。180s 覆盖 8MB 上限
+ * （服务端硬上限）的极端包；期间菜单 tick 照常刷新进度百分比，不阻塞任何交互。 */
+#define MENU_DL_TIMEOUT_MS 180000
 #define MENU_MAP_FN_CNT 4       /* 地图功能子页选项数（3 功能 + 返回地图列表） */
 #define MENU_STATUS_FLASH_MS 2500 /* 状态行一次性提示驻留时长（动作反馈/相机占位） */
 
