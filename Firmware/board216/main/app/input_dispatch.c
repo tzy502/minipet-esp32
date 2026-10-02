@@ -469,7 +469,11 @@ static void force_tick(const imu_accel_t *a)
         } else if (now - s_pickup_since_ms > PICKUP_HOLD_MS && !s_pickup_latched) {
             s_pickup_latched = true;
             mp_post_event_simple(MP_EVT_PICKUP, 0, 0, NULL);
-            post_action(MP_ACTION_FLY);
+            /* 【2026-10-02 用户口径】"设备倾斜的时候只用 walk 不用 fly"——拿起/翻转
+             * 也是一种倾斜姿态（偏离水平 ≥PICKUP_ANGLE_DEG 且 z 不朝天），原先播 fly，
+             * 现统一为 walk1（怪物/NPC 形象下由状态机映射到 move）；oops 表情保留 =
+             * "被拿起"的反馈仍在。菜单里手动选 Fly 不受影响（那是用户主动动作）。 */
+            post_action(MP_ACTION_WALK);
             input_trigger_expression(MP_EXPR_OOPS, 1800);
             note_interaction();
         }
