@@ -2232,6 +2232,16 @@ void asset_dl_reload_local(void)
 void asset_dl_request_sync(void)
 {
     if (!s_sync_req) return;
+    /* 【临时诊断 2026-10-03】用户报"没推送却一直提示拉取中" → 查明是谁在周期性请求同步。
+     * 只打调用方返回地址（30s 限频），事后用 build 目录的 .map 文件反查函数名即可定位。 */
+    {
+        static int64_t s_dbg_ms;
+        int64_t now = esp_timer_get_time() / 1000;
+        if (now - s_dbg_ms > 30000) {
+            s_dbg_ms = now;
+            ESP_LOGW(TAG, "[sync-trigger] caller=%p", __builtin_return_address(0));
+        }
+    }
     s_sync_again = true;      /* 单包请求与全量同步同批到达时不丢全量（见 asset_dl_task） */
     xSemaphoreGive(s_sync_req);
 }

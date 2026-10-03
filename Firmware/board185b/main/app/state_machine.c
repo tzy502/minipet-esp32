@@ -169,14 +169,6 @@ static void transition_locked(mp_state_t next)
         cmd_simple(MP_CMD_SET_ACTION, MP_ACTION_STAND, 0, 0);
         if (prev == MP_ST_CLOCK_DOZE) {
             cmd_simple(MP_CMD_CLOCK, NULL, 0, 0);               /* 收时钟 */
-            if (s_map_before_doze[0]) {                         /* 待机专用图 → 唤醒切回 */
-                mp_cmd_t mc = { 0 };
-                mc.type = MP_CMD_SET_MAP;
-                strlcpy(mc.s, s_map_before_doze, sizeof(mc.s));
-                mp_post_cmd(&mc);
-                ESP_LOGW(TAG, "唤醒切回原图：%s", s_map_before_doze);
-                s_map_before_doze[0] = 0;
-            }
             cmd_simple(MP_CMD_SET_EXPRESSION, MP_EXPR_BLINK, 0, 0);  /* 唤醒瞬目 */
         }
         post_banner_if_needed();     /* 问题4：无配置 → 常驻配网横幅 */
@@ -198,19 +190,10 @@ static void transition_locked(mp_state_t next)
         /* E9：待机时钟浮现；fontTime 素材与地图锚点由 dispatch 查 asset_dl */
         ESP_LOGW(TAG, "【待机时钟】进入 CLOCK_DOZE（闲置到点，idleToClockMin=%u）",
                  (unsigned)g_mp_cfg.idle_to_clock_min);   /* 状态迁移取证：该态原先无日志 */
-        /* 【待机背景专用图 2026-10-02】切到 doze_map 并记住当前图（唤醒切回） */
-        {
-            char dm[32];
-            if (asset_dl_doze_map(dm, sizeof dm) && !asset_dl_map_is_active(dm) &&
-                asset_dl_active_map_id(s_map_before_doze, sizeof(s_map_before_doze))) {
-                mp_cmd_t mc = { 0 };
-                mc.type = MP_CMD_SET_MAP;
-                strlcpy(mc.s, dm, sizeof(mc.s));
-                mp_post_cmd(&mc);
-                ESP_LOGW(TAG, "待机背景切图：%s → %s（唤醒后切回）", s_map_before_doze, dm);
-            }
-        }
-        cmd_simple(MP_CMD_CLOCK, NULL, 1, 0);
+        /* 【2026-10-03 删除待机切图】背景已写死在固件（render_doze_bg.c），不再 SET_MAP
+         * 换图 —— 原先那张图本地不可装载时会让 SET_MAP 失败并周期性请求素材同步
+         * （用户报"没推送却一直提示拉取中"）。 */
+                cmd_simple(MP_CMD_CLOCK, NULL, 1, 0);
         cmd_simple(MP_CMD_SET_EXPRESSION, MP_EXPR_DEFAULT, 0, 0);
         break;
 

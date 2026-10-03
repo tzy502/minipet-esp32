@@ -242,15 +242,6 @@ static void transition_locked(mp_state_t next)
         if (prev == MP_ST_CLOCK_DOZE) {
             cmd_simple(MP_CMD_CLOCK, NULL, 0, 0);               /* 收时钟 */
             cmd_simple(MP_CMD_SET_EXPRESSION, MP_EXPR_BLINK, 0, 0);  /* 唤醒瞬目 */
-            /* 【待机专用背景图】唤醒即切回进待机前那张图 */
-            if (s_map_before_doze[0]) {
-                mp_cmd_t mc = { 0 };
-                mc.type = MP_CMD_SET_MAP;
-                strlcpy(mc.s, s_map_before_doze, sizeof(mc.s));
-                mp_post_cmd(&mc);
-                ESP_LOGW(TAG, "唤醒切回原图：%s", s_map_before_doze);
-                s_map_before_doze[0] = 0;
-            }
         }
         post_banner_if_needed();     /* 问题4：无配置 → 常驻配网横幅 */
         /* 闲置计时只由用户交互/用户可达的场景切换刷新（boot/自检/菜单/唤醒/
@@ -268,24 +259,12 @@ static void transition_locked(mp_state_t next)
         break;
 
     case MP_ST_CLOCK_DOZE:
-        /* E9：待机时钟浮现；fontTime 素材与地图锚点由 dispatch 查 asset_dl。
-         * 【待机背景专用图 2026-10-02】先切到 doze_map（用户口径："背景直接换到我
-         * 给你的升降场那张图"），并记住当前图以便唤醒时切回。 */
-        {
-            char dm[32];
-            if (asset_dl_doze_map(dm, sizeof dm) && asset_dl_map_is_active(dm) == false) {
-                /* 记当前图（拿不到就不切回，免得切到空） */
-                extern bool asset_dl_active_map_id(char *out, size_t cap);
-                if (asset_dl_active_map_id(s_map_before_doze, sizeof(s_map_before_doze))) {
-                    mp_cmd_t mc = { 0 };
-                    mc.type = MP_CMD_SET_MAP;
-                    strlcpy(mc.s, dm, sizeof(mc.s));
-                    mp_post_cmd(&mc);
-                    ESP_LOGW(TAG, "待机背景切图：%s → %s（唤醒后切回）",
-                             s_map_before_doze, dm);
-                }
-            }
-        }
+        /* E9：待机时钟浮现（背景/锚点均已写死在固件里，见 render_doze_bg.c）。
+         * 【2026-10-03 删除待机切图】原先进待机要 SET_MAP(doze_map) 把背景换成那张图；
+         * 现在背景是**固件内置的一屏**（compositor 第 4.4 步整块覆盖），切图纯属多余 ——
+         * 而且那张图若在本地不可装载（真机：地图包 rc=-8），SET_MAP 失败会走
+         * "路径查询失败 → asset_dl_request_sync()"，形成周期性拉取（用户报"没推送却一直
+         * 提示拉取中"）。删掉即断根。 */
         cmd_simple(MP_CMD_CLOCK, NULL, 1, 0);
         cmd_simple(MP_CMD_SET_EXPRESSION, MP_EXPR_DEFAULT, 0, 0);
         break;
