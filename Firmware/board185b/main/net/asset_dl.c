@@ -2103,7 +2103,12 @@ static void asset_dl_task(void *arg)
     (void)arg;
     char one[20];
     for (;;) {
-        if (xSemaphoreTake(s_sync_req, pdMS_TO_TICKS(60000)) == pdTRUE) {
+        /* 【兜底对表周期 60s → 5min 2026-10-03 用户报"没推送却一直提示拉取中"】
+         * 这里只是"没人叫我也定期看一眼服务端 rev"的兜底；**实时性由 poll 通道保证**：
+         * poll 响应里带 mrev，一变（推送/配置改动/删除地图）poller 立刻 request_sync()。
+         * 60s 一轮会让服务端/Web 看到设备"一直在拉取"（用户口径的"拉取中"），
+         * 而它并不带来实时性收益 ⇒ 放宽到 5 分钟，真正有变更时依旧秒级响应。 */
+        if (xSemaphoreTake(s_sync_req, pdMS_TO_TICKS(300000)) == pdTRUE) {
             while (xSemaphoreTake(s_sync_req, 0) == pdTRUE) {}   /* 合并重复请求 */
             s_sync_again = false;                                /* 本次唤醒消费掉同步需求 */
             if (take_one_request(one, sizeof(one))) {
