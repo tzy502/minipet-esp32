@@ -48,6 +48,12 @@ static const char *TAG = "asset";
 
 #define MAX_FILES          256
 #define MAX_CLOCK_MAPS     32
+
+/* 【待机专用背景图默认值 2026-10-03】用户指定：待机背景用"金银岛：天空之城方向升降场"。
+ * manifest 的 doze_map 优先（服务端可远程改），缺省用这个。 */
+#ifndef DOZE_MAP_DEFAULT
+#define DOZE_MAP_DEFAULT   "104020110"
+#endif
 #define WATERMARK_PCT      85     /* E11/4.4：85% 水位触发 */
 #define STOP_PCT           80     /* 清到 80% 停手 */
 /* 16K：rev26/54 条目实测 ~11KB。旧 48K 常驻占内部堆 1/3——本板内部堆
@@ -938,10 +944,12 @@ static void load_local_manifest(void)
         }
     }
 
-    /* 待机专用背景图（空串 = 不切图）。解析失败/缺失一律置空 = 旧行为 */
+    /* 待机专用背景图。**固件侧默认值兜底**（2026-10-03 用户口径"两台机器都要做到、
+     * 硬件侧负责"）：服务端 manifest 没带 doze_map（或空串）时用编译期默认 —— 这样
+     * 待机切图不依赖服务端配置；服务端给了值就以服务端为准（可远程改图）。 */
     {
         const char *dm = cJSON_GetStringValue(cJSON_GetObjectItem(root, "doze_map"));
-        strlcpy(s_doze_map, dm ? dm : "", sizeof(s_doze_map));
+        strlcpy(s_doze_map, (dm && dm[0]) ? dm : DOZE_MAP_DEFAULT, sizeof(s_doze_map));
     }
 
     cJSON *ct = cJSON_GetObjectItem(root, "clock_table");

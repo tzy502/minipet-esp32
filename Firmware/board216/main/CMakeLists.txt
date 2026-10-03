@@ -22,6 +22,7 @@ idf_component_register(
         "render/font_cn/menu_font_cn.c"
         "render/font_lazy.c"
         "render/clock_digits.c"
+        "render/render_doze_bg.c"   # 待机背景（固件内置，用户口径"写死")
         "net/http_client.c"
         "net/poller.c"
         "net/events.c"

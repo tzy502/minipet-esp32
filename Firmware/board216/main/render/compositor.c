@@ -34,6 +34,7 @@
 #include "drivers.h"
 #include "entity_anim.h"
 #include "clock_digits.h"
+#include "render_doze_bg.h"   /* 待机背景（固件内置，用户口径"写死在硬件里"） */
 #include "font_lazy.h"
 #include "font5x7.h"
 #include "lvgl_bridge.h"
@@ -3528,6 +3529,42 @@ static void compose_region(int32_t x, int32_t y, int32_t w, int32_t h)
                 for (int dx2 = 0; dx2 < 8; dx2++)
                     if (tx + dx2 < g_sw && ty + dy2 < g_sh)
                         g_fb[(size_t)(ty + dy2) * g_sw + tx + dx2] = 0xFFFF;
+        }
+    }
+
+    /* 4.4) 【待机背景 = 固件内置图 2026-10-03 用户口径"地图资源直接写死在硬件里"】
+     * 进 CLOCK_DOZE 时背景不再用当前地图（不必等服务端 doze_map，也不依赖地图包下载），
+     * 直接用内置的"升降场那一屏"（render_doze_bg.c）按 RC_SCALE 就近放大铺满。
+     * 上面地图各层铺过的像素在这里被整块覆盖；随后是遮罩 → 人物 → 时钟。 */
+    if (doze) {
+        for (int32_t r = y; r < y + h; r++) {
+            int32_t sry = r >> RC_SCALE_SHIFT;
+            if (sry < 0) sry = 0;
+            if (sry >= g_doze_bg_h) sry = g_doze_bg_h - 1;
+            const uint16_t *srow = g_doze_bg + (size_t)sry * (size_t)g_doze_bg_w;
+            uint16_t *drow = g_fb + (size_t)r * g_sw;
+            for (int32_t c = x; c < x + w; c++) {
+                int32_t scx = c >> RC_SCALE_SHIFT;
+                if (scx < 0) scx = 0;
+                if (scx >= g_doze_bg_w) scx = g_doze_bg_w - 1;
+                drow[c] = srow[scx];
+            }
+        }
+    }
+
+    /* 4.5) 【待机半透明遮罩 2026-10-02 用户口径】"全屏除了时钟打上遮罩半透明"：
+     * 背景整块按 RC_DOZE_MASK_PCT 压暗；时钟在末尾叠（不受影响），人物保持原亮度。 */
+    if (doze) {
+        for (int32_t r = y; r < y + h; r++) {
+            uint16_t *drow = g_fb + (size_t)r * g_sw + x;
+            for (int32_t c = 0; c < w; c++) {
+                uint16_t px = drow[c];
+                uint32_t r5 = (px >> 11) & 0x1Fu, g6 = (px >> 5) & 0x3Fu, b5 = px & 0x1Fu;
+                r5 = r5 * RC_DOZE_MASK_PCT / 100u;
+                g6 = g6 * RC_DOZE_MASK_PCT / 100u;
+                b5 = b5 * RC_DOZE_MASK_PCT / 100u;
+                drow[c] = (uint16_t)((r5 << 11) | (g6 << 5) | b5);
+            }
         }
     }
 

@@ -1364,8 +1364,13 @@ static bool clock_parts_path(char *path, size_t cap)
 
 static void dispatch_clock(int enable)
 {
-    int16_t ax = 0, ay = 0;
-    bool has = asset_dl_clock_anchor(&ax, &ay);   /* 无地图/无表项 → AUTO 居中 */
+    /* 【时钟锚点写死 2026-10-03 用户口径"地图资源直接写死在硬件里"】待机背景是固件内置
+     * 那一屏（render_doze_bg.c），锚点必须配套 ⇒ 直接用内置锚点（不再查 clock_table，
+     * 服务端怎么配都不会让时钟跑偏）。 */
+    extern const int16_t g_doze_clock_anchor_x;
+    extern const int16_t g_doze_clock_anchor_y;
+    int16_t ax = g_doze_clock_anchor_x, ay = g_doze_clock_anchor_y;
+    bool has = true;
     if (!enable) {
         /* 收时钟（DOZE→POKER 唤醒）不依赖素材在位：fontTime 包可能已被 LRU
          * 淘汰/尚未同步，若查路径失败直接 return，时钟永远收不掉 → 永久黑屏。
