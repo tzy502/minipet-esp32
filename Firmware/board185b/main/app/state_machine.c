@@ -999,6 +999,15 @@ static void dispatch_entity(const char *entity)
  * （216 侧同一魔数在 action_maybe_camtest() 里；185b 无该函数，故在此拦截。） */
 static bool action_maybe_entity(const char *action)
 {
+    /* 【抓帧魔数（与 216 对齐）2026-10-03】{"type":"action","value":"shot"} → UDP 帧倾倒。
+     * 本板原先只有气泡 `::shot`，而气泡算用户交互会把 CLOCK_DOZE 打断 —— 待机画面
+     * 远程验不了（真机症状：抓到的永远是唤醒后的常态）。action 通道不打断待机。 */
+    if (action && strcmp(action, "shot") == 0) {
+        extern void render_frame_dump_udp(void);
+        render_frame_dump_udp();
+        return true;
+    }
+
     if (!action || strncmp(action, "entity:", 7) != 0) return false;
     mp_cmd_t c = { .type = MP_CMD_SET_ENTITY };
     strlcpy(c.s, action + 7, sizeof(c.s));
